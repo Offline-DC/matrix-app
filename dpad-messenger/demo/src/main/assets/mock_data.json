@@ -1,0 +1,75 @@
+{
+  "currentUserId": "me",
+  "users": [
+    { "id": "me",     "displayName": "You",            "avatarColor": "#2E7D32" },
+    { "id": "alice",  "displayName": "Alice Cooper",   "avatarColor": "#D81B60" },
+    { "id": "bob",    "displayName": "Bob Marley",     "avatarColor": "#1E88E5" },
+    { "id": "carol",  "displayName": "Carol Danvers",  "avatarColor": "#8E24AA" },
+    { "id": "dave",   "displayName": "Dave Grohl",     "avatarColor": "#F4511E" },
+    { "id": "eve",    "displayName": "Eve Polastri",   "avatarColor": "#00897B" }
+  ],
+  "rooms": [
+    { "id": "r1", "name": "Alice Cooper", "memberIds": ["alice"],                 "isGroup": false, "avatarColor": "#D81B60" },
+    { "id": "r2", "name": "Family",       "memberIds": ["alice", "bob", "carol"], "isGroup": true,  "avatarColor": "#7E57C2" },
+    { "id": "r3", "name": "Dave Grohl",   "memberIds": ["dave"],                  "isGroup": false, "avatarColor": "#F4511E" },
+    { "id": "r4", "name": "Work Crew",    "memberIds": ["bob", "carol", "eve"],   "isGroup": true,  "avatarColor": "#00897B" }
+  ],
+  "messages": [
+    { "id": "h01", "roomId": "r1", "senderId": "alice", "body": "Welcome to our chat!",                "timestampMs": 1716700000000, "status": "READ", "historical": true },
+    { "id": "h02", "roomId": "r1", "senderId": "me",    "body": "Glad to be here.",                    "timestampMs": 1716700060000, "status": "READ", "historical": true },
+    { "id": "h03", "roomId": "r1", "senderId": "alice", "body": "It's been a while since we caught up.","timestampMs": 1716800000000, "status": "READ", "historical": true },
+    { "id": "h04", "roomId": "r1", "senderId": "me",    "body": "I know, work has been hectic.",       "timestampMs": 1716800060000, "status": "READ", "historical": true },
+
+    { "id": "m01", "roomId": "r1", "senderId": "alice", "body": "Hey! Long time no chat 👋",           "timestampMs": 1717000000000, "status": "READ",
+      "reactions": { "👍": ["me"] } },
+    { "id": "m02", "roomId": "r1", "senderId": "me",    "body": "Hi Alice! Been heads-down at work.",   "timestampMs": 1717000060000, "status": "READ" },
+    { "id": "m03", "roomId": "r1", "senderId": "alice", "body": "Same here. Coffee this week?",         "timestampMs": 1717000120000, "status": "READ" },
+    { "id": "m04", "roomId": "r1", "senderId": "me",    "body": "Thursday morning?",                    "timestampMs": 1717000180000, "status": "READ",
+      "replyToId": "m03" },
+    { "id": "m05", "roomId": "r1", "senderId": "alice", "body": "Thursday 10am works 🙌",               "timestampMs": 1717000240000, "status": "DELIVERED",
+      "reactions": { "❤️": ["me"], "🎉": ["me"] } },
+
+    { "id": "h10", "roomId": "r2", "senderId": "bob",   "body": "Anyone watching the game tonight?",    "timestampMs": 1716900000000, "status": "READ", "historical": true },
+    { "id": "h11", "roomId": "r2", "senderId": "carol", "body": "I'm out — early start tomorrow.",      "timestampMs": 1716900060000, "status": "READ", "historical": true },
+
+    { "id": "m10", "roomId": "r2", "senderId": "carol", "body": "Family dinner Sunday?",                "timestampMs": 1717100000000, "status": "READ" },
+    { "id": "m11", "roomId": "r2", "senderId": "bob",   "body": "I'll bring the wine.",                 "timestampMs": 1717100060000, "status": "READ",
+      "reactions": { "🍷": ["alice", "carol"] } },
+    { "id": "m12", "roomId": "r2", "senderId": "alice", "body": "I'll handle dessert.",                 "timestampMs": 1717100120000, "status": "READ",
+      "replyToId": "m10" },
+    { "id": "m13", "roomId": "r2", "senderId": "me",    "body": "Sounds great, see you Sunday!",        "timestampMs": 1717100180000, "status": "READ" },
+    { "id": "m14", "roomId": "r2", "senderId": "carol", "body": "6pm sharp.",                           "timestampMs": 1717100240000, "status": "DELIVERED",
+      "reactions": { "👍": ["me", "bob", "alice"] } },
+    { "id": "m15", "roomId": "r2", "senderId": "bob",   "body": "Wrong room, sorry.",                   "timestampMs": 1717100300000, "status": "READ",
+      "isDeleted": true },
+
+    { "id": "m20", "roomId": "r3", "senderId": "dave",  "body": "Did you see the show last night?",     "timestampMs": 1717200000000, "status": "READ" },
+    { "id": "m21", "roomId": "r3", "senderId": "me",    "body": "Caught the last hour. Incredible.",    "timestampMs": 1717200060000, "status": "READ",
+      "editedAtMs": 1717200080000 },
+    { "id": "m22", "roomId": "r3", "senderId": "dave",  "body": "Encore was unreal 🤘",                "timestampMs": 1717200120000, "status": "DELIVERED",
+      "reactions": { "🤘": ["me"] } },
+
+    { "id": "h40", "roomId": "r4", "senderId": "eve",   "body": "Welcome to the work channel!",         "timestampMs": 1716000000000, "status": "READ", "historical": true },
+    { "id": "h41", "roomId": "r4", "senderId": "bob",   "body": "Thanks for setting this up.",          "timestampMs": 1716000060000, "status": "READ", "historical": true },
+    { "id": "h42", "roomId": "r4", "senderId": "carol", "body": "Let's keep day-to-day stuff here.",    "timestampMs": 1716000120000, "status": "READ", "historical": true },
+    { "id": "h43", "roomId": "r4", "senderId": "me",    "body": "Sounds good. I'll start posting updates Monday.", "timestampMs": 1716000180000, "status": "READ", "historical": true },
+    { "id": "h44", "roomId": "r4", "senderId": "eve",   "body": "Anyone seen the design refresh?",      "timestampMs": 1716100000000, "status": "READ", "historical": true },
+    { "id": "h45", "roomId": "r4", "senderId": "carol", "body": "Yes — I left comments on the spec.",   "timestampMs": 1716100060000, "status": "READ", "historical": true },
+    { "id": "h46", "roomId": "r4", "senderId": "bob",   "body": "Reviewing now.",                       "timestampMs": 1716100120000, "status": "READ", "historical": true },
+    { "id": "h47", "roomId": "r4", "senderId": "me",    "body": "I'll have notes by EOD.",              "timestampMs": 1716100180000, "status": "READ", "historical": true },
+    { "id": "h48", "roomId": "r4", "senderId": "eve",   "body": "Outage at 3pm today, FYI.",            "timestampMs": 1716200000000, "status": "READ", "historical": true },
+    { "id": "h49", "roomId": "r4", "senderId": "carol", "body": "On it. Pager went off.",               "timestampMs": 1716200060000, "status": "READ", "historical": true },
+    { "id": "h4A", "roomId": "r4", "senderId": "bob",   "body": "Rolling back the deploy.",             "timestampMs": 1716200120000, "status": "READ", "historical": true },
+    { "id": "h4B", "roomId": "r4", "senderId": "me",    "body": "Postmortem doc started.",              "timestampMs": 1716200180000, "status": "READ", "historical": true },
+    { "id": "h4C", "roomId": "r4", "senderId": "eve",   "body": "Quarterly review is next Wednesday.",  "timestampMs": 1716300000000, "status": "READ", "historical": true },
+    { "id": "h4D", "roomId": "r4", "senderId": "carol", "body": "Slides drafted, will share tomorrow.", "timestampMs": 1716300060000, "status": "READ", "historical": true },
+    { "id": "h4E", "roomId": "r4", "senderId": "bob",   "body": "Need anything from me?",               "timestampMs": 1716300120000, "status": "READ", "historical": true },
+
+    { "id": "m30", "roomId": "r4", "senderId": "eve",   "body": "Standup at 9 tomorrow.",               "timestampMs": 1717300000000, "status": "READ" },
+    { "id": "m31", "roomId": "r4", "senderId": "bob",   "body": "I'll have the demo ready.",            "timestampMs": 1717300060000, "status": "READ",
+      "reactions": { "👍": ["eve", "me"] } },
+    { "id": "m32", "roomId": "r4", "senderId": "carol", "body": "Adding the metrics dashboard before the call.", "timestampMs": 1717300120000, "status": "READ" },
+    { "id": "m33", "roomId": "r4", "senderId": "me",    "body": "I'll send the agenda tonight.",        "timestampMs": 1717300180000, "status": "SENT",
+      "replyToId": "m30" }
+  ]
+}

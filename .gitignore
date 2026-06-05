@@ -1,0 +1,20 @@
+# --- Gradle ---
+.gradle/
+.gradle-cache/
+build/
+.kotlin/
+
+# --- Android Studio / IntelliJ ---
+.idea/
+*.iml
+captures/
+.cxx/
+local.properties
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Logs / misc ---
+*.log
+*.hprof

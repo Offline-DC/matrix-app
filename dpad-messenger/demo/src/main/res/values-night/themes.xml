@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- DayNight already handles dark mode at the framework layer. -->
+    <style name="Theme.DpadMessenger" parent="Theme.AppCompat.DayNight.NoActionBar" />
+    <style name="Theme.DpadMessenger.Splash" parent="Theme.DpadMessenger" />
+</resources>

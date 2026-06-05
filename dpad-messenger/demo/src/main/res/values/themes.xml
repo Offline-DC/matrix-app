@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        AppCompat-descended parent is required because MainActivity extends
+        AppCompatActivity (to avoid auto edge-to-edge). DayNight follows the
+        system at the framework layer; Compose still drives the actual color
+        scheme inside the window.
+    -->
+    <style name="Theme.DpadMessenger" parent="Theme.AppCompat.DayNight.NoActionBar" />
+    <style name="Theme.DpadMessenger.Splash" parent="Theme.DpadMessenger" />
+</resources>

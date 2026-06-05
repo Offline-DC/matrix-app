@@ -1,0 +1,600 @@
+package com.offline.dpadmessenger.backend.signal
+
+import android.util.Base64
+import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
+import okio.ByteString.Companion.toByteString
+import org.signal.libsignal.metadata.SealedSessionCipher
+import org.signal.libsignal.metadata.SelfSendException
+import org.signal.libsignal.protocol.SignalProtocolAddress
+import org.signal.libsignal.protocol.SessionCipher
+import org.signal.libsignal.protocol.groups.GroupSessionBuilder
+import org.signal.libsignal.protocol.message.PreKeySignalMessage
+import org.signal.libsignal.protocol.message.SenderKeyDistributionMessage
+import org.signal.libsignal.protocol.message.SignalMessage
+import org.whispersystems.signalservice.internal.push.SignalServiceProtos
+import org.whispersystems.signalservice.internal.websocket.WebSocketProtos
+import java.util.UUID
+
+/**
+ * Authenticated chat WebSocket connection.
+ *
+ * Layer 2.5 status:
+ *  - **Wired:** TLS via Signal CA, HTTP-Basic auth, keepalive,
+ *    automatic reconnect on disconnect.
+ *  - **Wired:** Inbound WebSocketMessage envelope parsing.
+ *  - **Wired:** 200-response ack so the server doesn't tear us down.
+ *  - **TODO:** Actually decrypt the `Envelope` inside each request body.
+ *    Requires a [SignalProtocolStore] implementation (session/identity/
+ *    prekey storage backed by SQLite) plus SignalServiceCipher /
+ *    SealedSessionCipher. ~1500 lines on its own. See mautrix-signal
+ *    `pkg/signalmeow/receiving.go` for the structure.
+ *
+ * For now, every inbound message logs the envelope type + sender info
+ * and gets ack'd so the server keeps streaming. That's enough to verify
+ * the link is alive end-to-end without the heavyweight decrypt path.
+ */
+class SignalChatWebSocket(
+    private val account: SignalAccount,
+    private val repository: SignalMessageRepository,
+    private val okHttp: OkHttpClient,
+    /** Protocol store used for SessionCipher decrypt. Optional only so
+     *  pre-existing tests/callers can still wire up the socket without the
+     *  store; in production this MUST be set. */
+    private val protocolStore: AndroidSignalProtocolStore? = null,
+    /** Handler for SyncMessage.Contacts inbound. Optional only for tests;
+     *  in production wire it via the convenience constructor below so
+     *  contact names update from the primary's address book. */
+    private val contactSyncHandler: SignalContactSyncHandler? = null,
+    private val chatUrl: String = "wss://chat.signal.org/v1/websocket/",
+) {
+    /** Convenience: build with Signal-CA-trusting OkHttpClient + protocol store + contact-sync. */
+    constructor(
+        context: android.content.Context,
+        account: SignalAccount,
+        repository: SignalMessageRepository,
+    ) : this(
+        account = account,
+        repository = repository,
+        okHttp = SignalTrust.buildOkHttp(context),
+        protocolStore = AndroidSignalProtocolStore(context, account),
+        contactSyncHandler = SignalContactSyncHandler(
+            account = account,
+            api = SignalApi(SignalTrust.buildOkHttp(context)),
+            repository = repository,
+        ),
+    )
+
+    /**
+     * Optional callback fired every time the chat socket opens (initial
+     * connect AND after reconnects following dropouts). Use this to trigger
+     * contact-sync re-requests so a primary that wasn't reachable on the
+     * first try gets another shot.
+     */
+    var onSocketConnected: (() -> Unit)? = null
+
+    private var socket: WebSocket? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    fun connect() {
+        val auth = "${account.aci}.${account.deviceId}:${account.password}"
+        val authHeader = "Basic " + Base64.encodeToString(auth.toByteArray(), Base64.NO_WRAP)
+        // Signal's chat WebSocket accepts auth via either Basic header OR
+        // login/password query parameters; we send both for compatibility.
+        val url = "$chatUrl?login=${account.aci}.${account.deviceId}&password=${account.password}&agent=DPADMSG"
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", authHeader)
+            .header("X-Signal-Agent", "DPADMSG")
+            .build()
+        socket = okHttp.newWebSocket(request, listener)
+        Log.d(TAG, "connecting as ${account.aci}.${account.deviceId}")
+        startKeepalive()
+    }
+
+    fun disconnect() {
+        socket?.close(1000, "shutdown")
+        socket = null
+    }
+
+    private val listener = object : WebSocketListener() {
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            Log.d(TAG, "chat socket OPEN (HTTP ${response.code})")
+            // Notify outside the listener thread so anything heavy (network,
+            // crypto) doesn't block frame intake.
+            scope.launch { runCatching { onSocketConnected?.invoke() } }
+        }
+
+        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            handleFrame(webSocket, bytes.toByteArray())
+        }
+
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            Log.d(TAG, "chat socket CLOSED $code $reason")
+        }
+
+        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            Log.e(TAG, "chat socket failure code=${response?.code} ${t.message}", t)
+            // Reconnect after a backoff. Signal's server kills idle sockets
+            // after ~55s; transient network blips also trigger this.
+            scope.launch {
+                delay(5_000)
+                connect()
+            }
+        }
+    }
+
+    /**
+     * Parse the inbound [WebSocketProtos.WebSocketMessage] envelope.
+     * Two request paths matter:
+     *  - `PUT /api/v1/message` — body is a serialized SignalService Envelope
+     *    containing one (encrypted) message addressed to our device.
+     *  - `PUT /api/v1/queue/empty` — sent once after we've drained the
+     *    inbound queue; useful as a hook to know "all caught up."
+     */
+    private fun handleFrame(webSocket: WebSocket, bytes: ByteArray) {
+        val envelope = try {
+            WebSocketProtos.WebSocketMessage.parseFrom(bytes)
+        } catch (t: Throwable) {
+            Log.w(TAG, "could not parse chat-socket envelope", t)
+            return
+        }
+        if (envelope.type != WebSocketProtos.WebSocketMessage.Type.REQUEST) return
+        val req = envelope.request ?: return
+
+        when (req.path) {
+            "/api/v1/message" -> handleIncomingMessage(req.body.toByteArray())
+            "/api/v1/queue/empty" -> Log.d(TAG, "queue empty — caught up")
+            else -> Log.d(TAG, "ignoring path ${req.path}")
+        }
+
+        // Acknowledge — without this the server eventually terminates the
+        // socket on the assumption we're dead.
+        sendOk(webSocket, req.id)
+    }
+
+    /**
+     * Parse + decrypt one inbound Signal envelope.
+     *
+     * Two flavors of message we actually decrypt today:
+     *  - `PREKEY_BUNDLE` — first message from a peer; the body is a
+     *    [PreKeySignalMessage] which bootstraps a [SessionRecord].
+     *    `SessionCipher.decrypt(PreKeySignalMessage)` does the bundle
+     *    consumption + session establish + plaintext extract atomically.
+     *  - `CIPHERTEXT` — subsequent messages from an established session.
+     *    Body is a plain [SignalMessage], decrypted via
+     *    `SessionCipher.decrypt(SignalMessage)`.
+     *
+     * `UNIDENTIFIED_SENDER` (sealed-sender) is logged but not yet
+     * decrypted — it requires the server-fetched
+     * `UnidentifiedSenderCertificate` and `SealedSessionCipher`, which is
+     * the next chunk after this lands.
+     */
+    private fun handleIncomingMessage(envelopeBytes: ByteArray) {
+        val env = try {
+            SignalServiceProtos.Envelope.parseFrom(envelopeBytes)
+        } catch (t: Throwable) {
+            Log.w(TAG, "envelope parse failed", t)
+            return
+        }
+
+        val sourceServiceId = env.sourceServiceIdString()
+        Log.d(TAG, "ENVELOPE type=${env.type} from=$sourceServiceId deviceId=${env.sourceDeviceId}")
+
+        val store = protocolStore ?: run {
+            Log.w(TAG, "no protocol store wired — cannot decrypt; dropping")
+            return
+        }
+
+        val plaintext: ByteArray = try {
+            // Sealed-sender envelopes intentionally omit plaintext source
+            // info — the real sender is wrapped inside the encrypted body.
+            // Skip the source-id presence guard for that type only.
+            val isSealed = env.type == SignalServiceProtos.Envelope.Type.UNIDENTIFIED_SENDER
+            if (!isSealed && sourceServiceId.isNullOrEmpty()) {
+                Log.w(TAG, "envelope missing sourceServiceId / sourceServiceIdBinary; dropping")
+                return
+            }
+            val sourceDevice = if (env.hasSourceDeviceId()) env.sourceDeviceId else 1
+            // Address is only meaningful for non-sealed envelopes. For
+            // sealed sender we build it later from the sender certificate.
+            val address = if (isSealed) null
+                          else SignalProtocolAddress(sourceServiceId, sourceDevice)
+            val cipher = if (address != null) SessionCipher(store, address) else null
+            val cipherBody = env.content.toByteArray()
+
+            when (env.type) {
+                SignalServiceProtos.Envelope.Type.PREKEY_MESSAGE -> {
+                    val preKeyMessage = PreKeySignalMessage(cipherBody)
+                    cipher!!.decrypt(preKeyMessage)
+                }
+                SignalServiceProtos.Envelope.Type.DOUBLE_RATCHET -> {
+                    val signalMessage = SignalMessage(cipherBody)
+                    cipher!!.decrypt(signalMessage)
+                }
+                SignalServiceProtos.Envelope.Type.UNIDENTIFIED_SENDER -> {
+                    // Sealed sender — the body is a doubly-wrapped
+                    // UnidentifiedSenderMessage. SealedSessionCipher peels
+                    // both layers (outer ephemeral encryption + inner
+                    // SignalMessage / PreKeySignalMessage) and returns the
+                    // padded Content plaintext. We pivot away from the
+                    // null sourceServiceId here because the *real* sender
+                    // identity lives inside the embedded SenderCertificate
+                    // that SealedSessionCipher hands us back.
+                    val sealed = decryptSealedSender(env)
+                        ?: return  // skip-with-log path is inside the helper
+                    dispatchDecryptedContent(
+                        env = env,
+                        plaintext = sealed.plaintext,
+                        sourceServiceId = sealed.senderUuid,
+                        senderDeviceId = sealed.senderDeviceId,
+                        senderE164 = sealed.senderE164,
+                    )
+                    return
+                }
+                else -> {
+                    Log.d(TAG, "envelope type ${env.type} not handled — skipping")
+                    return
+                }
+            }
+        } catch (t: Throwable) {
+            // Common causes: stale identity, missing prekey on first
+            // contact, server replay. Log loudly so we can iterate, but
+            // don't tear the socket down.
+            Log.w(TAG, "decrypt failed for envelope from $sourceServiceId", t)
+            return
+        }
+
+        // Safe: the early guard above returns when sourceServiceId is
+        // null/empty for non-sealed envelopes, and the sealed branch does
+        // its own dispatch + return inline. Kotlin can't infer that, so
+        // we assert non-null here.
+        //
+        // SessionCipher.decrypt returns the PADDED plaintext (trailing
+        // 0x80 0x00*) just like sealed-sender. Strip it before handing
+        // off to Content.parseFrom — otherwise the proto parser hits the
+        // padding bytes and dies with "invalid tag (zero)".
+        //
+        // Non-sealed envelopes have no SenderCertificate, so no E164.
+        val srcDevice = if (env.hasSourceDeviceId()) env.sourceDeviceId else 1
+        dispatchDecryptedContent(env, stripPadding(plaintext), sourceServiceId!!, srcDevice, senderE164 = null)
+    }
+
+    /**
+     * Modern Signal sends `sourceServiceIdBinary` (16-byte ACI or 17-byte
+     * "1-byte prefix + 16-byte" PNI); legacy servers populate the string
+     * `sourceServiceId`. Try the string first, fall back to the binary.
+     */
+    private fun SignalServiceProtos.Envelope.sourceServiceIdString(): String? {
+        if (hasSourceServiceId() && sourceServiceId.isNotEmpty()) return sourceServiceId
+        val bin = sourceServiceIdBinary?.toByteArray() ?: return null
+        return when (bin.size) {
+            16 -> bytesToUuid(bin)
+            17 -> bytesToUuid(bin.copyOfRange(1, 17))  // strip PNI prefix
+            else -> null
+        }
+    }
+
+    private fun bytesToUuid(bytes: ByteArray): String {
+        val bb = java.nio.ByteBuffer.wrap(bytes)
+        return UUID(bb.long, bb.long).toString()
+    }
+
+    /**
+     * Decode the Content proto and convert any DataMessage into a UI
+     * [Message] for the repository. Sync messages, receipts, typing and
+     * other Content variants are logged but not yet routed.
+     *
+     * Also processes any [SenderKeyDistributionMessage] piggybacked on
+     * this Content — when a sender plans to use SenderKey encryption
+     * (the multi-recipient fast path most modern clients use for
+     * device-sync and group fan-out), they send an SKDM first as a
+     * side-car on a regular sealed-sender DM. Without that step, the
+     * follow-up SenderKey-encrypted envelope fails with
+     * `NoSessionException: missing sender key state for distribution ID`.
+     */
+    private fun dispatchDecryptedContent(
+        env: SignalServiceProtos.Envelope,
+        plaintext: ByteArray,
+        sourceServiceId: String,
+        senderDeviceId: Int,
+        senderE164: String?,
+    ) {
+        val content = try {
+            SignalServiceProtos.Content.parseFrom(plaintext)
+        } catch (t: Throwable) {
+            Log.w(TAG, "decrypted plaintext is not a Content proto", t)
+            return
+        }
+
+        // Process any senderKeyDistributionMessage BEFORE other payloads.
+        // SKDMs can arrive solo (Content with no DataMessage) or piggybacked
+        // onto a DataMessage — in both cases we need to populate the sender
+        // key store so a following SenderKey-encrypted envelope from the
+        // same (senderUuid, senderDeviceId) decrypts.
+        if (content.hasSenderKeyDistributionMessage()) {
+            val store = protocolStore
+            if (store != null) {
+                try {
+                    val skdmBytes = content.senderKeyDistributionMessage.toByteArray()
+                    val skdm = SenderKeyDistributionMessage(skdmBytes)
+                    val senderAddress = SignalProtocolAddress(sourceServiceId, senderDeviceId)
+                    GroupSessionBuilder(store).process(senderAddress, skdm)
+                    Log.d(TAG, "stored senderKey distribution=${skdm.distributionId} from $sourceServiceId.$senderDeviceId")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "failed to process senderKeyDistributionMessage", t)
+                }
+            }
+            // Solo SKDM (no other payload) — nothing further to dispatch.
+            if (!content.hasDataMessage() &&
+                !content.hasSyncMessage() &&
+                !content.hasReceiptMessage() &&
+                !content.hasTypingMessage()
+            ) {
+                return
+            }
+        }
+
+        if (content.hasDataMessage()) {
+            val data = content.dataMessage
+            val body = if (data.hasBody()) data.body else ""
+            val envTs = when {
+                env.hasClientTimestamp() -> env.clientTimestamp
+                env.hasServerTimestamp() -> env.serverTimestamp
+                else -> System.currentTimeMillis()
+            }
+            val ts = if (data.hasTimestamp()) data.timestamp else envTs
+            val messageId = "sig-$sourceServiceId-$ts-${UUID.randomUUID().toString().take(8)}"
+            scope.launch {
+                runCatching {
+                    repository.receiveIncoming(
+                        senderServiceId = sourceServiceId,
+                        senderE164 = senderE164,
+                        messageId = messageId,
+                        body = body,
+                        timestamp = ts,
+                    )
+                }.onFailure { Log.w(TAG, "repository.receiveIncoming failed", it) }
+            }
+        } else if (content.hasSyncMessage()) {
+            handleSyncMessage(content.syncMessage)
+        } else if (content.hasReceiptMessage()) {
+            Log.d(TAG, "receipt message received — not yet routed")
+        } else if (content.hasTypingMessage()) {
+            Log.d(TAG, "typing message — ignored")
+        } else {
+            Log.d(TAG, "decrypted Content has no recognized payload")
+        }
+    }
+
+    /**
+     * Route inbound SyncMessage variants. The two we care about right now:
+     *
+     *  - `contacts` — the primary device's address book, delivered as a
+     *    CDN attachment after we send a SyncMessage.Request{CONTACTS} (or
+     *    after the primary decides to re-push for any other reason).
+     *    Handed off to [SignalContactSyncHandler] which downloads,
+     *    decrypts, parses, and updates [SignalMessageRepository] names.
+     *
+     *  - `sent` — a sibling device of ours sent a message to someone; the
+     *    primary echoes that transcript to all other devices so chat
+     *    history stays consistent. We render it as an outgoing message in
+     *    the matching room.
+     *
+     * Other SyncMessage types (read, viewed, request, blocked, keys, etc.)
+     * are logged but not yet acted on.
+     */
+    private fun handleSyncMessage(sync: SignalServiceProtos.SyncMessage) {
+        when {
+            sync.hasContacts() -> {
+                val handler = contactSyncHandler
+                if (handler == null) {
+                    Log.w(TAG, "contact sync inbound but no handler wired")
+                    return
+                }
+                scope.launch {
+                    runCatching { handler.handle(sync.contacts) }
+                        .onFailure { Log.w(TAG, "contact sync handler threw", it) }
+                }
+            }
+            sync.hasSent() -> dispatchSentTranscript(sync.sent)
+            // `read` is a `repeated Read` field — protobuf-javalite generates
+            // getReadCount()/getReadList() but no hasRead(). Check the count.
+            sync.readCount > 0 -> Log.d(TAG, "sync read receipts (${sync.readCount}) — not yet applied")
+            sync.hasRequest() -> Log.d(TAG, "sync request type=${sync.request.type} from sibling")
+            else -> Log.d(TAG, "sync message with no recognized payload")
+        }
+    }
+
+    /**
+     * Render a Sent transcript from one of our other devices as an
+     * outgoing message in the matching room. Without this, messages sent
+     * on the primary phone would never appear on the Flip 2.
+     */
+    private fun dispatchSentTranscript(sent: SignalServiceProtos.SyncMessage.Sent) {
+        if (!sent.hasMessage()) {
+            Log.d(TAG, "sync.sent without DataMessage (probably edit/delete/reaction) — skipping")
+            return
+        }
+        val data = sent.message
+        val body = if (data.hasBody()) data.body else ""
+        if (body.isBlank()) return
+        val destination = if (sent.hasDestinationServiceId()) sent.destinationServiceId else null
+        if (destination.isNullOrBlank()) {
+            Log.d(TAG, "sync.sent without destinationServiceId (group?) — not yet routed")
+            return
+        }
+        val ts = if (sent.hasTimestamp()) sent.timestamp
+                 else if (data.hasTimestamp()) data.timestamp
+                 else System.currentTimeMillis()
+        val messageId = "sig-sent-$destination-$ts-${UUID.randomUUID().toString().take(8)}"
+        scope.launch {
+            runCatching {
+                repository.receiveOwnSent(
+                    recipientServiceId = destination,
+                    messageId = messageId,
+                    body = body,
+                    timestamp = ts,
+                )
+            }.onFailure { Log.w(TAG, "repository.receiveOwnSent failed", it) }
+        }
+    }
+
+    private fun sendOk(webSocket: WebSocket, requestId: Long) {
+        val response = WebSocketProtos.WebSocketResponseMessage.newBuilder()
+            .setId(requestId)
+            .setStatus(200)
+            .setMessage("OK")
+            .build()
+        val out = WebSocketProtos.WebSocketMessage.newBuilder()
+            .setType(WebSocketProtos.WebSocketMessage.Type.RESPONSE)
+            .setResponse(response)
+            .build()
+        webSocket.send(out.toByteArray().toByteString())
+    }
+
+    /**
+     * Signal's chat server expects an empty WebSocketRequest to
+     * `/v1/keepalive` every ~30 seconds; idle sockets get torn down.
+     * mautrix-signal sends one every 30s. We match.
+     */
+    private fun startKeepalive() {
+        scope.launch {
+            var keepaliveId = 1L
+            while (true) {
+                delay(30_000)
+                val sock = socket ?: return@launch
+                val req = WebSocketProtos.WebSocketRequestMessage.newBuilder()
+                    .setVerb("GET")
+                    .setPath("/v1/keepalive")
+                    .setId(keepaliveId++)
+                    .build()
+                val out = WebSocketProtos.WebSocketMessage.newBuilder()
+                    .setType(WebSocketProtos.WebSocketMessage.Type.REQUEST)
+                    .setRequest(req)
+                    .build()
+                runCatching { sock.send(out.toByteArray().toByteString()) }
+            }
+        }
+    }
+
+    /**
+     * Decrypt a sealed-sender envelope. Walks each of Signal's production
+     * trust roots in turn (cert rotation), and returns the unpadded
+     * Content-proto plaintext + recovered sender identity. Returns null
+     * (with a log) on any failure so the caller can short-circuit
+     * gracefully without breaking the socket.
+     */
+    private fun decryptSealedSender(env: SignalServiceProtos.Envelope): SealedDecryptResult? {
+        val store = protocolStore ?: return null.also {
+            Log.w(TAG, "sealed sender: no protocol store")
+        }
+        val localUuid = try {
+            UUID.fromString(account.aci)
+        } catch (t: Throwable) {
+            Log.w(TAG, "sealed sender: account.aci is not a valid UUID: ${account.aci}", t)
+            return null
+        }
+        val cipher = SealedSessionCipher(
+            store,
+            localUuid,
+            /* localE164Address = */ null,
+            account.deviceId,
+        )
+        val timestamp = when {
+            env.hasServerTimestamp() -> env.serverTimestamp
+            env.hasClientTimestamp() -> env.clientTimestamp
+            else -> System.currentTimeMillis()
+        }
+        val cipherBody = env.content.toByteArray()
+
+        // Diagnostic: log the version byte + size so we can tell whether
+        // we're getting single-recipient sealed sender (0x21/0x22) or
+        // multi-recipient (0x23 / new format). The cipher only handles
+        // single-recipient; if we see multi-recipient, the server is
+        // delivering an unextracted share which we need to flatten with
+        // multiRecipientMessageForSingleRecipient first.
+        val first = if (cipherBody.isNotEmpty()) cipherBody[0].toInt() and 0xFF else -1
+        val version = (first shr 4) and 0x0F
+        val variant = first and 0x0F
+        val hexPreview = cipherBody.take(32).joinToString(" ") { "%02x".format(it.toInt() and 0xFF) }
+        Log.d(
+            TAG,
+            "sealed sender cipherBody: ${cipherBody.size}b firstByte=0x${"%02x".format(first)} " +
+                "(version=$version variant=$variant) head=[$hexPreview]",
+        )
+
+        // libsignal accepts exactly one trust root per validator instance —
+        // walk the rotation list until one accepts the sender cert.
+        for (validator in SignalTrustRoots.productionValidators) {
+            try {
+                val result = cipher.decrypt(validator, cipherBody, timestamp)
+                val plaintext = stripPadding(result.paddedMessage)
+                Log.d(
+                    TAG,
+                    "sealed sender decrypt OK from ${result.senderUuid}.${result.deviceId} " +
+                        "(msgType=${result.ciphertextMessageType}, plain=${plaintext.size}b)",
+                )
+                return SealedDecryptResult(
+                    plaintext = plaintext,
+                    senderUuid = result.senderUuid,
+                    senderE164 = result.senderE164.orElse(null),
+                    senderDeviceId = result.deviceId,
+                )
+            } catch (selfSend: SelfSendException) {
+                // Echo of our own sent message via sync — not an error.
+                Log.d(TAG, "sealed sender: SelfSend echo — dropping")
+                return null
+            } catch (t: Throwable) {
+                // Try the next trust root before giving up. Only the LAST
+                // failure surfaces as a warning.
+                if (validator === SignalTrustRoots.productionValidators.last()) {
+                    Log.w(TAG, "sealed sender decrypt failed against all trust roots", t)
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Signal pads plaintext to obscure length. The padding is a single
+     * `0x80` terminator byte followed by zero or more trailing `0x00`
+     * bytes. Walk backwards from the end, skipping zeros, until we find
+     * the `0x80` marker; everything before it is the real plaintext.
+     *
+     * Reference: Signal-Android `PushTransportDetails
+     * .getStrippedPaddingMessageBody`.
+     */
+    private fun stripPadding(padded: ByteArray): ByteArray {
+        for (i in padded.indices.reversed()) {
+            when (padded[i].toInt() and 0xFF) {
+                0x80 -> return padded.copyOfRange(0, i)
+                0x00 -> continue
+                else -> return padded  // No padding marker found — return as-is; parse will fail loudly if truly corrupt.
+            }
+        }
+        return ByteArray(0)
+    }
+
+    private data class SealedDecryptResult(
+        val plaintext: ByteArray,
+        val senderUuid: String,
+        /** Phone number in E.164 format if the SenderCertificate carries it. */
+        val senderE164: String?,
+        val senderDeviceId: Int,
+    )
+
+    companion object {
+        private const val TAG = "SignalChatWS"
+    }
+}

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- AppCompat-descended so MainActivity (AppCompatActivity) doesn't crash;
+         Compose drives the actual colours inside. -->
+    <style name="Theme.DpadApp" parent="Theme.AppCompat.DayNight.NoActionBar" />
+</resources>
