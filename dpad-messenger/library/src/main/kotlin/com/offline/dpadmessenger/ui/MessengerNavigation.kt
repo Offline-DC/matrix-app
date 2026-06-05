@@ -18,11 +18,13 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.offline.dpadmessenger.data.ConversationStarter
 import com.offline.dpadmessenger.data.MessageRepository
 import com.offline.dpadmessenger.ui.chat.ChatScreen
 import com.offline.dpadmessenger.ui.chat.ChatViewModel
 import com.offline.dpadmessenger.ui.components.LocalCurrentUserId
 import com.offline.dpadmessenger.ui.login.LoginScreen
+import com.offline.dpadmessenger.ui.newconversation.NewConversationScreen
 import com.offline.dpadmessenger.ui.rooms.RoomListScreen
 import com.offline.dpadmessenger.ui.rooms.RoomListViewModel
 import com.offline.dpadmessenger.ui.settings.SettingsScreen
@@ -56,12 +58,38 @@ fun DpadMessengerApp(
     startAuthenticated: Boolean = true,
     darkTheme: Boolean = false,
     onToggleDarkTheme: ((Boolean) -> Unit)? = null,
+    /** Host-provided logout. When set (launcher), Settings → Log out calls
+     *  this instead of the built-in stub login navigation, so the host can
+     *  clear the real pairing and return to its own link screen. */
+    onLogout: (() -> Unit)? = null,
+    /** Auto-delete-old-messages setting (hidden when change handler is null). */
+    autoDeleteEnabled: Boolean = true,
+    onAutoDeleteChange: ((Boolean) -> Unit)? = null,
+    /** 24-hour clock setting (hidden when change handler is null). */
+    use24HourTime: Boolean = false,
+    onUse24HourTimeChange: ((Boolean) -> Unit)? = null,
+    /** Read-receipts setting (hidden when change handler is null). */
+    readReceiptsEnabled: Boolean = false,
+    onReadReceiptsChange: ((Boolean) -> Unit)? = null,
+    /** Deep link: open this conversation on top of the room list (set when
+     *  the user tapped a message notification). [initialRoomKey] must change
+     *  per tap so a fresh notification re-navigates. */
+    initialRoomId: String? = null,
+    initialRoomKey: Any? = null,
 ) {
     val nav = rememberNavController()
     val factory = remember(repository) { RepositoryViewModelFactory(repository) }
     var authed by rememberSaveable { mutableStateOf(startAuthenticated) }
 
     val startRoute = if (authed) Routes.ROOM_LIST else Routes.LOGIN
+
+    // Notification tap → jump straight into that thread. Keyed on the tap
+    // nonce so a second notification for the same room still navigates.
+    androidx.compose.runtime.LaunchedEffect(initialRoomKey) {
+        if (initialRoomId != null && authed) {
+            nav.navigate(Routes.chat(initialRoomId)) { launchSingleTop = true }
+        }
+    }
 
     CompositionLocalProvider(LocalCurrentUserId provides repository.currentUser.id) {
         NavHost(
@@ -91,6 +119,25 @@ fun DpadMessengerApp(
                     viewModel = vm,
                     onRoomClick = { roomId -> nav.navigate(Routes.chat(roomId)) },
                     onSettingsClick = { nav.navigate(Routes.SETTINGS) },
+                    // Only offer "new message" if the repo can actually start
+                    // conversations (the mock can't).
+                    onNewMessage = if (repository is ConversationStarter) {
+                        { nav.navigate(Routes.NEW_CONVERSATION) }
+                    } else null,
+                )
+            }
+            composable(Routes.NEW_CONVERSATION) {
+                NewConversationScreen(
+                    starter = repository as ConversationStarter,
+                    contactsSource = repository as? com.offline.dpadmessenger.data.ContactsSource,
+                    onBack = { nav.popBackStack() },
+                    onConversationStarted = { roomId ->
+                        nav.navigate(Routes.chat(roomId)) {
+                            // Replace the compose screen so Back from the chat
+                            // returns to the room list, not the number entry.
+                            popUpTo(Routes.NEW_CONVERSATION) { inclusive = true }
+                        }
+                    },
                 )
             }
             composable(
@@ -109,16 +156,29 @@ fun DpadMessengerApp(
                 SettingsScreen(
                     onBack = { nav.popBackStack() },
                     onLogout = {
-                        authed = false
-                        // Clear the entire back stack — there can be a chat in
-                        // it from before settings was opened, and the user
-                        // shouldn't be able to back-button into it post-logout.
-                        nav.navigate(Routes.LOGIN) {
-                            popUpTo(0) { inclusive = true }
+                        if (onLogout != null) {
+                            // Host clears the real session/pairing and swaps
+                            // this whole UI out for its link screen.
+                            onLogout()
+                        } else {
+                            authed = false
+                            // Clear the entire back stack — there can be a chat
+                            // in it from before settings was opened, and the
+                            // user shouldn't be able to back into it post-logout.
+                            nav.navigate(Routes.LOGIN) {
+                                popUpTo(0) { inclusive = true }
+                            }
                         }
                     },
+                    showDarkThemeToggle = onToggleDarkTheme != null,
                     darkTheme = darkTheme,
                     onDarkThemeChange = { onToggleDarkTheme?.invoke(it) },
+                    autoDeleteEnabled = autoDeleteEnabled,
+                    onAutoDeleteChange = onAutoDeleteChange,
+                    use24HourTime = use24HourTime,
+                    onUse24HourTimeChange = onUse24HourTimeChange,
+                    readReceiptsEnabled = readReceiptsEnabled,
+                    onReadReceiptsChange = onReadReceiptsChange,
                 )
             }
         }
@@ -129,6 +189,7 @@ internal object Routes {
     const val LOGIN = "login"
     const val ROOM_LIST = "rooms"
     const val SETTINGS = "settings"
+    const val NEW_CONVERSATION = "new_conversation"
     const val ARG_ROOM_ID = "roomId"
     const val CHAT = "chat/{$ARG_ROOM_ID}"
     fun chat(roomId: String) = "chat/$roomId"

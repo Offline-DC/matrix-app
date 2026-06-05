@@ -8,7 +8,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -39,9 +41,22 @@ import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 fun SettingsScreen(
     onBack: () -> Unit,
     onLogout: () -> Unit,
-    darkTheme: Boolean,
-    onDarkThemeChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
+    /** When true, show the dark-theme toggle (demo harness). The launcher
+     *  forces light, so it passes false and the row is hidden. */
+    showDarkThemeToggle: Boolean = false,
+    darkTheme: Boolean = false,
+    onDarkThemeChange: (Boolean) -> Unit = {},
+    /** Auto-delete-old-messages toggle. Hidden when [onAutoDeleteChange] is
+     *  null (repositories without local retention). */
+    autoDeleteEnabled: Boolean = true,
+    onAutoDeleteChange: ((Boolean) -> Unit)? = null,
+    /** 24-hour clock toggle. Hidden when [onUse24HourTimeChange] is null. */
+    use24HourTime: Boolean = false,
+    onUse24HourTimeChange: ((Boolean) -> Unit)? = null,
+    /** Read-receipts toggle. Hidden when [onReadReceiptsChange] is null. */
+    readReceiptsEnabled: Boolean = false,
+    onReadReceiptsChange: ((Boolean) -> Unit)? = null,
 ) {
     Scaffold(
         topBar = {
@@ -61,16 +76,60 @@ fun SettingsScreen(
         modifier = modifier.fillMaxSize(),
     ) { inner ->
         Column(
-            modifier = Modifier.padding(inner).padding(8.dp).fillMaxSize(),
+            modifier = Modifier
+                .padding(inner)
+                .padding(8.dp)
+                .fillMaxSize()
+                // Scrollable so content taller than the screen (esp. on a
+                // 240x320 flip) can be reached. The focusable rows drive the
+                // scroll via DPAD; the About section sits ABOVE the bottom so
+                // it's visible on the way down to Log out.
+                .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            SettingHeader("Display")
-            ToggleRow(
-                title = "Dark theme",
-                subtitle = "Use the system theme on by default",
-                checked = darkTheme,
-                onCheckedChange = onDarkThemeChange,
-            )
+            if (showDarkThemeToggle || onUse24HourTimeChange != null) {
+                SettingHeader("Display")
+                if (showDarkThemeToggle) {
+                    ToggleRow(
+                        title = "Dark theme",
+                        subtitle = "Use the system theme on by default",
+                        checked = darkTheme,
+                        onCheckedChange = onDarkThemeChange,
+                    )
+                }
+                if (onUse24HourTimeChange != null) {
+                    ToggleRow(
+                        title = "24-hour time",
+                        subtitle = "Show times like 14:30 instead of 2:30 PM",
+                        checked = use24HourTime,
+                        onCheckedChange = onUse24HourTimeChange,
+                    )
+                }
+            }
+            if (onAutoDeleteChange != null || onReadReceiptsChange != null) {
+                SettingHeader("Messages")
+                if (onReadReceiptsChange != null) {
+                    ToggleRow(
+                        title = "Send read receipts",
+                        subtitle = "Let senders see when you've read their message.",
+                        checked = readReceiptsEnabled,
+                        onCheckedChange = onReadReceiptsChange,
+                    )
+                }
+                if (onAutoDeleteChange != null) {
+                    ToggleRow(
+                        title = "Auto-delete old messages",
+                        subtitle = "Remove texts older than 3 days from this device. " +
+                            "This will not delete messages on other devices.",
+                        checked = autoDeleteEnabled,
+                        onCheckedChange = onAutoDeleteChange,
+                    )
+                }
+            }
+            SettingHeader("About")
+            StaticRow(title = "Version", subtitle = "0.2.0 — Phase 2 demo")
+            StaticRow(title = "Repository", subtitle = "dpad-messenger")
+            // Log out kept last so it's the bottom-most action.
             SettingHeader("Account")
             ActionRow(
                 title = "Log out",
@@ -78,9 +137,6 @@ fun SettingsScreen(
                 destructive = true,
                 onClick = onLogout,
             )
-            SettingHeader("About")
-            StaticRow(title = "Version", subtitle = "0.2.0 — Phase 2 demo")
-            StaticRow(title = "Repository", subtitle = "dpad-messenger")
         }
     }
 }

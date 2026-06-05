@@ -1,14 +1,27 @@
 package com.offline.dpadmessenger.ui.util
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
-/** "12:34" — short clock time. */
+/**
+ * App-wide clock format preference. 12-hour by default ("2:15 PM"); Settings
+ * exposes a toggle for 24-hour ("14:15"). Backed by Compose state so flipping
+ * the toggle recomposes every visible timestamp immediately. The host app is
+ * responsible for persisting the choice and re-applying it on startup.
+ */
+object TimeFormatPreference {
+    var use24Hour: Boolean by mutableStateOf(false)
+}
+
+/** Short clock time — "2:15 PM" (default) or "14:15" in 24-hour mode. */
 fun formatTimeShort(epochMs: Long): String {
-    val fmt = SimpleDateFormat("HH:mm", Locale.getDefault())
-    return fmt.format(Date(epochMs))
+    val pattern = if (TimeFormatPreference.use24Hour) "HH:mm" else "h:mm a"
+    return SimpleDateFormat(pattern, Locale.getDefault()).format(Date(epochMs))
 }
 
 /** Signal/WhatsApp-style relative label: time today, "Yesterday", or date. */

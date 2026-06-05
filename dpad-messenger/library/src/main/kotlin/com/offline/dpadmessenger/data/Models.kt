@@ -30,6 +30,25 @@ enum class MessageStatus {
 }
 
 @Serializable
+enum class AttachmentKind { IMAGE, VIDEO, OTHER }
+
+/**
+ * A media attachment on a message. [downloadToken] is whatever the backing
+ * repository needs to fetch + decrypt the bytes later (opaque to the UI).
+ * [localPath] is filled in once downloaded so the bubble can render/play it.
+ */
+@Serializable
+data class Attachment(
+    val kind: AttachmentKind,
+    val mimeType: String = "",
+    val name: String = "",
+    /** Opaque token the repository uses to download (e.g. "mediaId:keyB64"). */
+    val downloadToken: String = "",
+    /** Local file path once downloaded; null = not loaded yet. */
+    val localPath: String? = null,
+)
+
+@Serializable
 data class Message(
     val id: String,
     val roomId: String,
@@ -48,6 +67,8 @@ data class Message(
     val editedAtMs: Long? = null,
     /** True if redacted. Body will be empty. */
     val isDeleted: Boolean = false,
+    /** Media attachment, if this message carries one. */
+    val attachment: Attachment? = null,
 )
 
 @Serializable

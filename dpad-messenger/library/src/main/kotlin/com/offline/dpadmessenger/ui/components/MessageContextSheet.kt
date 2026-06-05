@@ -31,9 +31,9 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
-import androidx.tv.foundation.lazy.list.TvLazyRow
-import androidx.tv.foundation.lazy.list.itemsIndexed
-import androidx.tv.foundation.lazy.list.rememberTvLazyListState
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import com.offline.dpadmessenger.data.DefaultReactions
 import com.offline.dpadmessenger.data.Message
 import com.offline.dpadmessenger.focus.dpadRow
@@ -62,6 +62,8 @@ fun MessageContextSheet(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onDismiss: () -> Unit,
+    /** Resolve a user id to a display name, for the "who reacted" list. */
+    senderNameFor: (String) -> String = { it },
 ) {
     // skipPartiallyExpanded so the sheet opens fully on small screens (e.g.
     // 240x320 TCL Flip 2) where the half-expanded state hides actions below
@@ -91,6 +93,19 @@ fun MessageContextSheet(
                 },
                 firstChipFocus = firstChipFocus,
             )
+            // Who reacted: one line per emoji already on this message.
+            if (message.reactions.isNotEmpty() && !message.isDeleted) {
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
+                    message.reactions.forEach { (emoji, userIds) ->
+                        Text(
+                            text = "$emoji  ${userIds.joinToString(", ") { senderNameFor(it) }}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(vertical = 2.dp),
+                        )
+                    }
+                }
+            }
             Box(
                 modifier = Modifier
                     .padding(vertical = 8.dp)
@@ -127,10 +142,10 @@ private fun ReactionPickerRow(
     onPick: (String) -> Unit,
     firstChipFocus: FocusRequester,
 ) {
-    // TvLazyRow + DPAD-left/right keeps the picker usable on 240dp-wide
+    // LazyRow + DPAD-left/right keeps the picker usable on 240dp-wide
     // screens (TCL Flip 2 et al.) where a fixed Row of 7 chips overflows.
-    val state = rememberTvLazyListState()
-    TvLazyRow(
+    val state = rememberLazyListState()
+    LazyRow(
         state = state,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,

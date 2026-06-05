@@ -46,11 +46,22 @@ fun InitialsAvatar(
 }
 
 private fun initialsOf(name: String): String {
-    val parts = name.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+    val trimmed = name.trim()
+    if (trimmed.isEmpty()) return "?"
+    // Letter-based names (contacts): use word initials, e.g. "Google Voice" → "GV".
+    val letterParts = trimmed.split(Regex("\\s+")).filter { it.firstOrNull()?.isLetter() == true }
+    if (letterParts.isNotEmpty()) {
+        return if (letterParts.size == 1) letterParts[0].take(1).uppercase()
+        else (letterParts.first().take(1) + letterParts.last().take(1)).uppercase()
+    }
+    // No name — just a phone number like "(404) 980-1785" or a short code.
+    // The leading "(9" monogram reads as noise; the last two digits ("85")
+    // are far more recognizable for an unsaved contact.
+    val digits = trimmed.filter { it.isDigit() }
     return when {
-        parts.isEmpty() -> "?"
-        parts.size == 1 -> parts[0].take(1).uppercase()
-        else -> (parts.first().take(1) + parts.last().take(1)).uppercase()
+        digits.length >= 2 -> digits.takeLast(2)
+        digits.length == 1 -> digits
+        else -> trimmed.take(1).uppercase()
     }
 }
 

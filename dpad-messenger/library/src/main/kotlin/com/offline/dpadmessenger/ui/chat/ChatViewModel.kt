@@ -113,6 +113,28 @@ class ChatViewModel(
         viewModelScope.launch { repository.toggleReaction(roomId, messageId, emoji) }
     }
 
+    /** Message ids currently downloading their attachment. */
+    private val _downloadingMedia = MutableStateFlow<Set<String>>(emptySet())
+    val downloadingMedia: StateFlow<Set<String>> = _downloadingMedia.asStateFlow()
+
+    /** Message ids whose last download attempt failed (→ show "tap to retry"). */
+    private val _failedMedia = MutableStateFlow<Set<String>>(emptySet())
+    val failedMedia: StateFlow<Set<String>> = _failedMedia.asStateFlow()
+
+    /** Download an attachment (first tap on a media bubble). The repository
+     *  updates the message's localPath in the flow when it finishes. */
+    fun downloadMedia(messageId: String) {
+        val downloader = repository as? com.offline.dpadmessenger.data.MediaDownloader ?: return
+        if (messageId in _downloadingMedia.value) return
+        viewModelScope.launch {
+            _failedMedia.value = _failedMedia.value - messageId
+            _downloadingMedia.value = _downloadingMedia.value + messageId
+            val path = runCatching { downloader.downloadMedia(roomId, messageId) }.getOrNull()
+            _downloadingMedia.value = _downloadingMedia.value - messageId
+            if (path == null) _failedMedia.value = _failedMedia.value + messageId
+        }
+    }
+
     fun delete(messageId: String) {
         viewModelScope.launch { repository.deleteMessage(roomId, messageId) }
     }

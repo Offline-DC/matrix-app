@@ -23,8 +23,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
@@ -71,10 +73,28 @@ fun ChatScreen(
     val editTarget by viewModel.editTarget.collectAsState()
     val selected by viewModel.selectedMessage.collectAsState()
 
+    val downloadingMedia by viewModel.downloadingMedia.collectAsState()
+    val failedMedia by viewModel.failedMedia.collectAsState()
+    // Fullscreen media overlay: (file path, kind). Null = closed.
+    var mediaViewer by remember {
+        mutableStateOf<Pair<String, com.offline.dpadmessenger.data.AttachmentKind>?>(null)
+    }
+
     val composerFr = remember { FocusRequester() }
     val lastBubbleFr = remember { FocusRequester() }
     val backBtnFr = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
+
+    // Tap/OK on a media bubble: first load it, then (once cached) view it.
+    val onMediaActivate: (Message) -> Unit = activate@{ msg ->
+        val att = msg.attachment ?: return@activate
+        val path = att.localPath
+        if (path != null && java.io.File(path).exists()) {
+            mediaViewer = path to att.kind
+        } else if (msg.id !in downloadingMedia) {
+            viewModel.downloadMedia(msg.id)
+        }
+    }
 
     // No parent-side focus retry — the DpadComposer handles initial focus
     // itself via onGloballyPositioned, which guarantees the inner field is
@@ -125,6 +145,9 @@ fun ChatScreen(
                 onBubbleClick = viewModel::openMessageSheet,
                 onLoadOlderVisible = viewModel::requestLoadOlder,
                 lastBubbleFocusRequester = lastBubbleFr,
+                downloadingMedia = downloadingMedia,
+                failedMedia = failedMedia,
+                onMediaActivate = onMediaActivate,
                 modifier = Modifier.weight(1f),
             )
             BannerRegion(
@@ -140,14 +163,18 @@ fun ChatScreen(
                 prefillKey = editTarget?.id,
                 textFieldFocusRequester = composerFr,
                 onUpFromField = {
-                    // Yield one frame before requesting focus. If the user
-                    // just sent a message, the new bubble has been composed
-                    // but not yet placed in the focus tree — requesting
-                    // focus on the same frame silently no-ops. Waiting a
-                    // frame lets layout complete first.
+                    // Move focus up to the most-recent bubble. If the user
+                    // JUST sent a message, that bubble was composed this frame
+                    // and isn't in the focus tree yet — requesting focus on it
+                    // immediately silently no-ops. Retry across a few frames
+                    // until it attaches (or we give up), so DPAD-Up reliably
+                    // lands on the new message instead of doing nothing.
                     scope.launch {
-                        withFrameNanos {}
-                        runCatching { lastBubbleFr.requestFocus() }
+                        repeat(8) {
+                            withFrameNanos {}
+                            val ok = runCatching { lastBubbleFr.requestFocus() }.isSuccess
+                            if (ok) return@launch
+                        }
                     }
                 },
                 onLeftFromField = { runCatching { backBtnFr.requestFocus() } },
@@ -165,13 +192,34 @@ fun ChatScreen(
     if (sel != null) {
         MessageContextSheet(
             message = sel,
-            canEdit = sel.isOutgoing && !sel.isDeleted,
-            canDelete = sel.isOutgoing && !sel.isDeleted,
+            // Texting (SMS/RCS) has no "edit sent message" operation, and
+            // delete-for-everyone isn't wired yet — both would silently do
+            // nothing, so don't offer them. (Reply + reactions remain.)
+            canEdit = false,
+            canDelete = false,
             onReact = { emoji -> viewModel.react(sel.id, emoji) },
             onReply = { viewModel.startReply(sel) },
             onEdit = { viewModel.startEdit(sel) },
             onDelete = { viewModel.delete(sel.id) },
             onDismiss = viewModel::closeMessageSheet,
+            senderNameFor = viewModel::senderName,
+        )
+    }
+
+    // Fullscreen image/video viewer overlay.
+    mediaViewer?.let { (path, kind) ->
+        FullscreenMediaViewer(
+            path = path,
+            kind = kind,
+            onClose = {
+                mediaViewer = null
+                // Land focus back on the composer when the viewer closes, so
+                // the user can keep typing without hunting for focus.
+                scope.launch {
+                    withFrameNanos {}
+                    runCatching { composerFr.requestFocus() }
+                }
+            },
         )
     }
 }
@@ -209,6 +257,9 @@ private fun Timeline(
     onBubbleClick: (Message) -> Unit,
     onLoadOlderVisible: () -> Unit,
     lastBubbleFocusRequester: FocusRequester,
+    downloadingMedia: Set<String>,
+    failedMedia: Set<String>,
+    onMediaActivate: (Message) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // reverseLayout = true means item index 0 is anchored at the BOTTOM of
@@ -249,10 +300,27 @@ private fun Timeline(
     val lastMessageId = (timeline.lastOrNull { it is TimelineItem.MessageItem }
         as? TimelineItem.MessageItem)?.message?.id
 
+    // Keep the newest message fully on-screen when the timeline grows while
+    // the user is already at the bottom — e.g. they just sent a message, or a
+    // new one arrived while they were reading the latest. With reverseLayout,
+    // index 0 is the visual bottom, and firstVisibleItemIndex == 0 means
+    // "anchored at the newest". Only auto-scroll when near the bottom so we
+    // never yank the user away while they're scrolled up reading history.
+    // This also guarantees the just-sent bubble is measured/visible so the
+    // composer's DPAD-Up can focus it (an off-screen row can't take focus).
+    LaunchedEffect(lastMessageId) {
+        if (lastMessageId != null && listState.firstVisibleItemIndex <= 2) {
+            listState.animateScrollToItem(0)
+        }
+    }
+
     LazyColumn(
         state = listState,
         reverseLayout = true,
-        contentPadding = PaddingValues(vertical = 6.dp),
+        // Extra bottom padding (the visual bottom under reverseLayout) keeps
+        // the newest bubble's timestamp/✓ row clear of the composer instead of
+        // tucked right against it.
+        contentPadding = PaddingValues(top = 6.dp, bottom = 10.dp),
         modifier = modifier.fillMaxSize(),
     ) {
         items(items = reversed, key = { it.key }) { item ->
@@ -274,6 +342,9 @@ private fun Timeline(
                         parentSnippet = parent,
                         onClick = { onBubbleClick(msg) },
                         focusRequester = if (msg.id == lastMessageId) lastBubbleFocusRequester else null,
+                        isDownloadingMedia = msg.id in downloadingMedia,
+                        mediaFailed = msg.id in failedMedia,
+                        onMediaActivate = { onMediaActivate(msg) },
                     )
                 }
             }

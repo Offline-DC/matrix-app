@@ -8,7 +8,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -30,7 +32,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.focusGroup
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
@@ -39,6 +43,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import kotlinx.coroutines.delay
 import androidx.compose.ui.text.TextRange
@@ -139,12 +144,33 @@ fun DpadComposer(
         runCatching { fieldFr.requestFocus() }
     }
 
-    Column(modifier = modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)) {
+    // The Scaffold's imePadding shifts content up by the keyboard height, but
+    // on TCL devices the predictive/candidate strip sits ABOVE the keyboard and
+    // isn't part of the IME inset — so the composer's last line gets hidden
+    // behind it. While the keyboard is up, add extra bottom space to lift the
+    // field clear of that strip. Zero when the keyboard is closed.
+    val keyboardUp = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    val extraImeBottom = if (keyboardUp) 48.dp else 0.dp
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(bottom = extraImeBottom),
+    ) {
         if (header != null) header()
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.fillMaxWidth().padding(8.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp)
+                // Treat the field + Send button as one focus group, and make
+                // the TEXT FIELD the entry target. So DPAD-Down from the
+                // message list lands on "Type a message", not the Send button.
+                // (Right-from-field still reaches Send via its own requester.)
+                .focusProperties { @Suppress("DEPRECATION") enter = { fieldFr } }
+                .focusGroup(),
         ) {
             Box(
                 modifier = Modifier
