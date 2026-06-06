@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.offline.dpadmessenger.backend.matrix"
-    compileSdk = 34
+    compileSdk = 36
     defaultConfig {
         minSdk = 24
         // matrix-rust-sdk uses 16KB-aligned native libs and excludes some

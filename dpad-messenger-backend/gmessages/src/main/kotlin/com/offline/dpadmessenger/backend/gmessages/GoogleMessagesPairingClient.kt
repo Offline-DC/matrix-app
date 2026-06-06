@@ -223,8 +223,10 @@ class GoogleMessagesPairingClient(context: Context) {
         call.execute().use { resp ->
             Log.d(TAG, "long-poll #$attempt HTTP ${resp.code} ${resp.header("content-type")}")
             if (!resp.isSuccessful) {
-                val body = resp.body?.string().orEmpty()
-                Log.e(TAG, "long-poll #$attempt failed body=${body.take(300)}")
+                // NB: do NOT log the response body — failed pairing responses can
+                // echo request material. Status code is enough to diagnose.
+                resp.body?.close()
+                Log.e(TAG, "long-poll #$attempt failed HTTP ${resp.code}")
                 // 401/403 mean the token is dead — fatal. Others: retry.
                 return resp.code == 401 || resp.code == 403
             }
@@ -240,10 +242,12 @@ class GoogleMessagesPairingClient(context: Context) {
                 if (read == 0L) continue
                 totalBytes += read
                 val text = buf.readUtf8()
-                Log.d(TAG, "long-poll #$attempt read $read bytes (total $totalBytes): ${text.take(160).replace("\n", "\\n")}")
+                // NB: never log `text`/`element` — the pair payload carries the
+                // tachyon auth token and device identities. Sizes/counts only.
+                Log.d(TAG, "long-poll #$attempt read $read bytes (total $totalBytes)")
                 for (element in splitter.feed(text)) {
                     elementCount++
-                    Log.d(TAG, "long-poll element #$elementCount (${element.length} chars): ${element.take(200)}")
+                    Log.d(TAG, "long-poll element #$elementCount (${element.length} chars)")
                     val paired = runCatching { PbLite.extractPairedResult(element) }
                         .getOrElse { Log.w(TAG, "pair decode failed", it); null }
                         ?: continue

@@ -71,6 +71,7 @@ fun ChatScreen(
 ) {
     val room by viewModel.room.collectAsState()
     val timeline by viewModel.timeline.collectAsState()
+    val loading by viewModel.loading.collectAsState()
     val replyTarget by viewModel.replyTarget.collectAsState()
     val editTarget by viewModel.editTarget.collectAsState()
     val selected by viewModel.selectedMessage.collectAsState()
@@ -101,6 +102,12 @@ fun ChatScreen(
 
     // Tap/OK on a media bubble: first load it, then (once cached) view it.
     val onMediaActivate: (Message) -> Unit = activate@{ msg ->
+        // A failed outgoing media has nothing to download — open the context
+        // sheet (Retry/Reply) instead of attempting a pointless fetch.
+        if (msg.isOutgoing && msg.status == com.offline.dpadmessenger.data.MessageStatus.FAILED) {
+            viewModel.openMessageSheet(msg)
+            return@activate
+        }
         val att = msg.attachment ?: return@activate
         val path = att.localPath
         if (path != null && java.io.File(path).exists()) {
@@ -154,6 +161,7 @@ fun ChatScreen(
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
             Timeline(
                 timeline = timeline,
+                loading = loading,
                 isGroup = room?.isGroup == true,
                 senderNameFor = viewModel::senderName,
                 resolveParent = viewModel::parentSnippet,
@@ -224,6 +232,7 @@ fun ChatScreen(
             onReply = { viewModel.startReply(sel) },
             onEdit = { viewModel.startEdit(sel) },
             onDelete = { viewModel.delete(sel.id) },
+            onRetry = { viewModel.resend(sel.id) },
             onDismiss = viewModel::closeMessageSheet,
             senderNameFor = viewModel::senderName,
         )
@@ -297,6 +306,7 @@ private fun BannerRegion(
 @Composable
 private fun Timeline(
     timeline: List<TimelineItem>,
+    loading: Boolean,
     isGroup: Boolean,
     senderNameFor: (String) -> String,
     resolveParent: suspend (String?) -> ReplyParentSnippet?,
@@ -344,7 +354,13 @@ private fun Timeline(
 
     if (timeline.isEmpty()) {
         Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("No messages yet — say hi.")
+            // Spinner while the room's history is still loading; only show the
+            // empty-state once we're confident the conversation is actually empty.
+            if (loading) {
+                androidx.compose.material3.CircularProgressIndicator()
+            } else {
+                Text("No messages yet — say hi.")
+            }
         }
         return
     }

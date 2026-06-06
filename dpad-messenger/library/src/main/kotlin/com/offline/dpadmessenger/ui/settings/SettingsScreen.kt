@@ -20,8 +20,11 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.focus.dpadRow
 import com.offline.dpadmessenger.ui.components.CompactBarButton
@@ -58,12 +61,17 @@ fun SettingsScreen(
     readReceiptsEnabled: Boolean = false,
     onReadReceiptsChange: ((Boolean) -> Unit)? = null,
 ) {
+    // Land focus on the back button on entry, so the screen has a visible
+    // highlight and DPAD navigation works immediately (every other screen sets
+    // initial focus; this one used to start with nothing focused).
+    val backFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { backFocus.requestFocus() } }
     Scaffold(
         topBar = {
             CompactTopBar(
                 title = "Settings",
                 navigationIcon = {
-                    CompactBarButton(onClick = onBack) {
+                    CompactBarButton(onClick = onBack, focusRequester = backFocus) {
                         Icon(
                             Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",

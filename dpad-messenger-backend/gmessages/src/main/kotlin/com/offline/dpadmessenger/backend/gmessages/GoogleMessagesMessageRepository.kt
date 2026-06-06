@@ -29,6 +29,7 @@ import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * Real [MessageRepository] backed by a live [GoogleMessagesSessionClient].
@@ -143,9 +144,10 @@ internal class GoogleMessagesMessageRepository(
     val authExpired: StateFlow<Boolean> = _authExpired.asStateFlow()
 
     init {
-        // Restore the on-disk cache immediately so history shows on launch,
-        // before the network sync lands. Pruned to the retention window.
-        restoreFromCache()
+        // Restore the on-disk cache so history shows on launch, before the
+        // network sync lands. Off the constructor thread (IO inside) so a large
+        // cache can't jank/ANR startup; guarded against clobbering live data.
+        scope.launch { restoreFromCache() }
         scope.launch {
             session.events.collect { evt ->
                 when (evt) {
@@ -192,32 +194,39 @@ internal class GoogleMessagesMessageRepository(
         scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
     }
 
-    private fun restoreFromCache() {
-        val snap = cache.load() ?: return
-        val cutoff =
-            if (autoDeleteOldMessages) System.currentTimeMillis() - AUTO_DELETE_AGE_MS else 0L
-        usersById.value = snap.usersById + (ME to currentUser)
-        rooms.value = snap.rooms
-        messagesByRoom.value = snap.messagesByRoom
-            .mapValues { (_, list) -> list.filter { it.timestampMs >= cutoff } }
-        unreadByRoom.value = snap.unreadByRoom
-        outgoingIdByRoom.putAll(snap.outgoingIdByRoom)
-        snap.rooms.forEach { roomNameById[it.id] = it.name }
-        // We have something to show — skip the loading spinner; the live sync
-        // will merge fresh data in.
-        if (snap.rooms.isNotEmpty()) _initialSyncComplete.value = true
+    private suspend fun restoreFromCache() {
+        // Disk read + JSON decrypt/parse on IO (this runs off the constructor
+        // thread now, so it can't jank/ANR app startup).
+        val snap = withContext(Dispatchers.IO) { cache.load() } ?: return
+        writeLock.withLock {
+            // If the live session already pushed state while we were reading the
+            // cache, don't clobber it with the older snapshot.
+            if (rooms.value.isNotEmpty() || messagesByRoom.value.isNotEmpty()) return@withLock
+            val cutoff =
+                if (autoDeleteOldMessages) System.currentTimeMillis() - AUTO_DELETE_AGE_MS else 0L
+            usersById.value = snap.usersById + (ME to currentUser)
+            rooms.value = snap.rooms
+            messagesByRoom.value = snap.messagesByRoom
+                .mapValues { (_, list) -> list.filter { it.timestampMs >= cutoff } }
+            unreadByRoom.value = snap.unreadByRoom
+            outgoingIdByRoom.putAll(snap.outgoingIdByRoom)
+            snap.rooms.forEach { roomNameById[it.id] = it.name }
+            // We have something to show — skip the loading spinner; the live sync
+            // will merge fresh data in.
+            if (snap.rooms.isNotEmpty()) _initialSyncComplete.value = true
+        }
     }
 
-    private fun persistToCache() {
-        cache.save(
-            GoogleMessagesCache.Snapshot(
-                rooms = rooms.value,
-                messagesByRoom = messagesByRoom.value,
-                usersById = usersById.value,
-                outgoingIdByRoom = HashMap(outgoingIdByRoom),
-                unreadByRoom = unreadByRoom.value,
-            ),
+    private suspend fun persistToCache() {
+        val snapshot = GoogleMessagesCache.Snapshot(
+            rooms = rooms.value,
+            messagesByRoom = messagesByRoom.value,
+            usersById = usersById.value,
+            outgoingIdByRoom = HashMap(outgoingIdByRoom),
+            unreadByRoom = unreadByRoom.value,
         )
+        // JSON encode + encrypted write on IO.
+        withContext(Dispatchers.IO) { cache.save(snapshot) }
     }
 
     // ---- event handling ----------------------------------------------------
@@ -395,6 +404,20 @@ internal class GoogleMessagesMessageRepository(
         return optimistic
     }
 
+    /** Re-send a failed message: drop the failed bubble and send its body
+     *  fresh (a new optimistic SENDING bubble), preserving any reply target. */
+    override suspend fun resendMessage(roomId: String, messageId: String) {
+        val failed = messagesByRoom.value[roomId]?.firstOrNull { it.id == messageId } ?: return
+        if (failed.status != MessageStatus.FAILED || !failed.isOutgoing) return
+        if (failed.attachment != null) return // media resend not supported yet
+        writeLock.withLock {
+            val list = messagesByRoom.value[roomId].orEmpty().filterNot { it.id == messageId }
+            messagesByRoom.value = messagesByRoom.value + (roomId to list)
+            requestSave()
+        }
+        sendMessage(roomId, failed.body, failed.replyToId)
+    }
+
     /** Mark read locally + tell the phone. Also marks this thread "active" so
      *  we don't notify for messages the user is currently looking at, and
      *  clears any pending notification for it. (ChatViewModel calls this when
@@ -442,7 +465,7 @@ internal class GoogleMessagesMessageRepository(
         scope.launch {
             val ok = runCatching { session.sendReaction(messageId, emoji, add = adding) }
                 .getOrElse { Log.e(TAG, "sendReaction failed", it); false }
-            if (!ok) Log.w(TAG, "reaction $emoji on $messageId rejected by phone")
+            if (!ok) Log.w(TAG, "reaction rejected by phone")
         }
     }
 
@@ -531,7 +554,7 @@ internal class GoogleMessagesMessageRepository(
         } else null
 
         val encrypted = key != null
-        Log.d(TAG, "downloadMedia: fetching mediaId=$mediaId encrypted=$encrypted")
+        Log.d(TAG, "downloadMedia: fetching attachment (encrypted=$encrypted)")
         val bytes = session.downloadMedia(mediaId, key, encrypted)
         if (bytes == null) { Log.w(TAG, "downloadMedia: session returned null (see GMSession log)"); return null }
         Log.d(TAG, "downloadMedia: got ${bytes.size} bytes")

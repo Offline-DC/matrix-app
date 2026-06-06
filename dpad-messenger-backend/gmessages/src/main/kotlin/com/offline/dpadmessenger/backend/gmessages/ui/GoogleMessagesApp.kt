@@ -123,7 +123,10 @@ fun GoogleMessagesApp(
     // lifecycle — its long-poll must keep running while the user leaves the
     // app to scan the QR on their primary phone, and survive Activity
     // recreation (fold/unfold). See [GoogleMessagesPairing].
-    val client = remember { GoogleMessagesPairing.getOrStart(context) }
+    // Bumping this rebuilds the pairing client — used by the Failed-state
+    // "Try again" button to restart from scratch.
+    var pairAttempt by remember { mutableStateOf(0) }
+    val client = remember(pairAttempt) { GoogleMessagesPairing.getOrStart(context) }
     val state by client.state.collectAsState()
 
     LaunchedEffect(state) {
@@ -133,5 +136,9 @@ fun GoogleMessagesApp(
         }
     }
 
-    GoogleMessagesLinkScreen(state = state, modifier = modifier)
+    GoogleMessagesLinkScreen(
+        state = state,
+        onRetry = { GoogleMessagesPairing.reset(); pairAttempt++ },
+        modifier = modifier,
+    )
 }

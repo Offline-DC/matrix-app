@@ -16,6 +16,7 @@ import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -63,6 +64,7 @@ fun MessageContextSheet(
     onReply: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
+    onRetry: () -> Unit = {},
     onDismiss: () -> Unit,
     /** Resolve a user id to a display name, for the "who reacted" list. */
     senderNameFor: (String) -> String = { it },
@@ -115,6 +117,14 @@ fun MessageContextSheet(
                     .background(MaterialTheme.colorScheme.surfaceVariant)
                     .padding(vertical = 0.5.dp),
             )
+            // Retry is the primary action for a failed send — list it first.
+            if (message.status == MessageStatus.FAILED && message.isOutgoing && message.attachment == null) {
+                ActionRow(
+                    icon = Icons.Filled.Refresh,
+                    label = "Retry send",
+                    onClick = { onRetry(); onDismiss() },
+                )
+            }
             ActionRow(
                 icon = Icons.AutoMirrored.Filled.Reply,
                 label = "Reply",

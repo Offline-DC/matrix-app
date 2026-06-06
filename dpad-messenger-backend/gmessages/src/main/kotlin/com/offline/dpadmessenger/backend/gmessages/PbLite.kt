@@ -69,6 +69,10 @@ internal object PbLite {
             val out = ArrayList<String>()
             for (c in chunk) {
                 if (closed) break
+                // Defend against a stream whose payload bracket never closes:
+                // bound the buffer so a misbehaving/hostile relay can't grow it
+                // without limit (OOM). Real frames are far smaller than this.
+                if (sb.length > MAX_PAYLOAD_CHARS) { closed = true; break }
                 // Consume the two leading wrapper brackets first.
                 if (wrapperBrackets < 2) {
                     if (c == '[') { wrapperBrackets++; depth = wrapperBrackets }
@@ -103,6 +107,11 @@ internal object PbLite {
                 }
             }
             return out
+        }
+
+        companion object {
+            /** ~8 MB cap on a single un-closed payload before we abort the stream. */
+            private const val MAX_PAYLOAD_CHARS = 8 * 1024 * 1024
         }
     }
 
@@ -144,9 +153,13 @@ internal object PbLite {
 
     private class Parser(private val s: String) {
         private var i = 0
+        // The input is network data; cap recursion so a deeply-nested frame
+        // can't blow the stack (StackOverflowError isn't cleanly catchable).
+        private var depth = 0
 
         fun parseValue(): Node {
             skipWs()
+            if (i >= s.length) error("unexpected end of input")
             return when (val c = s[i]) {
                 '[' -> parseArray()
                 '{' -> { parseObjectSkip(); Node.Null }
@@ -160,33 +173,43 @@ internal object PbLite {
         }
 
         private fun parseArray(): Node.Arr {
-            expectChar('[')
-            val items = ArrayList<Node>()
-            skipWs()
-            if (peek() == ']') { i++; return Node.Arr(items) }
-            while (true) {
-                items.add(parseValue())
+            if (++depth > MAX_DEPTH) error("json nesting too deep at $i")
+            try {
+                expectChar('[')
+                val items = ArrayList<Node>()
                 skipWs()
-                when (peek()) {
-                    ',' -> { i++; skipWs() }
-                    ']' -> { i++; break }
-                    else -> error("expected , or ] at $i")
+                if (peek() == ']') { i++; return Node.Arr(items) }
+                while (true) {
+                    items.add(parseValue())
+                    skipWs()
+                    when (peek()) {
+                        ',' -> { i++; skipWs() }
+                        ']' -> { i++; break }
+                        else -> error("expected , or ] at $i")
+                    }
                 }
+                return Node.Arr(items)
+            } finally {
+                depth--
             }
-            return Node.Arr(items)
         }
 
         private fun parseObjectSkip() {
-            expectChar('{')
-            skipWs()
-            if (peek() == '}') { i++; return }
-            while (true) {
-                skipWs(); parseString(); skipWs(); expectChar(':'); parseValue(); skipWs()
-                when (peek()) {
-                    ',' -> i++
-                    '}' -> { i++; break }
-                    else -> error("expected , or } at $i")
+            if (++depth > MAX_DEPTH) error("json nesting too deep at $i")
+            try {
+                expectChar('{')
+                skipWs()
+                if (peek() == '}') { i++; return }
+                while (true) {
+                    skipWs(); parseString(); skipWs(); expectChar(':'); parseValue(); skipWs()
+                    when (peek()) {
+                        ',' -> i++
+                        '}' -> { i++; break }
+                        else -> error("expected , or } at $i")
+                    }
                 }
+            } finally {
+                depth--
             }
         }
 
@@ -194,15 +217,20 @@ internal object PbLite {
             expectChar('"')
             val out = StringBuilder()
             while (true) {
+                if (i >= s.length) error("unterminated string at $i")
                 val c = s[i++]
                 when (c) {
                     '"' -> break
                     '\\' -> {
+                        if (i >= s.length) error("truncated escape at $i")
                         when (val e = s[i++]) {
                             '"' -> out.append('"'); '\\' -> out.append('\\'); '/' -> out.append('/')
                             'b' -> out.append('\b'); 'f' -> out.append('\u000C'); 'n' -> out.append('\n')
                             'r' -> out.append('\r'); 't' -> out.append('\t')
-                            'u' -> { out.append(s.substring(i, i + 4).toInt(16).toChar()); i += 4 }
+                            'u' -> {
+                                if (i + 4 > s.length) error("truncated \\u escape at $i")
+                                out.append(s.substring(i, i + 4).toInt(16).toChar()); i += 4
+                            }
                             else -> out.append(e)
                         }
                     }
@@ -218,10 +246,18 @@ internal object PbLite {
             return s.substring(start, i).toDouble()
         }
 
-        private fun peek(): Char = s[i]
-        private fun expectChar(c: Char) { skipWs(); require(s[i] == c) { "expected '$c' at $i" }; i++ }
+        private fun peek(): Char = if (i < s.length) s[i] else error("unexpected end of input at $i")
+        private fun expectChar(c: Char) {
+            skipWs()
+            if (i >= s.length || s[i] != c) error("expected '$c' at $i")
+            i++
+        }
         private fun expect(word: String) { require(s.startsWith(word, i)) { "expected '$word' at $i" }; i += word.length }
         private fun skipWs() { while (i < s.length && s[i].isWhitespace()) i++ }
+
+        companion object {
+            private const val MAX_DEPTH = 200
+        }
     }
 
     /**

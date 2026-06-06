@@ -532,9 +532,13 @@ private fun MediaThumbnail(path: String, modifier: Modifier) {
     // null = still decoding; Decoded(null) = decode finished but failed (e.g.
     // an HEIC this device's codec can't handle) → show a clear message rather
     // than an endless spinner.
-    val result by androidx.compose.runtime.produceState<Decoded?>(initialValue = null, path) {
+    val result by androidx.compose.runtime.produceState<Decoded?>(
+        // Synchronous cache hit shows instantly (no spinner flash on scroll-back).
+        initialValue = com.offline.dpadmessenger.ui.util.cachedBitmap(path, 400)?.let { Decoded(it) },
+        path,
+    ) {
         value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            Decoded(com.offline.dpadmessenger.ui.util.decodeDownscaled(path, maxEdge = 400))
+            Decoded(com.offline.dpadmessenger.ui.util.decodeDownscaledCached(path, maxEdge = 400))
         }
     }
     when (val r = result) {

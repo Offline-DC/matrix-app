@@ -259,7 +259,10 @@ private fun MediaCell(
     focusRequester: FocusRequester?,
 ) {
     val shape = RoundedCornerShape(8.dp)
-    val thumb by produceState<ImageBitmap?>(initialValue = null, item.uri) {
+    val thumb by produceState<ImageBitmap?>(
+        initialValue = com.offline.dpadmessenger.ui.util.cachedImageByKey(item.uri),
+        item.uri,
+    ) {
         value = loadThumbnail(context, item.uri)
     }
     Box(
@@ -348,8 +351,9 @@ private suspend fun queryRecentMedia(context: Context, limit: Int = 300): List<P
  *  on API 29+, falls back to a downsampled decode on older builds. */
 private suspend fun loadThumbnail(context: Context, uriStr: String): ImageBitmap? =
     withContext(Dispatchers.IO) {
+        com.offline.dpadmessenger.ui.util.cachedImageByKey(uriStr)?.let { return@withContext it }
         val uri = Uri.parse(uriStr)
-        runCatching {
+        val bmp = runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 context.contentResolver.loadThumbnail(uri, Size(256, 256), null).asImageBitmap()
             } else {
@@ -359,4 +363,6 @@ private suspend fun loadThumbnail(context: Context, uriStr: String): ImageBitmap
                 }
             }
         }.getOrNull()
+        if (bmp != null) com.offline.dpadmessenger.ui.util.putCachedImage(uriStr, bmp)
+        bmp
     }

@@ -17,8 +17,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -87,12 +89,18 @@ fun FullscreenMediaViewer(
 
 @Composable
 private fun ImageView(path: String) {
-    // null = decoding; Decoded(null) = decode failed (e.g. HEIC with no codec).
-    val result by produceState<ImageResult?>(initialValue = null, path) {
+    // Decode only to the screen's longer edge (clamped) instead of a fixed
+    // 1280 — on a 240–480px panel a 1280px ARGB bitmap is ~5MB wasted and an
+    // OOM risk on back-to-back opens. Routed through the shared LRU cache.
+    val dm = LocalContext.current.resources.displayMetrics
+    val maxEdge = maxOf(dm.widthPixels, dm.heightPixels).coerceIn(480, 1080)
+    // null = decoding; ImageResult(null) = decode failed (e.g. HEIC with no codec).
+    val result by produceState<ImageResult?>(
+        initialValue = com.offline.dpadmessenger.ui.util.cachedBitmap(path, maxEdge)?.let { ImageResult(it) },
+        path, maxEdge,
+    ) {
         value = withContext(Dispatchers.IO) {
-            // Downscale large images so we don't OOM on a flip phone; the
-            // shared decoder also handles HEIF/HEIC via ImageDecoder.
-            ImageResult(com.offline.dpadmessenger.ui.util.decodeDownscaled(path, maxEdge = 1280))
+            ImageResult(com.offline.dpadmessenger.ui.util.decodeDownscaledCached(path, maxEdge))
         }
     }
     when (val r = result) {
@@ -121,6 +129,11 @@ private data class ImageResult(val bitmap: androidx.compose.ui.graphics.ImageBit
 
 @Composable
 private fun VideoPlayer(path: String) {
+    var failed by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+    if (failed) {
+        Text(text = "Can't play this video on this device.", color = Color.White)
+        return
+    }
     val context = LocalContext.current
     AndroidView(
         modifier = Modifier.fillMaxSize(),
@@ -130,6 +143,9 @@ private fun VideoPlayer(path: String) {
                 val controller = MediaController(context)
                 controller.setAnchorView(this)
                 setMediaController(controller)
+                // Don't leave a black screen on an undecodable/corrupt video —
+                // show a clear fallback (mirrors the image path).
+                setOnErrorListener { _, _, _ -> failed = true; true }
                 setOnPreparedListener { it.isLooping = false; start() }
             }
         },

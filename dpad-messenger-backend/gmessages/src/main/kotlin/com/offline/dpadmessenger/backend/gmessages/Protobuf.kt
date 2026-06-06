@@ -88,13 +88,29 @@ internal class ProtoReader(private val buf: ByteArray) {
         return when (wire) {
             Protobuf.WIRE_VARINT -> Field(number, wire, readVarint(), null)
             Protobuf.WIRE_LEN -> {
-                val len = readVarint().toInt()
-                val b = buf.copyOfRange(pos, pos + len)
-                pos += len
+                // Bounds-check the declared length against what's actually left
+                // (this buffer comes off the network/phone). A bogus length
+                // would otherwise throw NegativeArraySize / OOB or force a
+                // multi-MB allocation. Use Long math so a 64-bit varint can't
+                // overflow Int before the check.
+                val len = readVarint()
+                val remaining = (buf.size - pos).toLong()
+                if (len < 0L || len > remaining) {
+                    error("protobuf field length $len out of bounds (remaining $remaining) at pos $pos")
+                }
+                val l = len.toInt()
+                val b = buf.copyOfRange(pos, pos + l)
+                pos += l
                 Field(number, wire, 0, b)
             }
-            Protobuf.WIRE_I64 -> { val b = buf.copyOfRange(pos, pos + 8); pos += 8; Field(number, wire, 0, b) }
-            Protobuf.WIRE_I32 -> { val b = buf.copyOfRange(pos, pos + 4); pos += 4; Field(number, wire, 0, b) }
+            Protobuf.WIRE_I64 -> {
+                require(pos + 8 <= buf.size) { "protobuf i64 out of bounds at pos $pos" }
+                val b = buf.copyOfRange(pos, pos + 8); pos += 8; Field(number, wire, 0, b)
+            }
+            Protobuf.WIRE_I32 -> {
+                require(pos + 4 <= buf.size) { "protobuf i32 out of bounds at pos $pos" }
+                val b = buf.copyOfRange(pos, pos + 4); pos += 4; Field(number, wire, 0, b)
+            }
             else -> error("unsupported wire type $wire at pos $pos")
         }
     }
@@ -103,6 +119,11 @@ internal class ProtoReader(private val buf: ByteArray) {
         var result = 0L
         var shift = 0
         while (true) {
+            // Guard against a truncated varint (walks off the end) and an
+            // over-long one (>10 bytes / 64-bit shift overflow) from malformed
+            // input. Both throw a controlled error the callers already catch.
+            if (pos >= buf.size) error("truncated varint at pos $pos")
+            if (shift > 63) error("varint too long at pos $pos")
             val b = buf[pos++].toInt() and 0xFF
             result = result or ((b.toLong() and 0x7F) shl shift)
             if (b and 0x80 == 0) break

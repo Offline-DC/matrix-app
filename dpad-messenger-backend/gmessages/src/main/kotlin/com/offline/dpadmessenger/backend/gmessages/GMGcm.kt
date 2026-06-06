@@ -65,7 +65,12 @@ internal object GMGcm {
     fun decrypt(key: ByteArray, data: ByteArray): ByteArray {
         require(key.size == 32) { "media key must be 32 bytes (got ${key.size})" }
         require(data.size >= 2 && data[0].toInt() == 0) { "bad media header" }
-        val chunkSize = 1 shl (data[1].toInt() and 0xFF)
+        // data[1] is a chunk-size shift from the (untrusted) media header. The
+        // real protocol uses ~15–20 (32KB–1MB). Bound it so `1 shl shift` can't
+        // go negative (shift 31) / overflow or blow up memory on a junk header.
+        val shift = data[1].toInt() and 0xFF
+        require(shift in 10..24) { "bad media chunk-size shift $shift" }
+        val chunkSize = 1 shl shift
         val out = ByteArrayOutputStream(data.size)
         var index = 0
         var pos = 2

@@ -10,7 +10,7 @@ plugins {
 
 android {
     namespace = "com.offline.dpadmessenger.backend.gmessages"
-    compileSdk = 34
+    compileSdk = 36
     defaultConfig { minSdk = 24 }
 
     buildFeatures { compose = true }

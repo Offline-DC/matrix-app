@@ -15,6 +15,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -254,6 +255,18 @@ internal class GoogleMessagesSessionClient(
             if (!resp.isSuccessful) { Log.w(TAG, "upload start HTTP ${resp.code}"); return null }
             resp.header("x-goog-upload-url")
         } ?: run { Log.w(TAG, "upload start: no upload URL"); return null }
+
+        // The "start" response hands back a server-chosen upload URL. Validate
+        // its host before PUTting the media there — a compromised/spoofed relay
+        // shouldn't be able to redirect our (encrypted) uploads to an arbitrary
+        // host. Restrict to Google's upload domains.
+        val uploadHost = runCatching { uploadUrl.toHttpUrl().host }.getOrNull()
+        if (uploadHost == null || !(uploadHost.endsWith(".googleapis.com") ||
+                uploadHost.endsWith(".google.com") || uploadHost.endsWith(".googleusercontent.com"))
+        ) {
+            Log.w(TAG, "upload URL host not allowed; aborting")
+            return null
+        }
 
         // 2. upload + finalize
         val finalizeReq = Request.Builder()

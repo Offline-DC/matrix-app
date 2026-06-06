@@ -133,8 +133,14 @@ fun NewConversationScreen(
         scope.launch {
             val roomId = runCatching { starter.startConversation(destination) }.getOrNull()
             busy = false
-            if (roomId != null) onConversationStarted(roomId)
-            else error = "Couldn't start a conversation. Check the number and try again."
+            if (roomId != null) {
+                onConversationStarted(roomId)
+            } else {
+                error = "Couldn't start a conversation. Check the number and try again."
+                // Focus was cleared on submit; put it back on the field so the
+                // user isn't stranded on a screen with no DPAD highlight.
+                runCatching { fieldFocus.requestFocus() }
+            }
         }
     }
 

@@ -7,7 +7,7 @@ plugins {
 
 android {
     namespace = "com.offline.dpadmessenger.demo"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.offline.dpadmessenger.demo"

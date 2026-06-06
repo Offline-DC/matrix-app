@@ -7,16 +7,27 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.Spacer
 import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesPairingResult
+import com.offline.dpadmessenger.focus.dpadFocusHighlight
+import com.offline.dpadmessenger.focus.onDpadAction
 
 /**
  * Pairing UI for Google Messages. Observes a [GoogleMessagesPairingResult]
@@ -29,6 +40,8 @@ import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesPairingResult
 fun GoogleMessagesLinkScreen(
     state: GoogleMessagesPairingResult,
     modifier: Modifier = Modifier,
+    /** Restart pairing from the Failed state. Null hides the retry button. */
+    onRetry: (() -> Unit)? = null,
 ) {
     Column(
         modifier = modifier
@@ -90,6 +103,31 @@ fun GoogleMessagesLinkScreen(
                     style = MaterialTheme.typography.bodySmall,
                     textAlign = TextAlign.Center,
                 )
+                if (onRetry != null) {
+                    Spacer(Modifier.height(16.dp))
+                    val retryFocus = remember { FocusRequester() }
+                    LaunchedEffect(Unit) { runCatching { retryFocus.requestFocus() } }
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .focusRequester(retryFocus)
+                            .clip(RoundedCornerShape(24.dp))
+                            .background(MaterialTheme.colorScheme.primary)
+                            .dpadFocusHighlight(
+                                shape = RoundedCornerShape(24.dp),
+                                borderColor = MaterialTheme.colorScheme.onPrimary,
+                            )
+                            .focusable()
+                            .onDpadAction { onRetry(); true }
+                            .padding(horizontal = 24.dp, vertical = 12.dp),
+                    ) {
+                        Text(
+                            text = "Try again",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    }
+                }
             }
         }
     }

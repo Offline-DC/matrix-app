@@ -14,7 +14,7 @@ version = "0.2.0"
 
 android {
     namespace = "com.offline.dpadmessenger"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 24

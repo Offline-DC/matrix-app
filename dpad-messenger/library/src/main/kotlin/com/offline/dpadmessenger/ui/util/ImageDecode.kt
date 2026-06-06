@@ -3,9 +3,48 @@ package com.offline.dpadmessenger.ui.util
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.os.Build
+import android.util.LruCache
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import java.io.File
+
+/**
+ * Process-wide LRU cache of decoded thumbnails, keyed by path+target size.
+ * Without this, every media bubble / picker cell re-reads and re-decodes its
+ * file from disk each time it scrolls back into view (LazyColumn disposes
+ * off-screen items) — the dominant source of scroll jank and GC on the flip
+ * phone. Sized by approximate bitmap bytes; ~8 MB is a few screens' worth.
+ */
+private val bitmapCache = object : LruCache<String, ImageBitmap>(8 * 1024 * 1024) {
+    override fun sizeOf(key: String, value: ImageBitmap): Int =
+        (value.width.toLong() * value.height.toLong() * 4L)
+            .coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+}
+
+private fun cacheKey(path: String, maxEdge: Int) = "$path@$maxEdge"
+
+/** Cached decoded bitmap if present, else null. Safe on the main thread (a
+ *  cheap map lookup) — use it as a synchronous fast path so a cache hit shows
+ *  instantly instead of flashing a spinner. */
+fun cachedBitmap(path: String, maxEdge: Int): ImageBitmap? = bitmapCache.get(cacheKey(path, maxEdge))
+
+/**
+ * [decodeDownscaled] with the LRU cache in front. Call from a background
+ * thread. Returns null if the file can't be decoded (cached failures are not
+ * stored, so a later retry can still succeed).
+ */
+fun decodeDownscaledCached(path: String, maxEdge: Int): ImageBitmap? {
+    val key = cacheKey(path, maxEdge)
+    bitmapCache.get(key)?.let { return it }
+    val bmp = decodeDownscaled(path, maxEdge) ?: return null
+    bitmapCache.put(key, bmp)
+    return bmp
+}
+
+/** Generic cache access for callers that decode by their own means (e.g. the
+ *  MediaStore content-uri thumbnailer in the picker). Keep keys unique. */
+fun cachedImageByKey(key: String): ImageBitmap? = bitmapCache.get(key)
+fun putCachedImage(key: String, bitmap: ImageBitmap) { bitmapCache.put(key, bitmap) }
 
 /**
  * Decode an image file to a downscaled [ImageBitmap], or null if it can't be

@@ -52,6 +52,13 @@ interface MessageRepository {
     suspend fun deleteMessage(roomId: String, messageId: String)
 
     /**
+     * Re-send a message that failed to send (its [MessageStatus.FAILED]). The
+     * default implementation is a no-op for repos that don't support it; the
+     * UI only surfaces a "Retry" affordance when this can do something useful.
+     */
+    suspend fun resendMessage(roomId: String, messageId: String) {}
+
+    /**
      * Toggle a reaction on a message. If [currentUser] has already reacted
      * with [emoji], it's removed; otherwise added.
      */

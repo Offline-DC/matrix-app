@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -52,17 +53,38 @@ class ChatViewModel(
     private val _isLoadingOlder = MutableStateFlow(false)
     val isLoadingOlder: StateFlow<Boolean> = _isLoadingOlder.asStateFlow()
 
+    /** True until the room's messages have first loaded (or a short grace
+     *  period elapses). The screen shows a spinner instead of the "say hi"
+     *  empty-state while this is true, so history doesn't flash empty first. */
+    private val _loading = MutableStateFlow(true)
+    val loading: StateFlow<Boolean> = _loading.asStateFlow()
+
     val timeline: StateFlow<List<TimelineItem>> = combine(
         repository.observeMessages(roomId),
         repository.observeHasMoreOlder(roomId),
     ) { messages, hasMore ->
         buildTimeline(roomId, messages, hasMore)
+        // Eagerly: this ViewModel is per-open-conversation (created on open,
+        // cleared on leave), so eager collection only spans this one chat — it
+        // does NOT keep other rooms' timelines warm. Eager also means the
+        // timeline is already populated by first render, avoiding an empty
+        // flash. (WhileSubscribed's saving here was marginal and started the
+        // flow cold.)
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     init {
         viewModelScope.launch {
             _room.value = repository.getRoom(roomId)
             repository.markRoomRead(roomId)
+        }
+        viewModelScope.launch {
+            // Consider the room loaded once messages first arrive, or after a
+            // grace period (so a genuinely empty conversation still shows the
+            // "say hi" empty-state rather than spinning forever).
+            kotlinx.coroutines.withTimeoutOrNull(2_000) {
+                repository.observeMessages(roomId).first { it.isNotEmpty() }
+            }
+            _loading.value = false
         }
     }
 
@@ -137,6 +159,11 @@ class ChatViewModel(
 
     fun delete(messageId: String) {
         viewModelScope.launch { repository.deleteMessage(roomId, messageId) }
+    }
+
+    /** Re-send a failed message. */
+    fun resend(messageId: String) {
+        viewModelScope.launch { repository.resendMessage(roomId, messageId) }
     }
 
     /** True if this repo can send attachments (drives the composer "+" button). */
