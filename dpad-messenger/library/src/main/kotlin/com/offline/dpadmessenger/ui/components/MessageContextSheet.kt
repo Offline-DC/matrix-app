@@ -15,6 +15,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -36,6 +37,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import com.offline.dpadmessenger.data.DefaultReactions
 import com.offline.dpadmessenger.data.Message
+import com.offline.dpadmessenger.data.MessageStatus
 import com.offline.dpadmessenger.focus.dpadRow
 
 /**
@@ -133,6 +135,43 @@ fun MessageContextSheet(
                     onClick = { onDelete(); onDismiss() },
                 )
             }
+            // Failed send: surface the error here, below the actions, so tapping
+            // the message with a red "!" explains what went wrong.
+            if (message.status == MessageStatus.FAILED) {
+                FailedNotice()
+            }
+        }
+    }
+}
+
+/** Error notice shown in the context sheet for a message that failed to send. */
+@Composable
+private fun FailedNotice() {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.errorContainer)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Filled.ErrorOutline,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.error,
+        )
+        Column(modifier = Modifier.padding(start = 12.dp)) {
+            Text(
+                text = "Message not sent",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            Text(
+                text = "Check your connection — if it keeps failing, re-link your phone.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
         }
     }
 }

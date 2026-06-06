@@ -1,2 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" />
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The in-app photo/video picker (MediaPickerScreen, composer "+") reads
+         the device's media via MediaStore. On Android 13+ this needs the
+         granular READ_MEDIA_* permissions; on older builds (incl. the TCL
+         Flip 2's Android 11) the legacy READ_EXTERNAL_STORAGE covers it.
+         Declared here so any host app embedding this library gets a complete
+         picture of what the messenger UI requires. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+</manifest>

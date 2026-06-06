@@ -19,6 +19,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -93,6 +94,10 @@ fun DpadComposer(
     onUpFromField: () -> Unit = {},
     onLeftFromField: () -> Unit = {},
     autoFocusOnAttach: Boolean = false,
+    /** When non-null, shows a "+" attach button left of the field and invokes
+     *  this on activate. DPAD-Left from the field focuses it; Left again exits
+     *  via [onLeftFromField]. */
+    onAttach: (() -> Unit)? = null,
     header: @Composable (() -> Unit)? = null,
 ) {
     val colors = LocalDpadMessengerColors.current
@@ -102,6 +107,7 @@ fun DpadComposer(
     val keyboard = LocalSoftwareKeyboardController.current
 
     val fieldFr = textFieldFocusRequester ?: remember { FocusRequester() }
+    val attachFr = remember { FocusRequester() }
     val sendFr = sendButtonFocusRequester ?: remember { FocusRequester() }
 
     // Tracks whether the inner field has been placed in the layout (and
@@ -172,6 +178,14 @@ fun DpadComposer(
                 .focusProperties { @Suppress("DEPRECATION") enter = { fieldFr } }
                 .focusGroup(),
         ) {
+            if (onAttach != null) {
+                AttachButton(
+                    onClick = onAttach,
+                    focusRequester = attachFr,
+                    onLeft = onLeftFromField, // Left from "+" exits to back button
+                    onRight = { runCatching { fieldFr.requestFocus() } },
+                )
+            }
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -227,7 +241,10 @@ fun DpadComposer(
                                     true
                                 }
                                 Key.DirectionLeft -> {
-                                    onLeftFromField()
+                                    // Left from the field → "+" button if present,
+                                    // otherwise straight out to the back button.
+                                    if (onAttach != null) runCatching { attachFr.requestFocus() }
+                                    else onLeftFromField()
                                     true
                                 }
                                 Key.DirectionRight -> {
@@ -261,6 +278,42 @@ fun DpadComposer(
                 onLeftToField = { runCatching { fieldFr.requestFocus() } },
             )
         }
+    }
+}
+
+/** "+" attach button left of the text field. DPAD: Left exits (back button),
+ *  Right returns to the field, OK opens the picker. */
+@Composable
+private fun AttachButton(
+    onClick: () -> Unit,
+    focusRequester: FocusRequester,
+    onLeft: () -> Unit,
+    onRight: () -> Unit,
+) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .size(44.dp)
+            .focusRequester(focusRequester)
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .dpadFocusHighlight(shape = CircleShape)
+            .focusable()
+            .onDpadAction { onClick(); true }
+            .onPreviewKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when (event.key) {
+                    Key.DirectionLeft -> { onLeft(); true }
+                    Key.DirectionRight -> { onRight(); true }
+                    else -> false
+                }
+            },
+    ) {
+        Icon(
+            imageVector = Icons.Filled.Add,
+            contentDescription = "Attach photo or video",
+            tint = MaterialTheme.colorScheme.onSurface,
+        )
     }
 }
 

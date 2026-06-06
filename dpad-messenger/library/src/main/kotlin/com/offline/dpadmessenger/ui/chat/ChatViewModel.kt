@@ -139,6 +139,16 @@ class ChatViewModel(
         viewModelScope.launch { repository.deleteMessage(roomId, messageId) }
     }
 
+    /** True if this repo can send attachments (drives the composer "+" button). */
+    val canSendAttachments: Boolean =
+        repository is com.offline.dpadmessenger.data.AttachmentSender
+
+    /** Send a picked photo/video (content:// uri) to this room. */
+    fun sendAttachment(contentUri: String) {
+        val sender = repository as? com.offline.dpadmessenger.data.AttachmentSender ?: return
+        viewModelScope.launch { runCatching { sender.sendAttachment(roomId, contentUri) } }
+    }
+
     fun requestLoadOlder() {
         if (_isLoadingOlder.value) return
         viewModelScope.launch {

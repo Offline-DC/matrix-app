@@ -23,6 +23,7 @@ include(":core")
 include(":matrix")
 include(":conduit")
 include(":signal")
+include(":gmessages")
 include(":app")
 
 // Composite build: the UI library lives in the sibling dpad-messenger repo.

@@ -12,3 +12,16 @@ interface MediaDownloader {
      */
     suspend fun downloadMedia(roomId: String, messageId: String): String?
 }
+
+/**
+ * Optional capability for repositories that can send a media attachment
+ * (photo/video) picked from the device. The chat UI's "+" button uses it.
+ */
+interface AttachmentSender {
+    /**
+     * Send the media at [contentUri] (a content:// from the photo picker) to
+     * [roomId]. The repository reads + uploads the bytes. @return true if the
+     * send was accepted.
+     */
+    suspend fun sendAttachment(roomId: String, contentUri: String): Boolean
+}

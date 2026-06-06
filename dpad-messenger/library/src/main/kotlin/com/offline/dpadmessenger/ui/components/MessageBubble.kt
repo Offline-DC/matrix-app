@@ -39,10 +39,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusEvent
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import kotlinx.coroutines.launch
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontStyle
@@ -51,6 +55,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.data.Message
 import com.offline.dpadmessenger.data.MessageStatus
+import com.offline.dpadmessenger.focus.DpadFireGate
 import com.offline.dpadmessenger.focus.OkKeys
 import com.offline.dpadmessenger.focus.dpadFocusHighlight
 import com.offline.dpadmessenger.focus.onDpadAction
@@ -80,24 +85,53 @@ fun MessageBubble(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     focusRequester: FocusRequester? = null,
+    /** Additional focus handles pointing at this same bubble — used when a
+     *  bubble must be reachable from more than one requester (e.g. it's both
+     *  the newest message AND the one a closed media viewer should refocus). */
+    extraFocusRequesters: List<FocusRequester> = emptyList(),
     /** True while this message's attachment is downloading. */
     isDownloadingMedia: Boolean = false,
     /** True if the last download attempt failed (show "tap to retry"). */
     mediaFailed: Boolean = false,
     /** Tap/OK on a media bubble: load it (first tap) or view it (once loaded). */
     onMediaActivate: () -> Unit = {},
+    /**
+     * Returns the chat list's viewport bounds in window pixels as
+     * (topY, bottomY), or null if not yet measured. When provided, DPAD
+     * Up/Down on a focused bubble that's taller than the viewport scrolls the
+     * list to reveal the hidden top/bottom of THIS bubble before letting focus
+     * move on to the next one — so a long SMS can be read top-to-bottom with
+     * the DPAD instead of being clipped off-screen.
+     */
+    getListViewport: (() -> Pair<Float, Float>?)? = null,
 ) {
     val hasMedia = message.attachment != null
     val colors = LocalDpadMessengerColors.current
     val isOutgoing = message.isOutgoing
-    // Tracks when the OK key went down, to tell a short press (load/view) from
-    // a hold (open the context sheet) on media bubbles.
-    var okDownAtMs by remember { mutableStateOf(0L) }
+    // Media long-press: fire the sheet WHILE the OK key is still held (like the
+    // system Messages app), not on release. A timer started on key-down opens
+    // the sheet once the hold threshold elapses; key-up cancels it and, if it
+    // hadn't fired yet, treats the press as a short tap (load/view).
+    var mediaPressJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    var mediaLongFired by remember { mutableStateOf(false) }
+    // True only between a KeyDown and KeyUp that BOTH landed on this bubble.
+    // Guards against a stray KeyUp with no matching KeyDown — e.g. pressing OK
+    // to close the fullscreen viewer (which consumes the KeyDown) returns focus
+    // here, and the trailing KeyUp would otherwise be read as a fresh tap and
+    // immediately reopen the photo.
+    var mediaPressStarted by remember { mutableStateOf(false) }
     // TvLazyColumn's automatic scroll-on-focus is unreliable on older AOSP
     // builds (notably the TCL Flip 2's Android 11). Wire BringIntoViewRequester
     // explicitly so DPAD-Up onto an offscreen bubble forces the list to scroll.
     val bringIntoView = remember { BringIntoViewRequester() }
     val scope = rememberCoroutineScope()
+    // This bubble's bounds in window pixels, captured at layout. Used together
+    // with the chat list's viewport bounds to scroll a too-tall bubble into
+    // view a chunk at a time under DPAD Up/Down (see the read-scroll key
+    // handler on the bubble Box below).
+    var bubbleTopY by remember { mutableStateOf(0f) }
+    var bubbleHeightPx by remember { mutableStateOf(0) }
+    var bubbleWidthPx by remember { mutableStateOf(0) }
     val bubbleColor = if (isOutgoing) colors.outgoingBubble else colors.incomingBubble
     val alignment = if (isOutgoing) Arrangement.End else Arrangement.Start
     val bubbleShape = RoundedCornerShape(
@@ -112,6 +146,11 @@ fun MessageBubble(
             .fillMaxWidth()
             .padding(horizontal = 8.dp, vertical = 2.dp)
             .bringIntoViewRequester(bringIntoView)
+            .onGloballyPositioned { coords ->
+                bubbleTopY = coords.positionInWindow().y
+                bubbleHeightPx = coords.size.height
+                bubbleWidthPx = coords.size.width
+            }
             .onFocusEvent { state ->
                 if (state.hasFocus) {
                     scope.launch { bringIntoView.bringIntoView() }
@@ -131,8 +170,65 @@ fun MessageBubble(
                     // halo (border + tint) isn't overpainted.
                     .clip(bubbleShape)
                     .background(bubbleColor)
+                    .then(extraFocusRequesters.fold(Modifier as Modifier) { acc, fr -> acc.focusRequester(fr) })
                     .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
                     .dpadFocusHighlight(shape = bubbleShape)
+                    // Read-scroll: when this bubble is taller than the chat
+                    // viewport, DPAD Up/Down nudges the list to reveal the
+                    // clipped top/bottom of THIS bubble (a chunk per press)
+                    // before focus is allowed to leave it. Lets a long SMS be
+                    // read top-to-bottom on a DPAD instead of being cut off.
+                    // Returns false (doesn't consume) once nothing is hidden in
+                    // the pressed direction, so normal bubble-to-bubble focus
+                    // navigation resumes at the message's edges.
+                    .then(
+                        if (getListViewport == null) Modifier
+                        else Modifier.onPreviewKeyEvent ev@{ event ->
+                            if (event.type != KeyEventType.KeyDown) return@ev false
+                            if (event.nativeKeyEvent.repeatCount != 0) return@ev false
+                            if (event.key != Key.DirectionUp && event.key != Key.DirectionDown) return@ev false
+                            val viewport = getListViewport() ?: return@ev false
+                            val (viewTop, viewBottom) = viewport
+                            val viewH = viewBottom - viewTop
+                            if (viewH <= 0f || bubbleHeightPx <= 0) return@ev false
+                            val top = bubbleTopY
+                            val bottom = bubbleTopY + bubbleHeightPx
+                            val chunk = viewH * 0.8f
+                            val tolerance = 2f
+                            when (event.key) {
+                                Key.DirectionUp -> {
+                                    val hiddenAbove = viewTop - top
+                                    if (hiddenAbove <= tolerance) return@ev false // top is visible → let focus move up
+                                    val visibleTopLocal = (viewTop - top).coerceAtLeast(0f)
+                                    val target = (visibleTopLocal - chunk).coerceAtLeast(0f)
+                                    scope.launch {
+                                        runCatching {
+                                            bringIntoView.bringIntoView(
+                                                Rect(0f, target, bubbleWidthPx.toFloat(), target + 1f),
+                                            )
+                                        }
+                                    }
+                                    true
+                                }
+                                else -> { // Key.DirectionDown
+                                    val hiddenBelow = bottom - viewBottom
+                                    if (hiddenBelow <= tolerance) return@ev false // bottom is visible → let focus move down
+                                    val visibleBottomLocal =
+                                        (viewBottom - top).coerceAtMost(bubbleHeightPx.toFloat())
+                                    val target =
+                                        (visibleBottomLocal + chunk).coerceAtMost(bubbleHeightPx.toFloat())
+                                    scope.launch {
+                                        runCatching {
+                                            bringIntoView.bringIntoView(
+                                                Rect(0f, target - 1f, bubbleWidthPx.toFloat(), target),
+                                            )
+                                        }
+                                    }
+                                    true
+                                }
+                            }
+                        },
+                    )
                     // Open the context sheet on tap, long-press, AND DPAD-OK,
                     // so press-and-hold reliably brings up the modal regardless
                     // of input method.
@@ -155,14 +251,35 @@ fun MessageBubble(
                                 if (event.key !in OkKeys) return@onPreviewKeyEvent false
                                 when (event.type) {
                                     KeyEventType.KeyDown -> {
+                                        // Only the FIRST key-down (not auto-repeats) starts the
+                                        // hold timer; it opens the sheet mid-hold.
                                         if (event.nativeKeyEvent.repeatCount == 0) {
-                                            okDownAtMs = System.currentTimeMillis()
+                                            mediaPressStarted = true
+                                            mediaLongFired = false
+                                            mediaPressJob?.cancel()
+                                            mediaPressJob = scope.launch {
+                                                kotlinx.coroutines.delay(LONG_PRESS_MS)
+                                                mediaLongFired = true
+                                                // Claim the OK key so auto-repeats that land on
+                                                // the just-opened sheet's chips don't fire a
+                                                // reaction (the gate releases on key-up).
+                                                DpadFireGate.tryAcquire(event.key)
+                                                onClick() // open context sheet while still held
+                                            }
                                         }
                                         true
                                     }
                                     KeyEventType.KeyUp -> {
-                                        val held = System.currentTimeMillis() - okDownAtMs
-                                        if (held >= LONG_PRESS_MS) onClick() else onMediaActivate()
+                                        mediaPressJob?.cancel()
+                                        mediaPressJob = null
+                                        DpadFireGate.release(event.key)
+                                        // Released before the threshold → short tap (load/view),
+                                        // but ONLY if the matching key-down landed here too. A
+                                        // KeyUp with no prior KeyDown (focus arrived mid-press,
+                                        // e.g. closing the viewer) is ignored so it can't reopen.
+                                        val startedHere = mediaPressStarted
+                                        mediaPressStarted = false
+                                        if (startedHere && !mediaLongFired) onMediaActivate()
                                         true
                                     }
                                     else -> false
@@ -233,10 +350,16 @@ fun MessageBubble(
                             Spacer(Modifier.padding(start = 4.dp))
                             Text(
                                 text = statusGlyph(message.status),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (message.status == MessageStatus.READ)
-                                    MaterialTheme.colorScheme.primary
-                                else colors.mutedText,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = if (message.status == MessageStatus.FAILED)
+                                        FontWeight.Bold else FontWeight.Normal,
+                                ),
+                                color = when (message.status) {
+                                    MessageStatus.READ -> MaterialTheme.colorScheme.primary
+                                    // Red "!" so a failed send stands out.
+                                    MessageStatus.FAILED -> MaterialTheme.colorScheme.error
+                                    else -> colors.mutedText
+                                },
                             )
                         }
                     }
@@ -351,7 +474,17 @@ private fun MediaBlock(
         isDownloading -> Box(
             box.background(MaterialTheme.colorScheme.surfaceVariant),
             contentAlignment = Alignment.Center,
-        ) { androidx.compose.material3.CircularProgressIndicator(Modifier.size(28.dp)) }
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                androidx.compose.material3.CircularProgressIndicator(Modifier.size(28.dp))
+                Spacer(Modifier.padding(top = 6.dp))
+                Text(
+                    text = "Loading media…",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = LocalDpadMessengerColors.current.mutedText,
+                )
+            }
+        }
 
         loadedPath != null && attachment.kind == com.offline.dpadmessenger.data.AttachmentKind.IMAGE ->
             MediaThumbnail(loadedPath, box)
@@ -384,7 +517,7 @@ private fun MediaBlock(
                     else -> "file"
                 }
                 Text(
-                    text = if (failed) "Couldn't load — tap to retry" else "Tap to load $kindWord",
+                    text = if (failed) "Couldn't load — tap to retry" else "Tap to view $kindWord",
                     style = MaterialTheme.typography.labelMedium,
                     color = if (failed) MaterialTheme.colorScheme.error
                     else LocalDpadMessengerColors.current.mutedText,
@@ -396,35 +529,57 @@ private fun MediaBlock(
 
 @Composable
 private fun MediaThumbnail(path: String, modifier: Modifier) {
-    val bitmap by androidx.compose.runtime.produceState<androidx.compose.ui.graphics.ImageBitmap?>(
-        initialValue = null, path,
-    ) {
+    // null = still decoding; Decoded(null) = decode finished but failed (e.g.
+    // an HEIC this device's codec can't handle) → show a clear message rather
+    // than an endless spinner.
+    val result by androidx.compose.runtime.produceState<Decoded?>(initialValue = null, path) {
         value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            runCatching {
-                val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                android.graphics.BitmapFactory.decodeFile(path, bounds)
-                var sample = 1
-                var longer = maxOf(bounds.outWidth, bounds.outHeight)
-                while (longer / 2 >= 400) { sample *= 2; longer /= 2 }
-                val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
-                android.graphics.BitmapFactory.decodeFile(path, opts)?.asImageBitmap()
-            }.getOrNull()
+            Decoded(com.offline.dpadmessenger.ui.util.decodeDownscaled(path, maxEdge = 400))
         }
     }
-    val bmp = bitmap
-    if (bmp == null) {
-        Box(modifier.background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
-            androidx.compose.material3.CircularProgressIndicator(Modifier.size(24.dp))
+    when (val r = result) {
+        null -> Box(
+            modifier.background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center,
+        ) { androidx.compose.material3.CircularProgressIndicator(Modifier.size(24.dp)) }
+
+        else -> {
+            val bmp = r.bitmap
+            if (bmp != null) {
+                Image(
+                    bitmap = bmp,
+                    contentDescription = null,
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                    modifier = modifier,
+                )
+            } else {
+                Box(
+                    modifier.background(MaterialTheme.colorScheme.surfaceVariant),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(
+                            imageVector = Icons.Filled.Image,
+                            contentDescription = null,
+                            modifier = Modifier.size(32.dp),
+                            tint = LocalDpadMessengerColors.current.mutedText,
+                        )
+                        Spacer(Modifier.padding(top = 4.dp))
+                        Text(
+                            text = "Can't preview this photo",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = LocalDpadMessengerColors.current.mutedText,
+                        )
+                    }
+                }
+            }
         }
-    } else {
-        Image(
-            bitmap = bmp,
-            contentDescription = null,
-            contentScale = androidx.compose.ui.layout.ContentScale.Crop,
-            modifier = modifier,
-        )
     }
 }
+
+/** Wrapper so a finished-but-failed decode (bitmap == null) is distinguishable
+ *  from "still decoding" (the produceState value is still null). */
+private data class Decoded(val bitmap: androidx.compose.ui.graphics.ImageBitmap?)
 
 /** OK-key hold (ms) that counts as a long-press on a media bubble. */
 private const val LONG_PRESS_MS = 400L

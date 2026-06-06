@@ -1,6 +1,5 @@
 package com.offline.dpadmessenger.ui.chat
 
-import android.graphics.BitmapFactory
 import android.widget.MediaController
 import android.widget.VideoView
 import androidx.activity.compose.BackHandler
@@ -26,7 +25,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -89,31 +87,37 @@ fun FullscreenMediaViewer(
 
 @Composable
 private fun ImageView(path: String) {
-    val bitmap by produceState<androidx.compose.ui.graphics.ImageBitmap?>(initialValue = null, path) {
+    // null = decoding; Decoded(null) = decode failed (e.g. HEIC with no codec).
+    val result by produceState<ImageResult?>(initialValue = null, path) {
         value = withContext(Dispatchers.IO) {
-            runCatching {
-                // Downscale very large images so we don't OOM on a flip phone.
-                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeFile(path, bounds)
-                val opts = BitmapFactory.Options().apply {
-                    inSampleSize = sampleSize(bounds.outWidth, bounds.outHeight, 1280)
-                }
-                BitmapFactory.decodeFile(path, opts)?.asImageBitmap()
-            }.getOrNull()
+            // Downscale large images so we don't OOM on a flip phone; the
+            // shared decoder also handles HEIF/HEIC via ImageDecoder.
+            ImageResult(com.offline.dpadmessenger.ui.util.decodeDownscaled(path, maxEdge = 1280))
         }
     }
-    val bmp = bitmap
-    if (bmp == null) {
-        CircularProgressIndicator(color = Color.White)
-    } else {
-        Image(
-            bitmap = bmp,
-            contentDescription = null,
-            contentScale = ContentScale.Fit,
-            modifier = Modifier.fillMaxSize(),
-        )
+    when (val r = result) {
+        null -> CircularProgressIndicator(color = Color.White)
+        else -> {
+            val bmp = r.bitmap
+            if (bmp != null) {
+                Image(
+                    bitmap = bmp,
+                    contentDescription = null,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                Text(
+                    text = "Can't preview this photo on this device.",
+                    color = Color.White,
+                )
+            }
+        }
     }
 }
+
+/** Distinguishes a finished-but-failed decode from "still decoding". */
+private data class ImageResult(val bitmap: androidx.compose.ui.graphics.ImageBitmap?)
 
 @Composable
 private fun VideoPlayer(path: String) {
@@ -130,12 +134,4 @@ private fun VideoPlayer(path: String) {
             }
         },
     )
-}
-
-/** Largest power-of-two sample that keeps the longer edge ≥ [target]. */
-private fun sampleSize(w: Int, h: Int, target: Int): Int {
-    var sample = 1
-    var longer = maxOf(w, h)
-    while (longer / 2 >= target) { sample *= 2; longer /= 2 }
-    return sample
 }

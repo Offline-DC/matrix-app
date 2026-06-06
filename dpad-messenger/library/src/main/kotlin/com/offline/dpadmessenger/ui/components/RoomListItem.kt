@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -26,6 +27,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.offline.dpadmessenger.data.Attachment
+import com.offline.dpadmessenger.data.AttachmentKind
 import com.offline.dpadmessenger.data.RoomSummary
 import com.offline.dpadmessenger.focus.dpadRow
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
@@ -78,7 +81,10 @@ fun RoomListItem(
                 val prefix = if (summary.room.isGroup && !msg.isOutgoing) {
                     "${senderNameFor(msg.senderId)}: "
                 } else if (msg.isOutgoing) "You: " else ""
-                "$prefix${msg.body}"
+                // Media-only messages have a blank body; show a typed label
+                // ("📷 Photo" etc.) instead of an empty preview line.
+                val text = msg.body.ifBlank { mediaPreviewLabel(msg.attachment) }
+                "$prefix$text"
             } ?: "No messages yet"
             Text(
                 text = preview,
@@ -103,6 +109,16 @@ fun RoomListItem(
     }
 }
 
+/** Optical x-correction for the unread digit's right-leaning side bearing. */
+private val OPTICAL_NUDGE = (-0.5).dp
+
+/** Short typed label for a media-only message in the room-list preview. */
+private fun mediaPreviewLabel(attachment: Attachment?): String = when (attachment?.kind) {
+    AttachmentKind.IMAGE -> "📷 Photo"
+    AttachmentKind.VIDEO -> "🎥 Video"
+    else -> "📎 Attachment"
+}
+
 @Composable
 private fun UnreadBadge(count: Int) {
     Box(
@@ -116,16 +132,26 @@ private fun UnreadBadge(count: Int) {
         // the ascender/descender padding so the digit sits in the visual
         // center of the circle, not slightly above it.
         //
+        // Horizontal: a digit looks ~1px right of centre because Roboto's
+        // number glyphs carry a slightly larger left side-bearing than right,
+        // and centring the glyph's *advance box* can't correct for ink that
+        // sits off-centre within that box. letterSpacing=0 removes the trailing
+        // tracking labelSmall otherwise adds, and a tiny optical x-nudge re-
+        // centres the ink. (Tune OPTICAL_NUDGE if a hair remains on a given
+        // display.)
+        //
         // Cap at "9+" — at 22dp diameter, two digits look cramped and a single
         // "+" sigil reads at a glance.
         Text(
             text = if (count > 9) "9+" else count.toString(),
             color = MaterialTheme.colorScheme.onPrimary,
             textAlign = TextAlign.Center,
+            modifier = Modifier.offset(x = OPTICAL_NUDGE),
             style = MaterialTheme.typography.labelSmall.copy(
                 fontWeight = FontWeight.Bold,
                 fontSize = 11.sp,
                 lineHeight = 11.sp,
+                letterSpacing = 0.sp,
                 platformStyle = PlatformTextStyle(includeFontPadding = false),
                 lineHeightStyle = LineHeightStyle(
                     alignment = LineHeightStyle.Alignment.Center,

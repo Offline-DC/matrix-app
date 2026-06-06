@@ -32,6 +32,8 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import com.offline.dpadmessenger.data.Message
@@ -85,11 +87,24 @@ fun ChatScreen(
     val backBtnFr = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
 
+    // Which bubble to refocus when the fullscreen media viewer closes — the one
+    // whose photo/video was opened — so DPAD focus lands back where the user
+    // was, not on the composer. The requester is attached to that bubble in
+    // the timeline below.
+    val mediaReturnFr = remember { FocusRequester() }
+    var mediaReturnId by remember { mutableStateOf<String?>(null) }
+
+    // In-app, DPAD-navigable photo/video picker for the composer "+" button.
+    // Replaces the system Photos picker (not DPAD-friendly on flip phones).
+    // When true, the picker overlay is shown; picking sends via the repository.
+    var showMediaPicker by remember { mutableStateOf(false) }
+
     // Tap/OK on a media bubble: first load it, then (once cached) view it.
     val onMediaActivate: (Message) -> Unit = activate@{ msg ->
         val att = msg.attachment ?: return@activate
         val path = att.localPath
         if (path != null && java.io.File(path).exists()) {
+            mediaReturnId = msg.id
             mediaViewer = path to att.kind
         } else if (msg.id !in downloadingMedia) {
             viewModel.downloadMedia(msg.id)
@@ -145,6 +160,8 @@ fun ChatScreen(
                 onBubbleClick = viewModel::openMessageSheet,
                 onLoadOlderVisible = viewModel::requestLoadOlder,
                 lastBubbleFocusRequester = lastBubbleFr,
+                returnFocusId = mediaReturnId,
+                returnFocusRequester = mediaReturnFr,
                 downloadingMedia = downloadingMedia,
                 failedMedia = failedMedia,
                 onMediaActivate = onMediaActivate,
@@ -184,6 +201,12 @@ fun ChatScreen(
                     replyTarget != null -> "Reply…"
                     else -> "Type a message"
                 },
+                // "+" attach button: only when the repo can send media. Opens
+                // the in-app DPAD picker overlay rather than the system Photos
+                // UI.
+                onAttach = if (viewModel.canSendAttachments) {
+                    { showMediaPicker = true }
+                } else null,
             )
         }
     }
@@ -206,6 +229,27 @@ fun ChatScreen(
         )
     }
 
+    // In-app photo/video picker overlay (composer "+").
+    if (showMediaPicker) {
+        MediaPickerScreen(
+            onPick = { uri ->
+                viewModel.sendAttachment(uri)
+                showMediaPicker = false
+                scope.launch {
+                    withFrameNanos {}
+                    runCatching { composerFr.requestFocus() }
+                }
+            },
+            onClose = {
+                showMediaPicker = false
+                scope.launch {
+                    withFrameNanos {}
+                    runCatching { composerFr.requestFocus() }
+                }
+            },
+        )
+    }
+
     // Fullscreen image/video viewer overlay.
     mediaViewer?.let { (path, kind) ->
         FullscreenMediaViewer(
@@ -213,11 +257,13 @@ fun ChatScreen(
             kind = kind,
             onClose = {
                 mediaViewer = null
-                // Land focus back on the composer when the viewer closes, so
-                // the user can keep typing without hunting for focus.
+                // Return focus to the bubble whose media was opened. If that
+                // bubble is no longer composed (scrolled far off), fall back to
+                // the composer so focus is never lost.
                 scope.launch {
                     withFrameNanos {}
-                    runCatching { composerFr.requestFocus() }
+                    val landed = runCatching { mediaReturnFr.requestFocus() }.isSuccess
+                    if (!landed) runCatching { composerFr.requestFocus() }
                 }
             },
         )
@@ -257,6 +303,8 @@ private fun Timeline(
     onBubbleClick: (Message) -> Unit,
     onLoadOlderVisible: () -> Unit,
     lastBubbleFocusRequester: FocusRequester,
+    returnFocusId: String?,
+    returnFocusRequester: FocusRequester,
     downloadingMedia: Set<String>,
     failedMedia: Set<String>,
     onMediaActivate: (Message) -> Unit,
@@ -275,6 +323,12 @@ private fun Timeline(
     // items of that highest index.
     val listState = rememberLazyListState()
     val reversed = remember(timeline) { timeline.asReversed() }
+
+    // The list's viewport bounds in window pixels (top, bottom). A focused
+    // bubble taller than this needs the list scrolled to read it fully; the
+    // bubble compares its own window bounds against these to decide whether a
+    // DPAD Up/Down should scroll-to-read or move focus. Updated on (re)layout.
+    var listViewport by remember { mutableStateOf<Pair<Float, Float>?>(null) }
 
     val hasLoadingRow = timeline.firstOrNull() is TimelineItem.LoadingOlder
     val nearTop by remember {
@@ -321,7 +375,12 @@ private fun Timeline(
         // the newest bubble's timestamp/✓ row clear of the composer instead of
         // tucked right against it.
         contentPadding = PaddingValues(top = 6.dp, bottom = 10.dp),
-        modifier = modifier.fillMaxSize(),
+        modifier = modifier
+            .fillMaxSize()
+            .onGloballyPositioned { coords ->
+                val top = coords.positionInWindow().y
+                listViewport = top to (top + coords.size.height)
+            },
     ) {
         items(items = reversed, key = { it.key }) { item ->
             when (item) {
@@ -341,10 +400,16 @@ private fun Timeline(
                         showSenderName = isGroup && !msg.isOutgoing,
                         parentSnippet = parent,
                         onClick = { onBubbleClick(msg) },
+                        // Last bubble gets the composer's DPAD-Up requester; the
+                        // bubble whose media was just viewed additionally gets
+                        // the viewer's return-focus requester (both can be the
+                        // same bubble, hence a separate handle).
                         focusRequester = if (msg.id == lastMessageId) lastBubbleFocusRequester else null,
+                        extraFocusRequesters = if (msg.id == returnFocusId) listOf(returnFocusRequester) else emptyList(),
                         isDownloadingMedia = msg.id in downloadingMedia,
                         mediaFailed = msg.id in failedMedia,
                         onMediaActivate = { onMediaActivate(msg) },
+                        getListViewport = { listViewport },
                     )
                 }
             }
