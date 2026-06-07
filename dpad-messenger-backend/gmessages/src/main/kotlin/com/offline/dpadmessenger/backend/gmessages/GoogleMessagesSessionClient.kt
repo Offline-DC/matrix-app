@@ -63,6 +63,20 @@ internal class GoogleMessagesSessionClient(
         .readTimeout(0, TimeUnit.SECONDS) // long-poll: no read timeout
         .build()
 
+    // Google-account (GAIA / cookie) mode: messaging runs on the clients6 host
+    // with network "GDitto", destRegistrationIDs=[primary phone], and cookies +
+    // SAPISIDHASH on every request. (QR mode leaves all of these null/default.)
+    private val gaia: Boolean = store.isGaiaMode()
+    private val destRegB64: String? = if (gaia) store.loadGaiaDestReg() else null
+    private val cookies: Map<String, String> = if (gaia) store.loadCookies() else emptyMap()
+    private val authNetwork: String? = if (gaia) GMPairingProto.GOOGLE_NETWORK else null
+    private val receiveUrl =
+        if (gaia) GMPairingProto.RECEIVE_MESSAGES_URL_GOOGLE else GMPairingProto.RECEIVE_MESSAGES_URL
+    private val sendUrl =
+        if (gaia) GMPairingProto.SEND_MESSAGE_URL_GOOGLE else GMPairingProto.SEND_MESSAGE_URL
+    private val ackUrl =
+        if (gaia) GMPairingProto.ACK_MESSAGES_URL_GOOGLE else GMPairingProto.ACK_MESSAGES_URL
+
     private val _events = MutableSharedFlow<SessionEvent>(
         replay = 0, extraBufferCapacity = 64,
     )
@@ -128,10 +142,21 @@ internal class GoogleMessagesSessionClient(
      * conversation if the phone resolved it. Also emitted on [events] so the
      * room list picks it up.
      */
-    suspend fun getOrCreateConversation(number: String): GMSessionProto.GMConversation? {
+    suspend fun getOrCreateConversation(number: String): GMSessionProto.GMConversation? =
+        getOrCreateConversation(listOf(number), null)
+
+    /**
+     * Start (or look up) a conversation with one or more numbers. Two+ numbers
+     * asks the phone to create an RCS group. Returns the conversation if the
+     * phone resolved it.
+     */
+    suspend fun getOrCreateConversation(
+        numbers: List<String>,
+        groupName: String?,
+    ): GMSessionProto.GMConversation? {
         val resp = sendDataRequest(
             GMSessionProto.ACTION_GET_OR_CREATE_CONVERSATION,
-            GMSessionProto.getOrCreateConversationRequest(number),
+            GMSessionProto.getOrCreateConversationRequest(numbers, groupName),
             awaitResponse = true,
         ) ?: return null
         val plain = resp.encryptedData?.let(::decrypt) ?: return null
@@ -427,9 +452,11 @@ internal class GoogleMessagesSessionClient(
     /** @return true if fatal (stop polling). */
     private suspend fun openLongPollOnce(attempt: Int): Boolean {
         val acct = account
-        val body = PbLite.receiveMessagesRequest(UUID.randomUUID().toString(), acct.tachyonAuthToken)
+        val body = PbLite.receiveMessagesRequest(
+            UUID.randomUUID().toString(), acct.tachyonAuthToken, authNetwork,
+        )
         val req = Request.Builder()
-            .url(GMPairingProto.RECEIVE_MESSAGES_URL)
+            .url(receiveUrl)
             .post(body.toRequestBody(GMPairingProto.CONTENT_TYPE_PBLITE.toMediaType()))
             .applyRelayHeaders()
             .build()
@@ -518,6 +545,7 @@ internal class GoogleMessagesSessionClient(
             messageType = messageType,
             tachyonAuthToken = acct.tachyonAuthToken,
             ttl = acct.tokenTtl,
+            destRegB64 = destRegB64,
         )
 
         val deferred = if (awaitResponse) {
@@ -526,7 +554,7 @@ internal class GoogleMessagesSessionClient(
             }
         } else null
 
-        post(GMPairingProto.SEND_MESSAGE_URL, envelope)
+        post(sendUrl, envelope)
 
         if (deferred == null) return null
         return withTimeoutOrNull(10_000) { deferred.await() }.also {
@@ -547,8 +575,9 @@ internal class GoogleMessagesSessionClient(
             mobile = acct.mobile, requestId = sessionId, messageData = rpcData,
             messageType = GMSessionProto.MSGTYPE_BUGLE_MESSAGE,
             tachyonAuthToken = acct.tachyonAuthToken, ttl = 0L, // OmitTTL
+            destRegB64 = destRegB64,
         )
-        post(GMPairingProto.SEND_MESSAGE_URL, envelope)
+        post(sendUrl, envelope)
     }
 
     private suspend fun ackBrowserPresence() {
@@ -576,9 +605,9 @@ internal class GoogleMessagesSessionClient(
             runCatching {
                 val acct = account
                 val body = GMSessionProto.ackMessageRequest(
-                    UUID.randomUUID().toString(), acct.tachyonAuthToken, acct.browser, ids,
+                    UUID.randomUUID().toString(), acct.tachyonAuthToken, acct.browser, ids, authNetwork,
                 )
-                post(GMPairingProto.ACK_MESSAGES_URL, body)
+                post(ackUrl, body)
             }.onFailure {
                 Log.w(TAG, "ack failed; re-queueing ${ids.size}", it)
                 ackLock.withLock { pendingAcks.addAll(ids) }
@@ -622,7 +651,7 @@ internal class GoogleMessagesSessionClient(
             initSign(priv); update(signBytes); sign() // ASN.1 DER, matches Go ecdsa.SignASN1
         }
         val body = GMSessionProto.registerRefreshRequest(
-            requestId, acct.tachyonAuthToken, acct.browser, timestampMicros, signature,
+            requestId, acct.tachyonAuthToken, acct.browser, timestampMicros, signature, authNetwork,
         )
         val respBody = post(GMPairingProto.REGISTER_REFRESH_URL, body)
         val refreshed = GMSessionProto.parseRegisterRefreshResponse(respBody)
@@ -665,20 +694,29 @@ internal class GoogleMessagesSessionClient(
             }
         }
 
-    private fun Request.Builder.applyRelayHeaders(): Request.Builder = this
-        .header("sec-ch-ua", GMPairingProto.SEC_UA)
-        .header("x-user-agent", GMPairingProto.X_USER_AGENT)
-        .header("x-goog-api-key", GMPairingProto.GOOGLE_API_KEY)
-        .header("sec-ch-ua-mobile", "?1")
-        .header("user-agent", GMPairingProto.USER_AGENT)
-        .header("sec-ch-ua-platform", "\"Android\"")
-        .header("accept", "*/*")
-        .header("origin", "https://messages.google.com")
-        .header("sec-fetch-site", "cross-site")
-        .header("sec-fetch-mode", "cors")
-        .header("sec-fetch-dest", "empty")
-        .header("referer", "https://messages.google.com/")
-        .header("accept-language", "en-US,en;q=0.9")
+    private fun Request.Builder.applyRelayHeaders(): Request.Builder {
+        this.header("sec-ch-ua", GMPairingProto.SEC_UA)
+            .header("x-user-agent", GMPairingProto.X_USER_AGENT)
+            .header("x-goog-api-key", GMPairingProto.GOOGLE_API_KEY)
+            .header("sec-ch-ua-mobile", "?1")
+            .header("user-agent", GMPairingProto.USER_AGENT)
+            .header("sec-ch-ua-platform", "\"Android\"")
+            .header("accept", "*/*")
+            .header("origin", "https://messages.google.com")
+            .header("sec-fetch-site", "cross-site")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-dest", "empty")
+            .header("referer", "https://messages.google.com/")
+            .header("accept-language", "en-US,en;q=0.9")
+        // Google-account (GAIA) mode authenticates every request with the live
+        // Google cookies + a fresh SAPISIDHASH (this is what keeps the session
+        // durable — RegisterRefresh re-issues tokens while the cookies are good).
+        if (gaia) {
+            this.header("Cookie", GMCookieAuth.cookieHeader(cookies))
+                .header("Authorization", GMCookieAuth.sapisidHash(cookies["SAPISID"].orEmpty()))
+        }
+        return this
+    }
 
     companion object {
         private const val TAG = "GMSession"

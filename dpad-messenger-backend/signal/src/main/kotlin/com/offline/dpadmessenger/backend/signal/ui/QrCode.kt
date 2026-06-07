@@ -1,4 +1,4 @@
-package com.offline.dpadmessenger.backend.gmessages.ui
+package com.offline.dpadmessenger.backend.signal.ui
 
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -19,13 +19,8 @@ import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 
 /**
- * Render [data] as a square QR Bitmap. Pure-Java ZXing QRCodeWriter, no
- * Android-specific zxing dependency. Mirrors the QrCode composable in
- * dpad-messenger-backend/app so the pairing UX matches the Signal flow.
- *
- * The Google Messages pairing URL is long (~150+ chars), so we use
- * error-correction level L (more data capacity) and a tight margin to keep
- * the modules large enough to scan from the Flip's small screen.
+ * Render [data] as a square QR Bitmap (pure-Java ZXing). Mirrors the gmessages
+ * QrCode so the Signal link UX matches the Google Messages pairing flow.
  */
 @Composable
 fun QrCode(
@@ -37,7 +32,7 @@ fun QrCode(
     Box(modifier = modifier.size(size), contentAlignment = Alignment.Center) {
         Image(
             bitmap = bitmap.asImageBitmap(),
-            contentDescription = "Pairing QR code",
+            contentDescription = "Signal linking QR code",
             modifier = Modifier.fillMaxSize(),
         )
     }

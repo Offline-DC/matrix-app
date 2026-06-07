@@ -25,8 +25,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -238,12 +243,18 @@ private fun MediaGrid(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
                 modifier = Modifier.fillMaxSize(),
             ) {
-                items(items = current, key = { it.uri }) { item ->
+                val columns = 3
+                itemsIndexed(items = current, key = { _, it -> it.uri }) { index, item ->
                     MediaCell(
                         context = context,
                         item = item,
                         onClick = { onPick(item.uri) },
-                        focusRequester = if (item === current.first()) firstFocus else null,
+                        focusRequester = if (index == 0) firstFocus else null,
+                        // Consume Left on the first column and Right on the last
+                        // column / item so DPAD focus can't escape the grid into
+                        // nothing (which dropped the highlight).
+                        isLeftEdge = index % columns == 0,
+                        isRightEdge = index % columns == columns - 1 || index == current.lastIndex,
                     )
                 }
             }
@@ -257,6 +268,8 @@ private fun MediaCell(
     item: PickerItem,
     onClick: () -> Unit,
     focusRequester: FocusRequester?,
+    isLeftEdge: Boolean = false,
+    isRightEdge: Boolean = false,
 ) {
     val shape = RoundedCornerShape(8.dp)
     val thumb by produceState<ImageBitmap?>(
@@ -270,6 +283,16 @@ private fun MediaCell(
         modifier = Modifier
             .aspectRatio(1f)
             .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            // Trap Left/Right at the grid's horizontal edges so focus stays put
+            // instead of being lost off the side of the grid.
+            .onPreviewKeyEvent { e ->
+                if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when (e.key) {
+                    Key.DirectionLeft -> isLeftEdge
+                    Key.DirectionRight -> isRightEdge
+                    else -> false
+                }
+            }
             .clip(shape)
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .dpadRow(onClick = onClick, shape = shape),

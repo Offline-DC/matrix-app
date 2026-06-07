@@ -71,6 +71,45 @@ class GoogleMessagesAccountStore(context: Context) {
             .apply()
     }
 
+    // ---- Google-account (GAIA) cookies -------------------------------------
+    // Stored encrypted, independent of the QR-pairing fields above, so the
+    // cookie-auth port can persist/refresh them. Encoded as name\tvalue lines
+    // (cookie names/values never contain tab or newline).
+
+    fun saveCookies(cookies: Map<String, String>) {
+        val encoded = cookies.entries.joinToString("\n") { "${it.key}\t${it.value}" }
+        prefs.edit().putString(KEY_COOKIES, encoded).apply()
+    }
+
+    fun loadCookies(): Map<String, String> {
+        val s = prefs.getString(KEY_COOKIES, null) ?: return emptyMap()
+        return s.split("\n").mapNotNull { line ->
+            val i = line.indexOf('\t')
+            if (i <= 0) null else line.substring(0, i) to line.substring(i + 1)
+        }.toMap()
+    }
+
+    fun hasCookies(): Boolean = GMCookieAuth.hasRequiredCookies(loadCookies())
+
+    // ---- Google-account (GAIA) session mode --------------------------------
+    // After a successful UKey2 pairing, the session runs in "Google account"
+    // mode: clients6 host, network "GDitto", destRegistrationIDs + cookies +
+    // SAPISIDHASH on every RPC. Persist the marker + the dest registration id.
+
+    /** Mark the account as GAIA-paired and store the primary phone's dest
+     *  registration id (base64 of the UUID string, as sent on the wire). */
+    fun saveGaiaSession(destRegB64: String) {
+        prefs.edit()
+            .putBoolean(KEY_GAIA_MODE, true)
+            .putString(KEY_GAIA_DEST_REG, destRegB64)
+            .apply()
+    }
+
+    fun isGaiaMode(): Boolean = prefs.getBoolean(KEY_GAIA_MODE, false)
+
+    /** The primary phone's dest registration id (base64), or null if not GAIA. */
+    fun loadGaiaDestReg(): String? = prefs.getString(KEY_GAIA_DEST_REG, null)
+
     fun load(): GoogleMessagesAccount? {
         if (prefs.getInt(KEY_SCHEMA_VERSION, 1) < SCHEMA_VERSION) return null
         val auth = prefs.getString(KEY_TACHYON_AUTH, null)?.let(::decode) ?: return null
@@ -111,6 +150,7 @@ class GoogleMessagesAccountStore(context: Context) {
     companion object {
         private const val SCHEMA_VERSION = 2
         private const val KEY_SCHEMA_VERSION = "schemaVersion"
+        private const val KEY_COOKIES = "gaiaCookies"
         private const val KEY_TACHYON_AUTH = "tachyonAuthToken"
         private const val KEY_TOKEN_TTL = "tokenTtl"
         private const val KEY_BROWSER_USER_ID = "browserUserId"
@@ -122,6 +162,8 @@ class GoogleMessagesAccountStore(context: Context) {
         private const val KEY_ECDSA_PRIV = "ecdsaPrivatePkcs8"
         private const val KEY_AES = "aesKey"
         private const val KEY_HMAC = "hmacKey"
+        private const val KEY_GAIA_MODE = "gaiaMode"
+        private const val KEY_GAIA_DEST_REG = "gaiaDestReg"
     }
 }
 

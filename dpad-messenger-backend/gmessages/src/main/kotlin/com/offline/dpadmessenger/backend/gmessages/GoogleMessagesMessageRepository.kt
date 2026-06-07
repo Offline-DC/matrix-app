@@ -8,6 +8,7 @@ import com.offline.dpadmessenger.data.AttachmentSender
 import com.offline.dpadmessenger.data.ContactEntry
 import com.offline.dpadmessenger.data.ContactsSource
 import com.offline.dpadmessenger.data.ConversationStarter
+import com.offline.dpadmessenger.data.GroupConversationStarter
 import com.offline.dpadmessenger.data.InitialSyncAware
 import com.offline.dpadmessenger.data.MediaDownloader
 import com.offline.dpadmessenger.data.Message
@@ -50,7 +51,8 @@ import kotlinx.coroutines.withContext
 internal class GoogleMessagesMessageRepository(
     private val session: GoogleMessagesSessionClient,
     context: Context,
-) : MessageRepository, InitialSyncAware, ConversationStarter, ContactsSource, MediaDownloader, AttachmentSender {
+) : MessageRepository, InitialSyncAware, ConversationStarter, GroupConversationStarter,
+    ContactsSource, MediaDownloader, AttachmentSender {
 
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -142,6 +144,10 @@ internal class GoogleMessagesMessageRepository(
      *  user must re-link. The UI observes this to show a reconnect prompt. */
     private val _authExpired = MutableStateFlow(false)
     val authExpired: StateFlow<Boolean> = _authExpired.asStateFlow()
+
+    /** Message ids we've already logged an unparsed-media dump for (once each). */
+    private val loggedMediaParseFailures =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
     init {
         // Restore the on-disk cache so history shows on launch, before the
@@ -300,7 +306,11 @@ internal class GoogleMessagesMessageRepository(
             if (idx >= 0) list[idx] = preserved else list.add(preserved)
             list.sortBy { it.timestampMs }
             byRoom[gm.conversationId] = list
-            if (!gm.isOutgoing) {
+            // Don't bump the unread badge for the conversation the user is
+            // currently looking at — a message that arrives while the chat is
+            // open is effectively already read (maybeNotify already suppresses
+            // the notification for the active room).
+            if (!gm.isOutgoing && gm.conversationId != activeRoomId) {
                 unread[gm.conversationId] = (unread[gm.conversationId] ?: 0) + 1
             }
             // Ensure a room exists even if the conversation event hasn't arrived.
@@ -418,24 +428,20 @@ internal class GoogleMessagesMessageRepository(
         sendMessage(roomId, failed.body, failed.replyToId)
     }
 
-    /** Mark read locally + tell the phone. Also marks this thread "active" so
-     *  we don't notify for messages the user is currently looking at, and
-     *  clears any pending notification for it. (ChatViewModel calls this when
-     *  the conversation opens.) */
+    /** Mark read LOCALLY only. Also marks this thread "active" so we don't
+     *  notify for messages the user is currently looking at, and clears any
+     *  pending notification for it. (ChatViewModel calls this when the
+     *  conversation opens.)
+     *
+     *  Read receipts are intentionally never sent to the phone — the sender
+     *  should not see "Read" from this device. (The toggle was removed; this is
+     *  always off.) */
     override suspend fun markRoomRead(roomId: String) {
         activeRoomId = roomId
         notifier.clearConversation(roomId)
         writeLock.withLock {
             unreadByRoom.value = unreadByRoom.value + (roomId to 0)
             requestSave()
-        }
-        // Only tell the phone (→ sender sees "Read") when read receipts are on.
-        // The local unread badge is cleared above regardless.
-        if (sendReadReceipts) {
-            val lastIncoming = messagesByRoom.value[roomId]?.lastOrNull { !it.isOutgoing }
-            if (lastIncoming != null) {
-                scope.launch { runCatching { session.markRead(roomId, lastIncoming.id) } }
-            }
         }
     }
 
@@ -521,6 +527,16 @@ internal class GoogleMessagesMessageRepository(
             ?: return null
         // onConversations (via the event) will register the room; make sure
         // it's present before the UI navigates into it.
+        onConversations(listOf(conv))
+        return conv.conversationId
+    }
+
+    override suspend fun startGroupConversation(destinations: List<String>, title: String?): String? {
+        val numbers = destinations.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (numbers.size < 2) return null
+        val conv = runCatching { session.getOrCreateConversation(numbers, title?.trim()?.ifBlank { null }) }
+            .getOrElse { Log.e(TAG, "startGroupConversation failed", it); null }
+            ?: return null
         onConversations(listOf(conv))
         return conv.conversationId
     }
@@ -635,7 +651,12 @@ internal class GoogleMessagesMessageRepository(
         // whether a missing preview is a *parse* problem (this fires) vs a
         // *decode* problem (this doesn't, but the bubble shows "Can't preview").
         if (hasMedia && (media == null || media.mediaId.isBlank())) {
-            Log.w(TAG, "media present but no attachment parsed (mime=${media?.mimeType}) msg=$messageId")
+            // Log the actual field shape ONCE per message id (re-delivery
+            // otherwise spams it) so the unparsed-media wire format can be
+            // pinned down and the parser fixed.
+            if (loggedMediaParseFailures.add(messageId)) {
+                Log.w(TAG, "media present but no attachment parsed msg=$messageId ${mediaDebug ?: "(no field dump)"}")
+            }
         }
         val att = media?.takeIf { it.mediaId.isNotBlank() }?.let { m ->
             // RCS media carries a non-empty per-attachment key (encrypted).

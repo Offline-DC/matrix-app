@@ -1,5 +1,6 @@
 package com.offline.dpadmessenger.ui.newconversation
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.relocation.BringIntoViewRequester
@@ -22,6 +23,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -31,6 +35,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -55,6 +60,7 @@ import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.data.ContactEntry
 import com.offline.dpadmessenger.data.ContactsSource
 import com.offline.dpadmessenger.data.ConversationStarter
+import com.offline.dpadmessenger.data.GroupConversationStarter
 import com.offline.dpadmessenger.focus.dpadFocusHighlight
 import com.offline.dpadmessenger.focus.dpadRow
 import com.offline.dpadmessenger.ui.components.CompactBarButton
@@ -84,12 +90,18 @@ fun NewConversationScreen(
     onBack: () -> Unit,
     onConversationStarted: (roomId: String) -> Unit,
     modifier: Modifier = Modifier,
+    /** When non-null, a "New group" multi-select mode is offered. */
+    groupStarter: GroupConversationStarter? = null,
 ) {
     var query by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var contacts by remember { mutableStateOf<List<ContactEntry>>(emptyList()) }
     var contactsLoading by remember { mutableStateOf(contactsSource != null) }
+    // Group multi-select: when true, OK on a row toggles selection instead of
+    // opening a 1:1, and the top row creates the group.
+    var groupMode by remember { mutableStateOf(false) }
+    val selectedNumbers = remember { mutableStateListOf<String>() }
     val scope = rememberCoroutineScope()
     val fieldFocus = remember { FocusRequester() }
     val backFocus = remember { FocusRequester() }
@@ -144,10 +156,41 @@ fun NewConversationScreen(
         }
     }
 
+    fun toggleSelected(number: String) {
+        val n = number.trim()
+        if (n.isEmpty()) return
+        if (selectedNumbers.contains(n)) selectedNumbers.remove(n) else selectedNumbers.add(n)
+    }
+
+    fun createGroup() {
+        if (busy || groupStarter == null || selectedNumbers.size < 2) return
+        busy = true
+        error = null
+        val numbers = selectedNumbers.toList()
+        focusManager.clearFocus(force = true)
+        scope.launch {
+            val roomId = runCatching { groupStarter.startGroupConversation(numbers, null) }.getOrNull()
+            busy = false
+            if (roomId != null) {
+                onConversationStarted(roomId)
+            } else {
+                error = "Couldn't create the group. Try again."
+                runCatching { firstRowFocus.requestFocus() }
+            }
+        }
+    }
+
+    // Back exits group mode first (clearing the selection), then leaves.
+    BackHandler(enabled = groupMode) {
+        groupMode = false
+        selectedNumbers.clear()
+        runCatching { fieldFocus.requestFocus() }
+    }
+
     Scaffold(
         topBar = {
             CompactTopBar(
-                title = "New message",
+                title = if (groupMode) "New group" else "New message",
                 navigationIcon = {
                     CompactBarButton(
                         onClick = onBack,
@@ -254,25 +297,62 @@ fun NewConversationScreen(
                 return@Column
             }
 
-            // Result rows: optional "Send to <number>" first, then contacts.
+            // Result rows. Topmost focusable owns `firstRowFocus` (DPAD-Up from
+            // it returns to the field). With a group control present, that's the
+            // group row; otherwise the dial row or the first contact.
+            val groupRowPresent = groupStarter != null
+            val toField = { runCatching { fieldFocus.requestFocus() }; Unit }
             LazyColumn(modifier = Modifier.fillMaxSize()) {
-                if (dialable) {
-                    item(key = "dial") {
+                if (groupRowPresent) {
+                    item(key = "group") {
+                        val canCreate = selectedNumbers.size >= 2
                         ResultRow(
-                            title = "Send to ${query.trim()}",
-                            subtitle = "New number",
-                            avatarName = query.trim(),
-                            avatarColor = "#607D8B",
+                            title = if (groupMode) "Create group" else "New group",
+                            subtitle = when {
+                                !groupMode -> "Message several people at once"
+                                canCreate -> "${selectedNumbers.size} selected — OK to create"
+                                else -> "Pick at least 2 people"
+                            },
+                            avatarName = "+",
+                            avatarColor = "#3F51B5",
                             focusRequester = firstRowFocus,
-                            onUpToField = { runCatching { fieldFocus.requestFocus() } },
-                            onClick = { start(query.trim()) },
+                            onUpToField = toField,
+                            onClick = { if (!groupMode) groupMode = true else createGroup() },
                             leadingIcon = {
                                 Icon(
-                                    Icons.AutoMirrored.Filled.Send,
+                                    Icons.Filled.Group,
                                     contentDescription = null,
                                     tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(20.dp),
+                                    modifier = Modifier.size(22.dp),
                                 )
+                            },
+                        )
+                    }
+                }
+                if (dialable) {
+                    item(key = "dial") {
+                        val number = query.trim()
+                        val isFirst = !groupRowPresent
+                        ResultRow(
+                            title = if (groupMode) "Add $number" else "Send to $number",
+                            subtitle = "New number",
+                            avatarName = number,
+                            avatarColor = "#607D8B",
+                            focusRequester = if (isFirst) firstRowFocus else null,
+                            onUpToField = if (isFirst) toField else null,
+                            onClick = { if (groupMode) toggleSelected(number) else start(number) },
+                            trailing = if (groupMode) {
+                                { SelectionCheck(selected = selectedNumbers.contains(number)) }
+                            } else null,
+                            leadingIcon = if (groupMode) null else {
+                                {
+                                    Icon(
+                                        Icons.AutoMirrored.Filled.Send,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(20.dp),
+                                    )
+                                }
                             },
                         )
                     }
@@ -281,17 +361,20 @@ fun NewConversationScreen(
                     items = filtered,
                     key = { _, c -> c.number + c.name },
                 ) { index, contact ->
-                    val isFirstFocusable = !dialable && index == 0
+                    val isFirstFocusable = !groupRowPresent && !dialable && index == 0
                     ResultRow(
                         title = contact.name,
                         subtitle = contact.number,
                         avatarName = contact.name,
                         avatarColor = contact.avatarColor,
                         focusRequester = if (isFirstFocusable) firstRowFocus else null,
-                        onUpToField = if (isFirstFocusable || (dialable && index == 0)) {
-                            { runCatching { fieldFocus.requestFocus() } }
+                        onUpToField = if (isFirstFocusable) toField else null,
+                        onClick = {
+                            if (groupMode) toggleSelected(contact.number) else start(contact.number)
+                        },
+                        trailing = if (groupMode) {
+                            { SelectionCheck(selected = selectedNumbers.contains(contact.number.trim())) }
                         } else null,
-                        onClick = { start(contact.number) },
                     )
                 }
                 if (contactsLoading && filtered.isEmpty()) {
@@ -339,6 +422,7 @@ private fun ResultRow(
     onUpToField: (() -> Unit)?,
     onClick: () -> Unit,
     leadingIcon: (@Composable () -> Unit)? = null,
+    trailing: (@Composable () -> Unit)? = null,
 ) {
     // LazyColumn only composes rows near the viewport, so directional focus
     // can't reach an off-screen row on its own. Wire bringIntoView on focus so
@@ -370,7 +454,7 @@ private fun ResultRow(
             InitialsAvatar(name = avatarName, colorHex = avatarColor, size = 36.dp)
         }
         Spacer(Modifier.width(10.dp))
-        Column {
+        Column(modifier = Modifier.weight(1f)) {
             Text(
                 title,
                 style = MaterialTheme.typography.bodyLarge,
@@ -385,6 +469,30 @@ private fun ResultRow(
                 overflow = TextOverflow.Ellipsis,
             )
         }
+        if (trailing != null) {
+            Spacer(Modifier.width(8.dp))
+            trailing()
+        }
+    }
+}
+
+/** Round check used in group multi-select to show whether a contact is picked. */
+@Composable
+private fun SelectionCheck(selected: Boolean) {
+    if (selected) {
+        Icon(
+            Icons.Filled.Check,
+            contentDescription = "Selected",
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(22.dp),
+        )
+    } else {
+        Icon(
+            Icons.Filled.RadioButtonUnchecked,
+            contentDescription = "Not selected",
+            tint = LocalDpadMessengerColors.current.mutedText,
+            modifier = Modifier.size(22.dp),
+        )
     }
 }
 

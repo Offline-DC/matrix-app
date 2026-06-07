@@ -5,6 +5,11 @@ plugins {
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.serialization")
     id("com.google.protobuf")
+    // This module now ships Compose UI (the link screen + the pairing/chat
+    // gate `SignalApp`, mirroring the gmessages module) so it needs the Compose
+    // Compiler plugin. The Compose runtime/ui artifacts come transitively via
+    // api(project(":core")) → the dpad-messenger UI library.
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -17,6 +22,8 @@ android {
             abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
         }
     }
+    buildFeatures { compose = true }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -113,6 +120,9 @@ dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+
+    // ZXing (pure-Java core) to ENCODE the provisioning QR for the link screen.
+    implementation("com.google.zxing:core:3.5.3")
 
     // Required by libsignal-android.
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")

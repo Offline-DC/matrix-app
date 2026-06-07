@@ -32,6 +32,8 @@ internal object GMPairingProto {
         "\"Google Chrome\";v=\"146\", \"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\""
     const val X_USER_AGENT = "grpc-web-javascript/0.1"
     const val QR_NETWORK = "Bugle"
+    /** Network value for Google-account (GAIA / cookie) mode. */
+    const val GOOGLE_NETWORK = "GDitto"
     const val QR_CODE_URL_BASE = "https://support.google.com/messages/?p=web_computer#?c="
 
     /** Name shown for this device in the phone's Google Messages "paired
@@ -50,6 +52,15 @@ internal object GMPairingProto {
     const val RECEIVE_MESSAGES_URL = "$MESSAGING_BASE/ReceiveMessages"
     const val SEND_MESSAGE_URL = "$MESSAGING_BASE/SendMessage"
     const val ACK_MESSAGES_URL = "$MESSAGING_BASE/AckMessages"
+
+    // Google-account (GAIA / cookie) mode uses the clients6 host for messaging
+    // too (mautrix util/paths.go *URLGoogle). Same RPC service, different host.
+    private const val MESSAGING_BASE_GOOGLE =
+        "https://instantmessaging-pa.clients6.google.com/\$rpc/" +
+            "google.internal.communications.instantmessaging.v1.Messaging"
+    const val RECEIVE_MESSAGES_URL_GOOGLE = "$MESSAGING_BASE_GOOGLE/ReceiveMessages"
+    const val SEND_MESSAGE_URL_GOOGLE = "$MESSAGING_BASE_GOOGLE/SendMessage"
+    const val ACK_MESSAGES_URL_GOOGLE = "$MESSAGING_BASE_GOOGLE/AckMessages"
 
     // NOTE: Registration lives on clients6.google.com, not googleapis.com
     // (mautrix util/paths.go registrationBaseURL).

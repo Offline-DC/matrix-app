@@ -1,16 +1,17 @@
-package com.offline.dpadmessenger.backend.gmessages.ui
+package com.offline.dpadmessenger.backend.signal.ui
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.background
-import androidx.compose.foundation.focusable
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -24,23 +25,21 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.layout.Spacer
-import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesPairingResult
+import com.offline.dpadmessenger.backend.signal.SignalProvisioningResult
 import com.offline.dpadmessenger.focus.dpadFocusHighlight
 import com.offline.dpadmessenger.focus.onDpadAction
 
 /**
- * Pairing UI for Google Messages. Observes a [GoogleMessagesPairingResult]
- * and renders the matching state — connecting spinner, scannable QR with
- * instructions, success, or error. Mirrors
- * `dpad-messenger-backend/app/SignalLinkScreen` so the two link flows feel
- * identical to the user.
+ * Link UI for Signal. Observes [SignalProvisioningResult] and renders the
+ * matching state — connecting spinner, scannable QR with instructions, linked,
+ * or error. Mirrors `gmessages/ui/GoogleMessagesLinkScreen` so the two link
+ * flows feel identical.
  */
 @Composable
-fun GoogleMessagesLinkScreen(
-    state: GoogleMessagesPairingResult,
+fun SignalLinkScreen(
+    state: SignalProvisioningResult,
     modifier: Modifier = Modifier,
-    /** Restart pairing from the Failed state. Null hides the retry button. */
+    /** Restart linking from the Failed state. Null hides the retry button. */
     onRetry: (() -> Unit)? = null,
 ) {
     Column(
@@ -52,20 +51,21 @@ fun GoogleMessagesLinkScreen(
         verticalArrangement = Arrangement.Center,
     ) {
         when (state) {
-            GoogleMessagesPairingResult.Idle,
-            GoogleMessagesPairingResult.Connecting -> {
+            SignalProvisioningResult.Idle,
+            SignalProvisioningResult.Connecting,
+            SignalProvisioningResult.WaitingForUuid -> {
                 CircularProgressIndicator()
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    text = "Connecting to Google Messages…",
+                    text = "Connecting to Signal…",
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
                 )
             }
 
-            is GoogleMessagesPairingResult.WaitingForScan -> {
+            is SignalProvisioningResult.WaitingForScan -> {
                 Text(
-                    text = "Pair with your phone",
+                    text = "Link with Signal",
                     style = MaterialTheme.typography.titleMedium,
                     textAlign = TextAlign.Center,
                 )
@@ -73,27 +73,27 @@ fun GoogleMessagesLinkScreen(
                 QrCode(data = state.qrUrl, size = 200.dp)
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    text = "On your main phone, open Google Messages →\n" +
-                        "Settings → Device pairing → QR code scanner,\n" +
+                    text = "On your main phone, open Signal →\n" +
+                        "Settings → Linked devices → Link new device,\n" +
                         "then scan this code.",
                     style = MaterialTheme.typography.bodySmall,
                     textAlign = TextAlign.Center,
                 )
             }
 
-            is GoogleMessagesPairingResult.Paired -> {
+            is SignalProvisioningResult.Linked -> {
                 CircularProgressIndicator()
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    text = "Paired — loading your messages…",
+                    text = "Linked — loading your messages…",
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
                 )
             }
 
-            is GoogleMessagesPairingResult.Failed -> {
+            is SignalProvisioningResult.Failed -> {
                 Text(
-                    text = "Pairing failed",
+                    text = "Linking failed",
                     style = MaterialTheme.typography.titleMedium,
                     textAlign = TextAlign.Center,
                 )

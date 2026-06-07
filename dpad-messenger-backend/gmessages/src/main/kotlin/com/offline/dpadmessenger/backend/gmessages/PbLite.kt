@@ -28,7 +28,11 @@ internal object PbLite {
      *
      * Field number N → array index N-1; trailing nulls omitted.
      */
-    fun receiveMessagesRequest(requestId: String, tachyonAuthToken: ByteArray): String {
+    fun receiveMessagesRequest(
+        requestId: String,
+        tachyonAuthToken: ByteArray,
+        network: String? = null,
+    ): String {
         val tokenB64 = jsonString(B64.encode(tachyonAuthToken))
         // ConfigVersion: indices 2,3,4,6,8 set.
         val config = "[null,null,2026,3,18,null,4,null,6]"
@@ -37,7 +41,9 @@ internal object PbLite {
         // AuthData.AuthNetwork() returns "" for non-Google-account pairing
         // (only RegisterPhoneRelay sends "Bugle"). Sending "Bugle" here makes
         // Google hold the connection open but never route the pair event to it.
-        val auth = "[${jsonString(requestId)},null,null," +
+        // For Google-account (GAIA) mode it MUST be "GDitto".
+        val networkJson = if (network != null) jsonString(network) else "null"
+        val auth = "[${jsonString(requestId)},null,$networkJson," +
             "null,null,$tokenB64,$config]"
         // ReceiveMessagesRequest: idx0 auth, idx3 unknown=[null,[]].
         return "[$auth,null,null,[null,[]]]"

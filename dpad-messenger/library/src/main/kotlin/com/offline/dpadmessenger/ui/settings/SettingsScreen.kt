@@ -57,9 +57,6 @@ fun SettingsScreen(
     /** 24-hour clock toggle. Hidden when [onUse24HourTimeChange] is null. */
     use24HourTime: Boolean = false,
     onUse24HourTimeChange: ((Boolean) -> Unit)? = null,
-    /** Read-receipts toggle. Hidden when [onReadReceiptsChange] is null. */
-    readReceiptsEnabled: Boolean = false,
-    onReadReceiptsChange: ((Boolean) -> Unit)? = null,
 ) {
     // Land focus on the back button on entry, so the screen has a visible
     // highlight and DPAD navigation works immediately (every other screen sets
@@ -114,16 +111,8 @@ fun SettingsScreen(
                     )
                 }
             }
-            if (onAutoDeleteChange != null || onReadReceiptsChange != null) {
+            if (onAutoDeleteChange != null) {
                 SettingHeader("Messages")
-                if (onReadReceiptsChange != null) {
-                    ToggleRow(
-                        title = "Send read receipts",
-                        subtitle = "Let senders see when you've read their message.",
-                        checked = readReceiptsEnabled,
-                        onCheckedChange = onReadReceiptsChange,
-                    )
-                }
                 if (onAutoDeleteChange != null) {
                     ToggleRow(
                         title = "Auto-delete old messages",

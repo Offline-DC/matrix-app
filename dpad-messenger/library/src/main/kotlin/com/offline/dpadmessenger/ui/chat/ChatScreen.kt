@@ -32,10 +32,16 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
+import com.offline.dpadmessenger.focus.DpadFireGate
+import com.offline.dpadmessenger.focus.OkKeys
 import com.offline.dpadmessenger.data.Message
 import com.offline.dpadmessenger.data.TimelineItem
 import com.offline.dpadmessenger.ui.components.BannerKind
@@ -156,7 +162,19 @@ fun ChatScreen(
                 },
             )
         },
-        modifier = modifier.fillMaxSize().imePadding(),
+        modifier = modifier
+            .fillMaxSize()
+            .imePadding()
+            // The OK press on a room row that opened this chat loses its KeyUp to
+            // the screen transition, so DpadFireGate stays held (~2s) and swallows
+            // the user's FIRST OK on a message (they had to press twice). Release
+            // the gate on any OK key-up here so the first deliberate press fires.
+            .onPreviewKeyEvent { event ->
+                if (event.type == KeyEventType.KeyUp && event.key in OkKeys) {
+                    DpadFireGate.release(event.key)
+                }
+                false
+            },
     ) { padding ->
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
             Timeline(

@@ -15,6 +15,20 @@ interface ConversationStarter {
     suspend fun startConversation(destination: String): String?
 }
 
+/**
+ * Optional capability for repositories that can start a GROUP conversation
+ * from several destinations. The "new message" compose flow shows a
+ * multi-select "New group" mode only when the repository implements this.
+ */
+interface GroupConversationStarter {
+    /**
+     * Create (or resolve) a group conversation including all [destinations]
+     * (phone numbers). [title] is an optional group name.
+     * @return the conversation/room id to open, or null on failure.
+     */
+    suspend fun startGroupConversation(destinations: List<String>, title: String?): String?
+}
+
 /** An address-book entry the new-message picker can offer. */
 data class ContactEntry(
     val name: String,

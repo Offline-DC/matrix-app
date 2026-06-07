@@ -188,6 +188,8 @@ internal object GMSessionProto {
         val replyToMessageId: String?,
         val reactions: List<GMReaction> = emptyList(),
         val media: GMMedia? = null,
+        /** Diagnostic field dump set when media was present but unparsable. */
+        val mediaDebug: String? = null,
     ) {
         val isOutgoing: Boolean get() = statusCode in 1..99
         val isTombstone: Boolean get() = statusCode in 200..299
@@ -275,6 +277,7 @@ internal object GMSessionProto {
         var id = ""; var status = 0; var ts = 0L; var convId = ""; var pid = ""
         var tmpId = ""; var replyTo: String? = null; var hasMedia = false
         var media: GMMedia? = null
+        var mediaDebug: String? = null
         val textParts = ArrayList<String>()
         val reactions = ArrayList<GMReaction>()
         forEachField(bytes) { f ->
@@ -291,7 +294,11 @@ internal object GMSessionProto {
                     }
                     fields[3]?.bytes?.let { mediaBytes ->
                         hasMedia = true
-                        parseMediaContent(mediaBytes)?.let { media = it }
+                        val parsed = parseMediaContent(mediaBytes)
+                        if (parsed != null) media = parsed
+                        // Capture the actual field shape so an unparsed media
+                        // attachment can be diagnosed (logged once by the repo).
+                        else if (mediaDebug == null) mediaDebug = "mc{${describeFields(mediaBytes)}} mi{${describeFields(mi)}}"
                     }
                 }
                 12 -> tmpId = f.utf8()
@@ -304,8 +311,21 @@ internal object GMSessionProto {
             conversationId = convId, participantId = pid,
             text = textParts.joinToString("\n"), hasMedia = hasMedia,
             tmpId = tmpId, replyToMessageId = replyTo, reactions = reactions, media = media,
+            mediaDebug = mediaDebug,
         )
     }
+
+    /** Compact dump of a message's immediate proto fields (number → short
+     *  string / byte-length / varint). Used only to diagnose unparsed media. */
+    private fun describeFields(bytes: ByteArray): String =
+        ProtoReader.fields(bytes).entries.sortedBy { it.key }.joinToString(" ") { (n, field) ->
+            val b = field.bytes
+            if (b != null) {
+                val s = b.toString(Charsets.UTF_8)
+                if (s.isNotEmpty() && s.all { it.code in 32..126 } && s.length <= 48) "f$n='$s'"
+                else "f$n=[${b.size}b]"
+            } else "f$n=${field.value}"
+        }
 
     /** MediaContent (conversations.proto): format=1, mediaID=2, mediaName=4,
      *  decryptionKey=11, mimeType=14. */
@@ -482,9 +502,26 @@ internal object GMSessionProto {
      *   ContactNumber { mysteriousInt=1 (2=contact, 7=user input), number=2, number2=3 }
      * mautrix sends mysteriousInt=2 with number==number2 for a DM.
      */
-    fun getOrCreateConversationRequest(number: String): ByteArray {
-        val contact = ProtoWriter().int32(1, 2).string(2, number).string(3, number)
-        return ProtoWriter().message(2, contact).toByteArray()
+    fun getOrCreateConversationRequest(number: String): ByteArray =
+        getOrCreateConversationRequest(listOf(number), null)
+
+    /**
+     * GetOrCreateConversationRequest { numbers=2 (repeated ContactNumber),
+     * RCSGroupName=3, createRCSGroup=4 }. With one number this is a 1:1; with
+     * several it asks the phone to create an RCS group (field 4 = true).
+     */
+    fun getOrCreateConversationRequest(numbers: List<String>, rcsGroupName: String?): ByteArray {
+        val w = ProtoWriter()
+        for (n in numbers) {
+            // ContactNumber { type=1 (=2 PHONE), rawNumber=2, e164=3 }
+            val contact = ProtoWriter().int32(1, 2).string(2, n).string(3, n)
+            w.message(2, contact) // repeated field 2
+        }
+        if (numbers.size > 1) {
+            if (!rcsGroupName.isNullOrBlank()) w.string(3, rcsGroupName)
+            w.int32(4, 1) // createRCSGroup = true
+        }
+        return w.toByteArray()
     }
 
     /**
@@ -678,6 +715,9 @@ internal object GMSessionProto {
         messageType: Int,
         tachyonAuthToken: ByteArray,
         ttl: Long,
+        /** Google-account (GAIA) mode: the primary phone's registration id
+         *  (base64 of the UUID string). Goes in destRegistrationIDs (field 9). */
+        destRegB64: String? = null,
     ): String {
         val rid = PbLite.jsonString(requestId)
         val data = buildString {
@@ -691,7 +731,8 @@ internal object GMSessionProto {
         val auth = "[$rid,null,null,null,null," +
             "${PbLite.jsonString(B64.encode(tachyonAuthToken))},$CONFIG_VERSION_PBLITE]"
         val ttlJson = if (ttl != 0L) "$ttl" else "null"
-        return "[${deviceJson(mobile)},$data,$auth,null,$ttlJson,null,null,null,null]"
+        val destReg = if (destRegB64 != null) "[${PbLite.jsonString(destRegB64)}]" else "null"
+        return "[${deviceJson(mobile)},$data,$auth,null,$ttlJson,null,null,null,$destReg]"
     }
 
     /**
@@ -703,8 +744,10 @@ internal object GMSessionProto {
         tachyonAuthToken: ByteArray,
         browser: GMDeviceInfo,
         ackIds: List<String>,
+        network: String? = null,
     ): String {
-        val auth = "[${PbLite.jsonString(requestId)},null,null,null,null," +
+        val networkJson = if (network != null) PbLite.jsonString(network) else "null"
+        val auth = "[${PbLite.jsonString(requestId)},null,$networkJson,null,null," +
             "${PbLite.jsonString(B64.encode(tachyonAuthToken))},$CONFIG_VERSION_PBLITE]"
         val acks = ackIds.joinToString(",") {
             "[${PbLite.jsonString(it)},${deviceJson(browser)}]"
@@ -728,8 +771,10 @@ internal object GMSessionProto {
         browser: GMDeviceInfo,
         unixTimestampMicros: Long,
         signature: ByteArray,
+        network: String? = null,
     ): String {
-        val auth = "[${PbLite.jsonString(requestId)},null,null,null,null," +
+        val networkJson = if (network != null) PbLite.jsonString(network) else "null"
+        val auth = "[${PbLite.jsonString(requestId)},null,$networkJson,null,null," +
             "${PbLite.jsonString(B64.encode(tachyonAuthToken))},$CONFIG_VERSION_PBLITE]"
         // Parameters: 23 slots, idx8 = emptyArr.
         val params = buildString {

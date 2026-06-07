@@ -47,6 +47,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import kotlinx.coroutines.delay
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
@@ -104,6 +105,9 @@ fun DpadComposer(
     var fieldValue by rememberSaveable(stateSaver = TextFieldValueSaver) {
         mutableStateOf(TextFieldValue(""))
     }
+    // Latest text layout, so DPAD Up/Down can tell which line the cursor is on
+    // (escape out of the field only at the first/last line).
+    var textLayout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val keyboard = LocalSoftwareKeyboardController.current
 
     val fieldFr = textFieldFocusRequester ?: remember { FocusRequester() }
@@ -215,6 +219,7 @@ fun DpadComposer(
                         onSend = { submit() },
                     ),
                     cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
+                    onTextLayout = { textLayout = it },
                     modifier = Modifier
                         .fillMaxWidth()
                         // The inner field is the DPAD entry target — caller's
@@ -237,15 +242,27 @@ fun DpadComposer(
                             if (event.nativeKeyEvent.repeatCount != 0) return@onPreviewKeyEvent false
                             when (event.key) {
                                 Key.DirectionUp -> {
-                                    onUpFromField()
-                                    true
+                                    // Only leave the field for the messages above
+                                    // when the cursor is on the FIRST line —
+                                    // otherwise move the cursor up within the
+                                    // input so the user can edit multi-line text.
+                                    val onFirstLine = textLayout
+                                        ?.let { it.getLineForOffset(fieldValue.selection.start) == 0 }
+                                        ?: true
+                                    if (onFirstLine) { onUpFromField(); true } else false
                                 }
                                 Key.DirectionLeft -> {
-                                    // Left from the field → "+" button if present,
-                                    // otherwise straight out to the back button.
-                                    if (onAttach != null) runCatching { attachFr.requestFocus() }
-                                    else onLeftFromField()
-                                    true
+                                    // Only leave the field (→ "+" attach, else the
+                                    // back button) when the cursor is at the very
+                                    // start; otherwise move the cursor left so the
+                                    // user can edit.
+                                    val sel = fieldValue.selection
+                                    val atStart = sel.collapsed && sel.start == 0
+                                    if (atStart) {
+                                        if (onAttach != null) runCatching { attachFr.requestFocus() }
+                                        else onLeftFromField()
+                                        true
+                                    } else false
                                 }
                                 Key.DirectionRight -> {
                                     val sel = fieldValue.selection

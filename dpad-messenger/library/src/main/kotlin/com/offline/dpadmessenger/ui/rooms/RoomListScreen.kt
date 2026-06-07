@@ -201,10 +201,13 @@ private fun RoomList(
                 val idx = rooms.indexOfFirst { it.room.id == entryRoomId }
                 if (idx >= 0) listState.scrollToItem(idx)
             }
-            try {
-                entryRowFocus.requestFocus()
-            } catch (_: IllegalStateException) {
-                // Focus target not yet attached; safe to ignore.
+            // Retry focus across a few frames: when returning from a chat the
+            // target row isn't attached on the first frame, so a single
+            // requestFocus() silently failed and left the list UNFOCUSED — the
+            // first OK then just established focus (the "press OK twice" bug).
+            repeat(10) {
+                if (runCatching { entryRowFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+                withFrameNanos {}
             }
         }
     }

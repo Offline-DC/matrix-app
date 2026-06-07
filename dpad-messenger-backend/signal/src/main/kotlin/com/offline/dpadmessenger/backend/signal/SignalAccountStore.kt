@@ -44,6 +44,10 @@ class SignalAccountStore(context: Context) {
         return runCatching { json.decodeFromString<SignalAccount>(s) }.getOrNull()
     }
 
+    /** True if a linked Signal account is stored (mirrors gmessages'
+     *  GoogleMessagesAccountStore.isPaired()). */
+    fun isPaired(): Boolean = load() != null
+
     fun clear() { prefs.edit().clear().apply() }
 
     companion object {

@@ -1,6 +1,7 @@
 package com.offline.dpadmessenger.backend.gmessages.ui
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -9,11 +10,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.offline.dpadmessenger.ui.DpadMessengerApp
 import com.offline.dpadmessenger.ui.util.TimeFormatPreference
 import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesAccountStore
-import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesPairing
-import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesPairingResult
 import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesRepository
 
 /**
@@ -24,11 +26,11 @@ import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesRepository
  * linking:
  *  - Already paired → the chat UI ([DpadMessengerApp]) backed by the real
  *    Google Messages repository.
- *  - Not paired → kick off [GoogleMessagesPairingClient], show the
- *    [GoogleMessagesLinkScreen] (connecting spinner → scannable QR), and
- *    flip to the chat UI once the phone confirms the pair.
+ *  - Not paired → in launcher mode, hand off to the companion phone sign-in
+ *    ([onCompanionSignIn] → cookie transfer → GAIA/UKey2 pairing). QR pairing
+ *    was removed by Google, so there is no in-app QR screen.
  *
- * The chat UI and the link UI share the same Activity/host — no navigation
+ * The chat UI and the sign-in UI share the same Activity/host — no navigation
  * plumbing needed, just a state swap.
  */
 @Composable
@@ -38,12 +40,30 @@ fun GoogleMessagesApp(
      *  key so repeat taps on the same thread re-navigate. */
     initialRoomId: String? = null,
     initialRoomKey: Any? = null,
+    /** Host-provided "sign in via your phone" handler (the launcher opens the
+     *  companion cookie-transfer flow). When null, falls back to the in-app
+     *  WebView Google login (standalone/demo). */
+    onCompanionSignIn: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val store = remember { GoogleMessagesAccountStore(context) }
 
     // Snapshot pairing status once. Flips to true when pairing completes.
     var paired by remember { mutableStateOf(store.isPaired()) }
+
+    // Pairing finishes in a separate activity (the companion cookie/UKey2 flow).
+    // Re-check on resume so we flip straight to the chats once it succeeds,
+    // instead of leaving the user on the "waiting" screen until a relaunch.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME && !paired && store.isPaired()) {
+                paired = true
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     if (paired) {
         // The repository is a process-scoped singleton — one session/long-poll
@@ -64,8 +84,7 @@ fun GoogleMessagesApp(
             GoogleMessagesReconnectScreen(
                 onRelink = {
                     GoogleMessagesRepository.shutdown()
-                    store.clear()
-                    GoogleMessagesPairing.reset()
+                    store.clear() // wipes account + cookies + GAIA flag → re-pair
                     paired = false
                 },
                 modifier = modifier,
@@ -84,16 +103,14 @@ fun GoogleMessagesApp(
             TimeFormatPreference.use24Hour = saved
             mutableStateOf(saved)
         }
-        var readReceipts by remember { mutableStateOf(GoogleMessagesRepository.isReadReceiptsEnabled()) }
         DpadMessengerApp(
             repository = repository,
             modifier = modifier,
             onLogout = {
                 // Real logout: tear the session down, wipe the stored pairing,
-                // and drop back to the QR link screen for a fresh pairing.
+                // and drop back to the companion sign-in for a fresh pairing.
                 GoogleMessagesRepository.shutdown()
-                store.clear()
-                GoogleMessagesPairing.reset()
+                store.clear() // wipes account + cookies + GAIA flag → re-pair
                 paired = false
             },
             autoDeleteEnabled = autoDelete,
@@ -107,38 +124,40 @@ fun GoogleMessagesApp(
                 TimeFormatPreference.use24Hour = enabled
                 settingsPrefs.edit().putBoolean("use24HourTime", enabled).apply()
             },
-            readReceiptsEnabled = readReceipts,
-            onReadReceiptsChange = { enabled ->
-                readReceipts = enabled
-                GoogleMessagesRepository.setReadReceiptsEnabled(enabled)
-            },
             initialRoomId = initialRoomId,
             initialRoomKey = initialRoomKey,
         )
         return
     }
 
-    // Not paired: drive the process-scoped pairing client and render the
-    // link screen. The client is intentionally NOT tied to this composition's
-    // lifecycle — its long-poll must keep running while the user leaves the
-    // app to scan the QR on their primary phone, and survive Activity
-    // recreation (fold/unfold). See [GoogleMessagesPairing].
-    // Bumping this rebuilds the pairing client — used by the Failed-state
-    // "Try again" button to restart from scratch.
-    var pairAttempt by remember { mutableStateOf(0) }
-    val client = remember(pairAttempt) { GoogleMessagesPairing.getOrStart(context) }
-    val state by client.state.collectAsState()
-
-    LaunchedEffect(state) {
-        if (state is GoogleMessagesPairingResult.Paired) {
-            GoogleMessagesPairing.reset() // success — drop the pairing client
-            paired = true
+    // Launcher mode: QR pairing is dead (Google removed it), so skip the QR
+    // screen entirely and go straight to the companion phone sign-in ("waiting
+    // for your phone"). Auto-open the cookie-receive flow once on entry; the
+    // prompt behind it is a passive loading state (no button).
+    if (onCompanionSignIn != null) {
+        var launched by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
+        LaunchedEffect(Unit) {
+            if (!launched) { launched = true; onCompanionSignIn() }
         }
+        GoogleCompanionSignInPrompt(modifier = modifier)
+        return
     }
 
-    GoogleMessagesLinkScreen(
-        state = state,
-        onRetry = { GoogleMessagesPairing.reset(); pairAttempt++ },
+    // Standalone/demo only (no companion host). QR pairing was removed by
+    // Google, so there's no QR screen — real sign-in happens from the companion
+    // app. For demo/testing, harvest Google cookies via the in-app WebView login
+    // (the same cookies the companion otherwise sends over the relay).
+    GoogleAccountLoginScreen(
+        onCookies = { cookies ->
+            store.saveCookies(cookies)
+            android.util.Log.i(
+                "GMGaia",
+                "harvested ${cookies.size} Google cookies; required present=" +
+                    com.offline.dpadmessenger.backend.gmessages.GMCookieAuth.hasRequiredCookies(cookies) +
+                    " names=${cookies.keys.sorted()}",
+            )
+        },
+        onCancel = { },
         modifier = modifier,
     )
 }

@@ -68,9 +68,6 @@ fun DpadMessengerApp(
     /** 24-hour clock setting (hidden when change handler is null). */
     use24HourTime: Boolean = false,
     onUse24HourTimeChange: ((Boolean) -> Unit)? = null,
-    /** Read-receipts setting (hidden when change handler is null). */
-    readReceiptsEnabled: Boolean = false,
-    onReadReceiptsChange: ((Boolean) -> Unit)? = null,
     /** Deep link: open this conversation on top of the room list (set when
      *  the user tapped a message notification). [initialRoomKey] must change
      *  per tap so a fresh notification re-navigates. */
@@ -130,6 +127,7 @@ fun DpadMessengerApp(
                 NewConversationScreen(
                     starter = repository as ConversationStarter,
                     contactsSource = repository as? com.offline.dpadmessenger.data.ContactsSource,
+                    groupStarter = repository as? com.offline.dpadmessenger.data.GroupConversationStarter,
                     onBack = { nav.popBackStack() },
                     onConversationStarted = { roomId ->
                         nav.navigate(Routes.chat(roomId)) {
@@ -177,8 +175,6 @@ fun DpadMessengerApp(
                     onAutoDeleteChange = onAutoDeleteChange,
                     use24HourTime = use24HourTime,
                     onUse24HourTimeChange = onUse24HourTimeChange,
-                    readReceiptsEnabled = readReceiptsEnabled,
-                    onReadReceiptsChange = onReadReceiptsChange,
                 )
             }
         }
