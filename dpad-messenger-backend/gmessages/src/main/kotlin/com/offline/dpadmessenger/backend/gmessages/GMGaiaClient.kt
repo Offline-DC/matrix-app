@@ -40,6 +40,16 @@ class GMGaiaClient(context: Context) {
     // waiting and releases without finishing.
     @Volatile private var pairing: GMGaiaPairing? = null
 
+    /**
+     * Human-readable reason for the most recent failed [run] — surfaced to the
+     * user by the launcher so a cookie rejection reads as "your Google login was
+     * refused" instead of the misleading "you didn't tap the emoji". Null when the
+     * run succeeded, hasn't run, or failed inside the UKey2 emoji step (where the
+     * caller's generic "tap the matching emoji" message is the right one).
+     */
+    @Volatile var lastError: String? = null
+        private set
+
     /** Cancel an in-progress pairing handshake (no-op if not yet started or
      *  already done). The blocking [run] returns false shortly after. */
     fun cancel() {
@@ -53,9 +63,13 @@ class GMGaiaClient(context: Context) {
      *  processed; show it so the user can tap the matching one on their phone.
      *  @return true if pairing completed and the account was saved. */
     fun run(onEmoji: (String) -> Unit = { Log.i(TAG, "PAIRING EMOJI (no UI callback): $it") }): Boolean {
+        lastError = null
         val cookies = store.loadCookies()
         if (!GMCookieAuth.hasRequiredCookies(cookies)) {
             Log.w(TAG, "run: missing required cookies; have=${cookies.keys.sorted()}")
+            lastError = "The Google login was incomplete (missing cookies: " +
+                "${GMCookieAuth.REQUIRED_COOKIES.filter { cookies[it].isNullOrBlank() }}). " +
+                "On the computer, finish signing in at messages.google.com, then re-generate the code and rescan."
             return false
         }
         Log.i(TAG, "run: starting with ${cookies.size} cookies")
@@ -146,12 +160,18 @@ class GMGaiaClient(context: Context) {
                 Log.i(TAG, "signInGaia HTTP ${resp.code} (${body.length} bytes)")
                 if (!resp.isSuccessful) {
                     Log.w(TAG, "signInGaia failed body: ${body.take(600)}")
+                    lastError = describeHttpFailure("Google sign-in", resp.code, body)
                     return@use false
                 }
                 Log.i(TAG, "signInGaia resp: ${body.take(1200)}")
                 extractAndPair(body, cookies, onEmoji, refreshPriv)
             }
-        }.getOrElse { Log.e(TAG, "signInGaia threw", it); false }
+        }.getOrElse {
+            Log.e(TAG, "signInGaia threw", it)
+            lastError = "Couldn't reach Google to finish signing in (${it.message ?: "network error"}). " +
+                "Check the connection and try again."
+            false
+        }
     }
 
     /**
@@ -175,6 +195,8 @@ class GMGaiaClient(context: Context) {
         val tokenB64 = tokenData[0].asStringOrNull()
         if (tokenB64 == null) {
             Log.w(TAG, "signInGaia: no token at [3][0]; tokenData=$tokenData")
+            lastError = "Google's response didn't include a session token. This usually means the " +
+                "login was rejected — sign in again on the computer and rescan."
             return false
         }
         val token = Base64.decode(tokenB64, Base64.DEFAULT)
@@ -198,6 +220,8 @@ class GMGaiaClient(context: Context) {
         }
         if (destRegB64 == null) {
             Log.w(TAG, "signInGaia: no primary device (unknownInt4==1) in ${items2.size} devices")
+            lastError = "Couldn't find your phone in your Google account's device list. Open Google " +
+                "Messages on your phone (and enable messages for web) first, then try again."
             return false
         }
         Log.i(TAG, "signInGaia: token=${token.size}b ttl=$ttl mobile=${mobile.sourceId} dest=$destRegB64")
@@ -217,6 +241,41 @@ class GMGaiaClient(context: Context) {
     }
 
     // ---- helpers -----------------------------------------------------------
+
+    /**
+     * Turn a failed HTTP response into a short, user-facing reason. Google's
+     * RPC errors come back as a pblite array `[code,"message",[["…ErrorInfo",
+     * ["REASON_CODE",…]]]]`; we pull out the REASON_CODE and the human message
+     * and map the common ones to plain-language guidance. Falls back to the raw
+     * status + message so nothing is ever swallowed.
+     */
+    private fun describeHttpFailure(step: String, code: Int, body: String): String {
+        // The all-caps token (e.g. SESSION_COOKIE_INVALID) is the machine reason.
+        val reason = Regex("\"([A-Z][A-Z0-9_]{4,})\"").find(body)?.groupValues?.get(1)
+        // The first quoted string containing a space is the human sentence.
+        val human = Regex("\"([^\"]* [^\"]+)\"").find(body)?.groupValues?.get(1)
+
+        friendlyReason(reason)?.let { return it }
+
+        val detail = buildString {
+            append("Google rejected the $step (HTTP $code")
+            if (reason != null) append(": $reason")
+            append(").")
+            if (human != null) append(" $human")
+        }
+        return detail
+    }
+
+    /** Plain-language guidance for the failure reasons we expect to hit. */
+    private fun friendlyReason(reason: String?): String? = when (reason) {
+        "SESSION_COOKIE_INVALID", "SESSION_INVALID", "INVALID_GAIA_AUTH_TOKEN" ->
+            "Your Google login isn't valid on this device. Sign in again at messages.google.com on the " +
+                "computer, then re-generate the code and rescan."
+        "PERMISSION_DENIED", "UNAUTHENTICATED" ->
+            "Google wouldn't accept this login (it may need a fresh sign-in). Sign in again on the computer " +
+                "and rescan."
+        else -> null
+    }
 
     /** Cookie + SAPISIDHASH auth + the standard relay headers. */
     private fun Request.Builder.gaiaHeaders(cookies: Map<String, String>): Request.Builder {
