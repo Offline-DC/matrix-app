@@ -64,6 +64,11 @@ class GMGaiaPairing(
     private val waiters = ConcurrentHashMap<String, ArrayBlockingQueue<RpcResponse>>()
     @Volatile private var pollOpen = false
     @Volatile private var stopPoll = false
+    // Set only by an explicit cancel() — never automatically. The indefinite
+    // CLIENT_FINISHED wait checks this each poll chunk so a deliberate cancel
+    // (or process teardown) can still break it; otherwise the flip keeps
+    // listening for the phone to confirm for as long as it takes.
+    @Volatile private var canceled = false
 
     // One pairing-attempt id + start time for the WHOLE handshake. mautrix uses
     // ps.UUID / ps.Start for both CLIENT_INIT and CLIENT_FINISHED; if they don't
@@ -107,14 +112,18 @@ class GMGaiaPairing(
             onEmoji(emoji)
 
             // 2) CLIENT_FINISHED (user taps the matching emoji on their phone;
-            //    the finish response only arrives after they confirm).
+            //    the finish response only arrives after they confirm). Wait
+            //    INDEFINITELY — the user may take a while to pick up their phone
+            //    and tap the match, and we must keep listening the whole time
+            //    rather than giving up. The long-poll reconnects underneath, so
+            //    a dropped connection doesn't end the wait.
             val finishResp = sendPairingMessage(
                 action = ACTION_CLIENT_FINISHED,
                 messageType = MSGTYPE_BUGLE_MESSAGE,
                 ukeyData = session.finishMessage,
                 isInit = false,
-                timeoutMs = 120_000,
-            ) ?: run { Log.w(TAG, "no finish response (timeout waiting for phone confirm)"); return false }
+                timeoutMs = WAIT_FOREVER,
+            ) ?: run { Log.w(TAG, "finish wait ended without a response (canceled or stopped)"); return false }
 
             val fresp = parseGaiaResponse(finishResp)
             if (fresp.finishErrorType != 0) {
@@ -191,10 +200,34 @@ class GMGaiaPairing(
         if (!ok) { waiters.remove(requestId); return null }
 
         return try {
-            queue.poll(timeoutMs, TimeUnit.MILLISECONDS)?.data
+            if (timeoutMs <= 0L) {
+                // Indefinite wait (CLIENT_FINISHED): keep listening for the phone
+                // to confirm with no deadline. Poll in chunks so the loop stays
+                // responsive to cancel()/stopPoll and to thread interruption on
+                // teardown; the underlying long-poll auto-reconnects, so the
+                // response still lands here whenever the user finally taps.
+                var resp: RpcResponse? = null
+                while (resp == null && !stopPoll && !canceled) {
+                    resp = queue.poll(POLL_CHUNK_MS, TimeUnit.MILLISECONDS)
+                }
+                resp?.data
+            } else {
+                queue.poll(timeoutMs, TimeUnit.MILLISECONDS)?.data
+            }
         } finally {
             waiters.remove(requestId)
         }
+    }
+
+    /**
+     * Stop an in-flight handshake early. NOT called automatically — the
+     * CLIENT_FINISHED wait runs until the phone confirms unless something
+     * deliberately calls this (e.g. the user explicitly backs out). Safe from
+     * any thread; the indefinite wait notices within one [POLL_CHUNK_MS].
+     */
+    fun cancel() {
+        canceled = true
+        stopPoll = true
     }
 
     // ---- networking: long-poll receive loop --------------------------------
@@ -378,6 +411,11 @@ class GMGaiaPairing(
     companion object {
         private const val TAG = "GMGaiaPair"
         private const val GDITTO = "GDitto"
+        // sendPairingMessage timeout sentinel: wait with no deadline (used for
+        // CLIENT_FINISHED so the flip keeps listening for the phone forever).
+        private const val WAIT_FOREVER = -1L
+        // How often the indefinite wait wakes to re-check cancel/stop flags.
+        private const val POLL_CHUNK_MS = 15_000L
         private const val CONTENT_TYPE_PBLITE = "application/json+protobuf"
         private val CONFIG_VERSION_PBLITE = GMSessionProto.CONFIG_VERSION_PBLITE
 

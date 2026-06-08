@@ -35,6 +35,17 @@ class GMGaiaClient(context: Context) {
         .callTimeout(30, TimeUnit.SECONDS)
         .build()
 
+    // Set once the UKey2 handshake starts; lets a caller cancel an in-flight
+    // pairing (e.g. a newer sign-in supersedes a stale/stuck one) so it stops
+    // waiting and releases without finishing.
+    @Volatile private var pairing: GMGaiaPairing? = null
+
+    /** Cancel an in-progress pairing handshake (no-op if not yet started or
+     *  already done). The blocking [run] returns false shortly after. */
+    fun cancel() {
+        pairing?.cancel()
+    }
+
     /** Run FetchConfig → SignInGaia → UKey2 pairing, logging everything.
      *  Blocking; call off the main thread.
      *
@@ -191,7 +202,7 @@ class GMGaiaClient(context: Context) {
         }
         Log.i(TAG, "signInGaia: token=${token.size}b ttl=$ttl mobile=${mobile.sourceId} dest=$destRegB64")
 
-        return GMGaiaPairing(
+        val p = GMGaiaPairing(
             cookies = cookies,
             mobile = mobile,
             tachyonToken = token,
@@ -200,7 +211,9 @@ class GMGaiaClient(context: Context) {
             refreshKeyPkcs8 = refreshKeyPkcs8,
             store = store,
             onEmoji = onEmoji,
-        ).run()
+        )
+        pairing = p
+        return p.run()
     }
 
     // ---- helpers -----------------------------------------------------------
