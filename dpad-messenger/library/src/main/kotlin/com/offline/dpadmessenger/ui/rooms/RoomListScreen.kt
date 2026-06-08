@@ -320,6 +320,9 @@ private fun EmptyState(padding: PaddingValues) {
         modifier = Modifier.fillMaxSize().padding(padding),
         contentAlignment = Alignment.Center,
     ) {
-        Text("New conversations will appear here")
+        Text(
+            "New conversations will appear here",
+            modifier = Modifier.padding(horizontal = 32.dp),
+        )
     }
 }
