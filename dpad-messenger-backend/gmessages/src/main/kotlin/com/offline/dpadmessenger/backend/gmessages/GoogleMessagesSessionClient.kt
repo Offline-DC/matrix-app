@@ -68,7 +68,13 @@ internal class GoogleMessagesSessionClient(
     // SAPISIDHASH on every request. (QR mode leaves all of these null/default.)
     private val gaia: Boolean = store.isGaiaMode()
     private val destRegB64: String? = if (gaia) store.loadGaiaDestReg() else null
-    private val cookies: Map<String, String> = if (gaia) store.loadCookies() else emptyMap()
+    // Mutable + thread-safe: Google rotates session cookies (e.g. __Secure-*SIDTS)
+    // and pushes new values via Set-Cookie on responses. We update this from every
+    // response ([updateCookiesFromResponse]) and persist — otherwise the stored
+    // cookies go stale within ~30min and RegisterRefresh / RPCs start returning
+    // SESSION_COOKIE_INVALID (401) → dead session → needless re-pair.
+    private val cookies: MutableMap<String, String> =
+        java.util.concurrent.ConcurrentHashMap(if (gaia) store.loadCookies() else emptyMap())
     private val authNetwork: String? = if (gaia) GMPairingProto.GOOGLE_NETWORK else null
     private val receiveUrl =
         if (gaia) GMPairingProto.RECEIVE_MESSAGES_URL_GOOGLE else GMPairingProto.RECEIVE_MESSAGES_URL
@@ -529,6 +535,7 @@ internal class GoogleMessagesSessionClient(
             .applyRelayHeaders()
             .build()
         http.newCall(req).execute().use { resp ->
+            updateCookiesFromResponse(resp)
             if (!resp.isSuccessful) {
                 Log.e(TAG, "long-poll #$attempt HTTP ${resp.code}")
                 return resp.code == 401 || resp.code == 403
@@ -713,7 +720,12 @@ internal class GoogleMessagesSessionClient(
             val ttlMs = if (account.tokenTtl > 0) account.tokenTtl / 1000 else 24 * 3600_000L
             tokenExpiryMs = now + ttlMs
         }
-        if (now < tokenExpiryMs - 3600_000L) return
+        val minsLeft = (tokenExpiryMs - now) / 60000
+        if (now < tokenExpiryMs - 3600_000L) {
+            Log.d(TAG, "refreshTokenIfNeeded: ${minsLeft}min to expiry — skipping")
+            return
+        }
+        Log.i(TAG, "refreshTokenIfNeeded: ${minsLeft}min to expiry — refreshing now")
         refreshToken()
     }
 
@@ -744,16 +756,20 @@ internal class GoogleMessagesSessionClient(
         val body = GMSessionProto.registerRefreshRequest(
             requestId, acct.tachyonAuthToken, acct.browser, timestampMicros, signature, authNetwork,
         )
-        val (_, respBody) = post(GMPairingProto.REGISTER_REFRESH_URL, body)
+        Log.i(TAG, "refreshToken: requesting (gaia=$gaia net='$authNetwork' " +
+            "tokenLen=${acct.tachyonAuthToken.size} sigLen=${signature.size} " +
+            "browserSrc=${acct.browser.sourceId.take(12)} hasCookies=${cookies.isNotEmpty()})")
+        val (code, respBody) = post(GMPairingProto.REGISTER_REFRESH_URL, body)
         val refreshed = GMSessionProto.parseRegisterRefreshResponse(respBody)
         if (refreshed == null) {
-            Log.w(TAG, "token refresh: no token in response"); return false
+            Log.w(TAG, "token refresh FAILED: no token in HTTP $code response — body=${respBody.take(400)}")
+            return false
         }
         account = acct.copy(tachyonAuthToken = refreshed.tachyonAuthToken, tokenTtl = refreshed.ttl)
         store.updateToken(refreshed.tachyonAuthToken, refreshed.ttl)
         val ttlMs = if (refreshed.ttl > 0) refreshed.ttl / 1000 else 24 * 3600_000L
         tokenExpiryMs = System.currentTimeMillis() + ttlMs
-        Log.d(TAG, "tachyon token refreshed")
+        Log.i(TAG, "token refresh OK: new token ${refreshed.tachyonAuthToken.size}B ttl=${refreshed.ttl} (HTTP $code)")
         return true
     }
 
@@ -778,6 +794,7 @@ internal class GoogleMessagesSessionClient(
                 .applyRelayHeaders()
                 .build()
             http.newCall(req).execute().use { resp ->
+                updateCookiesFromResponse(resp)
                 val text = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
                     Log.w(TAG, "POST $url -> HTTP ${resp.code}: ${text.take(200)}")
@@ -785,6 +802,38 @@ internal class GoogleMessagesSessionClient(
                 resp.code to text
             }
         }
+
+    /**
+     * Refresh stored cookies from a response's Set-Cookie headers. Google rotates
+     * its session cookies (notably __Secure-1PSIDTS / __Secure-3PSIDTS) and hands
+     * back new values on authenticated responses; we must carry them forward or
+     * the saved set goes stale and cookie-authed calls start 401ing. Persists so
+     * the rotation survives process death.
+     */
+    private fun updateCookiesFromResponse(resp: okhttp3.Response) {
+        if (!gaia) return
+        val setCookies = resp.headers("Set-Cookie")
+        if (setCookies.isEmpty()) return
+        // Diagnostic: which cookies Google rotates here. If __Secure-*SIDTS never
+        // appears, these endpoints don't refresh the session cookie and we need
+        // the explicit RotateCookies endpoint instead.
+        Log.d(TAG, "Set-Cookie on ${resp.request.url.encodedPath}: " +
+            setCookies.joinToString { it.substringBefore('=').trim() })
+        var changed = false
+        for (sc in setCookies) {
+            val nameValue = sc.substringBefore(';')
+            val eq = nameValue.indexOf('=')
+            if (eq <= 0) continue
+            val name = nameValue.substring(0, eq).trim()
+            val value = nameValue.substring(eq + 1).trim()
+            if (name.isEmpty() || value.isEmpty() || value.equals("EXPIRED", ignoreCase = true)) continue
+            if (cookies[name] != value) { cookies[name] = value; changed = true }
+        }
+        if (changed) {
+            runCatching { store.saveCookies(cookies) }
+            Log.d(TAG, "cookies refreshed from Set-Cookie (${setCookies.size} header(s))")
+        }
+    }
 
     private fun Request.Builder.applyRelayHeaders(): Request.Builder {
         this.header("sec-ch-ua", GMPairingProto.SEC_UA)
