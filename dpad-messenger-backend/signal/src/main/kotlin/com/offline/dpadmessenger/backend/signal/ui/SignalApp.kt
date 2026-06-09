@@ -10,10 +10,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import com.offline.dpadmessenger.backend.signal.SignalAccountStore
+import com.offline.dpadmessenger.backend.signal.SignalMessageStore
 import com.offline.dpadmessenger.backend.signal.SignalPairing
 import com.offline.dpadmessenger.backend.signal.SignalProvisioningResult
 import com.offline.dpadmessenger.backend.signal.SignalRepository
+import com.offline.dpadmessenger.data.RetentionSettings
 import com.offline.dpadmessenger.ui.DpadMessengerApp
+import kotlinx.coroutines.flow.MutableStateFlow
 
 /**
  * Top-level entry for the in-app Signal experience — the Signal twin of
@@ -37,17 +40,28 @@ fun SignalApp(
 
     if (paired) {
         val repository = remember { SignalRepository.create(context) }
+        // Surface the auto-delete retention toggle when the repo supports it.
+        val retention = repository as? RetentionSettings
+        val autoDeleteFlow = remember(retention) { retention?.autoDeleteEnabled ?: MutableStateFlow(true) }
+        val autoDeleteEnabled by autoDeleteFlow.collectAsState()
         DpadMessengerApp(
             repository = repository,
             modifier = modifier,
             onLogout = {
                 SignalRepository.shutdown()
                 store.clear()
+                // Also wipe the locally-persisted conversation history so logging
+                // out removes all Signal messages from the phone (otherwise the
+                // encrypted snapshot survives and would reload on the next link,
+                // even under a different account).
+                SignalMessageStore(context).clear()
                 SignalPairing.reset()
                 paired = false
             },
             initialRoomId = initialRoomId,
             initialRoomKey = initialRoomKey,
+            autoDeleteEnabled = autoDeleteEnabled,
+            onAutoDeleteChange = retention?.let { r -> { value: Boolean -> r.setAutoDeleteEnabled(value) } },
         )
         return
     }

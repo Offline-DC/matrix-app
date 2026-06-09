@@ -16,6 +16,7 @@ import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -65,6 +66,10 @@ fun MessageContextSheet(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onRetry: () -> Unit = {},
+    /** Re-link the phone (re-pair, keeping history). When set, a failed message
+     *  offers a "Re-link phone" action so the user can recover without logging
+     *  out. Null hides it. */
+    onRelink: (() -> Unit)? = null,
     onDismiss: () -> Unit,
     /** Resolve a user id to a display name, for the "who reacted" list. */
     senderNameFor: (String) -> String = { it },
@@ -123,6 +128,15 @@ fun MessageContextSheet(
                     icon = Icons.Filled.Refresh,
                     label = "Retry send",
                     onClick = { onRetry(); onDismiss() },
+                )
+            }
+            // Re-link the phone (re-pairs, keeps history) — offered on a failed
+            // send so the user can recover a dead phone link without logging out.
+            if (message.status == MessageStatus.FAILED && onRelink != null) {
+                ActionRow(
+                    icon = Icons.Filled.Link,
+                    label = "Re-link phone",
+                    onClick = { onRelink(); onDismiss() },
                 )
             }
             ActionRow(

@@ -70,6 +70,12 @@ class GMGaiaPairing(
     // listening for the phone to confirm for as long as it takes.
     @Volatile private var canceled = false
 
+    /** Human-readable reason for a failed [run] — surfaced to the user so a
+     *  "phone never answered" reads correctly instead of "you didn't tap the
+     *  emoji". Null on success or an explicit cancel. */
+    @Volatile var lastError: String? = null
+        private set
+
     // One pairing-attempt id + start time for the WHOLE handshake. mautrix uses
     // ps.UUID / ps.Start for both CLIENT_INIT and CLIENT_FINISHED; if they don't
     // match, the server rejects the finish as NOT_LATEST_ATTEMPT. The per-RPC
@@ -101,11 +107,20 @@ class GMGaiaPairing(
                 ukeyData = initMsg,
                 isInit = true,
                 timeoutMs = 20_000,
-            ) ?: run { Log.w(TAG, "no SERVER_INIT (timeout)"); return false }
+            ) ?: run {
+                Log.w(TAG, "no SERVER_INIT (timeout)")
+                lastError = "Your phone didn't answer the pairing request. Open Google Messages on " +
+                    "your phone, make sure it's online and set as your texting app, then try again."
+                return false
+            }
 
             val sresp = parseGaiaResponse(serverInitResp)
             Log.i(TAG, "SERVER_INIT errType=${sresp.finishErrorType} verCodeVer=${sresp.confirmedVerCodeVer} keyDerivVer=${sresp.confirmedKeyDerivVer} dataLen=${sresp.data?.size}")
-            if (sresp.data == null) { Log.w(TAG, "SERVER_INIT has no ukey data"); return false }
+            if (sresp.data == null) {
+                Log.w(TAG, "SERVER_INIT has no ukey data")
+                lastError = "Your phone's pairing reply was empty. Try again."
+                return false
+            }
 
             val emoji = session.processServerInit(sresp.data, sresp.confirmedVerCodeVer)
             Log.i(TAG, "================ PAIRING EMOJI: $emoji ================")
@@ -128,6 +143,8 @@ class GMGaiaPairing(
             val fresp = parseGaiaResponse(finishResp)
             if (fresp.finishErrorType != 0) {
                 Log.w(TAG, "pairing failed: errType=${fresp.finishErrorType} errCode=${fresp.finishErrorCode}")
+                lastError = "Pairing was declined or the emoji didn't match (error " +
+                    "${fresp.finishErrorType}/${fresp.finishErrorCode}). Try again and tap the matching emoji."
                 return false
             }
             Log.i(TAG, "pairing CONFIRMED by phone; deriving session keys (keyDerivVer=${sresp.confirmedKeyDerivVer})")

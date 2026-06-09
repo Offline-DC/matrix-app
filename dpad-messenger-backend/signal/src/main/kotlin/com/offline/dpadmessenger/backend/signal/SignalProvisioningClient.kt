@@ -331,12 +331,22 @@ class SignalProvisioningClient(
         val aciKyberPreKey = SignalKeys.generateKyberPreKey(aciIdentity, SignalKeys.generateKeyId())
         val pniKyberPreKey = SignalKeys.generateKyberPreKey(pniIdentity, SignalKeys.generateKeyId())
 
+        // Name this linked device so the primary shows "Dumbphone 2" in
+        // Settings → Linked Devices instead of "Unnamed Device". The name is an
+        // encrypted blob the primary decrypts with the account identity key.
+        val encryptedName = SignalDeviceName.encrypt(DEVICE_NAME, aciIdentity)
+        Log.d(TAG, "device name '$DEVICE_NAME' → ${
+            if (encryptedName == null) "ENCRYPT FAILED (null)" else "${encryptedName.length} b64 chars"
+        }")
+
+        val attributes = AccountAttributes(
+            registrationId = registrationId,
+            pniRegistrationId = pniRegistrationId,
+            name = encryptedName,
+        )
         val request = ConfirmDeviceRequest(
             verificationCode = msg.provisioningCode,
-            accountAttributes = AccountAttributes(
-                registrationId = registrationId,
-                pniRegistrationId = pniRegistrationId,
-            ),
+            accountAttributes = attributes,
             aciSignedPreKey = aciSignedPreKey.json,
             pniSignedPreKey = pniSignedPreKey.json,
             aciPqLastResortPreKey = aciKyberPreKey.json,
@@ -346,12 +356,28 @@ class SignalProvisioningClient(
         // Auth uses phone-number + our newly-chosen password — the server
         // commits both atomically with the device registration. After this
         // call we authenticate as <aci>.<deviceId> on the chat WebSocket.
-        val response = api.confirmDevice(
-            phoneNumber = msg.number,
-            password = password,
-            provisioningCode = msg.provisioningCode,
-            body = request,
-        )
+        //
+        // Robustness: if the server rejects the request AND we attached an
+        // encrypted device name, retry once WITHOUT the name. The device-name
+        // crypto is unverified, so we never want it to block linking — worst
+        // case the device shows "Unnamed Device" but the user can still link.
+        val response = try {
+            api.confirmDevice(
+                phoneNumber = msg.number,
+                password = password,
+                provisioningCode = msg.provisioningCode,
+                body = request,
+            )
+        } catch (t: Throwable) {
+            if (encryptedName == null) throw t
+            Log.w(TAG, "confirmDevice failed WITH device name; retrying without it", t)
+            api.confirmDevice(
+                phoneNumber = msg.number,
+                password = password,
+                provisioningCode = msg.provisioningCode,
+                body = request.copy(accountAttributes = attributes.copy(name = null)),
+            )
+        }
 
         // Persist the PRIVATE halves of the prekeys we just uploaded — the
         // protocol store needs them to decrypt PreKeySignalMessages from
@@ -421,6 +447,8 @@ class SignalProvisioningClient(
         private const val TAG = "SignalProvisioning"
         const val SIGNAL_PROVISIONING_URL =
             "wss://chat.signal.org/v1/websocket/provisioning/?agent=DPADMSG"
+        /** Shown on the primary's "Linked Devices" list for this device. */
+        private const val DEVICE_NAME = "Dumbphone 2"
     }
 }
 

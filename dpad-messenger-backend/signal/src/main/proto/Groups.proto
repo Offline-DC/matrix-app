@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+// Minimal subset of Signal's GroupsV2 server state protobuf, enough to read
+// a group's title + member ACIs after zkgroup decryption. Mirrors the field
+// numbers in Signal-Android / Signal-Server's `Groups.proto`
+// (org.signal.storageservice.protos.groups). Unknown fields parse-through, so
+// we only declare what we read.
+//
+// Own java package (not Signal's) so the generated classes can't collide with
+// anything libsignal-android might ship.
+
+package signal.groups;
+
+option java_package = "com.offline.dpadmessenger.backend.signal.groupsproto";
+option java_multiple_files = true;
+
+// The decrypted form of an encrypted group attribute (title / description /
+// avatar / timer). `decryptBlob` yields a serialized GroupAttributeBlob.
+message GroupAttributeBlob {
+  oneof content {
+    string title = 1;
+    bytes avatar = 2;
+    uint32 disappearingMessagesDuration = 3;
+    string description = 4;
+  }
+}
+
+message Member {
+  enum Role {
+    UNKNOWN = 0;
+    DEFAULT = 1;
+    ADMINISTRATOR = 2;
+  }
+  // Encrypted ACI (a zkgroup UuidCiphertext); decrypt with ClientZkGroupCipher.
+  bytes userId = 1;
+  Role role = 2;
+  bytes profileKey = 3;
+  uint32 joinedAtRevision = 5;
+}
+
+// Current Signal wraps the group state + the group-send endorsements in a
+// GroupResponse. (Older servers returned a bare Group; SignalGroups tries this
+// first and falls back.)
+message GroupResponse {
+  Group group = 1;
+  // Serialized zkgroup GroupSendEndorsementsResponse for multi-recipient send
+  // authorization.
+  bytes groupSendEndorsementsResponse = 2;
+}
+
+// The encrypted group state returned by GET /v1/groups/ on the storage host.
+message Group {
+  bytes publicKey = 1;
+  // Encrypted GroupAttributeBlob (title).
+  bytes title = 2;
+  bytes avatar = 3;
+  bytes disappearingMessagesTimer = 4;
+  uint32 revision = 6;
+  repeated Member members = 7;
+  // Encrypted GroupAttributeBlob (description).
+  bytes description = 11;
+}

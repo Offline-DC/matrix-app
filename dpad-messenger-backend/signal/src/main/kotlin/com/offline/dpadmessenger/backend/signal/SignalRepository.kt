@@ -41,17 +41,21 @@ object SignalRepository {
         val appContext = context.applicationContext
         val account = SignalAccountStore(appContext).load() ?: return null
         val api = SignalApi(SignalTrust.buildOkHttp(appContext))
-        val sender = SignalSender(appContext, account, api)
-        val repo = SignalMessageRepository(account, sender)
+        val groups = SignalGroups(account, api)
+        val sender = SignalSender(appContext, account, api, groups)
+        val attachments = SignalAttachments(appContext, account, api)
+        val store = SignalMessageStore(appContext)
+        val profiles = SignalProfiles(account, api)
+        val notifier = SignalNotifier(appContext)
+        val repo = SignalMessageRepository(account, sender, attachments, groups, store, profiles, notifier)
+        // Let the sender echo each conversation's disappearing-messages timer.
+        sender.conversationTimerLookup = repo::expireTimerFor
         val sock = SignalChatWebSocket(appContext, account, repo)
-        // Re-request contact sync on every socket open (initial + reconnects),
-        // matching SignalBackendFactory.
-        sock.onSocketConnected = {
-            scope.launch {
-                runCatching { sender.sendContactSyncRequest() }
-                    .onFailure { Log.w(TAG, "contact sync request failed", it) }
-            }
-        }
+        // NOTE: we deliberately do NOT request contact sync here. Modern Signal
+        // primaries don't answer SyncMessage.Request{CONTACTS}, so the request
+        // only hammered the rate-limited /v2/keys/<own-aci> endpoint (HTTP 429),
+        // burning budget and occasionally blocking legitimate own-key fetches.
+        // Contact names now come from profile fetch (SignalProfiles) instead.
         sock.connect()
         socket = sock
         instance = repo

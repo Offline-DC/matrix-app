@@ -24,22 +24,19 @@ class SignalBackendFactory : BackendFactory {
         // building a fresh OkHttp here keeps things simple; cert/key
         // caching lives inside SignalSender itself.
         val api = SignalApi(SignalTrust.buildOkHttp(context))
-        val sender = SignalSender(context, account, api)
-        val repo = SignalMessageRepository(account, sender)
-        // Bring up the inbound chat WebSocket so the repo can receive.
-        // Re-request contact sync on EVERY socket open (initial + reconnects):
-        // if the primary wasn't reachable / didn't respond the first time
-        // (offline, backgrounded, rate-limited), a later reconnect retries
-        // automatically. The PUT itself is cheap; the primary dedupes if
-        // it's already in flight.
+        val groups = SignalGroups(account, api)
+        val sender = SignalSender(context, account, api, groups)
+        val attachments = SignalAttachments(context, account, api)
+        val store = SignalMessageStore(context)
+        val profiles = SignalProfiles(account, api)
+        val repo = SignalMessageRepository(account, sender, attachments, groups, store, profiles)
+        // Let the sender echo each conversation's disappearing-messages timer.
+        sender.conversationTimerLookup = repo::expireTimerFor
+        // Bring up the inbound chat WebSocket so the repo can receive. We do
+        // NOT request contact sync — modern primaries don't answer it, and the
+        // request only rate-limited (429) the /v2/keys/<own-aci> endpoint.
+        // Contact names come from profile fetch (SignalProfiles) instead.
         val socket = SignalChatWebSocket(context, account, repo)
-        socket.onSocketConnected = {
-            backgroundScope.launch {
-                Log.d("SignalBackend", "requesting contact sync from primary")
-                runCatching { sender.sendContactSyncRequest() }
-                    .onFailure { Log.w("SignalBackend", "contact sync request failed", it) }
-            }
-        }
         socket.connect()
         return repo
     }

@@ -118,6 +118,25 @@ internal class GoogleMessagesSessionClient(
         scope.coroutineContext[Job]?.cancel()
     }
 
+    /**
+     * Force a token refresh from the stored cookies and restart the long-poll —
+     * a manual "Re-link" that restores the link WITHOUT re-pairing (no QR scan,
+     * no UKey2 emoji), as long as the Google cookies are still valid. The
+     * long-poll loop exits when the token dies, so we (re)start it on the same
+     * still-alive scope. @return true if the token refreshed and we resumed.
+     */
+    suspend fun reauth(): Boolean {
+        if (!runCatching { refreshToken() }.getOrDefault(false)) return false
+        longPollJob?.cancel(); longPollJob = scope.launch { longPollLoop() }
+        ackJob?.cancel(); ackJob = scope.launch { ackLoop() }
+        scope.launch {
+            delay(1500)
+            runCatching { setActiveSession() }
+            runCatching { requestConversationList() }
+        }
+        return true
+    }
+
     // =======================================================================
     // Public RPCs
     // =======================================================================
@@ -241,10 +260,12 @@ internal class GoogleMessagesSessionClient(
         fileName: String,
     ): Boolean = withContext(Dispatchers.IO) {
         runCatching {
+            Log.i(TAG, "sendMedia: mime=$mime size=${bytes.size} name=$fileName conv=${conversationId.take(12)}…")
             val key = ByteArray(32).also(java.security.SecureRandom()::nextBytes)
             val encrypted = GMGcm.encrypt(key, bytes)
             val mediaId = uploadEncryptedMedia(encrypted, mime)
-            if (mediaId == null) { Log.w(TAG, "sendMedia: upload failed"); return@runCatching false }
+            if (mediaId == null) { Log.w(TAG, "sendMedia: upload failed (see upload logs above)"); return@runCatching false }
+            Log.i(TAG, "sendMedia: uploaded mediaId=${mediaId.take(16)}… — sending message RPC")
             val payload = GMSessionProto.sendMediaMessageRequest(
                 conversationId = conversationId,
                 tmpId = tmpId,
@@ -257,7 +278,11 @@ internal class GoogleMessagesSessionClient(
             )
             val resp = sendDataRequest(GMSessionProto.ACTION_SEND_MESSAGE, payload, awaitResponse = true)
             val plain = resp?.encryptedData?.let(::decrypt)
-            plain == null || GMSessionProto.parseSendMessageResponseStatus(plain) == 1
+            val status = plain?.let { GMSessionProto.parseSendMessageResponseStatus(it) }
+            // status==1 = accepted; plain==null = no body returned (treated as ok).
+            val ok = plain == null || status == 1
+            Log.i(TAG, "sendMedia: send RPC ok=$ok status=$status hadRespBody=${resp?.encryptedData != null}")
+            ok
         }.getOrElse { Log.e(TAG, "sendMedia failed", it); false }
     }
 
@@ -276,10 +301,14 @@ internal class GoogleMessagesSessionClient(
             .post(startBody.toRequestBody("application/x-www-form-urlencoded;charset=UTF-8".toMediaType()))
             .applyUploadHeaders(sizeStr, command = "start", uploadOffset = null, mime = mime, protocol = "resumable")
             .build()
+        Log.i(TAG, "upload start: mime=$mime encSize=$sizeStr")
         val uploadUrl = http.newCall(startReq).execute().use { resp ->
-            if (!resp.isSuccessful) { Log.w(TAG, "upload start HTTP ${resp.code}"); return null }
+            if (!resp.isSuccessful) {
+                Log.w(TAG, "upload start HTTP ${resp.code}: ${resp.body?.string()?.take(300)}")
+                return null
+            }
             resp.header("x-goog-upload-url")
-        } ?: run { Log.w(TAG, "upload start: no upload URL"); return null }
+        } ?: run { Log.w(TAG, "upload start: no x-goog-upload-url header in response"); return null }
 
         // The "start" response hands back a server-chosen upload URL. Validate
         // its host before PUTting the media there — a compromised/spoofed relay
@@ -299,16 +328,50 @@ internal class GoogleMessagesSessionClient(
             .post(encrypted.toRequestBody("application/octet-stream".toMediaType()))
             .applyUploadHeaders(sizeStr, command = "upload, finalize", uploadOffset = "0", mime = mime, protocol = null)
             .build()
+        Log.i(TAG, "upload finalize: PUT ${encrypted.size}B to $uploadHost")
         return http.newCall(finalizeReq).execute().use { resp ->
-            if (!resp.isSuccessful) { Log.w(TAG, "upload finalize HTTP ${resp.code}"); return null }
-            var body = resp.body?.bytes() ?: return null
-            // Response may be base64-wrapped.
-            runCatching {
-                val decoded = android.util.Base64.decode(body, android.util.Base64.DEFAULT)
-                if (decoded.isNotEmpty()) body = decoded
+            if (!resp.isSuccessful) {
+                Log.w(TAG, "upload finalize HTTP ${resp.code}: ${resp.body?.string()?.take(300)}")
+                return null
             }
-            GMSessionProto.parseUploadMediaResponse(body)
+            val raw = resp.body?.bytes() ?: run { Log.w(TAG, "upload finalize: empty response body"); return null }
+            // The UploadMediaResponse is protobuf, but Google sometimes base64-wraps
+            // it — and that base64 can be URL-safe / unpadded, which Base64.DEFAULT
+            // rejects. Parsing the wrong form throws "unsupported wire type", which
+            // previously killed the whole send. Try raw protobuf first, then base64
+            // variants, and never let a parse error escape.
+            val mediaId = parseUploadResponseFlexible(raw)
+            if (mediaId == null) {
+                Log.w(TAG, "upload finalize: couldn't parse mediaId from ${raw.size}B response " +
+                    "head='${String(raw.copyOf(minOf(24, raw.size)), Charsets.US_ASCII)}'")
+            } else {
+                Log.i(TAG, "upload finalize ok: mediaId=${mediaId.take(16)}…")
+            }
+            mediaId
         }
+    }
+
+    /**
+     * Parse an UploadMediaResponse that may be raw protobuf or base64-wrapped
+     * (standard or URL-safe, padded or not). Returns the mediaID, or null if no
+     * variant parses. Never throws — a malformed/unexpected body must not crash
+     * the send.
+     */
+    private fun parseUploadResponseFlexible(raw: ByteArray): String? {
+        runCatching { GMSessionProto.parseUploadMediaResponse(raw) }.getOrNull()?.let { return it }
+        val text = runCatching { String(raw, Charsets.US_ASCII).trim() }.getOrNull()
+            ?.takeIf { it.isNotEmpty() } ?: return null
+        for (flag in intArrayOf(
+            android.util.Base64.DEFAULT,
+            android.util.Base64.URL_SAFE,
+            android.util.Base64.DEFAULT or android.util.Base64.NO_PADDING,
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING,
+        )) {
+            val decoded = runCatching { android.util.Base64.decode(text, flag) }.getOrNull()
+                ?.takeIf { it.isNotEmpty() } ?: continue
+            runCatching { GMSessionProto.parseUploadMediaResponse(decoded) }.getOrNull()?.let { return it }
+        }
+        return null
     }
 
     private fun Request.Builder.applyUploadHeaders(
@@ -367,6 +430,7 @@ internal class GoogleMessagesSessionClient(
                     tachyonAuthToken = acct.tachyonAuthToken,
                     encrypted = encrypted,
                 )
+                Log.i(TAG, "downloadMedia: id=${mediaId.take(16)}… encrypted=$encrypted keyLen=${decryptionKey?.size ?: 0}")
                 val metaB64 = android.util.Base64.encodeToString(metadata, android.util.Base64.NO_WRAP)
                 // Media endpoint wants the "upload" header set, not the gRPC
                 // relay headers (mautrix util.BuildUploadHeaders).
@@ -388,12 +452,16 @@ internal class GoogleMessagesSessionClient(
                     .build()
                 http.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) {
-                        Log.w(TAG, "downloadMedia HTTP ${resp.code}")
+                        Log.w(TAG, "downloadMedia HTTP ${resp.code}: ${resp.body?.string()?.take(300)}")
                         return@use null
                     }
-                    val raw = resp.body?.bytes() ?: return@use null
+                    val raw = resp.body?.bytes() ?: run { Log.w(TAG, "downloadMedia: empty body"); return@use null }
+                    Log.i(TAG, "downloadMedia: got ${raw.size}B raw; willDecrypt=${encrypted && decryptionKey != null}")
                     // RCS media is chunked AES-GCM; MMS media is served plain.
-                    if (encrypted && decryptionKey != null) GMGcm.decrypt(decryptionKey, raw) else raw
+                    if (encrypted && decryptionKey != null) {
+                        runCatching { GMGcm.decrypt(decryptionKey, raw) }
+                            .getOrElse { Log.e(TAG, "downloadMedia: GCM decrypt failed on ${raw.size}B", it); null }
+                    } else raw
                 }
             }.getOrElse { Log.e(TAG, "downloadMedia failed", it); null }
         }
@@ -554,7 +622,24 @@ internal class GoogleMessagesSessionClient(
             }
         } else null
 
-        post(sendUrl, envelope)
+        val (code, _) = post(sendUrl, envelope)
+        if (code == 401) {
+            // The tachyon token lapsed at send time. Refresh from the stored
+            // cookies and retry ONCE so the message isn't silently dropped — the
+            // long-poll's self-heal doesn't cover one-off RPCs like SendMessage.
+            Log.w(TAG, "send RPC HTTP 401 — refreshing token and retrying once")
+            if (runCatching { refreshToken() }.getOrDefault(false)) {
+                val acct2 = account
+                val envelope2 = GMSessionProto.outgoingRpcMessage(
+                    mobile = acct2.mobile, requestId = requestId, messageData = rpcData,
+                    messageType = messageType, tachyonAuthToken = acct2.tachyonAuthToken,
+                    ttl = acct2.tokenTtl, destRegB64 = destRegB64,
+                )
+                post(sendUrl, envelope2)
+            } else {
+                Log.e(TAG, "send RPC 401 and token refresh failed — message not sent")
+            }
+        }
 
         if (deferred == null) return null
         return withTimeoutOrNull(10_000) { deferred.await() }.also {
@@ -643,17 +728,23 @@ internal class GoogleMessagesSessionClient(
         val acct = account
         val requestId = UUID.randomUUID().toString()
         val timestampMicros = System.currentTimeMillis() * 1000
+        // mautrix signs sha256("<requestId>:<timestamp>") DIRECTLY via
+        // ecdsa.SignASN1 (it does NOT re-hash). So compute the digest here and
+        // sign it with NONEwithECDSA — signing the precomputed hash with
+        // SHA256withECDSA would hash it a SECOND time (sha256(sha256(msg))),
+        // producing a signature Google rejects → RegisterRefresh returns no token
+        // → the session dies and forces a needless re-pair. Both produce ASN.1 DER.
         val signBytes = java.security.MessageDigest.getInstance("SHA-256")
             .digest("$requestId:$timestampMicros".toByteArray(Charsets.UTF_8))
         val priv = java.security.KeyFactory.getInstance("EC")
             .generatePrivate(PKCS8EncodedKeySpec(acct.ecdsaPrivatePkcs8))
-        val signature = Signature.getInstance("SHA256withECDSA").run {
-            initSign(priv); update(signBytes); sign() // ASN.1 DER, matches Go ecdsa.SignASN1
+        val signature = Signature.getInstance("NONEwithECDSA").run {
+            initSign(priv); update(signBytes); sign() // signs the 32-byte hash as-is
         }
         val body = GMSessionProto.registerRefreshRequest(
             requestId, acct.tachyonAuthToken, acct.browser, timestampMicros, signature, authNetwork,
         )
-        val respBody = post(GMPairingProto.REGISTER_REFRESH_URL, body)
+        val (_, respBody) = post(GMPairingProto.REGISTER_REFRESH_URL, body)
         val refreshed = GMSessionProto.parseRegisterRefreshResponse(respBody)
         if (refreshed == null) {
             Log.w(TAG, "token refresh: no token in response"); return false
@@ -678,7 +769,8 @@ internal class GoogleMessagesSessionClient(
      *  thread (e.g. the new-message screen requesting contacts / starting a
      *  conversation), and okhttp's blocking execute() would otherwise throw
      *  NetworkOnMainThreadException. */
-    private suspend fun post(url: String, pbliteBody: String): String =
+    /** @return (httpStatusCode, responseBody). */
+    private suspend fun post(url: String, pbliteBody: String): Pair<Int, String> =
         withContext(Dispatchers.IO) {
             val req = Request.Builder()
                 .url(url)
@@ -690,7 +782,7 @@ internal class GoogleMessagesSessionClient(
                 if (!resp.isSuccessful) {
                     Log.w(TAG, "POST $url -> HTTP ${resp.code}: ${text.take(200)}")
                 }
-                text
+                resp.code to text
             }
         }
 

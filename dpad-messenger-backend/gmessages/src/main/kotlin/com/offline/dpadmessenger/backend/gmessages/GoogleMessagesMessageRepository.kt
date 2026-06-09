@@ -193,10 +193,27 @@ internal class GoogleMessagesMessageRepository(
         session.connect()
     }
 
-    /** Stop the session (used on logout). */
-    fun shutdown() {
+    /**
+     * Re-link WITHOUT re-pairing: refresh the tachyon token from the stored
+     * cookies and resume the live session, keeping the existing pairing AND
+     * messages. Clears the auth-expired flag on success. @return false if the
+     * cookies are no longer valid (caller should then do a full re-pair).
+     */
+    suspend fun reauth(): Boolean {
+        val ok = session.reauth()
+        if (ok) _authExpired.value = false
+        return ok
+    }
+
+    /**
+     * Stop the session. [clearCache] = true (an explicit logout) deletes the
+     * persisted message history; false (a re-link / re-pair after the token
+     * expired) keeps it, so signing back in restores past conversations instead
+     * of starting from nothing.
+     */
+    fun shutdown(clearCache: Boolean = true) {
         session.shutdown()
-        cache.clear()
+        if (clearCache) cache.clear()
         scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
     }
 
@@ -645,6 +662,18 @@ internal class GoogleMessagesMessageRepository(
     // ---- helpers -----------------------------------------------------------
 
     private fun GMSessionProto.GMMessage.toDomain(): Message {
+        // Diagnostic for "says sent but not delivered / no preview": log every
+        // media message's delivery status as it updates. statusCode: 1=complete,
+        // 2=delivered, 5=sending, 8=failed, 13=too large, 17=recipient lost RCS,
+        // 18=no retry/no fallback, 19=recipient didn't decrypt. hasAttachment=false
+        // means the media reference didn't survive (download/preview impossible).
+        if (hasMedia) {
+            Log.i(
+                TAG,
+                "media msg=$messageId outgoing=$isOutgoing status=$statusCode " +
+                    "hasAttachment=${media?.mediaId?.isNotBlank() == true}",
+            )
+        }
         // Diagnostic: a media message that produced no Attachment means the
         // MediaContent had no usable mediaId (e.g. an unexpected wire shape for
         // some HEIC/RCS attachments). Logged so an on-device capture can show

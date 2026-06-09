@@ -56,12 +56,22 @@ object GoogleMessagesRepository {
         instance = null
     }
 
-    /** Full logout teardown: stop the live session and forget it. */
+    /**
+     * Tear down the live session and forget it. [clearMessages] = true (a manual
+     * logout) wipes the cached message history; false (a re-link after the token
+     * expired) preserves it so re-pairing restores past conversations.
+     */
     @Synchronized
-    fun shutdown() {
-        (instance as? GoogleMessagesMessageRepository)?.shutdown()
+    fun shutdown(clearMessages: Boolean = true) {
+        (instance as? GoogleMessagesMessageRepository)?.shutdown(clearCache = clearMessages)
         instance = null
     }
+
+    /** Re-link WITHOUT re-pairing: refresh the token from stored cookies and
+     *  resume, keeping the pairing + messages. Returns false if the cookies are
+     *  dead (caller should fall back to a full re-pair). */
+    suspend fun reauth(): Boolean =
+        (instance as? GoogleMessagesMessageRepository)?.reauth() ?: false
 
     /** Tell the live session the messenger UI went off-screen (Activity
      *  onStop), so notifications resume for the thread that was open. */

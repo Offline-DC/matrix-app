@@ -328,17 +328,25 @@ internal object GMSessionProto {
         }
 
     /** MediaContent (conversations.proto): format=1, mediaID=2, mediaName=4,
-     *  decryptionKey=11, mimeType=14. */
+     *  size=5, dimensions=6, mediaData=7, thumbnailMediaID=9, decryptionKey=11,
+     *  thumbnailDecryptionKey=12, mimeType=14.
+     *
+     *  Prefer the full media (mediaID 2 + key 11); if it's absent (e.g. an
+     *  undownloaded MMS or a preview-only push) fall back to the thumbnail
+     *  (thumbnailMediaID 9 + thumbnailDecryptionKey 12) so the message renders
+     *  something instead of a dead placeholder. */
     private fun parseMediaContent(bytes: ByteArray): GMMedia? {
         val f = ProtoReader.fields(bytes)
-        val mediaId = f[2]?.bytes?.toString(Charsets.UTF_8) ?: return null
-        if (mediaId.isBlank()) return null
+        val fullId = f[2]?.bytes?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
+        val thumbId = f[9]?.bytes?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
+        val mediaId = fullId ?: thumbId ?: return null
+        val key = if (fullId != null) f[11]?.bytes else f[12]?.bytes
         return GMMedia(
             mediaId = mediaId,
             mimeType = f[14]?.bytes?.toString(Charsets.UTF_8) ?: "",
             name = f[4]?.bytes?.toString(Charsets.UTF_8) ?: "",
             format = (f[1]?.value ?: 0L).toInt(),
-            decryptionKey = f[11]?.bytes,
+            decryptionKey = key,
         )
     }
 

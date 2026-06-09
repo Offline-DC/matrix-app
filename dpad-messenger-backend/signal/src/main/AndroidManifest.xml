@@ -2,4 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Post incoming-message notifications (Android 13+ runtime grant). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Briefly wake the (cover) display for a new message, like a normal SMS. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 </manifest>

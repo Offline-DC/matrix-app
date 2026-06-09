@@ -7,16 +7,21 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.signal.libsignal.metadata.SealedSessionCipher
 import org.signal.libsignal.metadata.certificate.SenderCertificate
+import org.signal.libsignal.metadata.protocol.UnidentifiedSenderMessageContent
 import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.SessionBuilder
 import org.signal.libsignal.protocol.SessionCipher
 import org.signal.libsignal.protocol.SignalProtocolAddress
 import org.signal.libsignal.protocol.ecc.ECPublicKey
+import org.signal.libsignal.protocol.groups.GroupCipher
+import org.signal.libsignal.protocol.groups.GroupSessionBuilder
 import org.signal.libsignal.protocol.kem.KEMPublicKey
 import org.signal.libsignal.protocol.message.CiphertextMessage
 import org.signal.libsignal.protocol.state.PreKeyBundle
 import org.whispersystems.signalservice.internal.push.SignalServiceProtos
+import java.util.Optional
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Sends outbound messages on the user's behalf.
@@ -43,10 +48,18 @@ class SignalSender(
     context: Context,
     private val account: SignalAccount,
     private val api: SignalApi,
+    /** GroupsV2 helper, for the SenderKey multi-recipient large-group path.
+     *  Null → group sends always use per-member fan-out. */
+    private val groups: SignalGroups? = null,
     private val protocolStore: AndroidSignalProtocolStore = AndroidSignalProtocolStore(context, account),
 ) {
     private val login = "${account.aci}.${account.deviceId}"
     private val password = account.password
+
+    // SenderKey state (in-memory, per process). distributionId per group +
+    // the set of members we've already shipped our SKDM to this session.
+    private val groupDistributionIds = ConcurrentHashMap<String, UUID>()
+    private val skdmDelivered = ConcurrentHashMap<String, MutableSet<String>>()
 
     // Cache the sender certificate across sends. Signal's cert lasts ~24h;
     // we conservatively refresh after 12h. Concurrent sends serialize on
@@ -76,72 +89,82 @@ class SignalSender(
     private data class CachedBundle(val bundle: PreKeyBundleResponse, val fetchedAt: Long)
 
     /**
+     * Quote metadata for an outbound reply. [targetTimestamp] is the
+     * sender-chosen timestamp of the message being replied to, [authorAci]
+     * its author's service id, and [text] a short preview the recipient
+     * renders in the quote chip.
+     */
+    data class QuoteInfo(
+        val targetTimestamp: Long,
+        val authorAci: String,
+        val text: String,
+    )
+
+    /** A conversation's disappearing-messages timer (seconds) + its version. */
+    data class ExpireTimer(val seconds: Int, val version: Int)
+
+    /**
+     * Looks up a conversation's current disappearing-messages timer by room id,
+     * set by the repository after construction. Every outbound DataMessage
+     * echoes this timer so we don't accidentally turn disappearing messages OFF
+     * for the conversation (Signal treats a missing/zero timer as "off").
+     */
+    var conversationTimerLookup: ((roomId: String) -> ExpireTimer?)? = null
+
+    /** Apply the conversation's timer to a DataMessage being built. */
+    private fun SignalServiceProtos.DataMessage.Builder.applyExpire(
+        roomId: String?,
+    ): SignalServiceProtos.DataMessage.Builder {
+        val t = roomId?.let { conversationTimerLookup?.invoke(it) }
+        if (t != null && (t.seconds > 0 || t.version > 0)) {
+            setExpireTimer(t.seconds)  // may be 0 = explicitly off at this version
+            if (t.version > 0) setExpireTimerVersion(t.version)
+        }
+        return this
+    }
+
+    private fun groupRoomId(target: GroupTarget): String? =
+        groups?.roomIdForMasterKey(target.masterKey)
+
+    /**
      * Send `body` to a single direct recipient identified by ACI/PNI.
+     * Optionally carries a [quote] so the recipient renders it as a reply.
      * Returns the sender-chosen timestamp on success; throws on any
      * non-2xx HTTP response or crypto error.
      */
-    suspend fun sendDirectMessage(recipientServiceId: String, body: String): Long {
+    suspend fun sendDirectMessage(
+        recipientServiceId: String,
+        body: String,
+        quote: QuoteInfo? = null,
+    ): Long {
         val cert = getOrRefreshSenderCertificate()
-
-        // Recipient prekey bundle, served from a short-lived cache. Signal's
-        // `/v2/keys/*` is rate-limited account-wide; fetching it on every
-        // send rapidly blows the budget when the user sends a few messages
-        // in close succession. The bundle is stable across a session unless
-        // the recipient adds a device or rotates keys — in either case the
-        // `PUT /v1/messages` below returns 409/410 with the mismatched
-        // device IDs, at which point we'd invalidate + refresh (TODO).
-        val bundle = getRecipientBundleCached(recipientServiceId)
-        val identityKey = IdentityKey(Base64.decode(bundle.identityKey, Base64.NO_WRAP), 0)
-        bundle.devices.forEach { dev ->
-            bootstrapSessionIfNeeded(recipientServiceId, dev, identityKey)
-        }
-        val devicesToEncryptFor: List<RecipientDevice> =
-            bundle.devices.map { RecipientDevice(it.deviceId, it.registrationId) }
 
         // Build the Content -> DataMessage proto. timestamp is the
         // sender-side message id; Signal echoes it back on the server-side
         // delivery receipt so we can ack the bubble we just sent.
         val timestamp = System.currentTimeMillis()
-        val dataMessage = SignalServiceProtos.DataMessage.newBuilder()
+        val dataMessageBuilder = SignalServiceProtos.DataMessage.newBuilder()
             .setBody(body)
             .setTimestamp(timestamp)
+        if (quote != null) {
+            dataMessageBuilder.setQuote(
+                SignalServiceProtos.DataMessage.Quote.newBuilder()
+                    .setId(quote.targetTimestamp)
+                    .setAuthorAci(quote.authorAci)
+                    .setText(quote.text)
+                    .setType(SignalServiceProtos.DataMessage.Quote.Type.NORMAL)
+                    .build()
+            )
+        }
+        val dataMessage = dataMessageBuilder
+            .applyExpire("sig:dm:$recipientServiceId")
             .build()
         val content = SignalServiceProtos.Content.newBuilder()
             .setDataMessage(dataMessage)
             .build()
-        val padded = padPlaintext(content.toByteArray())
 
-        // Encrypt once per device, then collect into one PUT payload.
-        val cipher = SealedSessionCipher(
-            protocolStore,
-            UUID.fromString(account.aci),
-            /* localE164 = */ account.phoneNumber,
-            account.deviceId,
-        )
-        val outgoing = devicesToEncryptFor.map { dev ->
-            val destAddress = SignalProtocolAddress(recipientServiceId, dev.deviceId)
-            val encrypted = cipher.encrypt(destAddress, cert, padded)
-            OutgoingMessage(
-                type = ENVELOPE_TYPE_UNIDENTIFIED_SENDER,
-                destinationDeviceId = dev.deviceId,
-                destinationRegistrationId = dev.registrationId,
-                content = Base64.encodeToString(encrypted, Base64.NO_WRAP),
-            )
-        }
-
-        val result = api.sendMessage(
-            login = login,
-            password = password,
-            recipientServiceId = recipientServiceId,
-            body = SendMessageRequest(
-                messages = outgoing,
-                timestamp = timestamp,
-            ),
-        )
-        if (!result.isSuccess) {
-            throw RuntimeException("send failed HTTP ${result.httpStatus}: ${result.rawBody}")
-        }
-        Log.d(TAG, "sent to $recipientServiceId (${outgoing.size} device(s)) @ $timestamp")
+        encryptAndSendContent(recipientServiceId, content, timestamp, cert)
+        Log.d(TAG, "sent to $recipientServiceId @ $timestamp")
 
         // Mirror the message back to our other linked devices (primary
         // phone, desktop, etc.) via a SyncMessage.Sent transcript. Without
@@ -153,6 +176,522 @@ class SignalSender(
             .onFailure { Log.w(TAG, "sent-transcript sync failed (recipient still got the message)", it) }
 
         return timestamp
+    }
+
+    /**
+     * Add or remove an emoji reaction on a message. `targetAuthorAci` +
+     * `targetSentTimestamp` identify the message being reacted to (Signal
+     * has no message ids — it keys off author + sent timestamp). Mirrors to
+     * our own devices like a normal send so the primary sees the reaction.
+     */
+    suspend fun sendReaction(
+        recipientServiceId: String,
+        emoji: String,
+        remove: Boolean,
+        targetAuthorAci: String,
+        targetSentTimestamp: Long,
+    ): Long {
+        val cert = getOrRefreshSenderCertificate()
+        val timestamp = System.currentTimeMillis()
+        val reaction = SignalServiceProtos.DataMessage.Reaction.newBuilder()
+            .setEmoji(emoji)
+            .setRemove(remove)
+            .setTargetAuthorAci(targetAuthorAci)
+            .setTargetSentTimestamp(targetSentTimestamp)
+            .build()
+        val dataMessage = SignalServiceProtos.DataMessage.newBuilder()
+            .setTimestamp(timestamp)
+            .setReaction(reaction)
+            .applyExpire("sig:dm:$recipientServiceId")
+            .build()
+        val content = SignalServiceProtos.Content.newBuilder()
+            .setDataMessage(dataMessage)
+            .build()
+        encryptAndSendContent(recipientServiceId, content, timestamp, cert)
+        runCatching { sendSentTranscript(recipientServiceId, dataMessage, timestamp, cert) }
+            .onFailure { Log.w(TAG, "reaction sent-transcript sync failed", it) }
+        Log.d(TAG, "reaction '$emoji' (remove=$remove) → $recipientServiceId for $targetAuthorAci@$targetSentTimestamp")
+        return timestamp
+    }
+
+    /**
+     * "Delete for everyone" — asks the recipient (and our own devices) to
+     * redact the message identified by [targetSentTimestamp]. Signal renders
+     * a "This message was deleted" tombstone in its place.
+     */
+    suspend fun sendRemoteDelete(
+        recipientServiceId: String,
+        targetSentTimestamp: Long,
+    ): Long {
+        val cert = getOrRefreshSenderCertificate()
+        val timestamp = System.currentTimeMillis()
+        val delete = SignalServiceProtos.DataMessage.Delete.newBuilder()
+            .setTargetSentTimestamp(targetSentTimestamp)
+            .build()
+        val dataMessage = SignalServiceProtos.DataMessage.newBuilder()
+            .setTimestamp(timestamp)
+            .setDelete(delete)
+            .applyExpire("sig:dm:$recipientServiceId")
+            .build()
+        val content = SignalServiceProtos.Content.newBuilder()
+            .setDataMessage(dataMessage)
+            .build()
+        encryptAndSendContent(recipientServiceId, content, timestamp, cert)
+        runCatching { sendSentTranscript(recipientServiceId, dataMessage, timestamp, cert) }
+            .onFailure { Log.w(TAG, "delete sent-transcript sync failed", it) }
+        Log.d(TAG, "remote-delete → $recipientServiceId for @$targetSentTimestamp")
+        return timestamp
+    }
+
+    /**
+     * Edit a previously-sent message. Signal models this as a top-level
+     * `Content.editMessage` carrying the new DataMessage and the original
+     * `targetSentTimestamp`. Synced to our own devices via a Sent transcript
+     * that itself carries the EditMessage.
+     */
+    suspend fun sendEdit(
+        recipientServiceId: String,
+        targetSentTimestamp: Long,
+        newBody: String,
+    ): Long {
+        val cert = getOrRefreshSenderCertificate()
+        val timestamp = System.currentTimeMillis()
+        val innerDataMessage = SignalServiceProtos.DataMessage.newBuilder()
+            .setBody(newBody)
+            .setTimestamp(timestamp)
+            .applyExpire("sig:dm:$recipientServiceId")
+            .build()
+        val edit = SignalServiceProtos.EditMessage.newBuilder()
+            .setTargetSentTimestamp(targetSentTimestamp)
+            .setDataMessage(innerDataMessage)
+            .build()
+        val content = SignalServiceProtos.Content.newBuilder()
+            .setEditMessage(edit)
+            .build()
+        encryptAndSendContent(recipientServiceId, content, timestamp, cert)
+        runCatching { sendEditTranscript(recipientServiceId, edit, timestamp, cert) }
+            .onFailure { Log.w(TAG, "edit sent-transcript sync failed", it) }
+        Log.d(TAG, "edit → $recipientServiceId for @$targetSentTimestamp")
+        return timestamp
+    }
+
+    /**
+     * Send a media attachment (already uploaded to the CDN by
+     * [SignalAttachments.upload]) to a direct recipient, optionally with a
+     * caption [body]. Builds an AttachmentPointer from the upload result.
+     */
+    suspend fun sendAttachment(
+        recipientServiceId: String,
+        uploaded: SignalAttachments.Uploaded,
+        body: String? = null,
+    ): Long {
+        val cert = getOrRefreshSenderCertificate()
+        val timestamp = System.currentTimeMillis()
+        val pointerBuilder = SignalServiceProtos.AttachmentPointer.newBuilder()
+            .setCdnKey(uploaded.cdnKey)
+            .setCdnNumber(uploaded.cdnNumber)
+            .setContentType(uploaded.contentType)
+            .setKey(com.google.protobuf.ByteString.copyFrom(uploaded.key))
+            .setDigest(com.google.protobuf.ByteString.copyFrom(uploaded.digest))
+            .setSize(uploaded.size)
+        uploaded.fileName?.let { pointerBuilder.setFileName(it) }
+        val dataMessageBuilder = SignalServiceProtos.DataMessage.newBuilder()
+            .setTimestamp(timestamp)
+            .addAttachments(pointerBuilder.build())
+        if (!body.isNullOrEmpty()) dataMessageBuilder.setBody(body)
+        val dataMessage = dataMessageBuilder
+            .applyExpire("sig:dm:$recipientServiceId")
+            .build()
+        val content = SignalServiceProtos.Content.newBuilder()
+            .setDataMessage(dataMessage)
+            .build()
+        encryptAndSendContent(recipientServiceId, content, timestamp, cert)
+        runCatching { sendSentTranscript(recipientServiceId, dataMessage, timestamp, cert) }
+            .onFailure { Log.w(TAG, "attachment sent-transcript sync failed", it) }
+        Log.d(TAG, "sent attachment (${uploaded.size}b, ${uploaded.contentType}) → $recipientServiceId @ $timestamp")
+        return timestamp
+    }
+
+    // ------------------------------------------------------------------
+    // group sends (GroupsV2)
+    // ------------------------------------------------------------------
+
+    /**
+     * Everything needed to fan a message out to a group: the 32-byte
+     * [masterKey] + current [revision] (echoed in each message's groupV2
+     * context so recipients attribute it to the group) and the resolved
+     * [memberAcis] to deliver to.
+     */
+    data class GroupTarget(
+        val masterKey: ByteArray,
+        val revision: Int,
+        val memberAcis: List<String>,
+    )
+
+    suspend fun sendGroupText(
+        target: GroupTarget,
+        body: String,
+        quote: QuoteInfo? = null,
+    ): Long {
+        val cert = getOrRefreshSenderCertificate()
+        val ts = System.currentTimeMillis()
+        val dm = SignalServiceProtos.DataMessage.newBuilder()
+            .setBody(body)
+            .setTimestamp(ts)
+            .setGroupV2(groupContext(target))
+        if (quote != null) {
+            dm.setQuote(
+                SignalServiceProtos.DataMessage.Quote.newBuilder()
+                    .setId(quote.targetTimestamp)
+                    .setAuthorAci(quote.authorAci)
+                    .setText(quote.text)
+                    .setType(SignalServiceProtos.DataMessage.Quote.Type.NORMAL)
+                    .build()
+            )
+        }
+        return sendGroupDataMessage(target, dm.applyExpire(groupRoomId(target)).build(), ts, cert)
+    }
+
+    suspend fun sendGroupReaction(
+        target: GroupTarget,
+        emoji: String,
+        remove: Boolean,
+        targetAuthorAci: String,
+        targetSentTimestamp: Long,
+    ): Long {
+        val cert = getOrRefreshSenderCertificate()
+        val ts = System.currentTimeMillis()
+        val reaction = SignalServiceProtos.DataMessage.Reaction.newBuilder()
+            .setEmoji(emoji)
+            .setRemove(remove)
+            .setTargetAuthorAci(targetAuthorAci)
+            .setTargetSentTimestamp(targetSentTimestamp)
+            .build()
+        val dm = SignalServiceProtos.DataMessage.newBuilder()
+            .setTimestamp(ts)
+            .setGroupV2(groupContext(target))
+            .setReaction(reaction)
+            .applyExpire(groupRoomId(target))
+            .build()
+        return sendGroupDataMessage(target, dm, ts, cert)
+    }
+
+    suspend fun sendGroupRemoteDelete(target: GroupTarget, targetSentTimestamp: Long): Long {
+        val cert = getOrRefreshSenderCertificate()
+        val ts = System.currentTimeMillis()
+        val delete = SignalServiceProtos.DataMessage.Delete.newBuilder()
+            .setTargetSentTimestamp(targetSentTimestamp)
+            .build()
+        val dm = SignalServiceProtos.DataMessage.newBuilder()
+            .setTimestamp(ts)
+            .setGroupV2(groupContext(target))
+            .setDelete(delete)
+            .applyExpire(groupRoomId(target))
+            .build()
+        return sendGroupDataMessage(target, dm, ts, cert)
+    }
+
+    suspend fun sendGroupEdit(target: GroupTarget, targetSentTimestamp: Long, newBody: String): Long {
+        val cert = getOrRefreshSenderCertificate()
+        val ts = System.currentTimeMillis()
+        val inner = SignalServiceProtos.DataMessage.newBuilder()
+            .setBody(newBody)
+            .setTimestamp(ts)
+            .setGroupV2(groupContext(target))
+            .applyExpire(groupRoomId(target))
+            .build()
+        val edit = SignalServiceProtos.EditMessage.newBuilder()
+            .setTargetSentTimestamp(targetSentTimestamp)
+            .setDataMessage(inner)
+            .build()
+        val content = SignalServiceProtos.Content.newBuilder().setEditMessage(edit).build()
+        deliverGroupContent(target, content, ts, cert)
+        runCatching { sendGroupSentTranscript(message = null, edit = edit, timestamp = ts, cert = cert) }
+            .onFailure { Log.w(TAG, "group edit transcript failed", it) }
+        Log.d(TAG, "group edit for @$targetSentTimestamp → ${memberCount(target)} member(s)")
+        return ts
+    }
+
+    suspend fun sendGroupAttachment(
+        target: GroupTarget,
+        uploaded: SignalAttachments.Uploaded,
+        body: String? = null,
+    ): Long {
+        val cert = getOrRefreshSenderCertificate()
+        val ts = System.currentTimeMillis()
+        val pointerBuilder = SignalServiceProtos.AttachmentPointer.newBuilder()
+            .setCdnKey(uploaded.cdnKey)
+            .setCdnNumber(uploaded.cdnNumber)
+            .setContentType(uploaded.contentType)
+            .setKey(com.google.protobuf.ByteString.copyFrom(uploaded.key))
+            .setDigest(com.google.protobuf.ByteString.copyFrom(uploaded.digest))
+            .setSize(uploaded.size)
+        uploaded.fileName?.let { pointerBuilder.setFileName(it) }
+        val dm = SignalServiceProtos.DataMessage.newBuilder()
+            .setTimestamp(ts)
+            .setGroupV2(groupContext(target))
+            .addAttachments(pointerBuilder.build())
+        if (!body.isNullOrEmpty()) dm.setBody(body)
+        return sendGroupDataMessage(target, dm.applyExpire(groupRoomId(target)).build(), ts, cert)
+    }
+
+    /** Build the GroupContextV2 echoed in every group message. */
+    private fun groupContext(target: GroupTarget): SignalServiceProtos.GroupContextV2 =
+        SignalServiceProtos.GroupContextV2.newBuilder()
+            .setMasterKey(com.google.protobuf.ByteString.copyFrom(target.masterKey))
+            .setRevision(target.revision)
+            .build()
+
+    private fun memberCount(target: GroupTarget): Int =
+        target.memberAcis.count { it != account.aci }
+
+    /** Wrap a group DataMessage in Content, fan it out, and transcript it. */
+    private suspend fun sendGroupDataMessage(
+        target: GroupTarget,
+        dataMessage: SignalServiceProtos.DataMessage,
+        timestamp: Long,
+        cert: SenderCertificate,
+    ): Long {
+        val content = SignalServiceProtos.Content.newBuilder()
+            .setDataMessage(dataMessage)
+            .build()
+        deliverGroupContent(target, content, timestamp, cert)
+        runCatching { sendGroupSentTranscript(message = dataMessage, edit = null, timestamp = timestamp, cert = cert) }
+            .onFailure { Log.w(TAG, "group sent-transcript failed", it) }
+        Log.d(TAG, "group send @ $timestamp → ${memberCount(target)} member(s)")
+        return timestamp
+    }
+
+    /**
+     * Deliver group [content] using the cheapest path that works: for groups
+     * past [SENDERKEY_THRESHOLD] members, attempt the SenderKey
+     * multi-recipient send (one PUT for the whole group); on any failure — or
+     * for small groups where it isn't worth the SKDM setup — fall back to
+     * per-member [fanOutGroup]. Either way every member is reached.
+     */
+    private suspend fun deliverGroupContent(
+        target: GroupTarget,
+        content: SignalServiceProtos.Content,
+        timestamp: Long,
+        cert: SenderCertificate,
+    ) {
+        val viaSenderKey = groups != null &&
+            memberCount(target) > SENDERKEY_THRESHOLD &&
+            runCatching { sendViaSenderKey(target, content, timestamp, cert) }
+                .onFailure { Log.w(TAG, "SenderKey multi-recipient send failed; falling back to fan-out", it) }
+                .getOrDefault(false)
+        if (!viaSenderKey) {
+            fanOutGroup(target, content, timestamp, cert)
+        }
+    }
+
+    /**
+     * The large-group fast path. Encrypt [content] ONCE with a SenderKey
+     * ([GroupCipher]) and deliver it to every member device in a single
+     * `multi_recipient` PUT, authorized by a zkgroup group-send token.
+     *
+     * Steps: resolve member devices + sessions → ensure each member has our
+     * SenderKeyDistributionMessage → GroupCipher-encrypt → wrap as
+     * [UnidentifiedSenderMessageContent] with the group id →
+     * [SealedSessionCipher.multiRecipientEncrypt] → PUT. Returns true on a 2xx;
+     * false (or throws, caught by the caller) triggers the fan-out fallback.
+     *
+     * ⚠️ Uses several version-sensitive libsignal APIs (GroupCipher,
+     * multiRecipientEncrypt, UnidentifiedSenderMessageContent) plus zkgroup
+     * endorsements — verify on-device against libsignal-android 0.86.5.
+     */
+    private suspend fun sendViaSenderKey(
+        target: GroupTarget,
+        content: SignalServiceProtos.Content,
+        timestamp: Long,
+        cert: SenderCertificate,
+    ): Boolean {
+        val groups = groups ?: return false
+        val groupIdBytes = groups.groupIdBytesForMasterKey(target.masterKey) ?: return false
+        val groupIdB64 = Base64.encodeToString(groupIdBytes, Base64.NO_WRAP)
+        val recipients = target.memberAcis.filter { it != account.aci }.distinct()
+        if (recipients.isEmpty()) return false
+
+        // Resolve every member device + ensure a session, collecting addresses.
+        val addresses = mutableListOf<SignalProtocolAddress>()
+        for (aci in recipients) {
+            val bundle = getRecipientBundleCached(aci)
+            val identityKey = IdentityKey(Base64.decode(bundle.identityKey, Base64.NO_WRAP), 0)
+            bundle.devices.forEach { dev ->
+                bootstrapSessionIfNeeded(aci, dev, identityKey)
+                addresses += SignalProtocolAddress(aci, dev.deviceId)
+            }
+        }
+        if (addresses.isEmpty()) return false
+
+        // SenderKey: stable distributionId per group, create our SKDM, and make
+        // sure every member has it (so their GroupCipher can decrypt).
+        val selfAddress = SignalProtocolAddress(account.aci, account.deviceId)
+        val distributionId = groupDistributionIds.getOrPut(groupIdB64) { UUID.randomUUID() }
+        val skdm = GroupSessionBuilder(protocolStore).create(selfAddress, distributionId)
+        distributeSenderKey(groupIdB64, target.revision, skdm, recipients, timestamp, cert)
+
+        // Encrypt the padded Content once under the SenderKey.
+        val padded = padPlaintext(content.toByteArray())
+        val groupCipher = GroupCipher(protocolStore, selfAddress)
+        val ciphertext = groupCipher.encrypt(distributionId, padded)
+
+        // Wrap + multi-recipient seal.
+        val usmc = UnidentifiedSenderMessageContent(
+            ciphertext,
+            cert,
+            CONTENT_HINT_RESENDABLE,
+            Optional.of(groupIdBytes),
+        )
+        val sealed = SealedSessionCipher(
+            protocolStore,
+            UUID.fromString(account.aci),
+            account.phoneNumber,
+            account.deviceId,
+        )
+        val blob = sealed.multiRecipientEncrypt(addresses, usmc)
+
+        // Authorize with a group-send token over the recipient set.
+        val token = groups.buildGroupSendToken(target.masterKey, recipients) ?: return false
+        val tokenB64 = Base64.encodeToString(token, Base64.NO_WRAP)
+
+        val result = api.sendMultiRecipient(blob, timestamp, tokenB64)
+        if (!result.isSuccess) {
+            Log.w(TAG, "multi_recipient HTTP ${result.httpStatus}: ${result.rawBody.take(160)}")
+            return false
+        }
+        Log.d(TAG, "SenderKey multi-recipient send → ${addresses.size} device(s) in 1 PUT")
+        return true
+    }
+
+    /**
+     * Ship our [skdm] to each member that hasn't received it for this group +
+     * revision yet (sealed-sender 1:1). Tracked in-memory so subsequent group
+     * sends in the same session skip straight to the single multi-recipient PUT.
+     * Membership changes bump the revision, which resets the delivered set.
+     */
+    private suspend fun distributeSenderKey(
+        groupIdB64: String,
+        revision: Int,
+        skdm: org.signal.libsignal.protocol.message.SenderKeyDistributionMessage,
+        recipients: List<String>,
+        timestamp: Long,
+        cert: SenderCertificate,
+    ) {
+        val key = "$groupIdB64@$revision"
+        val delivered = skdmDelivered.getOrPut(key) { java.util.Collections.synchronizedSet(mutableSetOf()) }
+        val skdmContent = SignalServiceProtos.Content.newBuilder()
+            .setSenderKeyDistributionMessage(com.google.protobuf.ByteString.copyFrom(skdm.serialize()))
+            .build()
+        for (aci in recipients) {
+            if (aci in delivered) continue
+            runCatching { encryptAndSendContent(aci, skdmContent, timestamp, cert) }
+                .onSuccess { delivered.add(aci) }
+                .onFailure { Log.w(TAG, "SKDM delivery to $aci failed", it) }
+        }
+    }
+
+    /**
+     * Deliver [content] to every group member (except ourselves) as an
+     * individual sealed-sender message. This is the per-recipient fallback to
+     * SenderKey multi-recipient fan-out — slower on big groups but far simpler,
+     * and every Signal client accepts it (the group attribution comes from the
+     * message's groupV2 context, not the transport). One member failing
+     * doesn't abort the rest.
+     */
+    private suspend fun fanOutGroup(
+        target: GroupTarget,
+        content: SignalServiceProtos.Content,
+        timestamp: Long,
+        cert: SenderCertificate,
+    ) {
+        val recipients = target.memberAcis.filter { it != account.aci }.distinct()
+        if (recipients.isEmpty()) {
+            Log.w(TAG, "group fan-out: no other members resolved")
+            return
+        }
+        var delivered = 0
+        for (memberAci in recipients) {
+            runCatching { encryptAndSendContent(memberAci, content, timestamp, cert) }
+                .onSuccess { delivered++ }
+                .onFailure { Log.w(TAG, "group send to $memberAci failed", it) }
+        }
+        Log.d(TAG, "group fan-out delivered to $delivered/${recipients.size}")
+    }
+
+    /**
+     * Group sent-transcript to our own devices. Unlike the DM transcript it
+     * omits `destinationServiceId` — recipients identify the group from the
+     * carried message's groupV2 context.
+     */
+    private suspend fun sendGroupSentTranscript(
+        message: SignalServiceProtos.DataMessage?,
+        edit: SignalServiceProtos.EditMessage?,
+        timestamp: Long,
+        cert: SenderCertificate,
+    ) {
+        val sentBuilder = SignalServiceProtos.SyncMessage.Sent.newBuilder()
+            .setTimestamp(timestamp)
+        if (message != null) sentBuilder.setMessage(message)
+        if (edit != null) sentBuilder.setEditMessage(edit)
+        val content = SignalServiceProtos.Content.newBuilder()
+            .setSyncMessage(
+                SignalServiceProtos.SyncMessage.newBuilder()
+                    .setSent(sentBuilder.build())
+                    .build()
+            )
+            .build()
+        sendSyncToOwnDevices(content, timestamp, cert)
+    }
+
+    /**
+     * Encrypt [content] once per recipient device (sealed sender) and PUT it
+     * to `/v1/messages/<recipientServiceId>`. Shared by every outbound path
+     * (text, reaction, delete, edit, receipt). Throws on any non-2xx.
+     *
+     * Recipient prekey bundle is served from a short-lived cache: Signal's
+     * the `/v2/keys` endpoint is rate-limited account-wide, so fetching on every send
+     * blows the budget when the user fires a few messages in close
+     * succession. The bundle is stable across a session unless the recipient
+     * adds a device or rotates keys.
+     */
+    private suspend fun encryptAndSendContent(
+        recipientServiceId: String,
+        content: SignalServiceProtos.Content,
+        timestamp: Long,
+        cert: SenderCertificate,
+    ) {
+        val bundle = getRecipientBundleCached(recipientServiceId)
+        val identityKey = IdentityKey(Base64.decode(bundle.identityKey, Base64.NO_WRAP), 0)
+        bundle.devices.forEach { dev ->
+            bootstrapSessionIfNeeded(recipientServiceId, dev, identityKey)
+        }
+        val padded = padPlaintext(content.toByteArray())
+        val cipher = SealedSessionCipher(
+            protocolStore,
+            UUID.fromString(account.aci),
+            /* localE164 = */ account.phoneNumber,
+            account.deviceId,
+        )
+        val outgoing = bundle.devices.map { dev ->
+            val destAddress = SignalProtocolAddress(recipientServiceId, dev.deviceId)
+            val encrypted = cipher.encrypt(destAddress, cert, padded)
+            OutgoingMessage(
+                type = ENVELOPE_TYPE_UNIDENTIFIED_SENDER,
+                destinationDeviceId = dev.deviceId,
+                destinationRegistrationId = dev.registrationId,
+                content = Base64.encodeToString(encrypted, Base64.NO_WRAP),
+            )
+        }
+        val result = api.sendMessage(
+            login = login,
+            password = password,
+            recipientServiceId = recipientServiceId,
+            body = SendMessageRequest(messages = outgoing, timestamp = timestamp),
+        )
+        if (!result.isSuccess) {
+            throw RuntimeException("send failed HTTP ${result.httpStatus}: ${result.rawBody}")
+        }
     }
 
     /**
@@ -310,6 +849,79 @@ class SignalSender(
         Log.d(TAG, "contact-sync request sent to ${outgoing.size} sibling device(s)")
     }
 
+    /**
+     * Sync an edit to our own other devices. Same shape as
+     * [sendSentTranscript] but the Sent transcript carries an `editMessage`
+     * instead of a plain `message`, so the primary applies the edit too.
+     */
+    private suspend fun sendEditTranscript(
+        recipientServiceId: String,
+        edit: SignalServiceProtos.EditMessage,
+        timestamp: Long,
+        cert: SenderCertificate,
+    ) {
+        val sent = SignalServiceProtos.SyncMessage.Sent.newBuilder()
+            .setDestinationServiceId(recipientServiceId)
+            .setTimestamp(timestamp)
+            .setEditMessage(edit)
+            .build()
+        val sync = SignalServiceProtos.SyncMessage.newBuilder()
+            .setSent(sent)
+            .build()
+        val content = SignalServiceProtos.Content.newBuilder()
+            .setSyncMessage(sync)
+            .build()
+        sendSyncToOwnDevices(content, timestamp, cert)
+    }
+
+    /**
+     * Encrypt [content] for each of our OTHER linked devices (sealed sender)
+     * and PUT it to our own ACI. The server fans it out to every device
+     * except the originator. Shared by the edit-transcript path; the older
+     * `sendSentTranscript` / `sendContactSyncRequestInternal` predate this
+     * helper and inline the same loop.
+     */
+    private suspend fun sendSyncToOwnDevices(
+        content: SignalServiceProtos.Content,
+        timestamp: Long,
+        cert: SenderCertificate,
+    ) {
+        val ourBundle = getOwnBundleCached()
+        val ourIdentityKey = IdentityKey(Base64.decode(ourBundle.identityKey, Base64.NO_WRAP), 0)
+        val otherDevices = ourBundle.devices.filter { it.deviceId != account.deviceId }
+        if (otherDevices.isEmpty()) {
+            Log.d(TAG, "no other linked devices — skipping own-device sync")
+            return
+        }
+        otherDevices.forEach { bootstrapSessionIfNeeded(account.aci, it, ourIdentityKey) }
+        val padded = padPlaintext(content.toByteArray())
+        val cipher = SealedSessionCipher(
+            protocolStore,
+            UUID.fromString(account.aci),
+            account.phoneNumber,
+            account.deviceId,
+        )
+        val outgoing = otherDevices.map { dev ->
+            val addr = SignalProtocolAddress(account.aci, dev.deviceId)
+            val encrypted = cipher.encrypt(addr, cert, padded)
+            OutgoingMessage(
+                type = ENVELOPE_TYPE_UNIDENTIFIED_SENDER,
+                destinationDeviceId = dev.deviceId,
+                destinationRegistrationId = dev.registrationId,
+                content = Base64.encodeToString(encrypted, Base64.NO_WRAP),
+            )
+        }
+        val result = api.sendMessage(
+            login = login,
+            password = password,
+            recipientServiceId = account.aci,
+            body = SendMessageRequest(messages = outgoing, timestamp = timestamp),
+        )
+        if (!result.isSuccess) {
+            throw RuntimeException("own-device sync HTTP ${result.httpStatus}: ${result.rawBody}")
+        }
+    }
+
     // ------------------------------------------------------------------
     // helpers
     // ------------------------------------------------------------------
@@ -453,17 +1065,6 @@ class SignalSender(
         return out
     }
 
-    /**
-     * Minimal view of a recipient device we need at encrypt time. We use
-     * this instead of [DevicePreKeyBundle] directly because cached/known-
-     * session paths don't carry the full prekey bundle around — only the
-     * deviceId is required for sealed-sender encrypt. registrationId is
-     * informational for the server's mismatched-devices check; sending 0
-     * when we don't know it is safe (server only flags a mismatch if the
-     * value is non-zero AND differs from the recipient's current value).
-     */
-    private data class RecipientDevice(val deviceId: Int, val registrationId: Int)
-
     companion object {
         private const val TAG = "SignalSender"
         private const val CERT_TTL_MS = 12L * 60 * 60 * 1000  // 12 hours
@@ -472,6 +1073,12 @@ class SignalSender(
         private const val RECIPIENT_BUNDLE_TTL_MS = 5L * 60 * 1000       // 5 minutes
         private const val ENVELOPE_TYPE_UNIDENTIFIED_SENDER = 6
         private const val PADDING_GRANULE = 159
+        /** Above this many other members, prefer the SenderKey multi-recipient
+         *  send (one PUT) over per-member fan-out (N PUTs). */
+        private const val SENDERKEY_THRESHOLD = 5
+        /** libsignal ContentHint: 1 = RESENDABLE (sender can re-send on
+         *  decrypt failure) — what Signal uses for group data messages. */
+        private const val CONTENT_HINT_RESENDABLE = 1
         @Suppress("unused")
         private const val CIPHERTEXT_TYPE_PREKEY = CiphertextMessage.PREKEY_TYPE
         @Suppress("unused")

@@ -6,7 +6,9 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -80,13 +82,25 @@ fun GoogleMessagesApp(
                 ?: kotlinx.coroutines.flow.MutableStateFlow(false)
         }
         val authExpired by authExpiredFlow.collectAsState()
+        // Re-link the phone WITHOUT logging out. First try to reauth from the
+        // STORED cookies — this restores the link using the SAME pairing (no QR
+        // re-scan, no UKey2 emoji) and keeps messages. Only if the cookies are
+        // dead do we wipe auth and fall back to a full re-pair (history kept).
+        // Shared by the auth-expired reconnect prompt, the "Re-link phone" action
+        // on a failed message, and Settings → Re-link phone.
+        val relinkScope = rememberCoroutineScope()
+        val relink: () -> Unit = {
+            relinkScope.launch {
+                if (!GoogleMessagesRepository.reauth()) {
+                    GoogleMessagesRepository.shutdown(clearMessages = false)
+                    store.clear() // cookies dead → wipe auth → full re-pair
+                    paired = false
+                }
+            }
+        }
         if (authExpired) {
             GoogleMessagesReconnectScreen(
-                onRelink = {
-                    GoogleMessagesRepository.shutdown()
-                    store.clear() // wipes account + cookies + GAIA flag → re-pair
-                    paired = false
-                },
+                onRelink = relink,
                 modifier = modifier,
             )
             return
@@ -106,10 +120,13 @@ fun GoogleMessagesApp(
         DpadMessengerApp(
             repository = repository,
             modifier = modifier,
+            onRelink = relink,
             onLogout = {
                 // Real logout: tear the session down and wipe the stored pairing
-                // + cookies. Signing back in gets fresh cookies from a new scan.
-                GoogleMessagesRepository.shutdown()
+                // + cookies AND delete the cached message history (clearMessages =
+                // true). Signing back in gets fresh cookies from a new scan and
+                // starts from an empty inbox.
+                GoogleMessagesRepository.shutdown(clearMessages = true)
                 store.clear()
                 android.util.Log.i(
                     "GMGaia",

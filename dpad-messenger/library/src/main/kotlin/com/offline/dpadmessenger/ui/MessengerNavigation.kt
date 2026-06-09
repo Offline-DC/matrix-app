@@ -62,6 +62,10 @@ fun DpadMessengerApp(
      *  this instead of the built-in stub login navigation, so the host can
      *  clear the real pairing and return to its own link screen. */
     onLogout: (() -> Unit)? = null,
+    /** Host-provided re-link. When set (launcher), a failed message offers a
+     *  "Re-link phone" action that calls this — re-pairing the phone while
+     *  KEEPING message history, so the user doesn't have to log out. */
+    onRelink: (() -> Unit)? = null,
     /** Auto-delete-old-messages setting (hidden when change handler is null). */
     autoDeleteEnabled: Boolean = true,
     onAutoDeleteChange: ((Boolean) -> Unit)? = null,
@@ -148,7 +152,7 @@ fun DpadMessengerApp(
                     ChatViewModelFactory(repository, roomId)
                 }
                 val vm: ChatViewModel = viewModel(factory = chatFactory)
-                ChatScreen(viewModel = vm, onBack = { nav.popBackStack() })
+                ChatScreen(viewModel = vm, onBack = { nav.popBackStack() }, onRelink = onRelink)
             }
             composable(Routes.SETTINGS) {
                 SettingsScreen(
@@ -168,6 +172,7 @@ fun DpadMessengerApp(
                             }
                         }
                     },
+                    onRelink = onRelink?.let { relink -> { relink(); nav.popBackStack() } },
                     showDarkThemeToggle = onToggleDarkTheme != null,
                     darkTheme = darkTheme,
                     onDarkThemeChange = { onToggleDarkTheme?.invoke(it) },

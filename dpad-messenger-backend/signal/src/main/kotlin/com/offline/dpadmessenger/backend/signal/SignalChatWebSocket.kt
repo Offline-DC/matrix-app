@@ -29,20 +29,19 @@ import java.util.UUID
 /**
  * Authenticated chat WebSocket connection.
  *
- * Layer 2.5 status:
- *  - **Wired:** TLS via Signal CA, HTTP-Basic auth, keepalive,
- *    automatic reconnect on disconnect.
- *  - **Wired:** Inbound WebSocketMessage envelope parsing.
- *  - **Wired:** 200-response ack so the server doesn't tear us down.
- *  - **TODO:** Actually decrypt the `Envelope` inside each request body.
- *    Requires a [SignalProtocolStore] implementation (session/identity/
- *    prekey storage backed by SQLite) plus SignalServiceCipher /
- *    SealedSessionCipher. ~1500 lines on its own. See mautrix-signal
- *    `pkg/signalmeow/receiving.go` for the structure.
+ * Status:
+ *  - TLS via Signal CA, HTTP-Basic auth, keepalive, auto-reconnect.
+ *  - Inbound WebSocketMessage envelope parsing + 200-ack.
+ *  - Full decrypt: PREKEY / DOUBLE_RATCHET via [SessionCipher] and
+ *    UNIDENTIFIED_SENDER (sealed) via [SealedSessionCipher], over
+ *    [AndroidSignalProtocolStore].
+ *  - Routing of DataMessage text, reactions, quotes (replies), deletes,
+ *    `Content.editMessage` edits, `ReceiptMessage` delivery/read receipts,
+ *    inbound media (AttachmentPointer), and SyncMessage contacts + Sent
+ *    transcripts into [SignalMessageRepository].
  *
- * For now, every inbound message logs the envelope type + sender info
- * and gets ack'd so the server keeps streaming. That's enough to verify
- * the link is alive end-to-end without the heavyweight decrypt path.
+ * See `docs/SIGNAL_BRIDGE.md` for what's still open (group messaging,
+ * cross-device sync of reactions/edits, prekey top-up).
  */
 class SignalChatWebSocket(
     private val account: SignalAccount,
@@ -317,6 +316,20 @@ class SignalChatWebSocket(
             return
         }
 
+        // Diagnostic: what is this decrypted message, and does a DataMessage
+        // carry a profileKey (the only thing we can resolve a name from)?
+        run {
+            val hasData = content.hasDataMessage()
+            Log.d(
+                TAG,
+                "content from $sourceServiceId.$senderDeviceId: " +
+                    "data=$hasData(body=${hasData && content.dataMessage.hasBody()}," +
+                    "profileKey=${hasData && content.dataMessage.hasProfileKey()}) " +
+                    "receipt=${content.hasReceiptMessage()} sync=${content.hasSyncMessage()} " +
+                    "typing=${content.hasTypingMessage()} edit=${content.hasEditMessage()}",
+            )
+        }
+
         // Process any senderKeyDistributionMessage BEFORE other payloads.
         // SKDMs can arrive solo (Content with no DataMessage) or piggybacked
         // onto a DataMessage — in both cases we need to populate the sender
@@ -339,7 +352,8 @@ class SignalChatWebSocket(
             if (!content.hasDataMessage() &&
                 !content.hasSyncMessage() &&
                 !content.hasReceiptMessage() &&
-                !content.hasTypingMessage()
+                !content.hasTypingMessage() &&
+                !content.hasEditMessage()
             ) {
                 return
             }
@@ -347,6 +361,43 @@ class SignalChatWebSocket(
 
         if (content.hasDataMessage()) {
             val data = content.dataMessage
+            val roomId = "sig:dm:$sourceServiceId"
+            // Group messages carry a GroupContextV2 with the 32-byte master
+            // key; non-null here means "route to the group room", null means DM.
+            val groupKey = groupMasterKey(data)
+
+            // Reaction — keyed off (targetAuthorAci, targetSentTimestamp).
+            if (data.hasReaction()) {
+                val r = data.reaction
+                scope.launch {
+                    runCatching {
+                        if (groupKey != null) {
+                            repository.applyIncomingGroupReaction(
+                                groupKey, sourceServiceId, r.targetSentTimestamp, r.emoji, r.remove,
+                            )
+                        } else {
+                            repository.applyIncomingReaction(
+                                roomId, sourceServiceId, r.targetSentTimestamp, r.emoji, r.remove,
+                            )
+                        }
+                    }.onFailure { Log.w(TAG, "applyIncomingReaction failed", it) }
+                }
+                return  // reaction-only message carries no body
+            }
+
+            // "Delete for everyone".
+            if (data.hasDelete()) {
+                val targetTs = data.delete.targetSentTimestamp
+                scope.launch {
+                    runCatching {
+                        if (groupKey != null) repository.applyIncomingGroupDelete(groupKey, targetTs)
+                        else repository.applyIncomingDelete(roomId, targetTs)
+                    }.onFailure { Log.w(TAG, "applyIncomingDelete failed", it) }
+                }
+                return
+            }
+
+            // Normal text (possibly a reply carrying a Quote) and/or media.
             val body = if (data.hasBody()) data.body else ""
             val envTs = when {
                 env.hasClientTimestamp() -> env.clientTimestamp
@@ -354,22 +405,83 @@ class SignalChatWebSocket(
                 else -> System.currentTimeMillis()
             }
             val ts = if (data.hasTimestamp()) data.timestamp else envTs
+            val quotedTs = if (data.hasQuote()) data.quote.id else null
+            val attachment = if (data.attachmentsCount > 0) {
+                buildAttachment(data.getAttachments(0))
+            } else null
+            // Sender's profile key (when shared) lets us resolve their name.
+            val profileKey = if (data.hasProfileKey()) data.profileKey.toByteArray() else null
+            // Conversation disappearing-messages timer (echoed on our sends).
+            val expireSeconds = if (data.hasExpireTimer()) data.expireTimer else 0
+            val expireVersion = if (data.hasExpireTimerVersion()) data.expireTimerVersion else 0
             val messageId = "sig-$sourceServiceId-$ts-${UUID.randomUUID().toString().take(8)}"
             scope.launch {
                 runCatching {
-                    repository.receiveIncoming(
-                        senderServiceId = sourceServiceId,
-                        senderE164 = senderE164,
-                        messageId = messageId,
-                        body = body,
-                        timestamp = ts,
-                    )
-                }.onFailure { Log.w(TAG, "repository.receiveIncoming failed", it) }
+                    if (groupKey != null) {
+                        repository.receiveIncomingGroup(
+                            masterKey = groupKey,
+                            senderServiceId = sourceServiceId,
+                            senderE164 = senderE164,
+                            messageId = messageId,
+                            body = body,
+                            timestamp = ts,
+                            quotedTimestamp = quotedTs,
+                            attachment = attachment,
+                            profileKey = profileKey,
+                            expireTimerSeconds = expireSeconds,
+                            expireTimerVersion = expireVersion,
+                        )
+                    } else {
+                        repository.receiveIncoming(
+                            senderServiceId = sourceServiceId,
+                            senderE164 = senderE164,
+                            messageId = messageId,
+                            body = body,
+                            timestamp = ts,
+                            quotedTimestamp = quotedTs,
+                            attachment = attachment,
+                            profileKey = profileKey,
+                            expireTimerSeconds = expireSeconds,
+                            expireTimerVersion = expireVersion,
+                        )
+                    }
+                }.onFailure { Log.w(TAG, "repository.receive(Group) failed", it) }
+            }
+        } else if (content.hasEditMessage()) {
+            // Signal edit: top-level Content.editMessage{ targetSentTimestamp,
+            // dataMessage{ body, groupV2? } }.
+            val edit = content.editMessage
+            val roomId = "sig:dm:$sourceServiceId"
+            val groupKey = groupMasterKey(edit.dataMessage)
+            val newBody = if (edit.dataMessage.hasBody()) edit.dataMessage.body else ""
+            val editTs = if (edit.dataMessage.hasTimestamp()) edit.dataMessage.timestamp
+                         else System.currentTimeMillis()
+            scope.launch {
+                runCatching {
+                    if (groupKey != null) {
+                        repository.applyIncomingGroupEdit(groupKey, edit.targetSentTimestamp, newBody, editTs)
+                    } else {
+                        repository.applyIncomingEdit(roomId, edit.targetSentTimestamp, newBody, editTs)
+                    }
+                }.onFailure { Log.w(TAG, "applyIncomingEdit failed", it) }
             }
         } else if (content.hasSyncMessage()) {
             handleSyncMessage(content.syncMessage)
         } else if (content.hasReceiptMessage()) {
-            Log.d(TAG, "receipt message received — not yet routed")
+            // Delivery/read receipt from the peer for messages WE sent. Maps
+            // each acked timestamp to the matching outgoing bubble's status.
+            val receipt = content.receiptMessage
+            val status = when (receipt.type) {
+                SignalServiceProtos.ReceiptMessage.Type.READ,
+                SignalServiceProtos.ReceiptMessage.Type.VIEWED ->
+                    com.offline.dpadmessenger.data.MessageStatus.READ
+                else -> com.offline.dpadmessenger.data.MessageStatus.DELIVERED
+            }
+            val timestamps = receipt.timestampList
+            scope.launch {
+                runCatching { repository.applyIncomingReceipt(sourceServiceId, timestamps, status) }
+                    .onFailure { Log.w(TAG, "applyIncomingReceipt failed", it) }
+            }
         } else if (content.hasTypingMessage()) {
             Log.d(TAG, "typing message — ignored")
         } else {
@@ -417,26 +529,98 @@ class SignalChatWebSocket(
     }
 
     /**
-     * Render a Sent transcript from one of our other devices as an
-     * outgoing message in the matching room. Without this, messages sent
-     * on the primary phone would never appear on the Flip 2.
+     * Apply a Sent transcript from one of our OTHER devices (typically the
+     * primary phone). This is what keeps the Flip in lock-step with actions
+     * taken elsewhere: outgoing messages, reactions, edits, and deletes — in
+     * both DMs and groups.
+     *
+     * Routing mirrors the inbound path: the message's `groupV2` (or the inner
+     * edit's) selects a group room; otherwise `destinationServiceId` selects
+     * the DM. Reactions/deletes are applied to the referenced message; an edit
+     * rewrites it; a plain message/attachment is rendered as our outgoing
+     * bubble.
      */
     private fun dispatchSentTranscript(sent: SignalServiceProtos.SyncMessage.Sent) {
+        // Edits arrive as Sent.editMessage (no Sent.message).
+        if (sent.hasEditMessage()) {
+            val edit = sent.editMessage
+            val groupKey = groupMasterKey(edit.dataMessage)
+            val dest = sent.destinationString()
+            val newBody = if (edit.dataMessage.hasBody()) edit.dataMessage.body else ""
+            val editTs = if (edit.dataMessage.hasTimestamp()) edit.dataMessage.timestamp
+                         else System.currentTimeMillis()
+            scope.launch {
+                runCatching {
+                    if (groupKey != null) {
+                        repository.applyIncomingGroupEdit(groupKey, edit.targetSentTimestamp, newBody, editTs)
+                    } else if (!dest.isNullOrBlank()) {
+                        repository.applyIncomingEdit("sig:dm:$dest", edit.targetSentTimestamp, newBody, editTs)
+                    }
+                }.onFailure { Log.w(TAG, "sent-transcript edit failed", it) }
+            }
+            return
+        }
         if (!sent.hasMessage()) {
-            Log.d(TAG, "sync.sent without DataMessage (probably edit/delete/reaction) — skipping")
+            Log.d(TAG, "sync.sent without message/editMessage — skipping")
             return
         }
         val data = sent.message
-        val body = if (data.hasBody()) data.body else ""
-        if (body.isBlank()) return
-        val destination = if (sent.hasDestinationServiceId()) sent.destinationServiceId else null
-        if (destination.isNullOrBlank()) {
-            Log.d(TAG, "sync.sent without destinationServiceId (group?) — not yet routed")
+        val groupKey = groupMasterKey(data)
+        val destination = sent.destinationString()
+        // Our own ACI authored these, so reactions/deletes are attributed to us.
+        val selfAci = account.aci
+
+        // Reaction from our other device.
+        if (data.hasReaction()) {
+            val r = data.reaction
+            scope.launch {
+                runCatching {
+                    if (groupKey != null) {
+                        repository.applyIncomingGroupReaction(groupKey, selfAci, r.targetSentTimestamp, r.emoji, r.remove)
+                    } else if (!destination.isNullOrBlank()) {
+                        repository.applyIncomingReaction("sig:dm:$destination", selfAci, r.targetSentTimestamp, r.emoji, r.remove)
+                    }
+                }.onFailure { Log.w(TAG, "sent-transcript reaction failed", it) }
+            }
             return
         }
+        // Delete from our other device.
+        if (data.hasDelete()) {
+            val targetTs = data.delete.targetSentTimestamp
+            scope.launch {
+                runCatching {
+                    if (groupKey != null) repository.applyIncomingGroupDelete(groupKey, targetTs)
+                    else if (!destination.isNullOrBlank()) repository.applyIncomingDelete("sig:dm:$destination", targetTs)
+                }.onFailure { Log.w(TAG, "sent-transcript delete failed", it) }
+            }
+            return
+        }
+
+        // Plain outgoing message and/or media we sent from another device.
+        val body = if (data.hasBody()) data.body else ""
+        val attachment = if (data.attachmentsCount > 0) buildAttachment(data.getAttachments(0)) else null
+        if (body.isBlank() && attachment == null) return
         val ts = if (sent.hasTimestamp()) sent.timestamp
                  else if (data.hasTimestamp()) data.timestamp
                  else System.currentTimeMillis()
+        val expireSeconds = if (data.hasExpireTimer()) data.expireTimer else 0
+        val expireVersion = if (data.hasExpireTimerVersion()) data.expireTimerVersion else 0
+
+        if (groupKey != null) {
+            val messageId = "sig-sent-grp-$ts-${UUID.randomUUID().toString().take(8)}"
+            scope.launch {
+                runCatching {
+                    repository.receiveOwnSentGroup(
+                        groupKey, messageId, body, ts, attachment, expireSeconds, expireVersion,
+                    )
+                }.onFailure { Log.w(TAG, "sent-transcript group own-send failed", it) }
+            }
+            return
+        }
+        if (destination.isNullOrBlank()) {
+            Log.d(TAG, "sync.sent without destination or group — skipping")
+            return
+        }
         val messageId = "sig-sent-$destination-$ts-${UUID.randomUUID().toString().take(8)}"
         scope.launch {
             runCatching {
@@ -445,9 +629,72 @@ class SignalChatWebSocket(
                     messageId = messageId,
                     body = body,
                     timestamp = ts,
+                    expireTimerSeconds = expireSeconds,
+                    expireTimerVersion = expireVersion,
                 )
             }.onFailure { Log.w(TAG, "repository.receiveOwnSent failed", it) }
         }
+    }
+
+    /**
+     * Resolve a Sent transcript's destination service id. Modern Signal sends
+     * the 16-byte `destinationServiceIdBinary` (ACI) / 17-byte (PNI prefix +
+     * UUID) rather than the legacy string `destinationServiceId`, so we try the
+     * string first and fall back to the binary — same as the envelope source.
+     * Returns null for group sends (no destination) or unparseable values.
+     */
+    private fun SignalServiceProtos.SyncMessage.Sent.destinationString(): String? {
+        if (hasDestinationServiceId() && destinationServiceId.isNotEmpty()) return destinationServiceId
+        if (!hasDestinationServiceIdBinary()) return null
+        val bin = destinationServiceIdBinary.toByteArray()
+        return when (bin.size) {
+            16 -> bytesToUuid(bin)
+            17 -> bytesToUuid(bin.copyOfRange(1, 17))  // strip PNI prefix
+            else -> null
+        }
+    }
+
+    /** Extract the 32-byte GroupsV2 master key from a DataMessage's groupV2
+     *  context, or null if it isn't a group message. */
+    private fun groupMasterKey(data: SignalServiceProtos.DataMessage): ByteArray? {
+        if (!data.hasGroupV2()) return null
+        val g = data.groupV2
+        if (!g.hasMasterKey()) return null
+        val mk = g.masterKey.toByteArray()
+        return if (mk.size == 32) mk else null
+    }
+
+    /**
+     * Convert an inbound [AttachmentPointer] into a UI [Attachment] whose
+     * [downloadToken] carries everything [SignalAttachments.download] needs
+     * (cdn + key + digest + size + type). Returns null if the pointer is
+     * missing the bits required to fetch + decrypt it later.
+     */
+    private fun buildAttachment(
+        pointer: SignalServiceProtos.AttachmentPointer,
+    ): com.offline.dpadmessenger.data.Attachment? {
+        val cdnLocator = when {
+            pointer.hasCdnKey() -> pointer.cdnKey
+            pointer.hasCdnId() -> pointer.cdnId.toString()
+            else -> return null
+        }
+        if (!pointer.hasKey()) return null
+        val contentType = if (pointer.hasContentType()) pointer.contentType else "application/octet-stream"
+        val token = SignalAttachments.AttachmentToken(
+            cdnNumber = if (pointer.hasCdnNumber()) pointer.cdnNumber else 0,
+            cdnKey = cdnLocator,
+            key = pointer.key.toByteArray(),
+            digest = if (pointer.hasDigest()) pointer.digest.toByteArray() else null,
+            size = if (pointer.hasSize()) pointer.size else -1,
+            contentType = contentType,
+        ).encode()
+        return com.offline.dpadmessenger.data.Attachment(
+            kind = SignalAttachments.kindFor(contentType),
+            mimeType = contentType,
+            name = if (pointer.hasFileName()) pointer.fileName else "",
+            downloadToken = token,
+            localPath = null,
+        )
     }
 
     private fun sendOk(webSocket: WebSocket, requestId: Long) {

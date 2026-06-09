@@ -64,6 +64,40 @@ object SignalAttachmentCrypto {
         return cipher.doFinal(ciphertext)
     }
 
+    /**
+     * Result of [encrypt]: the on-the-wire blob (`iv || ciphertext || mac`)
+     * plus its SHA-256 [digest] (over the whole blob), which the recipient's
+     * AttachmentPointer.digest field carries so they can verify the download.
+     */
+    class Encrypted(val data: ByteArray, val digest: ByteArray)
+
+    /**
+     * Encrypt [plaintext] for upload to Signal's CDN, the inverse of
+     * [decrypt]. Generates a random 16-byte IV, AES-256-CBC encrypts under
+     * `key[0..32)`, HMAC-SHA256s `(iv || ciphertext)` under `key[32..64)`,
+     * and returns `iv || ciphertext || mac` together with its SHA-256 digest.
+     *
+     * [key] must be the same 64-byte layout [decrypt] expects; callers
+     * generate it fresh per attachment (it travels to the recipient inside
+     * the encrypted DataMessage, never over the CDN).
+     */
+    fun encrypt(plaintext: ByteArray, key: ByteArray): Encrypted {
+        require(key.size == 64) { "attachment key must be 64 bytes (got ${key.size})" }
+        val aesKey = key.copyOfRange(0, 32)
+        val macKey = key.copyOfRange(32, 64)
+
+        val iv = ByteArray(IV_LEN).also { java.security.SecureRandom().nextBytes(it) }
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(aesKey, "AES"), IvParameterSpec(iv))
+        val ciphertext = cipher.doFinal(plaintext)
+
+        val ivAndCipher = iv + ciphertext
+        val mac = hmac(macKey, ivAndCipher)
+        val blob = ivAndCipher + mac
+        val digest = MessageDigest.getInstance("SHA-256").digest(blob)
+        return Encrypted(blob, digest)
+    }
+
     private fun hmac(key: ByteArray, data: ByteArray): ByteArray {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(key, "HmacSHA256"))

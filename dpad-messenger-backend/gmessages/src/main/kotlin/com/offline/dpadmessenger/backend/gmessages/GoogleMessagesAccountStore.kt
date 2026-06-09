@@ -91,6 +91,20 @@ class GoogleMessagesAccountStore(context: Context) {
 
     fun hasCookies(): Boolean = GMCookieAuth.hasRequiredCookies(loadCookies())
 
+    // ---- stable web-device identity ----------------------------------------
+    // A persisted UUID for our "messages-web-<uuid>" device id. Reused on every
+    // SignInGaia so we keep ONE web registration instead of minting a fresh
+    // device each attempt (which pollutes the account's device list). This is
+    // only our own local web identity — the pairing target (the phone) is
+    // unaffected. Mirrors mautrix-gmessages' persisted SessionID.
+
+    fun getOrCreateDeviceSessionId(): String {
+        prefs.getString(KEY_DEVICE_SESSION_ID, null)?.let { return it }
+        val id = java.util.UUID.randomUUID().toString()
+        prefs.edit().putString(KEY_DEVICE_SESSION_ID, id).apply()
+        return id
+    }
+
     // ---- Google-account (GAIA) session mode --------------------------------
     // After a successful UKey2 pairing, the session runs in "Google account"
     // mode: clients6 host, network "GDitto", destRegistrationIDs + cookies +
@@ -164,6 +178,7 @@ class GoogleMessagesAccountStore(context: Context) {
         private const val KEY_HMAC = "hmacKey"
         private const val KEY_GAIA_MODE = "gaiaMode"
         private const val KEY_GAIA_DEST_REG = "gaiaDestReg"
+        private const val KEY_DEVICE_SESSION_ID = "deviceSessionId"
     }
 }
 

@@ -44,6 +44,9 @@ import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 fun SettingsScreen(
     onBack: () -> Unit,
     onLogout: () -> Unit,
+    /** Re-link the phone (re-pair / reauth, keeping messages). Shown above
+     *  Log out when set; null hides it. */
+    onRelink: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
     /** When true, show the dark-theme toggle (demo harness). The launcher
      *  forces light, so it passes false and the row is hidden. */
@@ -128,6 +131,13 @@ fun SettingsScreen(
             StaticRow(title = "Repository", subtitle = "dpad-messenger")
             // Log out kept last so it's the bottom-most action.
             SettingHeader("Account")
+            if (onRelink != null) {
+                ActionRow(
+                    title = "Re-link phone",
+                    subtitle = "Reconnect to your phone — keeps your messages",
+                    onClick = onRelink,
+                )
+            }
             ActionRow(
                 title = "Log out",
                 subtitle = "Sign out of this device",

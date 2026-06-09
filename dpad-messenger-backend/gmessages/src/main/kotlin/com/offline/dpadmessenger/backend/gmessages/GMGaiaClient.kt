@@ -75,10 +75,15 @@ class GMGaiaClient(context: Context) {
         Log.i(TAG, "run: starting with ${cookies.size} cookies")
 
         val deviceUuid = fetchConfig(cookies)
+        // Reuse ONE persisted web-device UUID instead of minting a fresh random one
+        // each attempt. A new UUID registers a brand-new "messages-web-..." device
+        // every try, which is why the account's device list kept growing. The phone
+        // (the ==1 destination) is unaffected — this is only our local web identity.
+        // (mautrix does the same via a persisted SessionID.)
         if (deviceUuid == null) {
-            Log.w(TAG, "run: no device UUID from config — using a fresh random UUID as a fallback")
+            Log.i(TAG, "run: no device UUID from config — reusing persisted web-device UUID")
         }
-        val sessionId = deviceUuid ?: UUID.randomUUID().toString()
+        val sessionId = deviceUuid ?: store.getOrCreateDeviceSessionId()
         return signInGaia(cookies, sessionId, onEmoji)
     }
 
@@ -210,21 +215,42 @@ class GMGaiaClient(context: Context) {
             network = deviceNode[2].asStringOrNull() ?: "GDitto",
         )
 
+        // Pick the pairing target exactly like mautrix-gmessages: a "primary"
+        // (pairable phone) is an UnknownItems2 entry with UnknownInt4 == 1.
+        // Field map (pblite index = protoField-1):
+        //   index 0 = DestOrSourceUUID (pblite_binary base64, used as dest reg)
+        //   index 3 = UnknownInt4  (1 = real RCS phone; 6 = web/desktop surface)
+        //   index 6 = UnknownBigInt7 (numeric reg id)
+        // UnknownItems3 carries the per-device LastSeen timestamp (index 6).
         val items2 = (deviceData[1] as? PbLite.Node.Arr)?.items.orEmpty()
-        var destRegB64: String? = null
-        for (item in items2) {
-            if (item[3].asLongOrNull() == 1L) { // unknownInt4 == 1 -> primary phone
-                destRegB64 = item[0].asStringOrNull()
-                break
-            }
+        val items3 = (deviceData[2] as? PbLite.Node.Arr)?.items.orEmpty()
+        val lastSeenByUuid = HashMap<String, Long>()
+        for (item in items3) {
+            val u = item[0].asStringOrNull() ?: continue
+            lastSeenByUuid[u] = item[6].asLongOrNull() ?: 0L
         }
-        if (destRegB64 == null) {
-            Log.w(TAG, "signInGaia: no primary device (unknownInt4==1) in ${items2.size} devices")
-            lastError = "Couldn't find your phone in your Google account's device list. Open Google " +
-                "Messages on your phone (and enable messages for web) first, then try again."
+        // (uuidB64, unknownBigInt7, lastSeenMicros) for each primary phone.
+        val primaries = items2.mapNotNull { item ->
+            if (item[3].asLongOrNull() != 1L) return@mapNotNull null
+            val u = item[0].asStringOrNull() ?: return@mapNotNull null
+            Triple(u, item[6].asLongOrNull() ?: 0L, lastSeenByUuid[u] ?: 0L)
+        }
+        if (primaries.isEmpty()) {
+            Log.w(TAG, "signInGaia: no primary phone (UnknownInt4==1) among ${items2.size} devices; items2=$items2")
+            lastError = "Your phone isn't set up for Google-account pairing yet (a QR-code scan won't " +
+                "do it). On your phone:\n" +
+                "1) Open Google Messages.\n" +
+                "2) Tap your profile picture (top-right) → “Device pairing”.\n" +
+                "3) Choose “Pair with Google Account” and sign in with the same Google account — not " +
+                "the QR scanner.\n" +
+                "Once that's done, come back here and try again."
             return false
         }
-        Log.i(TAG, "signInGaia: token=${token.size}b ttl=$ttl mobile=${mobile.sourceId} dest=$destRegB64")
+        // Newest by LastSeen first — mautrix's default pick when there are several.
+        val primary = primaries.maxByOrNull { it.third }!!
+        val destRegB64 = primary.first
+        Log.i(TAG, "signInGaia: token=${token.size}b ttl=$ttl mobile=${mobile.sourceId} " +
+            "dest=$destRegB64 (${primaries.size} primary of ${items2.size} devices)")
 
         val p = GMGaiaPairing(
             cookies = cookies,
@@ -237,7 +263,9 @@ class GMGaiaClient(context: Context) {
             onEmoji = onEmoji,
         )
         pairing = p
-        return p.run()
+        val ok = p.run()
+        if (!ok && lastError == null) lastError = p.lastError
+        return ok
     }
 
     // ---- helpers -----------------------------------------------------------

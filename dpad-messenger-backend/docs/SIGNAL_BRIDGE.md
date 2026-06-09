@@ -87,26 +87,111 @@ Done and runnable on-device:
   appends the decrypted message, and bumps the room to the top of the
   list with an incremented unread count.
 
-## What still isn't here
+## Status update — core messenger is now implemented
 
-- **Outbound send.** `SignalMessageRepository.sendMessage` is still a
-  no-op placeholder. Needs: prekey fetch from
-  `GET /v2/keys/<aci>/<deviceId>`, session establish via
-  `SessionBuilder.process(...)`, encrypt with `SessionCipher.encrypt`,
-  PUT to `/v1/messages/<aci>`.
-- **Sealed sender (`UNIDENTIFIED_SENDER`) decrypt.** Requires fetching
-  the server's `UnidentifiedSenderCertificate` and using
-  `SealedSessionCipher`. Until this lands most "private" Signal traffic
-  (the default for known contacts) will be skipped — only PREKEY and
-  DOUBLE_RATCHET envelopes decrypt. Practical impact: you'll receive
-  the initial PREKEY_MESSAGE that establishes a session and see it in
-  the UI, but follow-ups from the same sender may come over the sealed
-  path and silently drop until the cipher is added.
-- **Sync messages.** Read receipts, contact sync, and the initial
-  history bundle are received and parsed but not yet applied to the UI.
-- **Periodic one-time prekey top-up.** Server drains the uploaded
-  bundle as peers consume keys; a background job should refill once
+The list below is the ORIGINAL Phase-5 gap list; most of it has since
+landed. Current reality:
+
+- **Outbound send — DONE.** `SignalMessageRepository.sendMessage` →
+  `SignalSender.sendDirectMessage`: prekey fetch (cached), session
+  establish via `SessionBuilder.process`, sealed-sender encrypt per
+  device, `PUT /v1/messages`, plus a `SyncMessage.Sent` transcript to
+  our own devices.
+- **Sealed sender (`UNIDENTIFIED_SENDER`) decrypt — DONE.**
+  `SignalChatWebSocket.decryptSealedSender` walks the production trust
+  roots and uses `SealedSessionCipher`; SenderKey distribution messages
+  are processed so group/multi-recipient follow-ups decrypt.
+- **Interactive features — DONE.** Reactions, replies (Quote), edits
+  (`Content.editMessage`), "delete for everyone" (`DataMessage.delete`),
+  and read/delivery receipts (`ReceiptMessage`) all send and apply
+  inbound. See `SignalSender.send{Reaction,RemoteDelete,Edit,ReadReceipt}`
+  and the `applyIncoming*` hooks on the repository.
+- **Media — DONE (send needs on-device CDN verification).** Inbound:
+  `AttachmentPointer` → download (`SignalApi.downloadAttachment`) +
+  decrypt (`SignalAttachmentCrypto.decrypt`) + cache, behind
+  `MediaDownloader`. Outbound: `SignalAttachments.upload` encrypts and
+  uploads via the v4 form + TUS resumable upload, then
+  `SignalSender.sendAttachment` sends the pointer, behind
+  `AttachmentSender`. The download/decrypt half is the same path contact
+  sync uses in production; the upload half can't be exercised in CI and
+  needs a device test against the live CDN.
+- **Contact sync — DONE.** `SyncMessage.Contacts` downloaded, decrypted,
+  parsed, and applied to room/contact names.
+
+### Primary↔Flip sync — DONE
+
+`dispatchSentTranscript` now applies `SyncMessage.Sent` transcripts for
+outgoing messages, reactions, edits, deletes, and media — in both DMs and
+groups — so actions taken on the primary phone reflect on the Flip and
+vice-versa. (DM own-sent *media* transcripts still render as text-only;
+group own-sent media is carried.)
+
+### Groups (GroupsV2) — DONE, needs on-device verification
+
+Read + send both implemented:
+
+- **Identity.** `SignalGroups.groupIdForMasterKey` derives a stable group
+  id from `GroupContextV2.masterKey` via zkgroup
+  (`GroupSecretParams` → `GroupIdentifier`); group rooms are
+  `sig:group:<base64 id>`.
+- **State.** `SignalGroups.getOrFetch` pulls weekly auth credentials
+  (`GET /v2/auth`), builds a zkgroup auth presentation, fetches the
+  encrypted `Group` from `storage.signal.org/v1/groups/`, and decrypts the
+  title + member ACIs with `ClientZkGroupCipher`. Cached ~10 min.
+- **Inbound.** Group text/media/reactions/edits/deletes route to the group
+  room (`receiveIncomingGroup` + `applyIncomingGroup*`).
+- **Outbound.** `SignalSender.sendGroup*` builds the `groupV2` context and
+  fans the message out to each member as an individual sealed-sender
+  message (the simple, universally-accepted fallback to SenderKey
+  multi-recipient fan-out), plus an own-device transcript.
+
+⚠️ **Two things to verify on a device** (neither can run in CI):
+  1. `SignalGroups.SERVER_PUBLIC_PARAMS_B64` MUST be filled with Signal's
+     real production zkgroup server public params (a public constant from
+     Signal-Android `BuildConfig.ZKGROUP_SERVER_PUBLIC_PARAMS`). It's blank
+     on purpose so it fails loudly rather than silently mis-deriving.
+  2. The exact zkgroup method names against libsignal-android 0.86.5
+     (`receiveAuthCredentialWithPniAsServiceId`,
+     `createAuthCredentialPresentation`, `decryptServiceId`, `decryptBlob`).
+
+### Large-group SenderKey fan-out — DONE, needs on-device verification
+
+Group sends past `SignalSender.SENDERKEY_THRESHOLD` (5 other members) take
+the SenderKey multi-recipient fast path: encrypt the Content ONCE with
+`GroupCipher`, distribute our `SenderKeyDistributionMessage` to members that
+need it (tracked per group+revision so later sends skip it), wrap as an
+`UnidentifiedSenderMessageContent`, `SealedSessionCipher
+.multiRecipientEncrypt` the whole group, and deliver in a single
+`PUT /v1/messages/multi_recipient` authorized by a zkgroup
+`Group-Send-Token` (from `GroupResponse.groupSendEndorsementsResponse`).
+
+Crucially this is an **optimization with graceful fallback**: the entire
+SenderKey path runs under `runCatching`, and ANY failure (or a small group)
+falls back to the proven per-member fan-out. So even if the version-sensitive
+libsignal calls (`GroupCipher`, `multiRecipientEncrypt`,
+`UnidentifiedSenderMessageContent`) or the zkgroup endorsement API differ on
+0.86.5, group send still works — it just isn't using the single-PUT path
+until those are verified on-device.
+
+### Read receipts — intentionally NOT sent
+
+By product decision we do not send Signal read receipts: `markRoomRead` only
+clears the local unread badge. (Inbound delivery/read receipts that peers
+choose to send US are still reflected on our own sent bubbles.)
+
+### Still open (nice-to-haves, not blockers)
+
+- **Group membership changes / `groupChange`.** We refetch full state on a
+  TTL; we don't apply incremental `groupChange` blobs.
+- **Persisted SenderKey distribution ids.** The per-group distributionId is
+  in-memory, so the first group send after an app restart re-distributes the
+  SKDM. Persisting it would avoid that.
+- **Periodic one-time prekey top-up.** Server drains the uploaded bundle
+  as peers consume keys; a background job should refill once the
   available count drops below ~10.
+- **Stale-device handling.** A `409/410` from `PUT /v1/messages` should
+  invalidate the cached prekey bundle and retry; today it surfaces as a
+  failed send.
 
 ## What needs filling in to actually exchange messages
 

@@ -80,6 +80,10 @@ fun RoomListScreen(
     val entryRowFocus = remember { FocusRequester() }
     val firstRowFocus = remember { FocusRequester() }
     val composeButtonFocus = remember { FocusRequester() }
+    // The settings cog's own focus handle, so the compose button can hand focus
+    // back up to it when the list is empty (otherwise the user would be trapped
+    // on the compose button with no row to return to).
+    val settingsFocus = remember { FocusRequester() }
     // Hoisted so the settings-cog Down handler can scroll the top row back into
     // composition before focusing it.
     val listState = rememberLazyListState()
@@ -92,8 +96,24 @@ fun RoomListScreen(
                 actions = {
                     CompactBarButton(
                         onClick = onSettingsClick,
-                        extraModifier = Modifier.onPreviewKeyEvent { event ->
+                        extraModifier = Modifier
+                            .focusRequester(settingsFocus)
+                            .onPreviewKeyEvent { event ->
                             if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionDown) {
+                                if (rooms.isEmpty()) {
+                                    // No rows to land on — go straight to the
+                                    // compose button (when present) so Down from
+                                    // the cog still does something useful.
+                                    if (onNewMessage != null) {
+                                        scope.launch {
+                                            repeat(8) {
+                                                withFrameNanos {}
+                                                if (runCatching { composeButtonFocus.requestFocus() }.isSuccess) return@launch
+                                            }
+                                        }
+                                    }
+                                    return@onPreviewKeyEvent true
+                                }
                                 // Move focus into the list. A just-arrived
                                 // message can re-sort the list and re-bind row
                                 // 0's focus requester this frame, so retry a few
@@ -154,7 +174,14 @@ fun RoomListScreen(
                 ComposeButton(
                     onClick = onNewMessage,
                     focusRequester = composeButtonFocus,
-                    onLeft = { runCatching { (entryRowFocus).requestFocus() } },
+                    // Leaving the compose button: back to the list normally, but
+                    // back up to the settings cog when there are no rows.
+                    onLeft = {
+                        runCatching {
+                            if (rooms.isEmpty()) settingsFocus.requestFocus()
+                            else entryRowFocus.requestFocus()
+                        }
+                    },
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
                         .padding(

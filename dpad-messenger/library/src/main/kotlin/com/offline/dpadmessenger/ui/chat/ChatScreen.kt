@@ -74,6 +74,9 @@ fun ChatScreen(
     viewModel: ChatViewModel,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    /** Host-provided re-link (re-pair the phone, keeping history). When set, a
+     *  failed message offers a "Re-link phone" action. */
+    onRelink: (() -> Unit)? = null,
 ) {
     val room by viewModel.room.collectAsState()
     val timeline by viewModel.timeline.collectAsState()
@@ -251,6 +254,7 @@ fun ChatScreen(
             onEdit = { viewModel.startEdit(sel) },
             onDelete = { viewModel.delete(sel.id) },
             onRetry = { viewModel.resend(sel.id) },
+            onRelink = onRelink,
             onDismiss = viewModel::closeMessageSheet,
             senderNameFor = viewModel::senderName,
         )
@@ -377,7 +381,10 @@ private fun Timeline(
             if (loading) {
                 androidx.compose.material3.CircularProgressIndicator()
             } else {
-                Text("No messages yet — say hi.")
+                Text(
+                    "messages will appear as you send/receive them",
+                    modifier = Modifier.padding(horizontal = 32.dp),
+                )
             }
         }
         return
