@@ -18,8 +18,14 @@ android {
     defaultConfig {
         minSdk = 24
         ndk {
-            // libsignal-android ships native code for these ABIs only.
-            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
+            // armeabi-v7a ONLY. The launcher targets a low-end ARM flip phone
+            // (TCL Flip 2), where 32-bit runs fine and native 64-bit speed is
+            // irrelevant. libsignal's v7a native lib is ~5 MB vs ~74 MB for the
+            // (often unstripped) arm64-v8a one, and v7a runs on every ARM device
+            // — so a single v7a lib is both smallest and universally compatible.
+            // (Re-add arm64-v8a only if a 64-bit-only target appears; then make
+            // sure the build env has the NDK so AGP strips the arm64 .so.)
+            abiFilters.add("armeabi-v7a")
         }
     }
     buildFeatures { compose = true }
