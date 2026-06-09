@@ -490,41 +490,60 @@ internal class GoogleMessagesSessionClient(
     private suspend fun longPollLoop() {
         var attempt = 0
         var reauthTried = false
+        var consecutiveFailures = 0
         while (coroutineContext.isActive) {
             attempt++
             runCatching { refreshTokenIfNeeded() }
                 .onFailure { Log.w(TAG, "token refresh failed (continuing)", it) }
-            val fatal = runCatching { openLongPollOnce(attempt) }
+            val code = runCatching { openLongPollOnce(attempt) }
                 .getOrElse { t ->
                     if (!coroutineContext.isActive) return
-                    Log.e(TAG, "long-poll #$attempt threw", t); false
+                    Log.e(TAG, "long-poll #$attempt threw", t); -1
                 }
-            if (fatal) {
-                // A 401/403 may just mean the token lapsed while we were
-                // backgrounded. Try one forced refresh + reconnect before
-                // declaring the link dead, so users stay linked across expiry.
-                if (!reauthTried) {
-                    reauthTried = true
-                    val recovered = runCatching { refreshToken() }.getOrDefault(false)
-                    if (recovered) {
-                        Log.w(TAG, "long-poll 401 — token refreshed, reconnecting")
-                        delay(1000)
-                        continue
+            when {
+                // Clean open/close — token + registration are healthy.
+                code == 0 -> {
+                    reauthTried = false
+                    consecutiveFailures = 0
+                    delay(2000)
+                }
+                // 401/403: the token lapsed. Try one forced refresh + reconnect
+                // before declaring the link dead, so users stay linked across expiry.
+                code == 401 || code == 403 -> {
+                    if (!reauthTried) {
+                        reauthTried = true
+                        if (runCatching { refreshToken() }.getOrDefault(false)) {
+                            Log.w(TAG, "long-poll $code — token refreshed, reconnecting")
+                            delay(1000)
+                            continue
+                        }
                     }
+                    Log.e(TAG, "long-poll fatal — token dead; re-pair needed")
+                    _events.emit(SessionEvent.AuthExpired)
+                    return
                 }
-                Log.e(TAG, "long-poll fatal — token dead; re-pair needed")
-                _events.emit(SessionEvent.AuthExpired)
-                return
+                // Any other error (e.g. 404 = registration not found / stale). Don't
+                // hammer the endpoint every 2s — back off exponentially. If it keeps
+                // failing the session is genuinely dead, so surface a single reconnect
+                // and stop the loop instead of polling forever.
+                else -> {
+                    consecutiveFailures++
+                    if (consecutiveFailures >= MAX_LONGPOLL_FAILURES) {
+                        Log.e(TAG, "long-poll persistently failing (HTTP $code ×$consecutiveFailures) — needs re-link")
+                        _events.emit(SessionEvent.AuthExpired)
+                        return
+                    }
+                    val backoffMs = minOf(2000L shl minOf(consecutiveFailures, 5), 60_000L)
+                    Log.w(TAG, "long-poll HTTP $code — backing off ${backoffMs}ms (failure #$consecutiveFailures)")
+                    delay(backoffMs)
+                }
             }
-            // A clean cycle means the token works — reset so a future lapse
-            // gets its own refresh attempt.
-            reauthTried = false
-            delay(2000)
         }
     }
 
-    /** @return true if fatal (stop polling). */
-    private suspend fun openLongPollOnce(attempt: Int): Boolean {
+    /** @return 0 if the stream opened (and later closed cleanly), else the HTTP
+     *  error status code. */
+    private suspend fun openLongPollOnce(attempt: Int): Int {
         val acct = account
         val body = PbLite.receiveMessagesRequest(
             UUID.randomUUID().toString(), acct.tachyonAuthToken, authNetwork,
@@ -538,9 +557,9 @@ internal class GoogleMessagesSessionClient(
             updateCookiesFromResponse(resp)
             if (!resp.isSuccessful) {
                 Log.e(TAG, "long-poll #$attempt HTTP ${resp.code}")
-                return resp.code == 401 || resp.code == 403
+                return resp.code
             }
-            val source = resp.body?.source() ?: return false
+            val source = resp.body?.source() ?: return 0
             val splitter = PbLite.StreamSplitter()
             val buf = okio.Buffer()
             Log.d(TAG, "session long-poll #$attempt open")
@@ -553,7 +572,7 @@ internal class GoogleMessagesSessionClient(
                         .onFailure { Log.w(TAG, "element handling failed", it) }
                 }
             }
-            return false
+            return 0
         }
     }
 
@@ -861,6 +880,9 @@ internal class GoogleMessagesSessionClient(
 
     companion object {
         private const val TAG = "GMSession"
+        /** Consecutive non-auth long-poll failures (e.g. 404) before we stop the
+         *  loop and surface a reconnect instead of polling forever. */
+        private const val MAX_LONGPOLL_FAILURES = 8
     }
 }
 
