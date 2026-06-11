@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Zeroconf (Spotify Connect handoff) needs mDNS multicast. Android
+         filters multicast packets at the Wi-Fi driver unless the app holds a
+         MulticastLock (acquired in SpotifyManager), which in turn needs these
+         two permissions. Without them the device never shows up in the
+         Spotify app's Devices list. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:name=".SpotifyApp"
+        android:label="Music"
+        android:icon="@android:drawable/ic_media_play"
+        android:theme="@style/Theme.DpadSpotify"
+        android:usesCleartextTraffic="true">
+        <!-- usesCleartextTraffic: librespot's AP socket connections go to
+             ap.spotify.com on plaintext ports (80/4070). -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

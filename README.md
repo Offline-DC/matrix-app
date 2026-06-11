@@ -1,10 +1,12 @@
 # matrix-app
 
-Messenger work for the dumb-down ecosystem. Two Gradle builds:
+Messenger work for the dumb-down ecosystem. Three Gradle builds:
 
 - **dpad-messenger/** — the shared chat UI library (Compose screens, navigation,
   `MessageRepository` interface). Consumed as a composite build by both
   dpad-messenger-backend and dumb-down-launcher.
+- **dpad-spotify/** — standalone prototype: DPAD-first Spotify client on
+  librespot-java (zeroconf login handoff, search, playback). See its README.
 - **dpad-messenger-backend/** — backends: Signal (device-link provisioning,
   chat WebSocket), Matrix, and Google Messages (`:gmessages` — QR pairing
   against the user's primary Android phone via Google's "Messages for web"
