@@ -10,16 +10,15 @@
          Spotify app's Devices list. -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:name=".SpotifyApp"
         android:label="Music"
         android:icon="@android:drawable/ic_media_play"
-        android:theme="@style/Theme.DpadSpotify"
-        android:usesCleartextTraffic="true">
-        <!-- usesCleartextTraffic: librespot's AP socket connections go to
-             ap.spotify.com on plaintext ports (80/4070). -->
+        android:theme="@style/Theme.DpadSpotify">
+        <!-- No usesCleartextTraffic needed: the Rust core's raw sockets are
+             outside Android's network security policy, and the in-app HTTP
+             (Web API search) is all HTTPS. -->
 
         <activity
             android:name=".MainActivity"

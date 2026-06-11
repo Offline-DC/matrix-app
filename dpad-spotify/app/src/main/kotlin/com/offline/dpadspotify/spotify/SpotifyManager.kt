@@ -1,48 +1,46 @@
 package com.offline.dpadspotify.spotify
 
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.net.wifi.WifiManager
 import android.util.Log
-import com.spotify.connectstate.Connect
-import kotlinx.coroutines.CoroutineScope
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import xyz.gianlu.librespot.ZeroconfServer
-import xyz.gianlu.librespot.android.sink.AndroidSinkOutput
-import xyz.gianlu.librespot.audio.MetadataWrapper
-import xyz.gianlu.librespot.audio.decoders.AudioQuality
-import xyz.gianlu.librespot.core.Session
-import xyz.gianlu.librespot.metadata.PlayableId
-import xyz.gianlu.librespot.player.Player
-import xyz.gianlu.librespot.player.PlayerConfiguration
-import java.io.File
+import kotlin.concurrent.thread
 
 /**
- * Application-scoped owner of the librespot [Session] and [Player].
+ * Application-scoped facade over the Rust librespot core ([LibrespotNative]).
  *
  * Login model (Spotify killed username/password auth in 2023, so a password
  * screen is off the table — convenient, because typing a password on a T9
  * keypad is misery):
  *
- *  1. First launch: start a [ZeroconfServer]. The device advertises itself on
- *     the LAN as a Spotify Connect speaker named [DEVICE_NAME]. The user opens
- *     the Spotify app on their REGULAR phone, taps Devices, picks it, and
- *     Spotify hands us an encrypted credential blob — zero typing here.
- *  2. The session created from that blob stores reusable credentials
- *     (credentials.json in app-private storage), so every later launch logs
- *     straight in with [Session.Builder.stored] — no phone needed.
+ *  1. First launch: the native core advertises this device on the LAN as a
+ *     Spotify Connect speaker named [DEVICE_NAME]. The user opens the Spotify
+ *     app on their REGULAR phone, taps Devices, picks it, and Spotify hands
+ *     over an encrypted credential blob — zero typing here.
+ *  2. librespot's cache stores reusable credentials in app-private storage,
+ *     so every later launch logs straight in — no phone needed.
  *
- * Everything librespot does is blocking network I/O, so all calls funnel
- * through [Dispatchers.IO].
+ * This class owns three long-lived workers:
+ *  - event pump thread: drains the native JSON event queue → state flows
+ *  - audio pump thread: drains decoded PCM → AudioTrack
+ *  - the native Tokio runtime itself (inside the .so)
+ *
+ * Next/previous: rust librespot's Player is a single-track engine (queueing
+ * lives in Spotify Connect's spirc, which this prototype doesn't run), so the
+ * play queue is app-side — the search result list the track was picked from.
  */
 class SpotifyManager(private val appContext: Context) {
 
     sealed interface State {
-        /** Working: either restoring stored credentials or booting zeroconf. */
+        /** Working: native core booting / restoring stored credentials. */
         data object Starting : State
 
         /** Advertising on the LAN; waiting for the user to pick us in the Spotify app. */
@@ -65,281 +63,236 @@ class SpotifyManager(private val appContext: Context) {
         val loading: Boolean,
     )
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
     private val _state = MutableStateFlow<State>(State.Starting)
     val state: StateFlow<State> = _state
 
     private val _nowPlaying = MutableStateFlow<NowPlaying?>(null)
     val nowPlaying: StateFlow<NowPlaying?> = _nowPlaying
 
-    @Volatile private var session: Session? = null
-    @Volatile private var player: Player? = null
-    @Volatile private var zeroconf: ZeroconfServer? = null
+    // App-side play queue (see class doc).
+    @Volatile private var queue: List<TrackResult> = emptyList()
+    @Volatile private var queueIndex: Int = -1
+
     private var multicastLock: WifiManager.MulticastLock? = null
+    @Volatile private var started = false
 
-    private val credentialsFile: File
-        get() = File(appContext.filesDir, "credentials.json")
-
-    private fun sessionConfiguration(): Session.Configuration =
-        Session.Configuration.Builder()
-            .setStoreCredentials(true)
-            .setStoredCredentialsFile(credentialsFile)
-            // The audio cache makes track starts much snappier on flash
-            // storage. Lives in cacheDir so the OS may reclaim it.
-            .setCacheEnabled(true)
-            .setCacheDir(File(appContext.cacheDir, "librespot"))
-            .build()
-
-    /** Idempotent. Call once from the Application / first composition. */
+    /** Idempotent. Call once from the Application. */
     fun start() {
-        if (session != null || zeroconf != null) return
-        _state.value = State.Starting
-        scope.launch {
-            if (credentialsFile.exists() && credentialsFile.length() > 0) {
-                _state.value = State.Authenticating
-                try {
-                    onSessionReady(
-                        Session.Builder(sessionConfiguration())
-                            .setDeviceType(Connect.DeviceType.SPEAKER)
-                            .setDeviceName(DEVICE_NAME)
-                            .setDeviceId(null)
-                            .stored(credentialsFile)
-                            .create()
-                    )
-                    return@launch
-                } catch (e: Session.SpotifyAuthenticationException) {
-                    // Actually rejected — revoked/corrupt. Only THIS case may
-                    // delete the file; a plain IOException is just "no Wi-Fi
-                    // yet" and must not force a fresh phone handoff.
-                    Log.w(TAG, "Stored credentials rejected, falling back to zeroconf", e)
-                    credentialsFile.delete()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Stored-credential login failed (transient?)", e)
-                    _state.value = State.Error("Couldn't reach Spotify — check Wi-Fi and reopen the app")
-                    return@launch
-                }
+        if (started) return
+        started = true
+
+        // Acquire BEFORE the native zeroconf can start advertising: Android
+        // filters mDNS multicast in the Wi-Fi driver unless this is held.
+        // Released once logged in (it's only needed while advertising).
+        acquireMulticastLock()
+
+        LibrespotNative.start(
+            appContext.filesDir.absolutePath,
+            appContext.cacheDir.absolutePath,
+            DEVICE_NAME,
+        )
+
+        thread(name = "librespot-events", isDaemon = true) { eventPump() }
+        thread(name = "librespot-audio", isDaemon = true) { audioPump() }
+    }
+
+    // ---- Playback controls (all non-blocking) ----
+
+    /** Play [index] of [tracks], adopting the list as the next/prev queue. */
+    fun play(tracks: List<TrackResult>, index: Int) {
+        queue = tracks
+        playIndex(index)
+    }
+
+    fun playPause() {
+        val np = _nowPlaying.value ?: return
+        if (np.paused) LibrespotNative.play() else LibrespotNative.pause()
+    }
+
+    fun next() {
+        if (queueIndex + 1 < queue.size) playIndex(queueIndex + 1)
+    }
+
+    fun previous() {
+        if (queueIndex > 0) playIndex(queueIndex - 1)
+    }
+
+    /** Current playback position in ms, or null when unknown. */
+    fun positionMs(): Int? = LibrespotNative.positionMs().takeIf { it >= 0 }
+
+    suspend fun search(query: String): List<TrackResult> = withContext(Dispatchers.IO) {
+        val token = LibrespotNative.getToken()
+            ?: throw IllegalStateException("Not logged in")
+        WebApi.searchTracks(token, query)
+    }
+
+    fun logout() {
+        queue = emptyList()
+        queueIndex = -1
+        _nowPlaying.value = null
+        // Re-acquire BEFORE the native side loops back into zeroconf
+        // advertising — otherwise the first mDNS queries from the phone get
+        // filtered while the event pump catches up to AwaitingHandoff.
+        acquireMulticastLock()
+        // State transitions (→ AwaitingHandoff) arrive via the event pump.
+        LibrespotNative.logout()
+    }
+
+    private fun playIndex(index: Int) {
+        val track = queue.getOrNull(index) ?: return
+        queueIndex = index
+        // User picked a different track: cut buffered audio of the old one
+        // immediately (the sink otherwise drains it out — right for pause,
+        // wrong for an explicit switch).
+        LibrespotNative.clearPcm()
+        // Optimistic update from the search result so the UI flips instantly;
+        // the native "track" event refines it (e.g. exact duration).
+        _nowPlaying.value = NowPlaying(
+            title = track.name,
+            artist = track.artist,
+            album = track.album,
+            durationMs = track.durationMs,
+            paused = false,
+            loading = true,
+        )
+        LibrespotNative.playUri(track.uri)
+    }
+
+    // ---- Event pump: native JSON events → state flows ----
+
+    private fun eventPump() {
+        while (true) {
+            val raw = LibrespotNative.pollEvent(1000) ?: continue
+            try {
+                handleEvent(JsonParser.parseString(raw).asJsonObject)
+            } catch (e: Exception) {
+                Log.e(TAG, "Bad native event: $raw", e)
             }
-            startZeroconf()
         }
     }
 
-    private fun startZeroconf() {
-        try {
-            // Android filters mDNS multicast in the Wi-Fi driver unless a
-            // MulticastLock is held; without this the phone's Spotify app
-            // never discovers us. Only held while advertising (battery).
-            releaseMulticastLock()
-            val wifi = appContext.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            multicastLock = wifi.createMulticastLock("dpad-spotify-zeroconf").apply {
-                setReferenceCounted(false)
-                acquire()
+    private fun handleEvent(event: JsonObject) {
+        when (event.get("type")?.asString) {
+            "state" -> when (event.get("value")?.asString) {
+                "starting" -> _state.value = State.Starting
+                "awaitingHandoff" -> {
+                    acquireMulticastLock()
+                    _state.value = State.AwaitingHandoff(DEVICE_NAME)
+                }
+                "authenticating" -> _state.value = State.Authenticating
+                "ready" -> {
+                    releaseMulticastLock()
+                    _state.value = State.Ready(event.get("username")?.asString ?: "")
+                }
+                "error" -> {
+                    releaseMulticastLock()
+                    _state.value = State.Error(event.get("message")?.asString ?: "Unknown error")
+                }
             }
 
-            val server = ZeroconfServer.Builder(sessionConfiguration())
-                .setDeviceType(Connect.DeviceType.SPEAKER)
-                .setDeviceName(DEVICE_NAME)
-                .setDeviceId(null)
-                .setPreferredLocale("en")
-                .setListenAll(true)
-                .create()
-            zeroconf = server
+            "track" -> _nowPlaying.value = NowPlaying(
+                title = event.get("title")?.asString ?: "Unknown",
+                artist = event.get("artist")?.asString ?: "",
+                album = event.get("album")?.asString ?: "",
+                durationMs = event.get("durationMs")?.asInt ?: 0,
+                paused = _nowPlaying.value?.paused ?: false,
+                loading = false,
+            )
 
-            server.addSessionListener(object : ZeroconfServer.SessionListener {
-                override fun sessionClosing(session: Session) {
-                    // The zeroconf server is about to close the old session
-                    // (user re-handed-off as a different account). Drop our
-                    // player first so it doesn't write to a dead session.
-                    teardownPlayer()
-                }
+            "playing" -> _nowPlaying.value =
+                _nowPlaying.value?.copy(paused = false, loading = false)
 
-                override fun sessionChanged(session: Session) {
-                    _state.value = State.Authenticating
-                    scope.launch {
-                        try {
-                            onSessionReady(session)
-                        } catch (e: Exception) {
-                            // Without this, an exception here unwinds to the
-                            // default handler and kills the process.
-                            Log.e(TAG, "Player bring-up after handoff failed", e)
-                            _state.value = State.Error("Login failed: ${e.message}")
-                        }
-                    }
-                }
-            })
+            "paused" -> _nowPlaying.value = _nowPlaying.value?.copy(paused = true)
 
-            _state.value = State.AwaitingHandoff(DEVICE_NAME)
-            Log.i(TAG, "Zeroconf advertising as '$DEVICE_NAME'")
-        } catch (e: Exception) {
-            Log.e(TAG, "Zeroconf failed to start", e)
-            _state.value = State.Error("Couldn't start network discovery: ${e.message}")
+            "loading" -> _nowPlaying.value = _nowPlaying.value?.copy(loading = true)
+
+            "endOfTrack" -> {
+                // Auto-advance through the app-side queue, like any sane
+                // music player. Stop at the end of the results list.
+                if (queueIndex + 1 < queue.size) playIndex(queueIndex + 1)
+                else _nowPlaying.value = _nowPlaying.value?.copy(paused = true)
+            }
+
+            "stopped" -> _nowPlaying.value =
+                _nowPlaying.value?.copy(paused = true, loading = false)
+
+            "unavailable" -> {
+                Log.w(TAG, "Track unavailable, skipping")
+                if (queueIndex + 1 < queue.size) playIndex(queueIndex + 1)
+                else _nowPlaying.value = null
+            }
         }
     }
 
+    // ---- Audio pump: native PCM → AudioTrack ----
+
+    private fun audioPump() = try {
+        audioPumpLoop()
+    } catch (e: Exception) {
+        // An uncaught exception on this thread would kill the whole app.
+        Log.e(TAG, "Audio pump died — no audio until restart", e)
+    }
+
+    private fun audioPumpLoop() {
+        // librespot's output is fixed: 44.1kHz stereo s16.
+        val minBuffer = AudioTrack.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_OUT_STEREO,
+            AudioFormat.ENCODING_PCM_16BIT,
+        )
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SAMPLE_RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                    .build()
+            )
+            .setBufferSizeInBytes(maxOf(minBuffer, 32 * 1024))
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+        track.play()
+
+        val buffer = ByteArray(8192)
+        while (true) {
+            val n = LibrespotNative.readPcm(buffer, 500)
+            if (n > 0) {
+                val written = track.write(buffer, 0, n, AudioTrack.WRITE_BLOCKING)
+                if (written < 0) {
+                    Log.e(TAG, "AudioTrack.write error $written — recreating is left to a restart")
+                }
+            }
+        }
+    }
+
+    // ---- Multicast lock (needed only while zeroconf advertises) ----
+
+    @Synchronized
+    private fun acquireMulticastLock() {
+        if (multicastLock?.isHeld == true) return
+        val wifi = appContext.applicationContext
+            .getSystemService(Context.WIFI_SERVICE) as WifiManager
+        multicastLock = wifi.createMulticastLock("dpad-spotify-zeroconf").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    @Synchronized
     private fun releaseMulticastLock() {
         multicastLock?.let { runCatching { if (it.isHeld) it.release() } }
         multicastLock = null
     }
 
-    private fun onSessionReady(s: Session) {
-        session = s
-
-        val conf = PlayerConfiguration.Builder()
-            .setOutput(PlayerConfiguration.AudioOutput.CUSTOM)
-            .setOutputClass(AndroidSinkOutput::class.java.name)
-            // NORMAL (96kbps Vorbis) — kind to the flip phone's storage,
-            // radio, and speaker. Bump to HIGH if it sounds rough.
-            .setPreferredQuality(AudioQuality.NORMAL)
-            .setAutoplayEnabled(false)
-            .build()
-
-        val p = Player(conf, s)
-        p.addEventsListener(playerListener)
-        player = p
-
-        p.waitReady()
-        // Advertising did its job; the Connect device registration now lives
-        // on the session's dealer connection, not mDNS.
-        releaseMulticastLock()
-        _state.value = State.Ready(s.username())
-        Log.i(TAG, "Session + player ready as ${s.username()}")
-    }
-
-    // ---- Playback controls (all safe to call from the UI thread) ----
-
-    fun playUri(uri: String) {
-        val p = player ?: return
-        // Optimistic "loading" so the UI reacts instantly to the keypress.
-        _nowPlaying.value = (_nowPlaying.value ?: NowPlaying("", "", "", 0, paused = false, loading = true))
-            .copy(loading = true, paused = false)
-        scope.launch {
-            try {
-                p.load(uri, true, false)
-            } catch (e: Exception) {
-                Log.e(TAG, "load($uri) failed", e)
-                // Drop the optimistic placeholder so the UI doesn't show a
-                // phantom "now playing" entry.
-                _nowPlaying.value = null
-            }
-        }
-    }
-
-    fun playPause() = scope.launch { runCatching { player?.playPause() } }
-    fun next() = scope.launch { runCatching { player?.next() } }
-    fun previous() = scope.launch { runCatching { player?.previous() } }
-
-    /** Current playback position in ms, or null when unknown. */
-    fun positionMs(): Int? = try {
-        player?.time()?.takeIf { it >= 0 }
-    } catch (e: Exception) {
-        null
-    }
-
-    suspend fun search(query: String): List<TrackResult> = withContext(Dispatchers.IO) {
-        val s = session ?: throw IllegalStateException("Not logged in")
-        // Dev-branch librespot mints access tokens via Login5; they're valid
-        // bearer tokens for the public Web API.
-        WebApi.searchTracks(s.tokens().get(), query)
-    }
-
-    fun logout() {
-        scope.launch {
-            credentialsFile.delete()
-            teardownPlayer()
-            runCatching { session?.close() }
-            session = null
-            runCatching { zeroconf?.close() }
-            zeroconf = null
-            _nowPlaying.value = null
-            startZeroconf()
-        }
-    }
-
-    private fun teardownPlayer() {
-        player?.let { p ->
-            p.removeEventsListener(playerListener)
-            runCatching { p.close() }
-        }
-        player = null
-    }
-
-    fun shutdown() {
-        scope.launch {
-            teardownPlayer()
-            runCatching { session?.close() }
-            runCatching { zeroconf?.close() }
-            releaseMulticastLock()
-        }
-    }
-
-    // ---- Player events → NowPlaying flow ----
-
-    private fun publishMetadata(metadata: MetadataWrapper?, paused: Boolean, loading: Boolean) {
-        if (metadata == null) {
-            _nowPlaying.value = _nowPlaying.value?.copy(paused = paused, loading = loading)
-            return
-        }
-        _nowPlaying.value = NowPlaying(
-            title = metadata.name ?: "Unknown",
-            artist = metadata.artist ?: "",
-            album = metadata.albumName ?: "",
-            durationMs = metadata.duration(),
-            paused = paused,
-            loading = loading,
-        )
-    }
-
-    private val playerListener = object : Player.EventsListener {
-        override fun onContextChanged(player: Player, newUri: String) {}
-
-        override fun onTrackChanged(player: Player, id: PlayableId, metadata: MetadataWrapper?, userInitiated: Boolean) {
-            publishMetadata(metadata, paused = false, loading = metadata == null)
-        }
-
-        override fun onPlaybackEnded(player: Player) {
-            _nowPlaying.value = _nowPlaying.value?.copy(paused = true)
-        }
-
-        override fun onPlaybackPaused(player: Player, trackTime: Long) {
-            _nowPlaying.value = _nowPlaying.value?.copy(paused = true)
-        }
-
-        override fun onPlaybackResumed(player: Player, trackTime: Long) {
-            _nowPlaying.value = _nowPlaying.value?.copy(paused = false)
-        }
-
-        override fun onPlaybackFailed(player: Player, e: Exception) {
-            Log.e(TAG, "Playback failed", e)
-            _nowPlaying.value = _nowPlaying.value?.copy(paused = true, loading = false)
-        }
-
-        override fun onTrackSeeked(player: Player, trackTime: Long) {}
-
-        override fun onMetadataAvailable(player: Player, metadata: MetadataWrapper) {
-            publishMetadata(metadata, paused = _nowPlaying.value?.paused ?: false, loading = false)
-        }
-
-        override fun onPlaybackHaltStateChanged(player: Player, halted: Boolean, trackTime: Long) {}
-
-        override fun onInactiveSession(player: Player, timeout: Boolean) {}
-
-        override fun onVolumeChanged(player: Player, volume: Float) {}
-
-        override fun onPanicState(player: Player) {
-            _state.value = State.Error("Player entered panic state — restart the app")
-        }
-
-        override fun onStartedLoading(player: Player) {
-            _nowPlaying.value = _nowPlaying.value?.copy(loading = true)
-        }
-
-        override fun onFinishedLoading(player: Player) {
-            _nowPlaying.value = _nowPlaying.value?.copy(loading = false)
-        }
-    }
-
     companion object {
         private const val TAG = "SpotifyManager"
+        private const val SAMPLE_RATE = 44_100
 
         /** Name shown in the Spotify app's Devices list. */
         const val DEVICE_NAME = "Offline Dpad"

@@ -1,23 +1,23 @@
 # dpad-spotify
 
 Prototype DPAD-first Spotify client for the dumb-down ecosystem (TCL Flip 2
-class devices), built on [librespot-java](https://github.com/librespot-org/librespot-java).
-Proves out: login without typing, search, and real playback. UI conventions
-(focus halo, one-action-per-press gate, snap navigation) are lifted from
-`../dpad-messenger`.
+class devices), built on **rust [librespot](https://github.com/librespot-org/librespot) v0.8**
+(the maintained client — this replaced an earlier librespot-java spike, see
+git history). Proves out: login without typing, search, and real playback.
+UI conventions (focus halo, one-action-per-press gate, snap navigation) are
+lifted from `../dpad-messenger`.
 
 ## How login works
 
 Spotify killed username/password auth in 2023, so there is no password screen.
-Instead the app runs librespot's **zeroconf / Spotify Connect handoff**:
+Instead the native core runs librespot's **zeroconf / Spotify Connect handoff**:
 
 1. App advertises itself on the LAN as a Spotify Connect device ("Offline
    Dpad").
 2. User opens Spotify on their regular phone (same Wi-Fi), plays anything,
    taps the devices icon, picks "Offline Dpad".
 3. Spotify transfers an encrypted credential blob; librespot logs in with it
-   and writes reusable credentials to app-private storage
-   (`files/credentials.json`).
+   and caches reusable credentials in app-private storage.
 4. Every subsequent launch logs in directly from stored credentials — the
    other phone is only needed once.
 
@@ -27,69 +27,74 @@ accounts can't stream this way).
 ## Architecture
 
 ```
+rust/                  cdylib crate → libdpadspotify.so
+  src/lib.rs           librespot session/discovery/player + JNI surface.
+                       Pull model: Rust never calls into the JVM. Kotlin pulls
+                       JSON events (pollEvent) and PCM (readPcm); commands are
+                       fire-and-forget onto a Tokio runtime.
 app/src/main/kotlin/com/offline/dpadspotify/
-  SpotifyApp.kt        Application: registers MediaCodec decoders, owns manager
+  SpotifyApp.kt        Application: owns the manager
   MainActivity.kt      AppCompatActivity + Compose host
   spotify/
-    SpotifyManager.kt  Session/Player lifecycle, zeroconf login, state flows
-    WebApi.kt          /v1/search via the session's Login5 bearer token
+    LibrespotNative.kt JNI bindings (names = part of the contract with lib.rs)
+    SpotifyManager.kt  state flows, event pump thread, AudioTrack pump thread,
+                       app-side next/prev queue
+    WebApi.kt          /v1/search via a session-minted bearer token
   focus/               DpadFocusModifiers — copied from dpad-messenger
   ui/                  Login (handoff instructions) → Search → Now Playing
-app/src/main/java/xyz/gianlu/librespot/
-  android/sink/AndroidSinkOutput.java        AudioTrack sink (vendored, see below)
-  player/decoders/AndroidNativeDecoder.java  MediaCodec Vorbis/MP3 decoder (vendored)
 ```
 
-The two Java files are vendored from
-[devgianlu/librespot-android](https://github.com/devgianlu/librespot-android)
-(Apache-2.0). `AndroidSinkOutput` is loaded **reflectively** by librespot —
-if minification is ever enabled, it must be kept (along with `com.spotify.**`
-and `xyz.gianlu.librespot.audio.decoders.**`).
+Audio path: librespot decodes (symphonia, in Rust) → custom `Sink` pushes
+44.1kHz stereo s16le into a ring buffer → Kotlin audio thread pulls it into
+an `AudioTrack`. TLS is rustls with bundled webpki roots — no OpenSSL to
+cross-compile, no reliance on the device's (old) system cert store.
 
-## Why librespot is a JitPack commit hash, not 1.6.5
-
-librespot-java's last Maven Central release (1.6.5, Dec 2024) broke in Aug
-2025 when Spotify sunset part of the apresolve spclient pool — every spclient
-request 500s ([#1098](https://github.com/librespot-org/librespot-java/issues/1098)).
-The fix ([PR #1097](https://github.com/librespot-org/librespot-java/pull/1097))
-only exists on the `dev` branch, so `app/build.gradle.kts` pins a JitPack
-build of the dev tip (`52a8c24`, Nov 2025). That branch also moved token
-minting from the dying Mercury keymaster to Login5 (`session.tokens().get()`,
-no scopes) — which is what `WebApi.kt` assumes.
-
-Note librespot-java is **officially deprecated** (development moved to
-go-librespot). It still works as of this commit, but it's living on borrowed
-time; if this prototype graduates, plan for either go-librespot (gomobile
-binding) or rust librespot (NDK) as the long-term core.
+Playback queue: rust librespot's `Player` is deliberately a single-track
+engine (queueing lives in Spotify Connect's spirc state machine, which this
+prototype doesn't run). Next/prev/auto-advance walk the search-result list
+app-side instead.
 
 ## Build & run
 
+One-time setup:
+
+```
+rustup target add aarch64-linux-android armv7-linux-androideabi
+cargo install cargo-ndk
+# plus an NDK: Android Studio → SDK Manager → NDK (side by side)
+```
+
+Then:
+
 ```
 cd dpad-spotify
+./gradlew :app:cargoNdk          # rust → app/src/main/jniLibs/*/libdpadspotify.so
 ./gradlew :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Same toolchain as dpad-messenger: AGP 8.13.2 / Kotlin 2.1.10 / Gradle 8.13
+`cargoNdk` is not wired into `preBuild` on purpose — a stale .so is fine for
+UI iteration, and gradle shouldn't depend on cargo being on PATH. Same JVM
+toolchain as dpad-messenger: AGP 8.13.2 / Kotlin 2.1.10 / Gradle 8.13
 wrapper, compileSdk 36, minSdk 24.
 
 ## Known risks / open questions
 
-- **Zeroconf discovery on Android is the flakiest link.** We hold a
-  `MulticastLock` (required — Android filters mDNS without it), but
-  librespot-android's tracker has reports of "Connecting to device…" stalls
-  ([#23](https://github.com/devgianlu/librespot-android/issues/23)). If the
-  device won't appear in the Spotify app: confirm both devices are on the
-  same subnet, AP isolation is off, and 2.4/5 GHz bands aren't split. The
-  fallback path would be an OAuth-PKCE login (librespot dev supports
-  `AUTHENTICATION_SPOTIFY_TOKEN` credentials) with the code entered on
-  another device.
-- **Web API search with a Login5 token** works today but is not a contract;
-  if Spotify starts requiring client tokens on `/v1/search`, switch to
-  librespot's native `session.search()` (Mercury — also deteriorating) or an
-  spclient search call.
-- No background playback service yet — audio stops if Android kills the
-  process. A `MediaSessionService` + media notification is the obvious next
-  step if this graduates.
-- No volume-key integration, queueing, or album art (the metadata wrapper
-  exposes cover image IDs; trivial to add via `https://i.scdn.co/image/<id>`).
+- **Zeroconf discovery on Android is the flakiest link.** The app holds a
+  `MulticastLock` while advertising (required — Android filters mDNS without
+  it), and librespot's libmdns responder is pure Rust so it should run fine,
+  but this is the first thing to verify on real hardware. If the device won't
+  appear in the Spotify app: same subnet, AP isolation off, 2.4/5 GHz bands
+  not split.
+- **No spirc (full Spotify Connect device) yet.** After the handoff the
+  phone's Spotify app may show a brief "couldn't connect" — expected: we take
+  the credentials but don't register as a controllable device. Wiring up
+  `librespot-connect`'s `Spirc` would make the device genuinely controllable
+  from the phone (and give us Spotify-side queueing) — the natural next step.
+- **Web API search with a session token** works today but is not a contract;
+  if Spotify tightens it, search can move to spclient through the session.
+- No background playback service — audio stops if Android kills the process.
+  A `MediaSessionService` + media notification is the obvious next step if
+  this graduates.
+- No volume-key integration (AudioTrack follows STREAM_MUSIC, so hardware
+  volume keys work while the app is foreground), no album art yet.

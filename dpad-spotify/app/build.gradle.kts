@@ -14,6 +14,11 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+
+        ndk {
+            // What cargoNdk below builds. Add x86_64 if you want emulator runs.
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     buildFeatures {
@@ -23,9 +28,6 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-        // librespot-java's dev branch (Login5 auth path) touches java.time;
-        // desugar so the prototype isn't silently API-26+ only.
-        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
@@ -37,56 +39,49 @@ android {
         )
     }
 
-    packaging {
-        resources {
-            // librespot ships a log4j2.xml (log4j is excluded below — the
-            // config file alone breaks packaging) and Apache-style META-INF
-            // files that collide across its transitive deps.
-            excludes += listOf(
-                "log4j2.xml",
-                "META-INF/DEPENDENCIES",
-                "META-INF/{AL2.0,LGPL2.1}",
-                "META-INF/INDEX.LIST",
-                "META-INF/io.netty.versions.properties",
-            )
-        }
-    }
-
     buildTypes {
         release {
-            // No minification for the prototype. If this ever gets minified,
-            // AndroidSinkOutput is loaded reflectively (PlayerConfiguration
-            // outputClass) and MUST be kept, along with com.spotify.** protos
-            // and xyz.gianlu.librespot.audio.decoders.**.
             isMinifyEnabled = false
         }
     }
 }
 
-dependencies {
-    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+// ---------------------------------------------------------------------------
+// Rust core (../rust → src/main/jniLibs/<abi>/libdpadspotify.so)
+//
+// Build it with:   ./gradlew :app:cargoNdk
+// Prereqs:         rustup target add aarch64-linux-android armv7-linux-androideabi
+//                  cargo install cargo-ndk      (and an NDK via Android Studio)
+//
+// Not wired into preBuild on purpose — cargo isn't on everyone's PATH and a
+// stale .so is fine for UI iteration. preBuild just warns when it's missing.
+// ---------------------------------------------------------------------------
+tasks.register<Exec>("cargoNdk") {
+    workingDir = rootProject.file("rust")
+    commandLine(
+        "cargo", "ndk",
+        "-t", "arm64-v8a",
+        "-t", "armeabi-v7a",
+        "-o", project.file("src/main/jniLibs").absolutePath,
+        "build", "--release",
+    )
+}
 
-    // ---- librespot ----
-    // Dev-branch tip (52a8c24, Nov 2025) via JitPack instead of the 1.6.5
-    // Central release; see settings.gradle.kts for why. JitPack rewrites the
-    // inter-module groupIds from xyz.gianlu.librespot to the JitPack group,
-    // so excludes are declared under both spellings.
-    implementation("com.github.librespot-org.librespot-java:librespot-player:52a8c24215") {
-        // Desktop javax.sound sink — useless on Android, we vendor an
-        // AudioTrack sink instead (AndroidSinkOutput).
-        exclude(group = "com.github.librespot-org.librespot-java", module = "librespot-sink")
-        exclude(group = "xyz.gianlu.librespot", module = "librespot-sink")
-        // log4j doesn't run on Android; we route slf4j to logcat instead.
-        exclude(group = "org.apache.logging.log4j")
-        exclude(group = "com.lmax", module = "disruptor")
+tasks.named("preBuild") {
+    doFirst {
+        if (!project.file("src/main/jniLibs").exists()) {
+            logger.warn(
+                "WARNING: app/src/main/jniLibs is missing — the app will crash at " +
+                    "startup without libdpadspotify.so. Run ./gradlew :app:cargoNdk first."
+            )
+        }
     }
-    // slf4j 2.x (librespot dev uses slf4j-api 2.0.16) → logcat provider.
-    implementation("uk.uuid.slf4j:slf4j-android:2.0.7-0")
-    // Used directly by WebApi.kt (also a librespot transitive).
+}
+
+dependencies {
+    // Web API search + native event JSON parsing.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.code.gson:gson:2.11.0")
-    // The vendored Java sink/decoder sources use @NotNull annotations.
-    compileOnly("org.jetbrains:annotations:24.1.0")
 
     // ---- UI (mirrors dpad-messenger/library) ----
     val composeBom = platform("androidx.compose:compose-bom:2026.01.01")

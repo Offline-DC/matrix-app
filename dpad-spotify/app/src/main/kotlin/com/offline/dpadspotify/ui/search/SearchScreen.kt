@@ -11,7 +11,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -142,11 +142,15 @@ fun SearchScreen(
             )
 
             else -> LazyColumn(modifier = Modifier.fillMaxSize()) {
-                items(results, key = { it.uri }) { track ->
+                // Key includes the index: Spotify search can return the same
+                // URI twice (e.g. a track and its single), and duplicate
+                // LazyColumn keys throw.
+                itemsIndexed(results, key = { i, t -> "$i:${t.uri}" }) { index, track ->
                     TrackRow(
                         track = track,
                         onClick = {
-                            spotify.playUri(track.uri)
+                            // The whole result list becomes the next/prev queue.
+                            spotify.play(results, index)
                             onOpenNowPlaying()
                         },
                     )
