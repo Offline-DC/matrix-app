@@ -21,6 +21,15 @@ import javax.crypto.KeyAgreement
  * CLIENT_FINISH, [processServerInit] consumes SERVER_INIT and returns the emoji,
  * [deriveSessionKeys] produces the AES/HMAC session keys after confirmation.
  */
+/**
+ * Thrown when SERVER_INIT asks for a verification-emoji list version this build
+ * doesn't ship (i.e. Google advanced the emoji set past what we ported from
+ * mautrix-gmessages). Carries the [version] so the caller can tell the user to
+ * update rather than display a wrong emoji.
+ */
+class UnsupportedPairingEmojiVersionException(val version: Int) :
+    RuntimeException("unsupported pairing emoji version $version (app emoji list is out of date)")
+
 class UKey2Session {
 
     private val keyPair: KeyPair = KeyPairGenerator.getInstance("EC").run {
@@ -103,7 +112,16 @@ class UKey2Session {
             ((ukeyV1Auth[1].toLong() and 0xFF) shl 16) or
             ((ukeyV1Auth[2].toLong() and 0xFF) shl 8) or
             (ukeyV1Auth[3].toLong() and 0xFF)
-        val list = if (verificationCodeVersion == 1) pairingEmojisV1 else pairingEmojisV0
+        // Pick the emoji list Google expects. We must NOT silently fall back to
+        // an older list for an unknown version: the phone would compute the
+        // emoji from the newer list, ours would differ, and the user would hunt
+        // for a match that isn't there ("the QR/pairing won't register"). Fail
+        // loudly so the caller can tell the user to update instead.
+        val list = when (verificationCodeVersion) {
+            0 -> pairingEmojisV0
+            1 -> pairingEmojisV1
+            else -> throw UnsupportedPairingEmojiVersionException(verificationCodeVersion)
+        }
         return list[(authNumber % list.size).toInt()]
     }
 

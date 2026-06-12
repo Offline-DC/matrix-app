@@ -122,7 +122,17 @@ class GMGaiaPairing(
                 return false
             }
 
-            val emoji = session.processServerInit(sresp.data, sresp.confirmedVerCodeVer)
+            val emoji = try {
+                session.processServerInit(sresp.data, sresp.confirmedVerCodeVer)
+            } catch (e: UnsupportedPairingEmojiVersionException) {
+                // Google advanced the verification-emoji set past what this build
+                // ships. Don't show a wrong emoji the user will hunt for in vain —
+                // tell them to update.
+                Log.e(TAG, "emoji list out of date: server asked for version ${e.version}", e)
+                lastError = "This launcher is out of date and can't show the right " +
+                    "pairing emoji. Please update the Dumb Down launcher, then try again."
+                return false
+            }
             Log.i(TAG, "================ PAIRING EMOJI: $emoji ================")
             onEmoji(emoji)
 
