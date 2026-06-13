@@ -77,15 +77,33 @@ class GoogleMessagesAccountStore(context: Context) {
     // (cookie names/values never contain tab or newline).
 
     fun saveCookies(cookies: Map<String, String>) {
-        val encoded = cookies.entries.joinToString("\n") { "${it.key}\t${it.value}" }
+        // EXPERIMENT (Alex's ~2h SESSION_COOKIE_INVALID kick). Field logs show a
+        // consumer-account pairing dies at ~2h on RegisterRefresh with
+        // SESSION_COOKIE_INVALID while the tachyon token is still healthy — i.e.
+        // it's the rotating session cookie, not the token. The Workspace test
+        // device, whose harvest carries NO __Secure-1PSIDTS, rides the long-lived
+        // __Secure-1PSID and stays linked for days. Hypothesis: a present-but-STALE
+        // __Secure-1PSIDTS (short TTL, never refreshed because the relay never
+        // re-issues it and on-device rotation can't reach the page) is what gets
+        // rejected — whereas its ABSENCE falls back to 1PSID and survives.
+        //
+        // So strip the rotating *PSIDTS cookies before persisting. We log the
+        // INCOMING set first (names only, no values) so the next test still proves
+        // whether the harvest actually carried a 1PSIDTS — the strip is applied
+        // either way.
+        val STRIP = setOf("__Secure-1PSIDTS", "__Secure-3PSIDTS")
+        val hadPsidts = cookies.containsKey("__Secure-1PSIDTS")
+        val stripped = cookies.keys.filter { it in STRIP }
+        val kept = cookies.filterKeys { it !in STRIP }
+
+        val encoded = kept.entries.joinToString("\n") { "${it.key}\t${it.value}" }
         prefs.edit().putString(KEY_COOKIES, encoded).apply()
-        // Diagnostic (names only — no values): confirms which cookies actually land
-        // on the phone, in particular whether the rotating session cookie
-        // __Secure-1PSIDTS made it across at pairing. Its absence is what lets the
-        // link die after ~1–2h. Fires on every save (pairing, Set-Cookie absorption,
-        // on-device rotation), so you can also watch 1PSIDTS appear after a rotate.
-        android.util.Log.i("GMCookies", "saved ${cookies.size} cookies: ${cookies.keys.sorted()} " +
-            "(has __Secure-1PSIDTS=${cookies.containsKey("__Secure-1PSIDTS")})")
+
+        android.util.Log.i(
+            "GMCookies",
+            "received ${cookies.size} cookies: ${cookies.keys.sorted()} " +
+                "(has __Secure-1PSIDTS=$hadPsidts); stripped $stripped → persisted ${kept.size}",
+        )
     }
 
     fun loadCookies(): Map<String, String> {
