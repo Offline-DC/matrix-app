@@ -23,21 +23,40 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.offline.dpadmessenger.backend.gmessages.AuthFailureReason
 import com.offline.dpadmessenger.focus.dpadFocusHighlight
 import com.offline.dpadmessenger.focus.onDpadAction
 
 /**
- * Shown in place of the chat when the phone link has expired (the relay
- * rejected our session token and a refresh couldn't recover it). Gives the
- * user a single DPAD-focusable action to re-link by scanning the QR again.
+ * Shown in place of the chat when the phone link has expired. The copy adapts to
+ * [reason] so the user understands *why* it happened — especially the common
+ * cookie case, where another browser signed into the same Google account rotated
+ * the login out from under the phone. Gives a single DPAD-focusable action to
+ * re-link (which first tries a silent token refresh, then falls back to a QR
+ * re-pair if the cookies are truly dead).
  */
 @Composable
 fun GoogleMessagesReconnectScreen(
     onRelink: () -> Unit,
     modifier: Modifier = Modifier,
+    reason: AuthFailureReason? = null,
 ) {
     val relinkFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) { runCatching { relinkFocus.requestFocus() } }
+
+    val (title, body) = when (reason) {
+        AuthFailureReason.COOKIE_INVALID -> Pair(
+            "Signed out of Google",
+            "Another browser signed into this Google account took over the " +
+                "session. Re-link to keep texting — then, on your computer, sign " +
+                "in using a private/incognito window and close it right after, so " +
+                "your phone stays the only one holding the login.",
+        )
+        else -> Pair(
+            "Disconnected from your phone",
+            "The link to your phone expired. Re-link to keep texting.",
+        )
+    }
 
     Box(
         modifier = modifier
@@ -54,14 +73,14 @@ fun GoogleMessagesReconnectScreen(
                 modifier = Modifier.size(48.dp),
             )
             Text(
-                text = "Disconnected from your phone",
+                text = title,
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurface,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.padding(top = 16.dp),
             )
             Text(
-                text = "The link to your phone expired. Re-link to keep texting.",
+                text = body,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,

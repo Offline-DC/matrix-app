@@ -79,6 +79,13 @@ class GoogleMessagesAccountStore(context: Context) {
     fun saveCookies(cookies: Map<String, String>) {
         val encoded = cookies.entries.joinToString("\n") { "${it.key}\t${it.value}" }
         prefs.edit().putString(KEY_COOKIES, encoded).apply()
+        // Diagnostic (names only — no values): confirms which cookies actually land
+        // on the phone, in particular whether the rotating session cookie
+        // __Secure-1PSIDTS made it across at pairing. Its absence is what lets the
+        // link die after ~1–2h. Fires on every save (pairing, Set-Cookie absorption,
+        // on-device rotation), so you can also watch 1PSIDTS appear after a rotate.
+        android.util.Log.i("GMCookies", "saved ${cookies.size} cookies: ${cookies.keys.sorted()} " +
+            "(has __Secure-1PSIDTS=${cookies.containsKey("__Secure-1PSIDTS")})")
     }
 
     fun loadCookies(): Map<String, String> {
