@@ -16,6 +16,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.offline.dpadmessenger.ui.DpadMessengerApp
 import com.offline.dpadmessenger.ui.util.TimeFormatPreference
+import com.offline.dpadmessenger.backend.gmessages.AuthFailureReason
 import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesAccountStore
 import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesRepository
 
@@ -82,6 +83,11 @@ fun GoogleMessagesApp(
                 ?: kotlinx.coroutines.flow.MutableStateFlow(false)
         }
         val authExpired by authExpiredFlow.collectAsState()
+        val authExpiredReasonFlow = remember {
+            GoogleMessagesRepository.authExpiredReasonFlow()
+                ?: kotlinx.coroutines.flow.MutableStateFlow<AuthFailureReason?>(null)
+        }
+        val authExpiredReason by authExpiredReasonFlow.collectAsState()
         // Re-link the phone WITHOUT logging out. First try to reauth from the
         // STORED cookies — this restores the link using the SAME pairing (no QR
         // re-scan, no UKey2 emoji) and keeps messages. Only if the cookies are
@@ -101,6 +107,7 @@ fun GoogleMessagesApp(
         if (authExpired) {
             GoogleMessagesReconnectScreen(
                 onRelink = relink,
+                reason = authExpiredReason,
                 modifier = modifier,
             )
             return

@@ -145,6 +145,11 @@ internal class GoogleMessagesMessageRepository(
     private val _authExpired = MutableStateFlow(false)
     val authExpired: StateFlow<Boolean> = _authExpired.asStateFlow()
 
+    /** Why the link expired (cookie invalid vs. token dead), so the reconnect
+     *  screen can explain the actual cause + fix. Null until auth expires. */
+    private val _authExpiredReason = MutableStateFlow<AuthFailureReason?>(null)
+    val authExpiredReason: StateFlow<AuthFailureReason?> = _authExpiredReason.asStateFlow()
+
     /** Message ids we've already logged an unparsed-media dump for (once each). */
     private val loggedMediaParseFailures =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
@@ -162,8 +167,9 @@ internal class GoogleMessagesMessageRepository(
                         _initialSyncComplete.value = true
                     }
                     is SessionEvent.MessagesUpdated -> onMessages(evt.messages)
-                    SessionEvent.AuthExpired -> {
-                        Log.w(TAG, "auth expired — re-pair needed")
+                    is SessionEvent.AuthExpired -> {
+                        Log.w(TAG, "auth expired — re-pair needed (reason=${evt.reason})")
+                        _authExpiredReason.value = evt.reason
                         _authExpired.value = true
                     }
                 }
@@ -201,7 +207,7 @@ internal class GoogleMessagesMessageRepository(
      */
     suspend fun reauth(): Boolean {
         val ok = session.reauth()
-        if (ok) _authExpired.value = false
+        if (ok) { _authExpired.value = false; _authExpiredReason.value = null }
         return ok
     }
 

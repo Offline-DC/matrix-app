@@ -63,6 +63,11 @@ internal class GoogleMessagesSessionClient(
         .readTimeout(0, TimeUnit.SECONDS) // long-poll: no read timeout
         .build()
 
+    /** Refreshes the rotating __Secure-*PSIDTS session cookies on-device so the
+     *  link stays alive without depending on the phone being the only holder of
+     *  the login. See [GMCookieRotator]. */
+    private val rotator = GMCookieRotator(http)
+
     // Google-account (GAIA / cookie) mode: messaging runs on the clients6 host
     // with network "GDitto", destRegistrationIDs=[primary phone], and cookies +
     // SAPISIDHASH on every request. (QR mode leaves all of these null/default.)
@@ -98,11 +103,13 @@ internal class GoogleMessagesSessionClient(
 
     private var longPollJob: Job? = null
     private var ackJob: Job? = null
+    private var rotateJob: Job? = null
 
     fun connect() {
         if (longPollJob != null) return
         longPollJob = scope.launch { longPollLoop() }
         ackJob = scope.launch { ackLoop() }
+        if (gaia) rotateJob = scope.launch { rotateLoop() }
         scope.launch {
             // Let the stream open, then ask the phone for current state.
             delay(1500)
@@ -116,6 +123,7 @@ internal class GoogleMessagesSessionClient(
     fun disconnect() {
         longPollJob?.cancel(); longPollJob = null
         ackJob?.cancel(); ackJob = null
+        rotateJob?.cancel(); rotateJob = null
     }
 
     /** Permanently tear down the session (logout) — cancels the whole scope. */
@@ -132,9 +140,14 @@ internal class GoogleMessagesSessionClient(
      * still-alive scope. @return true if the token refreshed and we resumed.
      */
     suspend fun reauth(): Boolean {
+        // Best-effort cookie rotation first — if the link died because the saved
+        // __Secure-*PSIDTS went stale, reminting it is what actually lets the
+        // token refresh succeed (vs. another doomed RegisterRefresh on dead cookies).
+        if (gaia) runCatching { rotateCookies() }
         if (!runCatching { refreshToken() }.getOrDefault(false)) return false
         longPollJob?.cancel(); longPollJob = scope.launch { longPollLoop() }
         ackJob?.cancel(); ackJob = scope.launch { ackLoop() }
+        if (gaia) { rotateJob?.cancel(); rotateJob = scope.launch { rotateLoop() } }
         scope.launch {
             delay(1500)
             runCatching { setActiveSession() }
@@ -518,8 +531,8 @@ internal class GoogleMessagesSessionClient(
                             continue
                         }
                     }
-                    Log.e(TAG, "long-poll fatal — token dead; re-pair needed")
-                    _events.emit(SessionEvent.AuthExpired)
+                    Log.e(TAG, "long-poll fatal — token dead; re-pair needed (reason=$lastAuthFailure)")
+                    _events.emit(SessionEvent.AuthExpired(lastAuthFailure))
                     return
                 }
                 // Any other error (e.g. 404 = registration not found / stale). Don't
@@ -530,7 +543,7 @@ internal class GoogleMessagesSessionClient(
                     consecutiveFailures++
                     if (consecutiveFailures >= MAX_LONGPOLL_FAILURES) {
                         Log.e(TAG, "long-poll persistently failing (HTTP $code ×$consecutiveFailures) — needs re-link")
-                        _events.emit(SessionEvent.AuthExpired)
+                        _events.emit(SessionEvent.AuthExpired(AuthFailureReason.TOKEN_DEAD))
                         return
                     }
                     val backoffMs = minOf(2000L shl minOf(consecutiveFailures, 5), 60_000L)
@@ -732,6 +745,10 @@ internal class GoogleMessagesSessionClient(
 
     @Volatile private var tokenExpiryMs: Long = 0L
 
+    /** Why the last auth failure happened, so the UI can show the right fix.
+     *  Set by [refreshToken]; read when emitting [SessionEvent.AuthExpired]. */
+    @Volatile private var lastAuthFailure: AuthFailureReason = AuthFailureReason.UNKNOWN
+
     private suspend fun refreshTokenIfNeeded() {
         // Refresh ~1h before expiry. tokenTtl is in microseconds (or 0 → 24h).
         val now = System.currentTimeMillis()
@@ -756,40 +773,89 @@ internal class GoogleMessagesSessionClient(
      * it survives process death. @return true if a new token was issued.
      */
     private suspend fun refreshToken(): Boolean {
-        val acct = account
-        val requestId = UUID.randomUUID().toString()
-        val timestampMicros = System.currentTimeMillis() * 1000
-        // mautrix signs sha256("<requestId>:<timestamp>") DIRECTLY via
-        // ecdsa.SignASN1 (it does NOT re-hash). So compute the digest here and
-        // sign it with NONEwithECDSA — signing the precomputed hash with
-        // SHA256withECDSA would hash it a SECOND time (sha256(sha256(msg))),
-        // producing a signature Google rejects → RegisterRefresh returns no token
-        // → the session dies and forces a needless re-pair. Both produce ASN.1 DER.
-        val signBytes = java.security.MessageDigest.getInstance("SHA-256")
-            .digest("$requestId:$timestampMicros".toByteArray(Charsets.UTF_8))
-        val priv = java.security.KeyFactory.getInstance("EC")
-            .generatePrivate(PKCS8EncodedKeySpec(acct.ecdsaPrivatePkcs8))
-        val signature = Signature.getInstance("NONEwithECDSA").run {
-            initSign(priv); update(signBytes); sign() // signs the 32-byte hash as-is
+        // Up to two attempts: if the first fails specifically because the saved
+        // session cookies went stale (SESSION_COOKIE_INVALID), remint the
+        // rotating __Secure-*PSIDTS cookie on-device and try once more. That
+        // recovery is what keeps users linked when their browser rotated the
+        // cookie out from under the phone (the old ~2h logout).
+        repeat(2) { attempt ->
+            val acct = account
+            val requestId = UUID.randomUUID().toString()
+            val timestampMicros = System.currentTimeMillis() * 1000
+            // mautrix signs sha256("<requestId>:<timestamp>") DIRECTLY via
+            // ecdsa.SignASN1 (it does NOT re-hash). So compute the digest here and
+            // sign it with NONEwithECDSA — signing the precomputed hash with
+            // SHA256withECDSA would hash it a SECOND time (sha256(sha256(msg))),
+            // producing a signature Google rejects → RegisterRefresh returns no token
+            // → the session dies and forces a needless re-pair. Both produce ASN.1 DER.
+            val signBytes = java.security.MessageDigest.getInstance("SHA-256")
+                .digest("$requestId:$timestampMicros".toByteArray(Charsets.UTF_8))
+            val priv = java.security.KeyFactory.getInstance("EC")
+                .generatePrivate(PKCS8EncodedKeySpec(acct.ecdsaPrivatePkcs8))
+            val signature = Signature.getInstance("NONEwithECDSA").run {
+                initSign(priv); update(signBytes); sign() // signs the 32-byte hash as-is
+            }
+            val body = GMSessionProto.registerRefreshRequest(
+                requestId, acct.tachyonAuthToken, acct.browser, timestampMicros, signature, authNetwork,
+            )
+            Log.i(TAG, "refreshToken: requesting (gaia=$gaia net='$authNetwork' " +
+                "tokenLen=${acct.tachyonAuthToken.size} sigLen=${signature.size} " +
+                "browserSrc=${acct.browser.sourceId.take(12)} hasCookies=${cookies.isNotEmpty()})")
+            val (code, respBody) = post(GMPairingProto.REGISTER_REFRESH_URL, body)
+            val refreshed = GMSessionProto.parseRegisterRefreshResponse(respBody)
+            if (refreshed != null) {
+                account = acct.copy(tachyonAuthToken = refreshed.tachyonAuthToken, tokenTtl = refreshed.ttl)
+                store.updateToken(refreshed.tachyonAuthToken, refreshed.ttl)
+                val ttlMs = if (refreshed.ttl > 0) refreshed.ttl / 1000 else 24 * 3600_000L
+                tokenExpiryMs = System.currentTimeMillis() + ttlMs
+                lastAuthFailure = AuthFailureReason.UNKNOWN
+                Log.i(TAG, "token refresh OK: new token ${refreshed.tachyonAuthToken.size}B ttl=${refreshed.ttl} (HTTP $code)")
+                return true
+            }
+
+            val cookieInvalid = respBody.contains("SESSION_COOKIE_INVALID")
+            Log.w(TAG, "token refresh FAILED: no token in HTTP $code response " +
+                "(cookieInvalid=$cookieInvalid) — body=${respBody.take(400)}")
+            // Only worth a rotate+retry on the FIRST attempt, in GAIA mode, when
+            // it's the cookies (not the token) Google rejected.
+            if (attempt == 0 && cookieInvalid && gaia) {
+                lastAuthFailure = AuthFailureReason.COOKIE_INVALID
+                Log.w(TAG, "SESSION_COOKIE_INVALID — rotating session cookies and retrying")
+                if (!runCatching { rotateCookies() }.getOrDefault(false)) {
+                    Log.w(TAG, "cookie rotation did not yield fresh cookies — giving up")
+                    return false
+                }
+                // fall through to the second attempt with rotated cookies
+            } else {
+                lastAuthFailure =
+                    if (cookieInvalid) AuthFailureReason.COOKIE_INVALID else AuthFailureReason.TOKEN_DEAD
+                return false
+            }
         }
-        val body = GMSessionProto.registerRefreshRequest(
-            requestId, acct.tachyonAuthToken, acct.browser, timestampMicros, signature, authNetwork,
-        )
-        Log.i(TAG, "refreshToken: requesting (gaia=$gaia net='$authNetwork' " +
-            "tokenLen=${acct.tachyonAuthToken.size} sigLen=${signature.size} " +
-            "browserSrc=${acct.browser.sourceId.take(12)} hasCookies=${cookies.isNotEmpty()})")
-        val (code, respBody) = post(GMPairingProto.REGISTER_REFRESH_URL, body)
-        val refreshed = GMSessionProto.parseRegisterRefreshResponse(respBody)
-        if (refreshed == null) {
-            Log.w(TAG, "token refresh FAILED: no token in HTTP $code response — body=${respBody.take(400)}")
-            return false
+        return false
+    }
+
+    /** One on-device rotation of the __Secure-*PSIDTS session cookies; merges any
+     *  refreshed values into the live cookie set and persists so the rotation
+     *  survives process death. @return true if cookies actually changed. */
+    private suspend fun rotateCookies(): Boolean = withContext(Dispatchers.IO) {
+        val rotated = rotator.rotate(cookies) ?: return@withContext false
+        cookies.putAll(rotated)
+        runCatching { store.saveCookies(cookies) }
+        Log.i(TAG, "session cookies rotated on-device (${rotated.keys.joinToString()})")
+        true
+    }
+
+    /** Periodically remint the rotating session cookie so the login stays valid
+     *  even when another holder (the user's browser) would otherwise rotate it
+     *  out from under us. GAIA/cookie mode only. */
+    private suspend fun rotateLoop() {
+        delay(60_000) // let the long-poll open first; don't stampede connect()
+        while (coroutineContext.isActive) {
+            runCatching { rotateCookies() }
+                .onFailure { Log.w(TAG, "rotateLoop iteration failed", it) }
+            delay(ROTATE_INTERVAL_MS)
         }
-        account = acct.copy(tachyonAuthToken = refreshed.tachyonAuthToken, tokenTtl = refreshed.ttl)
-        store.updateToken(refreshed.tachyonAuthToken, refreshed.ttl)
-        val ttlMs = if (refreshed.ttl > 0) refreshed.ttl / 1000 else 24 * 3600_000L
-        tokenExpiryMs = System.currentTimeMillis() + ttlMs
-        Log.i(TAG, "token refresh OK: new token ${refreshed.tachyonAuthToken.size}B ttl=${refreshed.ttl} (HTTP $code)")
-        return true
     }
 
     // =======================================================================
@@ -883,13 +949,30 @@ internal class GoogleMessagesSessionClient(
         /** Consecutive non-auth long-poll failures (e.g. 404) before we stop the
          *  loop and surface a reconnect instead of polling forever. */
         private const val MAX_LONGPOLL_FAILURES = 8
+        /** Cadence for proactive on-device cookie rotation. Comfortably under
+         *  Google's ~30min __Secure-*PSIDTS rotation window. */
+        private const val ROTATE_INTERVAL_MS = 20 * 60_000L
     }
+}
+
+/** Why a session's auth failed — drives the re-link screen's explanation. */
+internal enum class AuthFailureReason {
+    /** Google rejected the login cookies (HTTP 401 SESSION_COOKIE_INVALID), even
+     *  after an on-device rotation attempt — typically another browser/window is
+     *  signed into the same Google account and rotated the session cookie. */
+    COOKIE_INVALID,
+    /** The tachyon token itself is dead / revoked and RegisterRefresh couldn't
+     *  reissue it. */
+    TOKEN_DEAD,
+    /** Cause not specifically identified. */
+    UNKNOWN,
 }
 
 /** Things the session surfaces to the repository. */
 internal sealed class SessionEvent {
     data class ConversationsUpdated(val conversations: List<GMSessionProto.GMConversation>) : SessionEvent()
     data class MessagesUpdated(val messages: List<GMSessionProto.GMMessage>) : SessionEvent()
-    /** Token is dead / revoked — the user must re-pair. */
-    data object AuthExpired : SessionEvent()
+    /** Token/cookies dead — the user must re-link. [reason] explains why so the
+     *  UI can show the right fix. */
+    data class AuthExpired(val reason: AuthFailureReason) : SessionEvent()
 }

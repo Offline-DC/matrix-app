@@ -85,6 +85,11 @@ object GoogleMessagesRepository {
     fun authExpiredFlow(): StateFlow<Boolean>? =
         (instance as? GoogleMessagesMessageRepository)?.authExpired
 
+    /** Why the link expired (cookie invalid vs. token dead), for the reconnect
+     *  screen's explanation. Null when there's no live session / not expired. */
+    fun authExpiredReasonFlow(): StateFlow<AuthFailureReason?>? =
+        (instance as? GoogleMessagesMessageRepository)?.authExpiredReason
+
     /** Auto-delete-old-messages setting (Settings toggle). Defaults to ON. */
     fun isAutoDeleteEnabled(): Boolean =
         (instance as? GoogleMessagesMessageRepository)?.autoDeleteOldMessages ?: true
