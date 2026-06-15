@@ -104,6 +104,20 @@ fun GoogleMessagesApp(
                 }
             }
         }
+        // The USER-initiated re-link (Settings + the day-13 warning): ALWAYS a
+        // full re-sign-in (new QR + emoji) so the user gets a brand-new ~2-week
+        // session. Token refresh can't push out the Google session ceiling, so a
+        // proactive re-link must re-pair. Messages are kept (clearMessages=false);
+        // wiping auth flips us to the companion sign-in screen.
+        val freshRelink: () -> Unit = {
+            GoogleMessagesRepository.shutdown(clearMessages = false)
+            store.clear()
+            paired = false
+        }
+        // Age of the current Google session, for the Settings "last linked" row
+        // and the day-13 re-link banner. Plain (not remembered) so it advances
+        // across recompositions / resumes.
+        val linkAgeDays: Int? = store.daysSinceLink()
         if (authExpired) {
             GoogleMessagesReconnectScreen(
                 onRelink = relink,
@@ -128,6 +142,8 @@ fun GoogleMessagesApp(
             repository = repository,
             modifier = modifier,
             onRelink = relink,
+            onFreshRelink = freshRelink,
+            linkAgeDays = linkAgeDays,
             onLogout = {
                 // Real logout: tear the session down and wipe the stored pairing
                 // + cookies AND delete the cached message history (clearMessages =

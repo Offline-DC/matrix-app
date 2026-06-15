@@ -64,8 +64,18 @@ fun DpadMessengerApp(
     onLogout: (() -> Unit)? = null,
     /** Host-provided re-link. When set (launcher), a failed message offers a
      *  "Re-link phone" action that calls this — re-pairing the phone while
-     *  KEEPING message history, so the user doesn't have to log out. */
+     *  KEEPING message history, so the user doesn't have to log out. This is the
+     *  ADAPTIVE recovery path (token-refresh first, full re-pair only if needed),
+     *  used for reactive recovery (a failed send / the auth-expired screen). */
     onRelink: (() -> Unit)? = null,
+    /** User-initiated re-link from Settings (and the day-13 banner that routes
+     *  there): ALWAYS a full re-sign-in for a brand-new ~2-week session, since
+     *  token refresh can't extend the Google session ceiling. Keeps history.
+     *  Falls back to [onRelink] when null. */
+    onFreshRelink: (() -> Unit)? = null,
+    /** Whole days since the last fresh sign-in. Drives the Settings "last linked"
+     *  row and the day-13 "re-link soon" banner on the room list. Null hides both. */
+    linkAgeDays: Int? = null,
     /** Auto-delete-old-messages setting (hidden when change handler is null). */
     autoDeleteEnabled: Boolean = true,
     onAutoDeleteChange: ((Boolean) -> Unit)? = null,
@@ -81,6 +91,9 @@ fun DpadMessengerApp(
     val nav = rememberNavController()
     val factory = remember(repository) { RepositoryViewModelFactory(repository) }
     var authed by rememberSaveable { mutableStateOf(startAuthenticated) }
+    // Set when the user taps the day-13 re-link banner, so Settings lands focus
+    // on the Re-link row; cleared when Settings is opened via the cog.
+    var focusRelinkOnSettings by remember { mutableStateOf(false) }
 
     val startRoute = if (authed) Routes.ROOM_LIST else Routes.LOGIN
 
@@ -119,7 +132,15 @@ fun DpadMessengerApp(
                 RoomListScreen(
                     viewModel = vm,
                     onRoomClick = { roomId -> nav.navigate(Routes.chat(roomId)) },
-                    onSettingsClick = { nav.navigate(Routes.SETTINGS) },
+                    onSettingsClick = {
+                        focusRelinkOnSettings = false
+                        nav.navigate(Routes.SETTINGS)
+                    },
+                    linkAgeDays = linkAgeDays,
+                    onRelinkWarningClick = {
+                        focusRelinkOnSettings = true
+                        nav.navigate(Routes.SETTINGS)
+                    },
                     // Only offer "new message" if the repo can actually start
                     // conversations (the mock can't).
                     onNewMessage = if (repository is ConversationStarter) {
@@ -172,7 +193,12 @@ fun DpadMessengerApp(
                             }
                         }
                     },
-                    onRelink = onRelink?.let { relink -> { relink(); nav.popBackStack() } },
+                    // Settings re-link is the user-initiated FRESH re-sign-in
+                    // (new ~2-week session). Fall back to the adaptive onRelink
+                    // if the host didn't supply a fresh variant.
+                    onRelink = (onFreshRelink ?: onRelink)?.let { r -> { r(); nav.popBackStack() } },
+                    linkAgeDays = linkAgeDays,
+                    focusRelinkOnEntry = focusRelinkOnSettings,
                     showDarkThemeToggle = onToggleDarkTheme != null,
                     darkTheme = darkTheme,
                     onDarkThemeChange = { onToggleDarkTheme?.invoke(it) },

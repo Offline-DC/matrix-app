@@ -44,9 +44,15 @@ import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 fun SettingsScreen(
     onBack: () -> Unit,
     onLogout: () -> Unit,
-    /** Re-link the phone (re-pair / reauth, keeping messages). Shown above
-     *  Log out when set; null hides it. */
+    /** Re-link the phone — a fresh sign-in for a new ~2-week session, keeping
+     *  messages. Shown above Log out when set; null hides it. */
     onRelink: (() -> Unit)? = null,
+    /** Whole days since the last fresh sign-in. When set, shows a "last linked"
+     *  row under Re-link (and warns when the session is near its ~2-week end). */
+    linkAgeDays: Int? = null,
+    /** When true, land initial focus on the "Re-link phone" row instead of the
+     *  back button — used when the user arrives here from the day-13 banner. */
+    focusRelinkOnEntry: Boolean = false,
     modifier: Modifier = Modifier,
     /** When true, show the dark-theme toggle (demo harness). The launcher
      *  forces light, so it passes false and the row is hidden. */
@@ -65,7 +71,18 @@ fun SettingsScreen(
     // highlight and DPAD navigation works immediately (every other screen sets
     // initial focus; this one used to start with nothing focused).
     val backFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { backFocus.requestFocus() } }
+    val relinkFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        // Arriving from the re-link banner lands on the Re-link row; otherwise
+        // the back button (so the screen always has a visible highlight).
+        val target = if (focusRelinkOnEntry && onRelink != null) relinkFocus else backFocus
+        // Retry across a few frames — the target row may not be attached on the
+        // first frame (esp. the re-link row below the scroll fold).
+        repeat(10) {
+            if (runCatching { target.requestFocus() }.isSuccess) return@LaunchedEffect
+            androidx.compose.runtime.withFrameNanos {}
+        }
+    }
     Scaffold(
         topBar = {
             CompactTopBar(
@@ -134,9 +151,15 @@ fun SettingsScreen(
             if (onRelink != null) {
                 ActionRow(
                     title = "Re-link phone",
-                    subtitle = "Reconnect to your phone — keeps your messages",
+                    subtitle = "Scan the code again for a fresh 2-week session — keeps your messages",
+                    // Tint the row when the session is near its end so it stands out.
+                    destructive = linkAgeDays != null && linkAgeDays >= RELINK_WARN_DAYS,
+                    focusRequester = relinkFocus,
                     onClick = onRelink,
                 )
+            }
+            if (linkAgeDays != null) {
+                StaticRow(title = "Days since last link", subtitle = linkAgeDays.toString())
             }
             ActionRow(
                 title = "Log out",
@@ -147,6 +170,10 @@ fun SettingsScreen(
         }
     }
 }
+
+/** Day threshold at/after which we warn the user their ~2-week Google session is
+ *  about to expire and they should re-link. Shared with the room-list banner. */
+internal const val RELINK_WARN_DAYS = 13
 
 @Composable
 private fun SettingHeader(text: String) {
@@ -192,6 +219,7 @@ private fun ActionRow(
     title: String,
     subtitle: String,
     destructive: Boolean = false,
+    focusRequester: FocusRequester? = null,
     onClick: () -> Unit,
 ) {
     val color = if (destructive) MaterialTheme.colorScheme.error
@@ -200,7 +228,7 @@ private fun ActionRow(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .dpadRow(onClick = onClick, shape = RoundedCornerShape(10.dp))
+            .dpadRow(onClick = onClick, focusRequester = focusRequester, shape = RoundedCornerShape(10.dp))
             .padding(horizontal = 12.dp, vertical = 10.dp),
     ) {
         Column {

@@ -141,6 +141,12 @@ class GoogleMessagesAccountStore(context: Context) {
         prefs.edit()
             .putBoolean(KEY_GAIA_MODE, true)
             .putString(KEY_GAIA_DEST_REG, destRegB64)
+            // Stamp the moment of a FRESH sign-in. This is what "days since
+            // re-link" counts from, and what the day-13 warning watches. Only a
+            // full re-pair (new cookies + emoji) sets it — token refresh does
+            // not — so it tracks the real age of the Google session, whose
+            // ~2-week ceiling only a re-sign-in resets.
+            .putLong(KEY_LINK_TS, System.currentTimeMillis())
             .apply()
     }
 
@@ -148,6 +154,17 @@ class GoogleMessagesAccountStore(context: Context) {
 
     /** The primary phone's dest registration id (base64), or null if not GAIA. */
     fun loadGaiaDestReg(): String? = prefs.getString(KEY_GAIA_DEST_REG, null)
+
+    /** Epoch millis of the last fresh sign-in (full re-pair), or 0 if unknown.
+     *  Set in [saveGaiaSession]; survives token refreshes; wiped by [clear]. */
+    fun linkTimestampMs(): Long = prefs.getLong(KEY_LINK_TS, 0L)
+
+    /** Whole days since the last fresh sign-in, or null if unknown. */
+    fun daysSinceLink(): Int? {
+        val ts = linkTimestampMs()
+        if (ts <= 0L) return null
+        return ((System.currentTimeMillis() - ts) / 86_400_000L).toInt()
+    }
 
     fun load(): GoogleMessagesAccount? {
         if (prefs.getInt(KEY_SCHEMA_VERSION, 1) < SCHEMA_VERSION) return null
@@ -203,6 +220,7 @@ class GoogleMessagesAccountStore(context: Context) {
         private const val KEY_HMAC = "hmacKey"
         private const val KEY_GAIA_MODE = "gaiaMode"
         private const val KEY_GAIA_DEST_REG = "gaiaDestReg"
+        private const val KEY_LINK_TS = "linkTimestampMs"
         private const val KEY_DEVICE_SESSION_ID = "deviceSessionId"
     }
 }

@@ -3,17 +3,24 @@ package com.offline.dpadmessenger.ui.rooms
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Create
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -41,10 +48,12 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.data.RoomSummary
 import com.offline.dpadmessenger.focus.dpadFocusHighlight
+import com.offline.dpadmessenger.focus.dpadRow
 import com.offline.dpadmessenger.focus.onDpadAction
 import com.offline.dpadmessenger.ui.components.CompactBarButton
 import com.offline.dpadmessenger.ui.components.CompactTopBar
 import com.offline.dpadmessenger.ui.components.RoomListItem
+import com.offline.dpadmessenger.ui.settings.RELINK_WARN_DAYS
 
 /**
  * Top-level room list. DPAD Up/Down moves between rooms; OK opens the chat.
@@ -67,6 +76,12 @@ fun RoomListScreen(
     /** Open the new-conversation flow. When null, the compose button is hidden
      *  (repository can't start conversations — e.g. the mock). */
     onNewMessage: (() -> Unit)? = null,
+    /** Whole days since the last fresh sign-in. At/after [RELINK_WARN_DAYS] a red
+     *  "re-link in settings" banner is pinned above the list. Null hides it. */
+    linkAgeDays: Int? = null,
+    /** Tapping the day-13 re-link banner. Defaults to [onSettingsClick]; the host
+     *  passes a variant that opens Settings focused on the Re-link row. */
+    onRelinkWarningClick: (() -> Unit)? = null,
 ) {
     val rooms by viewModel.rooms.collectAsState()
     val isLoading by viewModel.isInitialLoading.collectAsState()
@@ -147,27 +162,44 @@ fun RoomListScreen(
         },
         modifier = modifier.fillMaxSize(),
     ) { innerPadding ->
+        // When the session is near its ~2-week end, pin a red re-link banner
+        // above the list (tapping it opens Settings). The top inset is applied
+        // once here on the Column so the banner clears the top bar; the list
+        // below only needs its bottom inset.
+        val showRelinkWarning = linkAgeDays != null && linkAgeDays >= RELINK_WARN_DAYS
         Box(modifier = Modifier.fillMaxSize()) {
-            when {
-                isLoading && rooms.isEmpty() -> LoadingState(innerPadding)
-                rooms.isEmpty() -> EmptyState(innerPadding)
-                else -> RoomList(
-                    rooms = rooms,
-                    lastOpenedRoomId = lastOpenedRoomId,
-                    senderNameFor = viewModel::senderName,
-                    onRoomClick = { roomId ->
-                        viewModel.setLastOpened(roomId)
-                        onRoomClick(roomId)
-                    },
-                    padding = innerPadding,
-                    entryRowFocus = entryRowFocus,
-                    firstRowFocus = firstRowFocus,
-                    // DPAD-Right anywhere in the list jumps to the compose button.
-                    composeButtonFocus = composeButtonFocus.takeIf { onNewMessage != null },
-                    savedScroll = viewModel.savedScroll,
-                    onScrollChanged = viewModel::saveScroll,
-                    listState = listState,
-                )
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(top = innerPadding.calculateTopPadding()),
+            ) {
+                if (showRelinkWarning) {
+                    RelinkWarningBanner(onClick = onRelinkWarningClick ?: onSettingsClick)
+                }
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    when {
+                        isLoading && rooms.isEmpty() -> LoadingState(innerPadding)
+                        rooms.isEmpty() -> EmptyState(innerPadding)
+                        else -> RoomList(
+                            rooms = rooms,
+                            lastOpenedRoomId = lastOpenedRoomId,
+                            senderNameFor = viewModel::senderName,
+                            onRoomClick = { roomId ->
+                                viewModel.setLastOpened(roomId)
+                                onRoomClick(roomId)
+                            },
+                            // Top inset already applied on the Column above.
+                            padding = PaddingValues(bottom = innerPadding.calculateBottomPadding()),
+                            entryRowFocus = entryRowFocus,
+                            firstRowFocus = firstRowFocus,
+                            // DPAD-Right anywhere in the list jumps to the compose button.
+                            composeButtonFocus = composeButtonFocus.takeIf { onNewMessage != null },
+                            savedScroll = viewModel.savedScroll,
+                            onScrollChanged = viewModel::saveScroll,
+                            listState = listState,
+                        )
+                    }
+                }
             }
 
             if (onNewMessage != null) {
@@ -328,6 +360,43 @@ private fun ComposeButton(
             tint = MaterialTheme.colorScheme.onPrimary,
             modifier = Modifier.size(24.dp),
         )
+    }
+}
+
+/** Red, DPAD-focusable banner pinned above the chat list when the Google
+ *  session is near its ~2-week expiry. OK opens Settings (where Re-link lives).
+ *  Reachable by DPAD-Up from the top conversation row. */
+@Composable
+private fun RelinkWarningBanner(onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.errorContainer)
+            .dpadRow(onClick = onClick, shape = RoundedCornerShape(10.dp))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Filled.Warning,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.error,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Column {
+            Text(
+                "Re-link in settings",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                "You may be logged out in the next day as your session expires.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+        }
     }
 }
 
