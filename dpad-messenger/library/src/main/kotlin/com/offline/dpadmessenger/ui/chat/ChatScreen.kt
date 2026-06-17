@@ -122,6 +122,11 @@ fun ChatScreen(
         if (path != null && java.io.File(path).exists()) {
             mediaReturnId = msg.id
             mediaViewer = path to att.kind
+        } else if (att.downloadToken.isBlank()) {
+            // Pre-download placeholder — there's nothing to fetch yet (the full
+            // copy with a media id arrives on its own). Don't kick off a fetch
+            // that can only fail.
+            return@activate
         } else if (msg.id !in downloadingMedia) {
             viewModel.downloadMedia(msg.id)
         }

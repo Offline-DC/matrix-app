@@ -470,7 +470,38 @@ private fun MediaBlock(
         .height(150.dp)
         .clip(shape)
     val loadedPath = attachment.localPath?.takeIf { java.io.File(it).exists() }
+    // A pre-download placeholder: the media exists on the sender's side but this
+    // device doesn't have a downloadable reference yet (the full copy with the
+    // media id arrives moments later). Show a "receiving" state, not an
+    // actionable "tap to view", so a premature tap doesn't read as an error.
+    val pending = loadedPath == null && attachment.downloadToken.isBlank()
     when {
+        pending && !failed -> Box(
+            box.background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(
+                    imageVector = when (attachment.kind) {
+                        com.offline.dpadmessenger.data.AttachmentKind.VIDEO -> Icons.Filled.Videocam
+                        else -> Icons.Filled.Image
+                    },
+                    contentDescription = null,
+                    modifier = Modifier.size(36.dp),
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+                Spacer(Modifier.padding(top = 4.dp))
+                Text(
+                    text = when (attachment.kind) {
+                        com.offline.dpadmessenger.data.AttachmentKind.VIDEO -> "Receiving video…"
+                        else -> "Receiving photo…"
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = LocalDpadMessengerColors.current.mutedText,
+                )
+            }
+        }
+
         isDownloading -> Box(
             box.background(MaterialTheme.colorScheme.surfaceVariant),
             contentAlignment = Alignment.Center,

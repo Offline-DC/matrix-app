@@ -295,10 +295,13 @@ internal object GMSessionProto {
                     fields[3]?.bytes?.let { mediaBytes ->
                         hasMedia = true
                         val parsed = parseMediaContent(mediaBytes)
-                        if (parsed != null) media = parsed
-                        // Capture the actual field shape so an unparsed media
-                        // attachment can be diagnosed (logged once by the repo).
-                        else if (mediaDebug == null) mediaDebug = "mc{${describeFields(mediaBytes)}} mi{${describeFields(mi)}}"
+                        media = parsed
+                        // Capture the actual field shape whenever the media has
+                        // no downloadable id yet (unparsed, or a pre-download
+                        // placeholder) so the repo can diagnose it once.
+                        if ((parsed == null || parsed.mediaId.isBlank()) && mediaDebug == null) {
+                            mediaDebug = "mc{${describeFields(mediaBytes)}} mi{${describeFields(mi)}}"
+                        }
                     }
                 }
                 12 -> tmpId = f.utf8()
@@ -331,21 +334,34 @@ internal object GMSessionProto {
      *  size=5, dimensions=6, mediaData=7, thumbnailMediaID=9, decryptionKey=11,
      *  thumbnailDecryptionKey=12, mimeType=14.
      *
-     *  Prefer the full media (mediaID 2 + key 11); if it's absent (e.g. an
-     *  undownloaded MMS or a preview-only push) fall back to the thumbnail
-     *  (thumbnailMediaID 9 + thumbnailDecryptionKey 12) so the message renders
-     *  something instead of a dead placeholder. */
+     *  Prefer the full media (mediaID 2 + key 11); if it's absent fall back to
+     *  the thumbnail (thumbnailMediaID 9 + thumbnailDecryptionKey 12).
+     *
+     *  Incoming RCS/MMS media is delivered TWICE: first as a pre-download
+     *  placeholder (incoming status 105, or outgoing while still sending) that
+     *  carries the format/name/size/mime but NO mediaID yet, then re-delivered
+     *  (status 100) with the real mediaID once Google has the blob. We still
+     *  return a [GMMedia] for that first placeholder — with a blank [mediaId] —
+     *  so the message renders as a typed "photo/video (pending)" bubble that the
+     *  later full copy de-dups over, rather than a dead "📎 Attachment" text.
+     *  Returns null only when there's nothing media-like to show at all. */
     private fun parseMediaContent(bytes: ByteArray): GMMedia? {
         val f = ProtoReader.fields(bytes)
         val fullId = f[2]?.bytes?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
         val thumbId = f[9]?.bytes?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
-        val mediaId = fullId ?: thumbId ?: return null
+        val mediaId = fullId ?: thumbId
+        val format = (f[1]?.value ?: 0L).toInt()
+        val mime = f[14]?.bytes?.toString(Charsets.UTF_8) ?: ""
+        val name = f[4]?.bytes?.toString(Charsets.UTF_8) ?: ""
+        // Nothing identifiable as media (no id, no format, no mime, no name) →
+        // genuinely not a media part.
+        if (mediaId == null && format == 0 && mime.isBlank() && name.isBlank()) return null
         val key = if (fullId != null) f[11]?.bytes else f[12]?.bytes
         return GMMedia(
-            mediaId = mediaId,
-            mimeType = f[14]?.bytes?.toString(Charsets.UTF_8) ?: "",
-            name = f[4]?.bytes?.toString(Charsets.UTF_8) ?: "",
-            format = (f[1]?.value ?: 0L).toInt(),
+            mediaId = mediaId ?: "",
+            mimeType = mime,
+            name = name,
+            format = format,
             decryptionKey = key,
         )
     }

@@ -270,13 +270,31 @@ internal class GoogleMessagesMessageRepository(
                 if (!p.isMe && p.participantId.isNotEmpty()) {
                     users[p.participantId] = User(
                         id = p.participantId,
-                        displayName = p.fullName.ifBlank { p.firstName.ifBlank { p.formattedNumber.ifBlank { p.number } } }
-                            .ifBlank { "Unknown" },
+                        displayName = participantLabel(p),
                         avatarColor = p.avatarHexColor.ifBlank { "#7E57C2" },
                     )
                 }
             }
             val roomName = c.name.ifBlank { displayNameFor(c) }
+            // Diagnostic for the "mystery short-number senders" report: dump the
+            // raw inputs that feed the room name so a fresh capture shows exactly
+            // which field (conversation name vs participant number/id) is the
+            // source of a bogus label. Fires only when the resolved name looks
+            // suspicious (blank, the placeholder, or no real participant names),
+            // so it doesn't spam for normal contacts.
+            val others = c.participants.filterNot { it.isMe }
+            val anyRealName = others.any { it.fullName.isNotBlank() || it.firstName.isNotBlank() }
+            if (roomName == UNKNOWN_SENDER || c.name.isNotBlank() && c.name.all { it.isDigit() } || !anyRealName) {
+                Log.i(
+                    TAG,
+                    "roomname conv=${c.conversationId} name='${c.name}' group=${c.isGroupChat} " +
+                        "resolved='$roomName' parts=[" +
+                        others.joinToString(";") {
+                            "id=${it.participantId} num='${it.number}' fmt='${it.formattedNumber}' " +
+                                "first='${it.firstName}' full='${it.fullName}'"
+                        } + "]",
+                )
+            }
             roomNameById[c.conversationId] = roomName
             roomMap[c.conversationId] = Room(
                 id = c.conversationId,
@@ -337,8 +355,18 @@ internal class GoogleMessagesMessageRepository(
                 unread[gm.conversationId] = (unread[gm.conversationId] ?: 0) + 1
             }
             // Ensure a room exists even if the conversation event hasn't arrived.
+            // Don't name it after the raw conversationId — a nameless metadata
+            // gap is what surfaced the bogus "66 / 666" sender rows. Use any name
+            // we already learned for it, otherwise a neutral placeholder that the
+            // later conversation event overwrites.
             if (rooms.value.none { it.id == gm.conversationId }) {
-                rooms.value = rooms.value + Room(id = gm.conversationId, name = gm.conversationId)
+                val provisional = roomNameById[gm.conversationId] ?: UNKNOWN_SENDER
+                Log.i(
+                    TAG,
+                    "room-before-conv conv=${gm.conversationId} sender=${gm.participantId} " +
+                        "provisional='$provisional' (conversation event not seen yet)",
+                )
+                rooms.value = rooms.value + Room(id = gm.conversationId, name = provisional)
             }
             maybeNotify(gm, mapped, isNew)
         }
@@ -372,7 +400,9 @@ internal class GoogleMessagesMessageRepository(
     // ---- MessageRepository reads -------------------------------------------
 
     override fun userById(id: String): User =
-        usersById.value[id] ?: User(id = id, displayName = id, avatarColor = "#9E9E9E")
+        // Unknown participant: surface a neutral label, never the opaque raw id
+        // (a raw participantId as a "name" is one source of the bogus-sender rows).
+        usersById.value[id] ?: User(id = id, displayName = UNKNOWN_SENDER, avatarColor = "#9E9E9E")
 
     override fun observeRoomSummaries(): Flow<List<RoomSummary>> =
         combine(rooms, messagesByRoom, unreadByRoom) { rs, msgs, unread ->
@@ -693,7 +723,13 @@ internal class GoogleMessagesMessageRepository(
                 Log.w(TAG, "media present but no attachment parsed msg=$messageId ${mediaDebug ?: "(no field dump)"}")
             }
         }
-        val att = media?.takeIf { it.mediaId.isNotBlank() }?.let { m ->
+        val att = media?.let { m ->
+            // A pre-download placeholder (status 105 / still-sending) carries the
+            // format/name/mime but no mediaId yet — render it as a typed media
+            // bubble with an empty download token. The full copy (real mediaId)
+            // is re-delivered moments later and de-dups over it. Without this the
+            // bubble would be a dead "📎 Attachment" text with nothing to tap.
+            val hasId = m.mediaId.isNotBlank()
             // RCS media carries a non-empty per-attachment key (encrypted).
             // MMS media has an empty/zero-length key — Google still sends the
             // field, so guard on isNotEmpty, not just non-null. Token is
@@ -708,10 +744,11 @@ internal class GoogleMessagesMessageRepository(
                 },
                 mimeType = m.mimeType,
                 name = m.name,
-                downloadToken = if (key != null) {
-                    m.mediaId + "|" + android.util.Base64.encodeToString(key, android.util.Base64.NO_WRAP)
-                } else {
-                    m.mediaId
+                downloadToken = when {
+                    !hasId -> "" // pending placeholder — not downloadable yet
+                    key != null ->
+                        m.mediaId + "|" + android.util.Base64.encodeToString(key, android.util.Base64.NO_WRAP)
+                    else -> m.mediaId
                 },
                 localPath = null,
             )
@@ -722,8 +759,9 @@ internal class GoogleMessagesMessageRepository(
             senderId = if (isOutgoing) ME else participantId,
             body = when {
                 text.isNotBlank() -> text
-                // Media we couldn't turn into a previewable attachment: show a
-                // neutral label instead of the raw-looking "[media]".
+                // hasMedia but we couldn't parse even a placeholder: neutral
+                // label instead of the raw-looking "[media]". (Real and pending
+                // media both produce a non-null [att] and render as a bubble.)
                 att == null && hasMedia -> "📎 Attachment"
                 else -> ""
             },
@@ -748,14 +786,41 @@ internal class GoogleMessagesMessageRepository(
         }
     }
 
+    /** Best human label for a participant: name → formatted/raw number →
+     *  "Unknown sender". Never returns the opaque participantId (a raw id like
+     *  "66" is what produced the mystery "senders from numbers not in my phone"
+     *  rows — those are conversations whose participant/name metadata hadn't
+     *  synced, so the old fallback surfaced the bare id). */
+    private fun participantLabel(p: GMSessionProto.GMParticipant): String =
+        p.fullName.ifBlank {
+            p.firstName.ifBlank { p.formattedNumber.ifBlank { prettyNumber(p.number) } }
+        }.ifBlank { UNKNOWN_SENDER }
+
+    /** Light touch-up for a bare number so a fallback reads as a phone number,
+     *  not a random integer. Leaves anything that isn't plainly a phone number
+     *  (short codes, non-numeric ids) alone. */
+    private fun prettyNumber(raw: String): String {
+        val s = raw.trim()
+        if (s.isBlank()) return ""
+        val digits = s.filter { it.isDigit() }
+        // Short codes (≤6 digits) and anything non-numeric: show as-is.
+        if (digits.length < 7 || s.any { !it.isDigit() && it != '+' }) return s
+        return when (digits.length) {
+            10 -> "(${digits.substring(0, 3)}) ${digits.substring(3, 6)}-${digits.substring(6)}"
+            11 -> "+${digits[0]} (${digits.substring(1, 4)}) ${digits.substring(4, 7)}-${digits.substring(7)}"
+            else -> if (s.startsWith("+")) s else "+$digits"
+        }
+    }
+
     private fun displayNameFor(c: GMSessionProto.GMConversation): String {
         val others = c.participants.filterNot { it.isMe }
         return when {
-            others.isEmpty() -> c.conversationId
-            others.size == 1 -> others[0].fullName.ifBlank {
-                others[0].firstName.ifBlank { others[0].formattedNumber.ifBlank { others[0].number } }
-            }
-            else -> others.joinToString(", ") { it.firstName.ifBlank { it.number } }
+            // No participant metadata (yet): never leak the raw conversationId
+            // as a name — that's the bogus "66 / 666" rows. Show a neutral
+            // placeholder; onConversations overwrites it once metadata arrives.
+            others.isEmpty() -> UNKNOWN_SENDER
+            others.size == 1 -> participantLabel(others[0])
+            else -> others.joinToString(", ") { participantLabel(it) }
         }
     }
 
@@ -770,6 +835,9 @@ internal class GoogleMessagesMessageRepository(
     companion object {
         private const val TAG = "GMRepo"
         private const val ME = "me"
+        /** Shown instead of a raw conversation/participant id when no real name
+         *  or number is available yet. */
+        private const val UNKNOWN_SENDER = "Unknown sender"
         private const val KEY_AUTO_DELETE = "autoDeleteOldMessages"
         private const val KEY_READ_RECEIPTS = "sendReadReceipts"
         private const val AUTO_DELETE_AGE_MS = 3L * 24 * 60 * 60 * 1000 // 3 days
