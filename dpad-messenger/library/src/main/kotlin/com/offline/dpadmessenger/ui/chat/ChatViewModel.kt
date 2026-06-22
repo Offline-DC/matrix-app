@@ -73,13 +73,6 @@ class ChatViewModel(
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     init {
-        // Mark the room active SYNCHRONOUSLY, before any suspend work, so a
-        // notification that arrives in the moment the chat opens is suppressed
-        // and cleared immediately. (markRoomRead below still runs async for the
-        // unread badge + persistence; active-room ownership lives here so it
-        // can't lose a race with an incoming-message burst — the cause of
-        // notifications that wouldn't clear until you re-entered the thread.)
-        repository.onRoomOpened(roomId)
         viewModelScope.launch {
             _room.value = repository.getRoom(roomId)
             repository.markRoomRead(roomId)
@@ -95,11 +88,18 @@ class ChatViewModel(
         }
     }
 
-    override fun onCleared() {
-        super.onCleared()
-        // The user left this chat (navigated back / the screen was torn down).
-        // Resume notifications for it. Tied to the ViewModel lifecycle, not the
-        // Activity's onStop, so a transient screen-sleep doesn't reset it.
+    /** The chat screen became the foreground, resumed screen — the user is
+     *  actively looking at this thread. Suppress + clear its notifications.
+     *  Driven by the screen's RESUME lifecycle (see ChatScreen), so it is true
+     *  ONLY while the thread is actually on screen — not after the user leaves
+     *  via the call button / a hotkey / the screen sleeping. */
+    fun markActive() {
+        repository.onRoomOpened(roomId)
+    }
+
+    /** The chat screen was paused or left (call button, hotkey, back, app
+     *  backgrounded, screen off). Resume notifications for this thread. */
+    fun markInactive() {
         repository.onRoomClosed(roomId)
     }
 

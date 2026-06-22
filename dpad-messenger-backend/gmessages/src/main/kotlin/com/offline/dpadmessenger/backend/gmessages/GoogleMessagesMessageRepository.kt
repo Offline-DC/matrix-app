@@ -513,16 +513,19 @@ internal class GoogleMessagesMessageRepository(
         sendMessage(roomId, failed.body, failed.replyToId)
     }
 
-    /** Mark read LOCALLY only. Also marks this thread "active" so we don't
-     *  notify for messages the user is currently looking at, and clears any
-     *  pending notification for it. (ChatViewModel calls this when the
-     *  conversation opens.)
+    /** Mark read LOCALLY only, and clear any pending notification for the thread.
+     *  (ChatViewModel calls this when the conversation opens.)
+     *
+     *  NOTE: this no longer sets [activeRoomId]. Active-room ownership lives
+     *  solely with [onRoomOpened]/[onRoomClosed], which are driven by the chat
+     *  screen's RESUME/PAUSE lifecycle — so the suppression is true only while
+     *  the thread is actually on screen, never lingering after the user leaves
+     *  via the call button / a hotkey / the screen sleeping.
      *
      *  Read receipts are intentionally never sent to the phone — the sender
      *  should not see "Read" from this device. (The toggle was removed; this is
      *  always off.) */
     override suspend fun markRoomRead(roomId: String) {
-        activeRoomId = roomId
         notifier.clearConversation(roomId, reason = "mark-read")
         writeLock.withLock {
             unreadByRoom.value = unreadByRoom.value + (roomId to 0)

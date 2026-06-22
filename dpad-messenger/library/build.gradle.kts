@@ -58,6 +58,9 @@ dependencies {
     api("androidx.activity:activity-compose:1.8.2")
     api("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
     api("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
+    // LifecycleResumeEffect + the current LocalLifecycleOwner (chat screen uses
+    // the RESUME/PAUSE lifecycle to decide when a thread is "active").
+    api("androidx.lifecycle:lifecycle-runtime-compose:2.7.0")
 
     // Compose
     api("androidx.compose.ui:ui")

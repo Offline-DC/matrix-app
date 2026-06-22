@@ -28,6 +28,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -78,6 +79,18 @@ fun ChatScreen(
      *  failed message offers a "Re-link phone" action. */
     onRelink: (() -> Unit)? = null,
 ) {
+    // Mark this thread "active" (suppress + clear its notifications) ONLY while
+    // its chat screen is actually the resumed, on-screen UI. Tied to the screen
+    // RESUME/PAUSE lifecycle — not to back-navigation or the Activity's onStop —
+    // so leaving via the call button / a hotkey / the screen turning off
+    // correctly resumes this thread's notifications, while sitting on the thread
+    // keeps them suppressed. (Returning to the thread re-clears anything posted
+    // while away.)
+    LifecycleResumeEffect(viewModel) {
+        viewModel.markActive()
+        onPauseOrDispose { viewModel.markInactive() }
+    }
+
     val room by viewModel.room.collectAsState()
     val timeline by viewModel.timeline.collectAsState()
     val loading by viewModel.loading.collectAsState()
