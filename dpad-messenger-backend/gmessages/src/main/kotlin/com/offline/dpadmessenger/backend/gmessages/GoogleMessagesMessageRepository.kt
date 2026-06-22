@@ -94,13 +94,18 @@ internal class GoogleMessagesMessageRepository(
         activeRoomId = null
     }
 
-    /** UI opened [roomId]'s chat. Mark it active and clear any pending
-     *  notification SYNCHRONOUSLY so a message landing in the same instant the
-     *  chat opens can't out-race it. */
+    /** UI opened [roomId]'s chat. Mark it active, clear its notification, and
+     *  clear its unread badge. Runs on every RESUME of the chat screen, so it
+     *  covers reopening a thread from a notification even when the ViewModel
+     *  (and thus its one-shot markRoomRead) is reused rather than recreated. */
     override fun onRoomOpened(roomId: String) {
         activeRoomId = roomId
         notifier.clearConversation(roomId, reason = "room-open")
-        Log.i(TAG, "room-open active=$roomId (notification cleared, notifications suppressed for it)")
+        if ((unreadByRoom.value[roomId] ?: 0) != 0) {
+            unreadByRoom.value = unreadByRoom.value + (roomId to 0)
+            scope.launch { writeLock.withLock { requestSave() } }
+        }
+        Log.i(TAG, "room-open active=$roomId (notification + unread cleared, suppressed)")
     }
 
     /** UI left [roomId]'s chat. Resume notifications for it. */
@@ -327,7 +332,15 @@ internal class GoogleMessagesMessageRepository(
                 isGroup = c.isGroupChat,
                 avatarColor = c.avatarHexColor.ifBlank { "#7E57C2" },
             )
-            if (c.unread) unread[c.conversationId] = (unread[c.conversationId] ?: 0).coerceAtLeast(1)
+            // NOTE: we deliberately do NOT raise the unread badge from the
+            // server's conversation.unread flag. We never send read receipts, so
+            // Google keeps received threads flagged unread forever and re-pushes
+            // that flag on every sync/reconnect — which used to resurrect the
+            // badge on threads the user had already read. The badge is driven
+            // purely locally instead (incremented in onMessages when a message
+            // arrives for a thread you're not looking at; cleared on open).
+            // Keep the active thread explicitly clear.
+            if (c.conversationId == activeRoomId) unread[c.conversationId] = 0
         }
         usersById.value = users
         rooms.value = roomMap.values.toList()
@@ -371,12 +384,17 @@ internal class GoogleMessagesMessageRepository(
             if (idx >= 0) list[idx] = preserved else list.add(preserved)
             list.sortBy { it.timestampMs }
             byRoom[gm.conversationId] = list
-            // Don't bump the unread badge for the conversation the user is
-            // currently looking at — a message that arrives while the chat is
-            // open is effectively already read (maybeNotify already suppresses
-            // the notification for the active room).
-            if (!gm.isOutgoing && gm.conversationId != activeRoomId) {
-                unread[gm.conversationId] = (unread[gm.conversationId] ?: 0) + 1
+            // Unread badge: only for a genuinely-new incoming message that
+            // arrives while the user is NOT looking at that thread. Skip backfill
+            // replayed during the initial sync (older than session start) so it
+            // doesn't inflate the count. A message that lands while the thread is
+            // open keeps the badge clear.
+            if (!gm.isOutgoing && isNew) {
+                if (gm.conversationId == activeRoomId) {
+                    unread[gm.conversationId] = 0
+                } else if (mapped.timestampMs >= sessionStartMs - 10_000L) {
+                    unread[gm.conversationId] = (unread[gm.conversationId] ?: 0) + 1
+                }
             }
             // Ensure a room exists even if the conversation event hasn't arrived.
             // Don't name it after the raw conversationId — a nameless metadata
