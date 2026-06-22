@@ -111,6 +111,10 @@ internal class GoogleMessagesNotifier(context: Context) {
 
         try {
             nm.notify(notificationIdFor(conversationId), notification)
+            android.util.Log.i(
+                TAG,
+                "post id=${notificationIdFor(conversationId)} conv=$conversationId title='$title'",
+            )
         } catch (_: SecurityException) {
             // POST_NOTIFICATIONS not granted (Android 13+); silently skip.
         }
@@ -141,10 +145,17 @@ internal class GoogleMessagesNotifier(context: Context) {
         }
     }
 
-    /** Clear a thread's notification + history (e.g. when the user opens it). */
-    fun clearConversation(conversationId: String) {
+    /** Clear a thread's notification + history (e.g. when the user opens it).
+     *  [reason] is logged so a future capture shows *why* a notification was
+     *  cleared (room-open / mark-read / active-room-msg) and confirms the
+     *  clear-on-open fix is working. */
+    fun clearConversation(conversationId: String, reason: String = "unspecified") {
         historyByConversation.remove(conversationId)
         nm.cancel(notificationIdFor(conversationId))
+        android.util.Log.i(
+            TAG,
+            "clear id=${notificationIdFor(conversationId)} conv=$conversationId reason=$reason",
+        )
     }
 
     private fun openMessengerIntent(conversationId: String): PendingIntent? {
@@ -175,6 +186,7 @@ internal class GoogleMessagesNotifier(context: Context) {
         // where an earlier build already created the channel (channel config is
         // immutable once created).
         private const val CHANNEL_ID = "gmessages_incoming_v2"
+        private const val TAG = "GMNotify"
         private const val NOTIFICATION_ID_BASE = 4200
         private const val MAX_LINES = 6
         /** How long to hold the screen-wake lock (auto-releases). */

@@ -314,6 +314,7 @@ fun MessageBubble(
                             attachment = attachment,
                             isDownloading = isDownloadingMedia,
                             failed = mediaFailed,
+                            messageTimestampMs = message.timestampMs,
                         )
                         if (message.body.isNotBlank()) Spacer(Modifier.padding(top = 6.dp))
                     }
@@ -452,6 +453,12 @@ private fun statusGlyph(status: MessageStatus): String = when (status) {
     MessageStatus.FAILED -> "!"
 }
 
+/** How long an id-less media placeholder may sit on "Receiving…" before we
+ *  treat it as never-going-to-resolve and show a non-spinning fallback. The
+ *  real (RCS) placeholder→full re-delivery completes in seconds; anything still
+ *  pending well past that is the MMS/group case with no downloadable id. */
+private const val PENDING_MEDIA_GRACE_MS = 45_000L
+
 /**
  * In-bubble media: a tap-to-load placeholder, a spinner while downloading, or
  * the loaded image thumbnail / video play card once cached. (Tapping the
@@ -462,6 +469,7 @@ private fun MediaBlock(
     attachment: com.offline.dpadmessenger.data.Attachment,
     isDownloading: Boolean,
     failed: Boolean,
+    messageTimestampMs: Long,
 ) {
     val shape = RoundedCornerShape(10.dp)
     val box = Modifier
@@ -475,6 +483,13 @@ private fun MediaBlock(
     // media id arrives moments later). Show a "receiving" state, not an
     // actionable "tap to view", so a premature tap doesn't read as an error.
     val pending = loadedPath == null && attachment.downloadToken.isBlank()
+    // ...but a placeholder that never gets its real media id (the MMS / group
+    // case where Google never sends a downloadable reference) would otherwise
+    // spin on "Receiving…" forever and read as an empty message that claims to
+    // have an attachment. After a grace period, switch to a clear, non-spinning
+    // "couldn't load — open on phone" so it never looks broken/empty.
+    val stalePending = pending &&
+        (System.currentTimeMillis() - messageTimestampMs) > PENDING_MEDIA_GRACE_MS
     when {
         pending && !failed -> Box(
             box.background(MaterialTheme.colorScheme.surfaceVariant),
@@ -492,12 +507,17 @@ private fun MediaBlock(
                 )
                 Spacer(Modifier.padding(top = 4.dp))
                 Text(
-                    text = when (attachment.kind) {
-                        com.offline.dpadmessenger.data.AttachmentKind.VIDEO -> "Receiving video…"
+                    text = when {
+                        stalePending && attachment.kind == com.offline.dpadmessenger.data.AttachmentKind.VIDEO ->
+                            "Video couldn't load — open on your phone"
+                        stalePending -> "Photo couldn't load — open on your phone"
+                        attachment.kind == com.offline.dpadmessenger.data.AttachmentKind.VIDEO ->
+                            "Receiving video…"
                         else -> "Receiving photo…"
                     },
                     style = MaterialTheme.typography.labelMedium,
                     color = LocalDpadMessengerColors.current.mutedText,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 )
             }
         }

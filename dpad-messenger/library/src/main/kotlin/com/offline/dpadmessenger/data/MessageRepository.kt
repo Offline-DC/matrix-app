@@ -77,6 +77,24 @@ interface MessageRepository {
     suspend fun markRoomRead(roomId: String)
 
     /**
+     * UI lifecycle: the user opened [roomId]'s chat screen and is actively
+     * looking at it. Repos that post notifications should mark this room
+     * "active" (suppress + clear its notifications) *synchronously* here, so a
+     * message arriving during the open can't out-race an async mark-as-read.
+     * Default no-op for repos without notifications.
+     */
+    fun onRoomOpened(roomId: String) {}
+
+    /**
+     * UI lifecycle: the user left [roomId]'s chat screen (navigated back), so
+     * notifications for it should resume. Deliberately tied to leaving the
+     * chat — NOT to the Activity stopping — so a transient screen-sleep on a
+     * flip phone doesn't make the still-open thread start notifying again.
+     * Default no-op.
+     */
+    fun onRoomClosed(roomId: String) {}
+
+    /**
      * Test/demo hook: simulate an incoming message from another participant.
      * Real repos can leave this as a no-op.
      */

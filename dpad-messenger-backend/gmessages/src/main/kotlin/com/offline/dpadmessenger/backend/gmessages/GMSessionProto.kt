@@ -300,7 +300,14 @@ internal object GMSessionProto {
                         // no downloadable id yet (unparsed, or a pre-download
                         // placeholder) so the repo can diagnose it once.
                         if ((parsed == null || parsed.mediaId.isBlank()) && mediaDebug == null) {
-                            mediaDebug = "mc{${describeFields(mediaBytes)}} mi{${describeFields(mi)}}"
+                            // Include a capped raw-hex dump of the MediaContent
+                            // bytes. describeFields only shows the top-level
+                            // field shape; the MMS/group download reference is
+                            // nested (likely inside the `mediaData` field 7),
+                            // so a future on-device capture needs the actual
+                            // bytes to finish the MMS parser. Logged once per id.
+                            mediaDebug = "mc{${describeFields(mediaBytes)}} mi{${describeFields(mi)}} " +
+                                "rawmc=${hexPreview(mediaBytes, 384)}"
                         }
                     }
                 }
@@ -316,6 +323,17 @@ internal object GMSessionProto {
             tmpId = tmpId, replyToMessageId = replyTo, reactions = reactions, media = media,
             mediaDebug = mediaDebug,
         )
+    }
+
+    /** Lowercase-hex of up to [max] bytes (then a "+Nb" tail marker). Used only
+     *  to capture the exact wire bytes of media we couldn't parse, so the MMS
+     *  layout can be decoded offline. */
+    private fun hexPreview(bytes: ByteArray, max: Int): String {
+        val n = minOf(bytes.size, max)
+        val sb = StringBuilder(n * 2 + 8)
+        for (i in 0 until n) sb.append("%02x".format(bytes[i]))
+        if (bytes.size > max) sb.append("+").append(bytes.size - max).append("b")
+        return sb.toString()
     }
 
     /** Compact dump of a message's immediate proto fields (number → short

@@ -82,9 +82,33 @@ internal class GoogleMessagesMessageRepository(
     @Volatile private var activeRoomId: String? = null
 
     /** Called when the messenger UI is no longer visible (Activity onStop):
-     *  every thread should notify again, including the one that was open. */
+     *  every thread should notify again, including the one that was open.
+     *
+     *  NOTE: this is intentionally NOT wired to the chat lifecycle anymore.
+     *  Active-room ownership is driven by [onRoomOpened]/[onRoomClosed] (the
+     *  ViewModel open/leave), because tying it to Activity.onStop made a
+     *  transient screen-sleep on a flip phone reset the active room and let the
+     *  open thread start notifying again — the "notifications won't clear until
+     *  I re-enter the thread" bug. Kept for explicit teardown/unpair only. */
     fun clearActiveRoom() {
         activeRoomId = null
+    }
+
+    /** UI opened [roomId]'s chat. Mark it active and clear any pending
+     *  notification SYNCHRONOUSLY so a message landing in the same instant the
+     *  chat opens can't out-race it. */
+    override fun onRoomOpened(roomId: String) {
+        activeRoomId = roomId
+        notifier.clearConversation(roomId, reason = "room-open")
+        Log.i(TAG, "room-open active=$roomId (notification cleared, notifications suppressed for it)")
+    }
+
+    /** UI left [roomId]'s chat. Resume notifications for it. */
+    override fun onRoomClosed(roomId: String) {
+        if (activeRoomId == roomId) {
+            activeRoomId = null
+            Log.i(TAG, "room-close active cleared (was $roomId — notifications resume)")
+        }
     }
 
     /** conversationId → display name, for notification titles. */
@@ -380,7 +404,15 @@ internal class GoogleMessagesMessageRepository(
      *  old message replayed during the initial sync. */
     private fun maybeNotify(gm: GMSessionProto.GMMessage, mapped: Message, isNew: Boolean) {
         if (!isNew || gm.isOutgoing) return
-        if (gm.conversationId == activeRoomId) return
+        if (gm.conversationId == activeRoomId) {
+            // The user is looking at this thread: don't post, and defensively
+            // cancel any notification already on screen for it (covers the race
+            // where a notification was posted in the instant before the chat
+            // opened — which is what left a stale notification needing a
+            // re-enter to clear).
+            notifier.clearConversation(gm.conversationId, reason = "active-room-msg")
+            return
+        }
         // Suppress backfill: only notify for messages newer than session start
         // (small slack for clock skew between phone and this device).
         if (mapped.timestampMs < sessionStartMs - 10_000L) return
@@ -491,7 +523,7 @@ internal class GoogleMessagesMessageRepository(
      *  always off.) */
     override suspend fun markRoomRead(roomId: String) {
         activeRoomId = roomId
-        notifier.clearConversation(roomId)
+        notifier.clearConversation(roomId, reason = "mark-read")
         writeLock.withLock {
             unreadByRoom.value = unreadByRoom.value + (roomId to 0)
             requestSave()
