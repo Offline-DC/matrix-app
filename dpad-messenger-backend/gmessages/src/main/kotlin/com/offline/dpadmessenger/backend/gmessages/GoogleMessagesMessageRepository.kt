@@ -183,6 +183,10 @@ internal class GoogleMessagesMessageRepository(
     private val loggedMediaParseFailures =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
+    /** Message ids we've already logged a contentless-ghost dump for (once each). */
+    private val loggedEmptyMessages =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
     init {
         // Restore the on-disk cache so history shows on launch, before the
         // network sync lands. Off the constructor thread (IO inside) so a large
@@ -359,6 +363,24 @@ internal class GoogleMessagesMessageRepository(
             // redundant — the reaction itself renders as a chip on the target
             // bubble — so don't show (or notify for) them as standalone rows.
             if (isReactionFallbackText(gm.text)) continue
+            // Contentless "ghost" rows: a message with no text, no media and no
+            // reactions has nothing to display. These were surfacing as empty
+            // "📎 Attachment" rows — notably one per sender alongside group
+            // messages (delivery/read receipts and group protocol events that
+            // Google delivers in the message stream). Skip ingesting them so they
+            // don't create phantom conversations, and log the wire shape ONCE per
+            // id so we can confirm exactly what they are from a fresh capture.
+            if (gm.text.isBlank() && !gm.hasMedia && gm.reactions.isEmpty() && !gm.isDeleted) {
+                if (loggedEmptyMessages.add(gm.messageId)) {
+                    Log.w(
+                        TAG,
+                        "ghost-skip msg=${gm.messageId} conv=${gm.conversationId} " +
+                            "sender=${gm.participantId} status=${gm.statusCode} " +
+                            (gm.emptyDebug ?: "(no field dump)"),
+                    )
+                }
+                continue
+            }
             // Local auto-delete: don't ingest anything already older than the
             // retention window.
             if (gm.timestampMicros / 1000 < autoDeleteCutoff) continue

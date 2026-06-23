@@ -112,11 +112,14 @@ fun RoomListItem(
 /** Optical x-correction for the unread digit's right-leaning side bearing. */
 private val OPTICAL_NUDGE = (-0.5).dp
 
-/** Short typed label for a media-only message in the room-list preview. */
+/** Short typed label for a media-only message in the room-list preview. A null
+ *  attachment means there's genuinely nothing to show (an empty body with no
+ *  media) — return "" rather than a misleading "📎 Attachment" paperclip. */
 private fun mediaPreviewLabel(attachment: Attachment?): String = when (attachment?.kind) {
     AttachmentKind.IMAGE -> "📷 Photo"
     AttachmentKind.VIDEO -> "🎥 Video"
-    else -> "📎 Attachment"
+    AttachmentKind.OTHER -> "📎 Attachment"
+    null -> ""
 }
 
 @Composable

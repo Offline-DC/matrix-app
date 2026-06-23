@@ -190,6 +190,11 @@ internal object GMSessionProto {
         val media: GMMedia? = null,
         /** Diagnostic field dump set when media was present but unparsable. */
         val mediaDebug: String? = null,
+        /** Diagnostic field dump set when the message has no text, no media and
+         *  no reactions — i.e. a contentless "ghost" row. Lets the repo log the
+         *  wire shape so we can see what these actually are (receipts, group
+         *  protocol events, …). */
+        val emptyDebug: String? = null,
     ) {
         val isOutgoing: Boolean get() = statusCode in 1..99
         val isTombstone: Boolean get() = statusCode in 200..299
@@ -316,12 +321,18 @@ internal object GMSessionProto {
                 21 -> f.bytes?.let { replyTo = ProtoReader.fields(it)[1]?.bytes?.toString(Charsets.UTF_8) }
             }
         }
+        val text = textParts.joinToString("\n")
+        // Contentless row (no text, no media, no reactions) that isn't a
+        // tombstone/deleted marker → capture its full field shape so the repo
+        // can log what these phantom "ghost" messages actually carry.
+        val emptyDebug = if (text.isBlank() && !hasMedia && reactions.isEmpty() && status !in 200..299 && status != 300)
+            "msg{${describeFields(bytes)}}" else null
         return GMMessage(
             messageId = id, statusCode = status, timestampMicros = ts,
             conversationId = convId, participantId = pid,
-            text = textParts.joinToString("\n"), hasMedia = hasMedia,
+            text = text, hasMedia = hasMedia,
             tmpId = tmpId, replyToMessageId = replyTo, reactions = reactions, media = media,
-            mediaDebug = mediaDebug,
+            mediaDebug = mediaDebug, emptyDebug = emptyDebug,
         )
     }
 
