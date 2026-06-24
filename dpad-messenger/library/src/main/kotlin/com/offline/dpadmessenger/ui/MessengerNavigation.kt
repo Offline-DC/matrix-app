@@ -98,10 +98,21 @@ fun DpadMessengerApp(
     val startRoute = if (authed) Routes.ROOM_LIST else Routes.LOGIN
 
     // Notification tap → jump straight into that thread. Keyed on the tap
-    // nonce so a second notification for the same room still navigates.
-    androidx.compose.runtime.LaunchedEffect(initialRoomKey) {
+    // nonce so a second notification for the same room still navigates, and on
+    // [authed] so a tap that arrives before pairing finishes still lands the
+    // user in the thread once they're authenticated (rather than being dropped).
+    androidx.compose.runtime.LaunchedEffect(initialRoomKey, authed) {
         if (initialRoomId != null && authed) {
-            nav.navigate(Routes.chat(initialRoomId)) { launchSingleTop = true }
+            nav.navigate(Routes.chat(initialRoomId)) {
+                // Pop any thread the user was already sitting in back to the room
+                // list first. Without this, deep-linking from one chat to another
+                // reuses the same "chat/{roomId}" destination (and its existing
+                // ChatViewModel, still bound to the old room) — so the tap appeared
+                // to "do nothing" and left you in the thread you were already in.
+                // Popping to the list guarantees a fresh chat entry for the target.
+                popUpTo(Routes.ROOM_LIST)
+                launchSingleTop = true
+            }
         }
     }
 
