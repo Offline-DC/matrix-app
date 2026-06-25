@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
@@ -138,10 +139,14 @@ class SignalNotifier(context: Context) {
         }
     }
 
-    /** Clear a thread's notification + history (e.g. when the user opens it). */
-    fun clearConversation(conversationId: String) {
+    /** Clear a thread's notification + history (e.g. when the user opens it).
+     *  [reason] is logged only (e.g. "room-open", "active-room-msg",
+     *  "mark-read") to trace why a thread's notification was dismissed —
+     *  mirrors GoogleMessagesNotifier so the clear-on-open path is debuggable. */
+    fun clearConversation(conversationId: String, reason: String? = null) {
         historyByConversation.remove(conversationId)
         nm.cancel(notificationIdFor(conversationId))
+        Log.i(TAG, "clear conversation=$conversationId reason=${reason ?: "n/a"}")
     }
 
     private fun openMessengerIntent(conversationId: String): PendingIntent? {
@@ -168,6 +173,7 @@ class SignalNotifier(context: Context) {
         NOTIFICATION_ID_BASE + (conversationId.hashCode() and 0xFFFF)
 
     companion object {
+        private const val TAG = "SigNotify"
         private const val CHANNEL_ID = "signal_incoming_v1"
         private const val NOTIFICATION_ID_BASE = 5200
         private const val MAX_LINES = 6

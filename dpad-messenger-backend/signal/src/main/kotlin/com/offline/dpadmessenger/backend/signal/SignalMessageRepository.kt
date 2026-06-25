@@ -1,5 +1,6 @@
 package com.offline.dpadmessenger.backend.signal
 
+import android.util.Log
 import com.offline.dpadmessenger.data.Attachment
 import com.offline.dpadmessenger.data.AttachmentSender
 import com.offline.dpadmessenger.data.ContactEntry
@@ -373,6 +374,40 @@ class SignalMessageRepository(
         return false
     }
 
+    /** The conversation whose chat screen is currently open + foregrounded.
+     *  Incoming messages to it must NOT notify (the user is already looking),
+     *  and any stale notification for it is cleared. Driven by the chat
+     *  ViewModel lifecycle via [onRoomOpened]/[onRoomClosed] — NOT by the
+     *  Activity stopping — so a flip-phone screen-sleep on an open thread can't
+     *  make it start notifying again. Mirrors GoogleMessagesMessageRepository. */
+    @Volatile private var activeRoomId: String? = null
+
+    /** UI opened [roomId]'s chat. Mark it active and clear any pending
+     *  notification SYNCHRONOUSLY so a message landing in the same instant the
+     *  chat opens can't out-race it. */
+    override fun onRoomOpened(roomId: String) {
+        activeRoomId = roomId
+        notifier?.clearConversation(roomId, reason = "room-open")
+        // Also clear the unread badge here — not just in the one-shot
+        // markRoomRead — so reopening a thread from its notification (where the
+        // chat ViewModel may be reused rather than recreated, so its markRoomRead
+        // doesn't fire again) still drops the badge. Mirrors the gmessages read-fix.
+        if (rooms.value.any { it.room.id == roomId && it.unreadCount != 0 }) {
+            rooms.value = rooms.value.map {
+                if (it.room.id == roomId && it.unreadCount != 0) it.copy(unreadCount = 0) else it
+            }
+        }
+        Log.i(TAG, "room-open active=$roomId (notification + unread cleared, suppressed)")
+    }
+
+    /** UI left [roomId]'s chat (navigated back). Resume notifications for it. */
+    override fun onRoomClosed(roomId: String) {
+        if (activeRoomId == roomId) {
+            activeRoomId = null
+            Log.i(TAG, "room-close active cleared (was $roomId — notifications resume)")
+        }
+    }
+
     override suspend fun markRoomRead(roomId: String) {
         // Clear the unread badge locally only. By product decision we do NOT
         // send Signal read receipts, so the other side is never told we've
@@ -381,9 +416,11 @@ class SignalMessageRepository(
         rooms.value = rooms.value.map {
             if (it.room.id == roomId && it.unreadCount != 0) it.copy(unreadCount = 0) else it
         }
-        // Opening a thread dismisses its notification (and resets its history)
-        // so a thread the user is reading doesn't linger in the system shade.
-        notifier?.clearConversation(roomId)
+        // Reading a thread also makes it the active room, and dismisses its
+        // notification (and resets its history) so a thread the user is reading
+        // doesn't linger in the system shade.
+        activeRoomId = roomId
+        notifier?.clearConversation(roomId, reason = "mark-read")
     }
 
     override suspend fun simulateIncoming(roomId: String, senderId: String, body: String) {
@@ -681,7 +718,7 @@ class SignalMessageRepository(
         // Surface a system notification (mirrored into the launcher's
         // Notifications tab). The room name is the best sender label we have.
         val displayName = rooms.value.firstOrNull { it.room.id == roomId }?.room?.name ?: betterName
-        notifier?.notifyIncoming(
+        maybeNotifyIncoming(
             conversationId = roomId,
             title = displayName,
             senderName = displayName,
@@ -695,6 +732,32 @@ class SignalMessageRepository(
         body.isNotBlank() -> body
         attachment != null -> "📎 Attachment"
         else -> "New message"
+    }
+
+    /** Post an incoming-message notification unless the user is currently
+     *  looking at [conversationId]. When it IS the active room we don't notify
+     *  and defensively clear any notification already on screen for it — this
+     *  covers the race where one was posted in the instant before the chat
+     *  opened (the "won't clear until I re-enter the thread" bug gmessages
+     *  fixed). Mirrors GoogleMessagesMessageRepository.maybeNotify. */
+    private fun maybeNotifyIncoming(
+        conversationId: String,
+        title: String,
+        senderName: String,
+        body: String,
+        timeMs: Long,
+    ) {
+        if (conversationId == activeRoomId) {
+            notifier?.clearConversation(conversationId, reason = "active-room-msg")
+            return
+        }
+        notifier?.notifyIncoming(
+            conversationId = conversationId,
+            title = title,
+            senderName = senderName,
+            body = body,
+            timeMs = timeMs,
+        )
     }
 
     // ---- inbound interactive events (reactions / edits / deletes / receipts) ----
@@ -815,7 +878,7 @@ class SignalMessageRepository(
         // message author (so the launcher tab reads "Group — Alice: ...").
         val groupName = rooms.value.firstOrNull { it.room.id == roomId }?.room?.name ?: "Group"
         val senderName = userCache.value[senderServiceId]?.displayName ?: shortName(senderServiceId)
-        notifier?.notifyIncoming(
+        maybeNotifyIncoming(
             conversationId = roomId,
             title = groupName,
             senderName = senderName,
@@ -1117,6 +1180,7 @@ class SignalMessageRepository(
             unreadCount = when {
                 m.isOutgoing -> previous.unreadCount       // never bump for outbound
                 isSameMessage -> previous.unreadCount      // same message, status flip
+                roomId == activeRoomId -> previous.unreadCount  // user is looking at it → keep badge clear
                 else -> previous.unreadCount + 1           // genuinely new inbound
             },
         )
@@ -1147,5 +1211,6 @@ class SignalMessageRepository(
     private companion object {
         /** Max chars of the parent body echoed into an outbound reply quote. */
         const val QUOTE_PREVIEW_MAX = 120
+        private const val TAG = "SigRepo"
     }
 }
