@@ -44,20 +44,35 @@ fun SignalApp(
         val retention = repository as? RetentionSettings
         val autoDeleteFlow = remember(retention) { retention?.autoDeleteEnabled ?: MutableStateFlow(true) }
         val autoDeleteEnabled by autoDeleteFlow.collectAsState()
+
+        // Full log-out + forget the pairing so the next launch shows the QR.
+        // Used by the Settings "log out" action AND the auth-expired re-link
+        // prompt below. We deliberately wipe the cached message history too —
+        // an unlinked device's old messages shouldn't survive a re-link.
+        val logout = {
+            SignalRepository.shutdown()
+            store.clear()
+            SignalMessageStore(context).clear()
+            SignalPairing.reset()
+            paired = false
+        }
+
+        // If the device was unlinked from the primary phone, the server 401s
+        // every send. Swap the chat for a re-link prompt instead of letting
+        // messages silently fail with a misleading "sent" check.
+        val authExpiredFlow = remember {
+            SignalRepository.authExpiredFlow() ?: MutableStateFlow(false)
+        }
+        val authExpired by authExpiredFlow.collectAsState()
+        if (authExpired) {
+            SignalReconnectScreen(onRelink = logout, modifier = modifier)
+            return
+        }
+
         DpadMessengerApp(
             repository = repository,
             modifier = modifier,
-            onLogout = {
-                SignalRepository.shutdown()
-                store.clear()
-                // Also wipe the locally-persisted conversation history so logging
-                // out removes all Signal messages from the phone (otherwise the
-                // encrypted snapshot survives and would reload on the next link,
-                // even under a different account).
-                SignalMessageStore(context).clear()
-                SignalPairing.reset()
-                paired = false
-            },
+            onLogout = logout,
             initialRoomId = initialRoomId,
             initialRoomKey = initialRoomKey,
             autoDeleteEnabled = autoDeleteEnabled,

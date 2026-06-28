@@ -85,16 +85,32 @@ class SignalChatWebSocket(
     private var socket: WebSocket? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /** Set by [disconnect] and by a terminal auth failure so a pending
+     *  reconnect doesn't fire. */
+    @Volatile private var stopped = false
+
+    /** Consecutive failed reconnects, for exponential backoff. Reset on open. */
+    @Volatile private var reconnectAttempts = 0
+
+    /** Consecutive 401/403 upgrade rejections. Reset on open. A few in a row
+     *  (creds never self-heal) means the device was unlinked. */
+    @Volatile private var authFailures = 0
+
     fun connect() {
+        stopped = false
         val auth = "${account.aci}.${account.deviceId}:${account.password}"
         val authHeader = "Basic " + Base64.encodeToString(auth.toByteArray(), Base64.NO_WRAP)
         // Signal's chat WebSocket accepts auth via either Basic header OR
         // login/password query parameters; we send both for compatibility.
-        val url = "$chatUrl?login=${account.aci}.${account.deviceId}&password=${account.password}&agent=DPADMSG"
+        //
+        // Do NOT append `&agent=…` (and don't send a custom X-Signal-Agent):
+        // an unrecognized agent makes the server reject the upgrade with HTTP
+        // 403 Forbidden — the exact failure we hit before, and the same reason
+        // the provisioning socket needed the agent param removed.
+        val url = "$chatUrl?login=${account.aci}.${account.deviceId}&password=${account.password}"
         val request = Request.Builder()
             .url(url)
             .header("Authorization", authHeader)
-            .header("X-Signal-Agent", "DPADMSG")
             .build()
         socket = okHttp.newWebSocket(request, listener)
         Log.d(TAG, "connecting as ${account.aci}.${account.deviceId}")
@@ -102,6 +118,7 @@ class SignalChatWebSocket(
     }
 
     fun disconnect() {
+        stopped = true
         socket?.close(1000, "shutdown")
         socket = null
     }
@@ -109,6 +126,8 @@ class SignalChatWebSocket(
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             Log.d(TAG, "chat socket OPEN (HTTP ${response.code})")
+            reconnectAttempts = 0  // healthy connection — reset backoff
+            authFailures = 0
             // Notify outside the listener thread so anything heavy (network,
             // crypto) doesn't block frame intake.
             scope.launch { runCatching { onSocketConnected?.invoke() } }
@@ -123,12 +142,40 @@ class SignalChatWebSocket(
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            Log.e(TAG, "chat socket failure code=${response?.code} ${t.message}", t)
-            // Reconnect after a backoff. Signal's server kills idle sockets
-            // after ~55s; transient network blips also trigger this.
+            if (stopped) return
+            val code = response?.code
+
+            // A 401/403 on the upgrade means the server rejected our device
+            // credentials — the device was unlinked. Credentials never self-heal,
+            // so after a few in a row, stop the loop instead of hammering every
+            // few seconds and surface the same "re-link" prompt the send path
+            // uses. We allow a couple retries first to ride out a fluke.
+            if (code == 401 || code == 403) {
+                authFailures++
+                if (authFailures >= AUTH_FAILURE_LIMIT) {
+                    stopped = true
+                    socket = null
+                    Log.w(TAG, "chat socket auth rejected (HTTP $code) ×$authFailures — device unlinked; stopping reconnect")
+                    repository.markAuthExpired()
+                    return
+                }
+                Log.w(TAG, "chat socket auth rejected (HTTP $code) — retry $authFailures/$AUTH_FAILURE_LIMIT")
+                scope.launch {
+                    delay(5_000)
+                    if (!stopped) connect()
+                }
+                return
+            }
+
+            // Otherwise it's a transient drop (Signal kills idle sockets after
+            // ~55s; network blips too). Reconnect with exponential backoff so a
+            // persistent outage doesn't spin in a tight loop.
+            val attempt = reconnectAttempts++
+            val backoffMs = (5_000L * (1L shl attempt.coerceAtMost(5))).coerceAtMost(MAX_BACKOFF_MS)
+            Log.w(TAG, "chat socket dropped (code=$code ${t.message}); reconnecting in ${backoffMs}ms")
             scope.launch {
-                delay(5_000)
-                connect()
+                delay(backoffMs)
+                if (!stopped) connect()
             }
         }
     }
@@ -843,5 +890,9 @@ class SignalChatWebSocket(
 
     companion object {
         private const val TAG = "SignalChatWS"
+        /** Cap on reconnect backoff so a long outage settles at a slow poll. */
+        private const val MAX_BACKOFF_MS = 60_000L
+        /** Consecutive 401/403s before we conclude the device is unlinked. */
+        private const val AUTH_FAILURE_LIMIT = 3
     }
 }

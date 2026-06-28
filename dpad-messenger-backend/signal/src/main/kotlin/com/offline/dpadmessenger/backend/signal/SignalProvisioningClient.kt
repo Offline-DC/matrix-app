@@ -106,14 +106,17 @@ class SignalProvisioningClient(
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            Log.d(TAG, "socket onOpen — HTTP ${response.code} ${response.message}")
             _state.value = SignalProvisioningResult.WaitingForUuid
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            Log.d(TAG, "socket onMessage — ${bytes.size} bytes")
             handleBinaryFrame(webSocket, bytes.toByteArray())
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            Log.w(TAG, "socket onFailure — http=${response?.code} ${t::class.java.simpleName}: ${t.message}", t)
             // Same logic as onClosed — once the provision message is in
             // hand, any subsequent socket failure is irrelevant to linking.
             if (provisionMessageReceived || _state.value is SignalProvisioningResult.Linked) {
@@ -125,6 +128,7 @@ class SignalProvisioningClient(
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            Log.d(TAG, "socket onClosed — $code: $reason (provisionReceived=$provisionMessageReceived)")
             // If we've already pulled the ProvisionMessage off the wire OR
             // finished registration, the close is the normal end-of-handshake
             // (we close ourselves with code 1000 right after decoding the
@@ -159,8 +163,12 @@ class SignalProvisioningClient(
             return
         }
 
-        if (envelope.type != WebSocketProtos.WebSocketMessage.Type.REQUEST) return
+        if (envelope.type != WebSocketProtos.WebSocketMessage.Type.REQUEST) {
+            Log.d(TAG, "frame type=${envelope.type} (not REQUEST) — ignoring")
+            return
+        }
         val request = envelope.request ?: return
+        Log.d(TAG, "inbound request: ${request.verb} ${request.path} (id=${request.id}, ${request.body.size()} body bytes)")
 
         when (request.path) {
             "/v1/address" -> {
@@ -445,8 +453,13 @@ class SignalProvisioningClient(
 
     companion object {
         private const val TAG = "SignalProvisioning"
+        // Plain provisioning path — matches Signal-Android / mautrix-signal.
+        // Do NOT append `?agent=…`: the server issues an address to any opened
+        // socket, but tags an unrecognized agent and can refuse to *route* the
+        // primary's provision message to it (QR shows, scan silently fails).
+        // If an agent string is ever needed, it goes in a header, not the URL.
         const val SIGNAL_PROVISIONING_URL =
-            "wss://chat.signal.org/v1/websocket/provisioning/?agent=DPADMSG"
+            "wss://chat.signal.org/v1/websocket/provisioning/"
         /** Shown on the primary's "Linked Devices" list for this device. */
         private const val DEVICE_NAME = "Dumbphone 2"
     }

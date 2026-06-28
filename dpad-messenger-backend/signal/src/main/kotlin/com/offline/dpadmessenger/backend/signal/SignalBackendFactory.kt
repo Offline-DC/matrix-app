@@ -29,7 +29,11 @@ class SignalBackendFactory : BackendFactory {
         val attachments = SignalAttachments(context, account, api)
         val store = SignalMessageStore(context)
         val profiles = SignalProfiles(account, api)
-        val repo = SignalMessageRepository(account, sender, attachments, groups, store, profiles)
+        val repo = SignalMessageRepository(
+            account, sender, attachments, groups, store, profiles,
+            appContext = context.applicationContext,
+            discovery = SignalContactDiscovery(account, api),
+        )
         // Let the sender echo each conversation's disappearing-messages timer.
         sender.conversationTimerLookup = repo::expireTimerFor
         // Bring up the inbound chat WebSocket so the repo can receive. We do

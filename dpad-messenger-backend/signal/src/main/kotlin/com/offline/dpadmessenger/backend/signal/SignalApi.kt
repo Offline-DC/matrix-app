@@ -518,6 +518,38 @@ class SignalApi(
         SendMessageResult(response.code, respText)
     }
 
+    /**
+     * `GET /v2/directory/auth` — fetch short-lived credentials for the Contact
+     * Discovery Service (CDSI). The returned username/password authenticate the
+     * subsequent `cdsiLookup` against `cdsi.signal.org` (the actual enclave
+     * handshake + attestation is handled inside libsignal's `Network`). Returns
+     * null on any failure so discovery degrades to "number not resolvable".
+     *
+     * Reference: Signal-Android `PushServiceSocket.getCdsiAuthorization()`.
+     */
+    suspend fun getCdsiAuth(login: String, password: String): CdsiAuthResponse? =
+        withContext(Dispatchers.IO) {
+            val authHeader = "Basic " + Base64.encodeToString(
+                "$login:$password".toByteArray(),
+                Base64.NO_WRAP,
+            )
+            val url = "$baseUrl/v2/directory/auth"
+            Log.d(TAG, "GET $url")
+            val request = Request.Builder()
+                .url(url)
+                .get()
+                .header("Authorization", authHeader)
+                .header("User-Agent", "DPADMessenger/0.1")
+                .build()
+            val response = okHttp.newCall(request).execute()
+            val respText = response.body?.string().orEmpty()
+            Log.d(TAG, "getCdsiAuth → HTTP ${response.code}: ${respText.take(120)}")
+            if (!response.isSuccessful) return@withContext null
+            runCatching {
+                JSON.decodeFromString(CdsiAuthResponse.serializer(), respText)
+            }.getOrNull()
+        }
+
     companion object {
         private const val TAG = "SignalApi"
         private const val MRM_MEDIA_TYPE = "application/vnd.signal-messenger.mrm"
@@ -537,6 +569,13 @@ class SignalApi(
 data class SendMessageResult(val httpStatus: Int, val rawBody: String) {
     val isSuccess: Boolean get() = httpStatus in 200..299
 }
+
+/** GET /v2/directory/auth response — short-lived CDSI credentials. */
+@Serializable
+data class CdsiAuthResponse(
+    val username: String,
+    val password: String,
+)
 
 /** GET /v1/profile/&lt;serviceId&gt; response (subset). `name` is the
  *  base64 AES-GCM-encrypted display name. */

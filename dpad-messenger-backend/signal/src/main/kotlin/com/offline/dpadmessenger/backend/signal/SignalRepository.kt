@@ -7,6 +7,7 @@ import com.offline.dpadmessenger.data.MessageRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /**
@@ -47,7 +48,11 @@ object SignalRepository {
         val store = SignalMessageStore(appContext)
         val profiles = SignalProfiles(account, api)
         val notifier = SignalNotifier(appContext)
-        val repo = SignalMessageRepository(account, sender, attachments, groups, store, profiles, notifier)
+        val discovery = SignalContactDiscovery(account, api)
+        val repo = SignalMessageRepository(
+            account, sender, attachments, groups, store, profiles, notifier, appContext,
+            discovery = discovery,
+        )
         // Let the sender echo each conversation's disappearing-messages timer.
         sender.conversationTimerLookup = repo::expireTimerFor
         val sock = SignalChatWebSocket(appContext, account, repo)
@@ -61,6 +66,11 @@ object SignalRepository {
         instance = repo
         return repo
     }
+
+    /** Live "device was unlinked" signal (HTTP 401 on send), or null when not
+     *  linked. The Signal app gate observes this to show the re-link prompt. */
+    fun authExpiredFlow(): StateFlow<Boolean>? =
+        (instance as? SignalMessageRepository)?.authExpired
 
     fun create(context: Context): MessageRepository {
         val repo = createIfPaired(context)

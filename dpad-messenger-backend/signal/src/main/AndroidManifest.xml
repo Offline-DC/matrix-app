@@ -6,4 +6,6 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Briefly wake the (cover) display for a new message, like a normal SMS. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Read the device address book to populate the new-message contact picker. -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
 </manifest>

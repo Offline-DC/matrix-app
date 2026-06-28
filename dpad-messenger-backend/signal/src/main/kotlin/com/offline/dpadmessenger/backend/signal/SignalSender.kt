@@ -44,6 +44,16 @@ import java.util.concurrent.ConcurrentHashMap
  * uses our login/password; the "unidentified" part is that the encrypted
  * envelope wraps the SenderCertificate, not the auth header.
  */
+
+/**
+ * Thrown when the Signal server rejects our device credentials with HTTP 401.
+ * In practice this means the linked device was removed from the primary phone
+ * (Settings → Linked devices), so every authenticated call will keep failing
+ * until the user re-links. The repository watches for this to flip into its
+ * "re-link" state instead of silently failing sends.
+ */
+class SignalAuthException(message: String) : RuntimeException(message)
+
 class SignalSender(
     context: Context,
     private val account: SignalAccount,
@@ -611,12 +621,23 @@ class SignalSender(
             return
         }
         var delivered = 0
+        var lastError: Throwable? = null
         for (memberAci in recipients) {
             runCatching { encryptAndSendContent(memberAci, content, timestamp, cert) }
                 .onSuccess { delivered++ }
-                .onFailure { Log.w(TAG, "group send to $memberAci failed", it) }
+                .onFailure { Log.w(TAG, "group send to $memberAci failed", it); lastError = it }
         }
         Log.d(TAG, "group fan-out delivered to $delivered/${recipients.size}")
+        // Reaching at least one member counts as sent (partial delivery is
+        // normal). Reaching NOBODY is a real failure the UI must show — rethrow
+        // so sendMessage marks the bubble failed. Prefer the auth exception (a
+        // 401 = unlinked device) so the repository can prompt a re-link.
+        if (delivered == 0) {
+            val authErr = lastError as? SignalAuthException
+            throw authErr
+                ?: lastError
+                ?: RuntimeException("group send: 0/${recipients.size} members reached")
+        }
     }
 
     /**
@@ -662,6 +683,14 @@ class SignalSender(
         cert: SenderCertificate,
     ) {
         val bundle = getRecipientBundleCached(recipientServiceId)
+        // No devices means there's nothing to deliver to — sending an empty
+        // message list still returns 2xx from the server, which would surface
+        // as a misleading "sent" check on a message nobody received. Fail loud
+        // instead so the bubble shows as failed. (Seen with PNI-only recipients
+        // whose prekeys aren't fetchable by phone-number identity.)
+        if (bundle.devices.isEmpty()) {
+            throw RuntimeException("no prekey devices for $recipientServiceId — message not delivered")
+        }
         val identityKey = IdentityKey(Base64.decode(bundle.identityKey, Base64.NO_WRAP), 0)
         bundle.devices.forEach { dev ->
             bootstrapSessionIfNeeded(recipientServiceId, dev, identityKey)
@@ -683,6 +712,7 @@ class SignalSender(
                 content = Base64.encodeToString(encrypted, Base64.NO_WRAP),
             )
         }
+        Log.d(TAG, "sending to $recipientServiceId — ${outgoing.size} device message(s)")
         val result = api.sendMessage(
             login = login,
             password = password,
@@ -690,6 +720,13 @@ class SignalSender(
             body = SendMessageRequest(messages = outgoing, timestamp = timestamp),
         )
         if (!result.isSuccess) {
+            // A 401 means our device credentials are no longer valid — almost
+            // always because the device was unlinked from the primary phone.
+            // Surface it as a distinct type so the repository can prompt a
+            // re-link instead of just silently failing the send.
+            if (result.httpStatus == 401) {
+                throw SignalAuthException("send failed HTTP 401: ${result.rawBody}")
+            }
             throw RuntimeException("send failed HTTP ${result.httpStatus}: ${result.rawBody}")
         }
     }

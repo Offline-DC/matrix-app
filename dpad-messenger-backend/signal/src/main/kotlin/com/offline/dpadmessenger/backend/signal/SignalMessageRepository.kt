@@ -61,6 +61,14 @@ class SignalMessageRepository(
      *  posts a notification (which the launcher mirrors into its in-app
      *  Notifications tab). Null in mock/unit-test paths. */
     private val notifier: SignalNotifier? = null,
+    /** Optional app context, used to read the device's local address book for
+     *  the new-message picker. Null in mock/unit-test paths (picker then shows
+     *  only synced contacts). */
+    private val appContext: android.content.Context? = null,
+    /** Optional CDSI contact-discovery client. When present, starting a chat
+     *  with a number we don't already know resolves it to an ACI via CDSI.
+     *  Null in mock/unit-test paths (unknown numbers then can't be started). */
+    private val discovery: SignalContactDiscovery? = null,
 ) : MessageRepository, MediaDownloader, AttachmentSender, ConversationStarter, ContactsSource, RetentionSettings {
 
     /** masterKey per group room id — learned from inbound group messages,
@@ -113,6 +121,19 @@ class SignalMessageRepository(
     private val messagesByRoom = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
     private val hasMoreOlder = MutableStateFlow<Map<String, Boolean>>(emptyMap())
     private val userCache = MutableStateFlow<Map<String, User>>(mapOf(account.aci to currentUser))
+
+    /**
+     * Flips to true when the server rejects our credentials (HTTP 401) — i.e.
+     * the device was unlinked from the primary phone. The UI watches this to
+     * swap the chat for a "re-link" prompt instead of letting sends silently
+     * fail. Surfaced to the app layer via [SignalRepository.authExpiredFlow].
+     */
+    private val _authExpired = MutableStateFlow(false)
+    val authExpired: StateFlow<Boolean> = _authExpired.asStateFlow()
+
+    /** Flip into the unlinked/"re-link" state. Called by the send path on a 401
+     *  and by the receive socket when the server rejects its credentials. */
+    fun markAuthExpired() { _authExpired.value = true }
 
     // ---- persistence + retention (RetentionSettings) ------------------------
 
@@ -277,6 +298,7 @@ class SignalMessageRepository(
             tentative.copy(status = MessageStatus.SENT, timestampMs = serverTs)
         } catch (t: Throwable) {
             android.util.Log.w("SignalRepo", "send failed for $roomId", t)
+            if (t is SignalAuthException) _authExpired.value = true
             updateStatus(roomId, tentativeId, MessageStatus.FAILED)
             tentative.copy(status = MessageStatus.FAILED)
         }
@@ -494,6 +516,7 @@ class SignalMessageRepository(
             true
         } catch (t: Throwable) {
             android.util.Log.w("SignalRepo", "attachment send failed for $roomId", t)
+            if (t is SignalAuthException) _authExpired.value = true
             updateStatus(roomId, tentativeId, MessageStatus.FAILED)
             false
         }
@@ -503,27 +526,82 @@ class SignalMessageRepository(
 
     /**
      * Start (or open) a 1:1 chat for [destination] — a phone number chosen in
-     * the "new chat" picker or typed in. Signal addresses by ACI, so we resolve
-     * the number against the contacts we learned from contact sync; if found we
-     * create an (empty) DM room and return its id for the UI to open. Returns
-     * null if we can't map the number to a Signal user (we don't run CDSI
-     * contact discovery, so unknown numbers can't be started).
+     * the "new chat" picker or typed in. Signal addresses by ACI, so we first
+     * resolve the number against contacts we already know (contact sync /
+     * prior inbound). If that misses, we fall back to CDSI contact discovery
+     * ([discovery]) to map the number → ACI. Either way we create an (empty) DM
+     * room and return its id for the UI to open. Returns null only if the
+     * number isn't on Signal (or discovery is unavailable / failed).
      */
     override suspend fun startConversation(destination: String): String? {
-        val serviceId = resolveServiceIdForNumber(destination) ?: return null
+        val serviceId = resolveServiceIdForNumber(destination)
+            ?: discovery?.resolveAci(destination)?.also { aci ->
+                // Remember the mapping so future taps + receipts resolve locally.
+                numberToServiceId[normalizeNumber(destination)] = aci
+            }
+            ?: return null
+        // Show the saved contact name (like Signal does) rather than a bare
+        // number: prefer anything we already know for this service id, else the
+        // local address-book name for the number, else the number itself.
         val name = contactsByServiceId[serviceId]?.name
             ?: userCache.value[serviceId]?.displayName
+            ?: localNameForNumber(destination)
             ?: destination
+        // Persist the name → service id so the room header + picker show it and
+        // future lookups resolve locally.
+        if (name != destination) {
+            updateContact(serviceId = serviceId, name = name, e164 = normalizeNumber(destination))
+        }
         return ensureDmRoom(serviceId, name)
     }
 
-    /** Address book for the new-chat picker (synced contacts that have a number). */
-    override suspend fun listContacts(): List<ContactEntry> =
-        contactsByServiceId.entries
+    /** Best-effort: the device address-book display name for [rawNumber],
+     *  matched on the last 7 digits. Null if no local contact or no context. */
+    private suspend fun localNameForNumber(rawNumber: String): String? {
+        val ctx = appContext ?: return null
+        val wantDigits = rawNumber.filter { it.isDigit() }.takeLast(7)
+        if (wantDigits.isBlank()) return null
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
+            SignalLocalContacts.read(ctx)
+                .firstOrNull { it.number.filter(Char::isDigit).takeLast(7) == wantDigits }
+                ?.name
+                ?.takeIf { it.isNotBlank() && it != rawNumber }
+        }
+    }
+
+    /**
+     * Address book for the new-chat picker. Merges two sources:
+     *  1. Synced/known Signal contacts (those we have an ACI for) — these can
+     *     be messaged directly.
+     *  2. The device's local address book (ContactsContract) — gives the picker
+     *     a full, searchable list even on a fresh link with no synced contacts.
+     *
+     * De-duped by the last 7 digits (formatting-insensitive); a Signal-known
+     * entry wins over a bare local one so names/colors stay consistent.
+     */
+    override suspend fun listContacts(): List<ContactEntry> {
+        val synced = contactsByServiceId.entries
             .filter { it.key != account.aci && !it.value.e164.isNullOrBlank() }
             .map { ContactEntry(name = it.value.name, number = it.value.e164!!, avatarColor = "#3A76F0") }
-            .distinctBy { it.number }
-            .sortedBy { it.name.lowercase() }
+
+        val local = appContext?.let { ctx ->
+            kotlinx.coroutines.withContext(Dispatchers.IO) { SignalLocalContacts.read(ctx) }
+                .map { ContactEntry(name = it.name, number = it.number, avatarColor = "#3A76F0") }
+        }.orEmpty()
+
+        Log.d(TAG, "contacts: synced=${synced.size}, local=${local.size}")
+
+        val byKey = LinkedHashMap<String, ContactEntry>()
+        // Synced first so they win ties over bare local entries.
+        for (c in synced + local) {
+            val key = c.number.filter(Char::isDigit).takeLast(7).ifBlank { c.number }
+            val existing = byKey[key]
+            if (existing == null || (existing.name == existing.number && c.name != c.number)) {
+                byKey[key] = c
+            }
+        }
+        return byKey.values.sortedBy { it.name.lowercase() }
+    }
 
     /** Create the DM room for [serviceId] if it doesn't exist yet so the chat
      *  opens (and the first send shows up in the room list). Returns the id. */
