@@ -727,6 +727,16 @@ class SignalMessageRepository(
         // id derivation (groupId from DataMessage.groupV2).
         val roomId = "sig:dm:$senderServiceId"
 
+        // Learn this number → ACI from the reply. When you next type/search the
+        // number in the picker, startConversation → resolveServiceIdForNumber
+        // returns this ACI and opens THIS room, instead of re-running CDSI and
+        // getting the PNI (which would open a second, split thread). This only
+        // fixes resolution going forward — it deliberately does not back-migrate
+        // any existing PNI thread; during dev those get cleared with pm clear.
+        if (!senderE164.isNullOrBlank()) {
+            numberToServiceId[normalizeNumber(senderE164)] = senderServiceId
+        }
+
         // Pick the best display name we can without contact sync:
         //   1. Phone number from the SenderCertificate (sealed sender only)
         //   2. A short "Contact xxxxxxxx" derived from the first 8 hex of ACI

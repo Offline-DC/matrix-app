@@ -13,10 +13,12 @@ Last updated: June 2026.
 ## TL;DR — where we are
 
 Linking, receiving, sending to **already-known** contacts, unlink handling, and
-the contact picker all work on-device. The one remaining functional blocker for
-the core flow is **delivering a first message to a brand-new contact** (CDSI
-returns them as PNI-only) — the chat opens with the right name but delivery isn't
-confirmed yet. See [Open blocker](#open-blocker--pni-first-contact-delivery).
+the contact picker all work on-device. **First-contact delivery to a PNI-only
+cold contact now works** — verified on-device: CDSI returns a real 2-device PNI
+bundle, the type-6 sealed-sender send returns HTTP 200, and the recipient
+received it and replied. The remaining issue is cosmetic-but-important:
+**PNI/ACI thread splitting** — sends keyed by PNI land in one thread while the
+ACI reply opens a second. See [Thread splitting](#pniaci-thread-splitting).
 
 ---
 
@@ -112,32 +114,48 @@ inside libsignal's native `net` stack).
 
 ---
 
-## Open blocker — PNI first-contact delivery
+## PNI first-contact delivery — RESOLVED (verified on-device)
 
-Tapping a never-messaged contact now opens the chat with the right **name**, but
-the **first message to a PNI-only recipient is not confirmed to deliver**.
-
-**Next step (need this to finish):** capture one send and read the result —
+A cold send to `+12489046456` (CDSI: `aci=null pni=PNI:e20ffa63…`) went through
+end-to-end. Decisive log lines:
 ```
-adb logcat -s SignalCDSI SignalSender SignalApi
+refreshed prekey bundle for PNI:e20ffa63… (2 device(s))
+sending to PNI:e20ffa63… — 2 device message(s)
+PUT …/v1/messages/PNI:e20ffa63… → HTTP 200: {"needsSync":true}
+sent-transcript delivered to 3 sibling device(s)
 ```
-The decisive lines: `refreshed prekey bundle for PNI:… (N device(s))`,
-`sending to PNI:… — N device message(s)`, and `PUT …/v1/messages/PNI:… → HTTP xxx`.
+The PNI returned a **real 2-device prekey bundle** (so the feared "N=0, no
+fetchable prekeys" branch didn't happen), the existing **type-6 sealed-sender**
+path was accepted (no authenticated `SessionCipher` fallback needed after all),
+and the recipient **received the message and replied** — full confirmation.
 
-Branches:
-- **N = 0 devices** → PNI has no fetchable prekeys by phone-number identity; need
-  a different resolution (e.g. fetch ACI via profile, or send authenticated).
-- **HTTP 4xx** → likely sealed-sender/unidentified-access issue; regular Signal
-  falls back to an **authenticated (non-sealed) send** for first contact (we
-  currently only do `SealedSessionCipher`, type 6). Adding a `SessionCipher`
-  authenticated path — type mapping `WHISPER_TYPE→1`, `PREKEY_TYPE→3` — is the
-  likely fix. Constants `CIPHERTEXT_TYPE_*` already exist in `SignalSender`.
-- **HTTP 2xx but recipient sees nothing** → PNI delivery semantics / message
-  request; investigate on the recipient side.
+> The authenticated-send fallback (`WHISPER_TYPE→1` / `PREKEY_TYPE→3`,
+> `CIPHERTEXT_TYPE_*` in `SignalSender`) was the contingency plan if this had
+> been a 4xx. It turned out unnecessary; keep it noted in case a different
+> recipient with no PNI prekeys ever forces the issue.
 
-How regular Signal does it (target behavior): discover → if ACI unknown, send the
-first message to the **PNI**, sealed-sender when you have the access key else
-authenticated; once they reply you learn their ACI and upgrade.
+---
+
+## PNI/ACI thread splitting
+
+Once delivery worked, the next on-device symptom: outgoing messages to a cold
+contact sit in a thread keyed by **PNI** (shows as the bare number, e.g.
+`2489046456`), while that person's **reply** arrives under their **ACI** and
+opens a *second* thread (under their saved name, e.g. `jack android`). Same
+human, two chats — because DM rooms are keyed by service-id (`sig:dm:<serviceId>`)
+and PNI ≠ ACI, with no upgrade step.
+
+**Fix applied (forward resolution, no back-migration):** `receiveIncoming` now
+records `numberToServiceId[senderE164] = senderACI` from the reply. So the next
+time you type/search that number, `startConversation → resolveServiceIdForNumber`
+returns the **ACI** and opens the same room the replies land in, instead of
+re-running CDSI → PNI and splitting again. Existing split PNI threads are **not**
+migrated — during dev they're cleared with `pm clear`.
+
+> Heavier alternative (deferred): merge-on-receive (move the PNI room's messages
+> into the ACI room when the reply arrives) and/or re-key DM rooms by E.164 with
+> PNI/ACI as upgradeable routing attributes. Matches how real Signal upgrades
+> PNI→ACI on first reply. Not needed while data is disposable.
 
 ---
 
