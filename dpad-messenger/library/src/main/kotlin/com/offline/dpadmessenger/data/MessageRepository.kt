@@ -77,6 +77,24 @@ interface MessageRepository {
     suspend fun markRoomRead(roomId: String)
 
     /**
+     * Conversations the user has muted. A muted conversation posts no
+     * notifications. Default: nothing muted (repos without the feature).
+     */
+    fun observeMutedRooms(): Flow<Set<String>> =
+        kotlinx.coroutines.flow.flowOf(emptySet())
+
+    /**
+     * Delete a conversation/thread locally: remove it from the room list and
+     * drop its messages. Default no-op for repos that don't support it; the UI
+     * only offers "Delete" when the repo can actually do it (see
+     * [com.offline.dpadmessenger.data.ThreadActions]).
+     */
+    suspend fun deleteRoom(roomId: String) {}
+
+    /** Mute or unmute a conversation. Muted = no notifications. Default no-op. */
+    suspend fun setMuted(roomId: String, muted: Boolean) {}
+
+    /**
      * UI lifecycle: the user opened [roomId]'s chat screen and is actively
      * looking at it. Repos that post notifications should mark this room
      * "active" (suppress + clear its notifications) *synchronously* here, so a

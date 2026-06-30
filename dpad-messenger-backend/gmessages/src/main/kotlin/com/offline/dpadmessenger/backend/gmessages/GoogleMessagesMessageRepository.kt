@@ -52,7 +52,7 @@ internal class GoogleMessagesMessageRepository(
     private val session: GoogleMessagesSessionClient,
     context: Context,
 ) : MessageRepository, InitialSyncAware, ConversationStarter, GroupConversationStarter,
-    ContactsSource, MediaDownloader, AttachmentSender {
+    ContactsSource, MediaDownloader, AttachmentSender, com.offline.dpadmessenger.data.ThreadActions {
 
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -163,6 +163,8 @@ internal class GoogleMessagesMessageRepository(
     private val rooms = MutableStateFlow<List<Room>>(emptyList())
     private val messagesByRoom = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
     private val unreadByRoom = MutableStateFlow<Map<String, Int>>(emptyMap())
+    /** Muted conversations (roomId) — suppress notifications. Persisted. */
+    private val mutedRooms = MutableStateFlow<Set<String>>(emptySet())
 
     /** conversationId → participant id we send as (Conversation.defaultOutgoingID). */
     private val outgoingIdByRoom = HashMap<String, String>()
@@ -271,6 +273,7 @@ internal class GoogleMessagesMessageRepository(
             messagesByRoom.value = snap.messagesByRoom
                 .mapValues { (_, list) -> list.filter { it.timestampMs >= cutoff } }
             unreadByRoom.value = snap.unreadByRoom
+            mutedRooms.value = snap.mutedRooms
             outgoingIdByRoom.putAll(snap.outgoingIdByRoom)
             snap.rooms.forEach { roomNameById[it.id] = it.name }
             // We have something to show — skip the loading spinner; the live sync
@@ -286,6 +289,7 @@ internal class GoogleMessagesMessageRepository(
             usersById = usersById.value,
             outgoingIdByRoom = HashMap(outgoingIdByRoom),
             unreadByRoom = unreadByRoom.value,
+            mutedRooms = mutedRooms.value,
         )
         // JSON encode + encrypted write on IO.
         withContext(Dispatchers.IO) { cache.save(snapshot) }
@@ -453,6 +457,11 @@ internal class GoogleMessagesMessageRepository(
             notifier.clearConversation(gm.conversationId, reason = "active-room-msg")
             return
         }
+        // Muted conversation → never post (and clear any stale notification).
+        if (gm.conversationId in mutedRooms.value) {
+            notifier.clearConversation(gm.conversationId, reason = "muted")
+            return
+        }
         // Suppress backfill: only notify for messages newer than session start
         // (small slack for clock skew between phone and this device).
         if (mapped.timestampMs < sessionStartMs - 10_000L) return
@@ -571,6 +580,39 @@ internal class GoogleMessagesMessageRepository(
             unreadByRoom.value = unreadByRoom.value + (roomId to 0)
             requestSave()
         }
+    }
+
+    // ---- thread actions (ThreadActions) -------------------------------------
+
+    override fun observeMutedRooms(): Flow<Set<String>> = mutedRooms.asStateFlow()
+
+    override suspend fun setMuted(roomId: String, muted: Boolean) {
+        writeLock.withLock {
+            mutedRooms.value = mutedRooms.value.toMutableSet().apply {
+                if (muted) add(roomId) else remove(roomId)
+            }
+            requestSave()
+        }
+        if (muted) notifier.clearConversation(roomId, reason = "muted")
+        Log.i(TAG, "room $roomId muted=$muted")
+    }
+
+    override suspend fun deleteRoom(roomId: String) {
+        // Local delete only: remove the conversation from THIS device's list and
+        // cache. We deliberately do NOT delete on the phone (Messages-for-web
+        // has no thread-delete RPC, and we don't want to touch the user's SMS).
+        notifier.clearConversation(roomId, reason = "thread-deleted")
+        writeLock.withLock {
+            rooms.value = rooms.value.filterNot { it.id == roomId }
+            messagesByRoom.value = messagesByRoom.value.toMutableMap().apply { remove(roomId) }
+            unreadByRoom.value = unreadByRoom.value.toMutableMap().apply { remove(roomId) }
+            mutedRooms.value = mutedRooms.value - roomId
+            outgoingIdByRoom.remove(roomId)
+            roomNameById.remove(roomId)
+            if (activeRoomId == roomId) activeRoomId = null
+            requestSave()
+        }
+        Log.i(TAG, "room $roomId deleted (local)")
     }
 
     /** Edits/deletes aren't part of the Messages-for-web text flow we support

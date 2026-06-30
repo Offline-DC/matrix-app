@@ -28,10 +28,11 @@ class InMemoryMessageRepository(
     initialMessages: List<Message>,
     /** Messages held in reserve to be revealed by loadOlder calls. */
     historicalMessages: List<Message> = emptyList(),
-) : MessageRepository {
+) : MessageRepository, ThreadActions {
 
     private val usersById = MutableStateFlow(initialUsers.associateBy { it.id })
     private val rooms = MutableStateFlow(initialRooms)
+    private val mutedRooms = MutableStateFlow<Set<String>>(emptySet())
     private val messagesByRoom = MutableStateFlow(
         initialMessages.groupBy { it.roomId }
             .mapValues { (_, list) -> list.sortedBy { it.timestampMs } }
@@ -150,6 +151,27 @@ class InMemoryMessageRepository(
     override suspend fun markRoomRead(roomId: String) {
         writeLock.withLock {
             unreadByRoom.value = unreadByRoom.value.toMutableMap().apply { this[roomId] = 0 }
+        }
+    }
+
+    override fun observeMutedRooms(): Flow<Set<String>> = mutedRooms
+
+    override suspend fun setMuted(roomId: String, muted: Boolean) {
+        writeLock.withLock {
+            mutedRooms.value = mutedRooms.value.toMutableSet().apply {
+                if (muted) add(roomId) else remove(roomId)
+            }
+        }
+    }
+
+    override suspend fun deleteRoom(roomId: String) {
+        writeLock.withLock {
+            rooms.value = rooms.value.filterNot { it.id == roomId }
+            messagesByRoom.value = messagesByRoom.value.toMutableMap().apply { remove(roomId) }
+            unreadByRoom.value = unreadByRoom.value.toMutableMap().apply { remove(roomId) }
+            historicalByRoom.value = historicalByRoom.value.toMutableMap().apply { remove(roomId) }
+            hasMoreOlderByRoom.value = hasMoreOlderByRoom.value.toMutableMap().apply { remove(roomId) }
+            mutedRooms.value = mutedRooms.value - roomId
         }
     }
 

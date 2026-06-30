@@ -9,6 +9,7 @@ import com.offline.dpadmessenger.data.Room
 import com.offline.dpadmessenger.data.User
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.MapSerializer
+import kotlinx.serialization.builtins.SetSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
@@ -52,6 +53,7 @@ internal class GoogleMessagesCache(context: Context) {
     private val usersSer = MapSerializer(String.serializer(), User.serializer())
     private val stringMapSer = MapSerializer(String.serializer(), String.serializer())
     private val unreadSer = MapSerializer(String.serializer(), Int.serializer())
+    private val stringSetSer = SetSerializer(String.serializer())
 
     data class Snapshot(
         val rooms: List<Room>,
@@ -59,6 +61,7 @@ internal class GoogleMessagesCache(context: Context) {
         val usersById: Map<String, User>,
         val outgoingIdByRoom: Map<String, String>,
         val unreadByRoom: Map<String, Int>,
+        val mutedRooms: Set<String> = emptySet(),
     )
 
     fun load(): Snapshot? {
@@ -85,6 +88,7 @@ internal class GoogleMessagesCache(context: Context) {
                 put("users", json.encodeToJsonElement(usersSer, snapshot.usersById))
                 put("outgoing", json.encodeToJsonElement(stringMapSer, snapshot.outgoingIdByRoom))
                 put("unread", json.encodeToJsonElement(unreadSer, snapshot.unreadByRoom))
+                put("muted", json.encodeToJsonElement(stringSetSer, snapshot.mutedRooms))
             }
             // EncryptedFile.openFileOutput() refuses to overwrite an existing
             // file, so delete first. A crash between delete and write only
@@ -107,6 +111,7 @@ internal class GoogleMessagesCache(context: Context) {
             usersById = obj["users"]?.let { json.decodeFromJsonElement(usersSer, it) } ?: emptyMap(),
             outgoingIdByRoom = obj["outgoing"]?.let { json.decodeFromJsonElement(stringMapSer, it) } ?: emptyMap(),
             unreadByRoom = obj["unread"]?.let { json.decodeFromJsonElement(unreadSer, it) } ?: emptyMap(),
+            mutedRooms = obj["muted"]?.let { json.decodeFromJsonElement(stringSetSer, it) } ?: emptySet(),
         )
     }
 

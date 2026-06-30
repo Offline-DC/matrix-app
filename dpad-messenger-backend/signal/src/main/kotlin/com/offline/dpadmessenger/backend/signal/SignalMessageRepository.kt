@@ -13,6 +13,7 @@ import com.offline.dpadmessenger.data.MessageStatus
 import com.offline.dpadmessenger.data.RetentionSettings
 import com.offline.dpadmessenger.data.Room
 import com.offline.dpadmessenger.data.RoomSummary
+import com.offline.dpadmessenger.data.ThreadActions
 import com.offline.dpadmessenger.data.User
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -69,7 +70,7 @@ class SignalMessageRepository(
      *  with a number we don't already know resolves it to an ACI via CDSI.
      *  Null in mock/unit-test paths (unknown numbers then can't be started). */
     private val discovery: SignalContactDiscovery? = null,
-) : MessageRepository, MediaDownloader, AttachmentSender, ConversationStarter, ContactsSource, RetentionSettings {
+) : MessageRepository, MediaDownloader, AttachmentSender, ConversationStarter, ContactsSource, RetentionSettings, ThreadActions {
 
     /** masterKey per group room id — learned from inbound group messages,
      *  required to send (the room id only carries the public group id). */
@@ -127,6 +128,8 @@ class SignalMessageRepository(
     private val messagesByRoom = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
     private val hasMoreOlder = MutableStateFlow<Map<String, Boolean>>(emptyMap())
     private val userCache = MutableStateFlow<Map<String, User>>(mapOf(account.aci to currentUser))
+    /** Muted conversations (roomId) — suppress notifications. Persisted. */
+    private val mutedRooms = MutableStateFlow<Set<String>>(emptySet())
 
     /**
      * Flips to true when the server rejects our credentials (HTTP 401) — i.e.
@@ -159,7 +162,7 @@ class SignalMessageRepository(
             // Debounced auto-save: any change to messages/rooms/users persists
             // the whole snapshot ~1.5s later (coalescing bursts).
             persistScope.launch {
-                combine(messagesByRoom, rooms, userCache) { _, _, _ -> Unit }
+                combine(messagesByRoom, rooms, userCache, mutedRooms) { _, _, _, _ -> Unit }
                     .debounce(1500)
                     .collect { saveSnapshot() }
             }
@@ -188,6 +191,7 @@ class SignalMessageRepository(
         snap.expireTimers.forEach { (roomId, t) ->
             conversationTimers[roomId] = SignalSender.ExpireTimer(t.seconds, t.version)
         }
+        mutedRooms.value = snap.mutedRooms
         rooms.value = snap.rooms.map { pr ->
             val msgs = snap.messages[pr.room.id].orEmpty()
             RoomSummary(pr.room, lastMessage = msgs.maxByOrNull { it.timestampMs }, unreadCount = pr.unreadCount)
@@ -210,6 +214,7 @@ class SignalMessageRepository(
             expireTimers = conversationTimers.mapValues {
                 SignalMessageStore.PersistedTimer(it.value.seconds, it.value.version)
             },
+            mutedRooms = mutedRooms.value,
         )
         s.saveSnapshot(snap)
     }
@@ -453,6 +458,35 @@ class SignalMessageRepository(
 
     override suspend fun simulateIncoming(roomId: String, senderId: String, body: String) {
         // No-op for a real backend.
+    }
+
+    // ---- thread actions (ThreadActions) -------------------------------------
+
+    override fun observeMutedRooms(): Flow<Set<String>> = mutedRooms.asStateFlow()
+
+    override suspend fun setMuted(roomId: String, muted: Boolean) {
+        mutedRooms.value = mutedRooms.value.toMutableSet().apply {
+            if (muted) add(roomId) else remove(roomId)
+        }
+        // Muting should also clear any notification already showing for it.
+        if (muted) notifier?.clearConversation(roomId, reason = "muted")
+        saveSnapshot()
+        Log.i(TAG, "room $roomId muted=$muted")
+    }
+
+    override suspend fun deleteRoom(roomId: String) {
+        // Local delete: drop the room, its messages, timers, and mute flag, and
+        // clear any notification. We do NOT tell the server/primary — this is a
+        // local hide, mirroring how the launcher treats history as disposable.
+        rooms.value = rooms.value.filterNot { it.room.id == roomId }
+        messagesByRoom.value = messagesByRoom.value.toMutableMap().apply { remove(roomId) }
+        hasMoreOlder.value = hasMoreOlder.value.toMutableMap().apply { remove(roomId) }
+        conversationTimers.remove(roomId)
+        mutedRooms.value = mutedRooms.value - roomId
+        if (activeRoomId == roomId) activeRoomId = null
+        notifier?.clearConversation(roomId, reason = "thread-deleted")
+        saveSnapshot()
+        Log.i(TAG, "room $roomId deleted (local)")
     }
 
     // ---- media (MediaDownloader + AttachmentSender) -------------------------
@@ -929,6 +963,11 @@ class SignalMessageRepository(
     ) {
         if (conversationId == activeRoomId) {
             notifier?.clearConversation(conversationId, reason = "active-room-msg")
+            return
+        }
+        // Muted conversation → never post (and clear any stale notification).
+        if (conversationId in mutedRooms.value) {
+            notifier?.clearConversation(conversationId, reason = "muted")
             return
         }
         notifier?.notifyIncoming(

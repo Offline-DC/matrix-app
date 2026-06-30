@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.offline.dpadmessenger.data.InitialSyncAware
 import com.offline.dpadmessenger.data.MessageRepository
 import com.offline.dpadmessenger.data.RoomSummary
+import com.offline.dpadmessenger.data.ThreadActions
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -45,6 +46,26 @@ class RoomListViewModel(
 
     fun setLastOpened(roomId: String) {
         _lastOpenedRoomId.value = roomId
+    }
+
+    /** Muted conversations (no notifications). Drives the row's muted indicator
+     *  and the Mute/Unmute label in the press-and-hold sheet. */
+    val mutedRooms: StateFlow<Set<String>> = repository
+        .observeMutedRooms()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptySet())
+
+    /** Whether the backing repository supports delete/mute — gates the
+     *  press-and-hold conversation menu (mirrors the new-message gating). */
+    val supportsThreadActions: Boolean = repository is ThreadActions
+
+    /** Delete a conversation (remove it from the list + drop its messages). */
+    fun deleteRoom(roomId: String) {
+        viewModelScope.launch { repository.deleteRoom(roomId) }
+    }
+
+    /** Mute or unmute a conversation. */
+    fun setMuted(roomId: String, muted: Boolean) {
+        viewModelScope.launch { repository.setMuted(roomId, muted) }
     }
 
     /**

@@ -53,6 +53,11 @@ fun RoomListItem(
     modifier: Modifier = Modifier,
     focusRequester: FocusRequester? = null,
     extraFocusRequesters: List<FocusRequester> = emptyList(),
+    /** Press-and-hold the row (touch long-press or DPAD OK-hold) — opens the
+     *  conversation context menu. Null disables it. */
+    onLongClick: (() -> Unit)? = null,
+    /** Show a small muted indicator when the conversation is muted. */
+    isMuted: Boolean = false,
 ) {
     val colors = LocalDpadMessengerColors.current
     // Layer additional FocusRequesters on top — each .focusRequester() points
@@ -65,7 +70,12 @@ fun RoomListItem(
         modifier = modifier
             .fillMaxWidth()
             .then(extras)
-            .dpadRow(onClick = onClick, focusRequester = focusRequester, shape = RoundedCornerShape(14.dp))
+            .dpadRow(
+                onClick = onClick,
+                focusRequester = focusRequester,
+                shape = RoundedCornerShape(14.dp),
+                onLongClick = onLongClick,
+            )
             .padding(horizontal = 12.dp, vertical = 10.dp),
     ) {
         InitialsAvatar(name = summary.room.name, colorHex = summary.room.avatarColor)
@@ -93,6 +103,12 @@ fun RoomListItem(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+        }
+        if (isMuted) {
+            Spacer(Modifier.width(6.dp))
+            // Muted indicator (🔕). Text glyph avoids pulling in the extended
+            // material-icons dependency just for one symbol.
+            Text(text = "🔕", style = MaterialTheme.typography.labelSmall, color = colors.mutedText)
         }
         Spacer(Modifier.width(8.dp))
         Column(horizontalAlignment = Alignment.End) {

@@ -31,8 +31,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
@@ -86,6 +88,12 @@ fun RoomListScreen(
     val rooms by viewModel.rooms.collectAsState()
     val isLoading by viewModel.isInitialLoading.collectAsState()
     val lastOpenedRoomId by viewModel.lastOpenedRoomId.collectAsState()
+    val mutedRooms by viewModel.mutedRooms.collectAsState()
+    // Set when the user presses-and-holds a conversation: drives the context
+    // sheet (mute / delete). Null = no sheet. Only enabled when the repository
+    // supports thread actions.
+    val threadActionsEnabled = viewModel.supportsThreadActions
+    var contextRoom by remember { mutableStateOf<RoomSummary?>(null) }
     // Two distinct focus targets:
     //  - entryRowFocus is attached to the last-opened row so screen entry
     //    lands the user where they left off.
@@ -197,6 +205,11 @@ fun RoomListScreen(
                             savedScroll = viewModel.savedScroll,
                             onScrollChanged = viewModel::saveScroll,
                             listState = listState,
+                            mutedRooms = mutedRooms,
+                            // Press-and-hold a row → open the mute/delete sheet.
+                            onRoomLongClick = if (threadActionsEnabled) {
+                                { summary -> contextRoom = summary }
+                            } else null,
                         )
                     }
                 }
@@ -241,6 +254,19 @@ fun RoomListScreen(
                         ),
                 )
             }
+
+            // Press-and-hold context sheet for the selected conversation.
+            contextRoom?.let { cr ->
+                val roomId = cr.room.id
+                val muted = roomId in mutedRooms
+                com.offline.dpadmessenger.ui.components.RoomContextSheet(
+                    roomName = cr.room.name,
+                    isMuted = muted,
+                    onToggleMute = { viewModel.setMuted(roomId, !muted) },
+                    onDelete = { viewModel.deleteRoom(roomId) },
+                    onDismiss = { contextRoom = null },
+                )
+            }
         }
     }
 }
@@ -258,6 +284,8 @@ private fun RoomList(
     savedScroll: Pair<Int, Int>?,
     onScrollChanged: (index: Int, offset: Int) -> Unit,
     listState: androidx.compose.foundation.lazy.LazyListState,
+    mutedRooms: Set<String> = emptySet(),
+    onRoomLongClick: ((RoomSummary) -> Unit)? = null,
 ) {
     // Which row should be focused on screen entry: the last opened one if it
     // still exists, otherwise the first row.
@@ -338,6 +366,8 @@ private fun RoomList(
                 // isFirst, both requesters point at the same row (which is
                 // what we want — they're separate handles to the same target).
                 extraFocusRequesters = if (isFirst) listOf(firstRowFocus) else emptyList(),
+                onLongClick = onRoomLongClick?.let { handler -> { handler(summary) } },
+                isMuted = summary.room.id in mutedRooms,
             )
         }
     }

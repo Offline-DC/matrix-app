@@ -58,6 +58,8 @@ class SignalMessageStore(context: Context) {
         val groupMasterKeysB64: Map<String, String> = emptyMap(),
         /** roomId → disappearing-messages timer (seconds, version). */
         val expireTimers: Map<String, PersistedTimer> = emptyMap(),
+        /** Muted conversations (roomId) — suppress notifications. */
+        val mutedRooms: Set<String> = emptySet(),
     )
 
     fun loadSnapshot(): Snapshot? {

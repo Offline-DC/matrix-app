@@ -3,7 +3,11 @@ package com.offline.dpadmessenger.focus
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
@@ -174,26 +178,87 @@ internal object DpadFireGate {
  *                       this element (e.g. when a screen first opens).
  * @param shape the clip/highlight shape.
  */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun Modifier.dpadRow(
     onClick: () -> Unit,
     focusRequester: FocusRequester? = null,
     shape: RoundedCornerShape = RoundedCornerShape(12.dp),
+    /** Press-and-hold action. When null, dpadRow behaves exactly as before
+     *  (short press only). When set, touch uses combinedClickable's long-press
+     *  and DPAD uses an OK-hold timer: a quick press fires [onClick], holding
+     *  past [LONG_PRESS_MS] fires [onLongClick]. */
+    onLongClick: (() -> Unit)? = null,
 ): Modifier {
     val interaction = remember { MutableInteractionSource() }
-    return this
+    val base = this
         .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
         .dpadFocusHighlight(shape = shape)
+
+    if (onLongClick == null) {
         // clickable adds the focus target; onDpadAction lives on top of it so
         // the key handler is attached to the same focused node.
-        .clickable(
+        return base
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClick = onClick,
+            )
+            .onDpadAction { onClick(); true }
+            .padding(2.dp)
+    }
+
+    // Long-press variant. Touch: combinedClickable. DPAD has no native
+    // long-press, so we time the OK key (mirrors MessageBubble): KeyDown starts
+    // a timer that fires onLongClick mid-hold; a KeyUp before it fires onClick.
+    val scope = rememberCoroutineScope()
+    var pressStarted by remember { mutableStateOf(false) }
+    var longFired by remember { mutableStateOf(false) }
+    var pressJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    return base
+        .combinedClickable(
             interactionSource = interaction,
             indication = null,
             onClick = onClick,
+            onLongClick = onLongClick,
         )
-        .onDpadAction { onClick(); true }
+        // Preview-consume the OK key so combinedClickable's own KeyUp handler
+        // doesn't ALSO fire onClick for the same press.
+        .onPreviewKeyEvent { event ->
+            if (event.key !in OkKeys) return@onPreviewKeyEvent false
+            when (event.type) {
+                KeyEventType.KeyDown -> {
+                    if (event.nativeKeyEvent.repeatCount == 0) {
+                        pressStarted = true
+                        longFired = false
+                        pressJob?.cancel()
+                        pressJob = scope.launch {
+                            kotlinx.coroutines.delay(LONG_PRESS_MS)
+                            longFired = true
+                            // Claim the OK key so held-key auto-repeats don't
+                            // fire an action on the just-opened menu.
+                            DpadFireGate.tryAcquire(event.key)
+                            onLongClick()
+                        }
+                    }
+                    true
+                }
+                KeyEventType.KeyUp -> {
+                    pressJob?.cancel(); pressJob = null
+                    DpadFireGate.release(event.key)
+                    val startedHere = pressStarted
+                    pressStarted = false
+                    if (startedHere && !longFired) onClick()
+                    true
+                }
+                else -> false
+            }
+        }
         .padding(2.dp)
 }
+
+/** DPAD OK-hold threshold for [dpadRow]'s long-press; matches MessageBubble. */
+const val LONG_PRESS_MS: Long = 400L
 
 /** Standard DPAD key set we treat as "OK / select". */
 val OkKeys: Set<Key> = setOf(Key.Enter, Key.DirectionCenter, Key.NumPadEnter)
