@@ -107,6 +107,13 @@ fun MessageBubble(
     getListViewport: (() -> Pair<Float, Float>?)? = null,
 ) {
     val hasMedia = message.attachment != null
+    // A downloaded voice memo: tapping/OK on the bubble should toggle play/pause
+    // (driven via audioToggle → VoiceMemoPlayer) rather than the load/view path.
+    val loadedAudio = message.attachment?.let { a ->
+        a.kind == com.offline.dpadmessenger.data.AttachmentKind.AUDIO &&
+            a.localPath?.let { java.io.File(it).exists() } == true
+    } ?: false
+    var audioToggle by remember { mutableStateOf(0) }
     val colors = LocalDpadMessengerColors.current
     val isOutgoing = message.isOutgoing
     // Media long-press: fire the sheet WHILE the OK key is still held (like the
@@ -239,7 +246,13 @@ fun MessageBubble(
                     .combinedClickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
-                        onClick = { if (hasMedia) onMediaActivate() else onClick() },
+                        onClick = {
+                            when {
+                                loadedAudio -> audioToggle++   // play/pause the memo
+                                hasMedia -> onMediaActivate()
+                                else -> onClick()
+                            }
+                        },
                         onLongClick = onClick,
                     )
                     .then(
@@ -280,7 +293,9 @@ fun MessageBubble(
                                         // e.g. closing the viewer) is ignored so it can't reopen.
                                         val startedHere = mediaPressStarted
                                         mediaPressStarted = false
-                                        if (startedHere && !mediaLongFired) onMediaActivate()
+                                        if (startedHere && !mediaLongFired) {
+                                            if (loadedAudio) audioToggle++ else onMediaActivate()
+                                        }
                                         true
                                     }
                                     else -> false
@@ -316,6 +331,7 @@ fun MessageBubble(
                             isDownloading = isDownloadingMedia,
                             failed = mediaFailed,
                             messageTimestampMs = message.timestampMs,
+                            audioToggleKey = audioToggle,
                         )
                         if (message.body.isNotBlank()) Spacer(Modifier.padding(top = 6.dp))
                     }
@@ -471,6 +487,7 @@ private fun MediaBlock(
     isDownloading: Boolean,
     failed: Boolean,
     messageTimestampMs: Long,
+    audioToggleKey: Int = 0,
 ) {
     val shape = RoundedCornerShape(10.dp)
     val box = Modifier
@@ -540,7 +557,11 @@ private fun MediaBlock(
 
         // Voice memo: render the inline play/pause + progress control.
         attachment.kind == com.offline.dpadmessenger.data.AttachmentKind.AUDIO && loadedPath != null ->
-            VoiceMemoPlayer(localPath = loadedPath, modifier = Modifier.padding(top = 4.dp))
+            VoiceMemoPlayer(
+                localPath = loadedPath,
+                modifier = Modifier.padding(top = 4.dp),
+                toggleKey = audioToggleKey,
+            )
 
         // Voice memo not downloaded yet: a compact play affordance. Tapping the
         // bubble triggers the download (see onMediaActivate); once it lands this

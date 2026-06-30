@@ -54,6 +54,9 @@ fun VoiceMemoPlayer(
     onColor: Color = MaterialTheme.colorScheme.onPrimary,
     trackColor: Color = MaterialTheme.colorScheme.surfaceVariant,
     focusRequester: FocusRequester? = null,
+    /** Increment to toggle play/pause from outside (e.g. a tap on the whole
+     *  message bubble). 0 = no external control. */
+    toggleKey: Int = 0,
     onNeedDownload: (suspend () -> String?)? = null,
 ) {
     val scope = rememberCoroutineScope()
@@ -110,6 +113,12 @@ fun VoiceMemoPlayer(
             positionMs = runCatching { player?.currentPosition ?: 0 }.getOrDefault(0)
             delay(200)
         }
+    }
+
+    // External toggle (e.g. a tap on the whole message bubble). toggleKey starts
+    // at 0 (this initial pass is ignored); each later increment toggles play.
+    LaunchedEffect(toggleKey) {
+        if (toggleKey > 0) toggle()
     }
 
     val fraction = if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f

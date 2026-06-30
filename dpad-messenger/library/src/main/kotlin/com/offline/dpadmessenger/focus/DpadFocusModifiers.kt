@@ -189,11 +189,17 @@ fun Modifier.dpadRow(
      *  and DPAD uses an OK-hold timer: a quick press fires [onClick], holding
      *  past [LONG_PRESS_MS] fires [onLongClick]. */
     onLongClick: (() -> Unit)? = null,
+    /** Override the focus-border color. Defaults to the theme primary; pass a
+     *  contrasting color (e.g. onPrimary) on a primary-colored element so the
+     *  border doesn't vanish into the background. */
+    focusBorderColor: Color = Color.Unspecified,
+    /** Focus-border width. */
+    focusBorderWidth: Dp = 3.dp,
 ): Modifier {
     val interaction = remember { MutableInteractionSource() }
     val base = this
         .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
-        .dpadFocusHighlight(shape = shape)
+        .dpadFocusHighlight(shape = shape, borderWidth = focusBorderWidth, borderColor = focusBorderColor)
 
     if (onLongClick == null) {
         // clickable adds the focus target; onDpadAction lives on top of it so

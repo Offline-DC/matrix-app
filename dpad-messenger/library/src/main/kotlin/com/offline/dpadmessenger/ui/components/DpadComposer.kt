@@ -174,6 +174,16 @@ fun DpadComposer(
     var recordStartMs by remember { mutableStateOf(0L) }
     var elapsedSec by remember { mutableStateOf(0) }
     var previewPath by remember { mutableStateOf<String?>(null) }
+    // Bumped after a voice memo is sent so we can move focus back to the text
+    // field ("Type a message"), the same as after sending text.
+    var focusFieldSignal by remember { mutableStateOf(0) }
+    LaunchedEffect(focusFieldSignal) {
+        if (focusFieldSignal == 0) return@LaunchedEffect
+        repeat(12) {
+            if (runCatching { fieldFr.requestFocus() }.isSuccess) return@LaunchedEffect
+            delay(16)
+        }
+    }
 
     // Abandon any in-progress recording if the composer leaves composition.
     DisposableEffect(Unit) { onDispose { runCatching { recorder.cancel() } } }
@@ -199,11 +209,23 @@ fun DpadComposer(
         val file = recorder.stop()
         recording = false
         previewPath = file?.absolutePath
-        // Return focus to the trailing button so DPAD users aren't stranded.
-        runCatching { sendFr.requestFocus() }
+        // Move the composer's focus to the text input. Without this, removing the
+        // Stop button drops focus to the back button (which flashes behind the
+        // modal and looks wrong). The preview modal manages its own focus (Play)
+        // in its separate layer, so this doesn't fight it.
+        focusFieldSignal++
     }
-    // Tick the elapsed timer while recording.
     LaunchedEffect(recording) {
+        if (!recording) return@LaunchedEffect
+        // The trailing button just swapped mic→stop, which is a new focus node,
+        // so DPAD focus was dropped. Land it on the Stop button so the user can
+        // actually stop. Retry a few frames since the new node may not be
+        // attached the instant we ask (requestFocus throws until it is).
+        for (i in 0 until 12) {
+            if (runCatching { sendFr.requestFocus() }.isSuccess) break
+            delay(16)
+        }
+        // Tick the elapsed timer while recording.
         while (recording) {
             elapsedSec = ((System.currentTimeMillis() - recordStartMs) / 1000).toInt()
             delay(250)
@@ -377,9 +399,23 @@ fun DpadComposer(
         previewPath?.let { p ->
             VoiceMemoPreviewSheet(
                 path = p,
-                onSend = { onSendVoiceMemo?.invoke(p); previewPath = null },
-                onDiscard = { runCatching { File(p).delete() }; previewPath = null },
-                onDismiss = { runCatching { File(p).delete() }; previewPath = null },
+                // Every exit from the preview returns focus to "Type a message",
+                // never the back button.
+                onSend = {
+                    onSendVoiceMemo?.invoke(p)
+                    previewPath = null
+                    focusFieldSignal++
+                },
+                onDiscard = {
+                    runCatching { File(p).delete() }
+                    previewPath = null
+                    focusFieldSignal++
+                },
+                onDismiss = {
+                    runCatching { File(p).delete() }
+                    previewPath = null
+                    focusFieldSignal++
+                },
             )
         }
     }
@@ -404,15 +440,24 @@ private fun RecordStopButton(
             .background(accent)
             .dpadFocusHighlight(
                 shape = CircleShape,
+                borderWidth = 4.dp,
                 borderColor = MaterialTheme.colorScheme.onPrimary,
-                focusedTint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.18f),
+                focusedTint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.35f),
             )
             .focusable()
             .onDpadAction { onClick(); true }
             .onPreviewKeyEvent { event ->
-                if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionLeft) {
-                    onLeftToField(); true
-                } else false
+                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when (event.key) {
+                    // While recording, trap focus on Stop — swallow every
+                    // direction so the user can't DPAD away mid-recording and
+                    // must press OK (stop) to leave.
+                    Key.DirectionUp, Key.DirectionDown, Key.DirectionLeft, Key.DirectionRight ->
+                        if (recording) true
+                        else if (event.key == Key.DirectionLeft) { onLeftToField(); true }
+                        else false
+                    else -> false
+                }
             }
             .padding(PaddingValues(8.dp)),
     ) {
@@ -508,11 +553,13 @@ private fun SendButton(
             .clip(CircleShape)
             .background(accent)
             // Halo color is onPrimary (white-ish), not primary — otherwise it
-            // disappears into the blue button background.
+            // disappears into the blue button background. Thicker + stronger tint
+            // so the DPAD focus state on the round button reads clearly.
             .dpadFocusHighlight(
                 shape = CircleShape,
+                borderWidth = 4.dp,
                 borderColor = MaterialTheme.colorScheme.onPrimary,
-                focusedTint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.18f),
+                focusedTint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.35f),
             )
             .focusable()
             .onDpadAction { if (enabled) { onClick(); true } else false }

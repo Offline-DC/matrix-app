@@ -44,8 +44,14 @@ fun VoiceMemoPreviewSheet(
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val sendFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { sendFocus.requestFocus() } }
+    val playFocus = remember { FocusRequester() }
+    // Land focus on the Play button so the user can preview the memo immediately.
+    LaunchedEffect(Unit) {
+        repeat(12) {
+            if (runCatching { playFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            kotlinx.coroutines.delay(16)
+        }
+    }
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
         Column(
@@ -61,6 +67,7 @@ fun VoiceMemoPreviewSheet(
             VoiceMemoPlayer(
                 localPath = path,
                 modifier = Modifier.padding(vertical = 8.dp),
+                focusRequester = playFocus,
             )
             Spacer(Modifier.size(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -78,7 +85,6 @@ fun VoiceMemoPreviewSheet(
                     container = MaterialTheme.colorScheme.primary,
                     content = MaterialTheme.colorScheme.onPrimary,
                     onClick = onSend,
-                    focusRequester = sendFocus,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -102,7 +108,15 @@ private fun PreviewActionButton(
         modifier = modifier
             .clip(RoundedCornerShape(12.dp))
             .background(container)
-            .dpadRow(onClick = onClick, focusRequester = focusRequester, shape = RoundedCornerShape(12.dp))
+            .dpadRow(
+                onClick = onClick,
+                focusRequester = focusRequester,
+                shape = RoundedCornerShape(12.dp),
+                // Border in the button's content color (white on the blue Send
+                // button) so the DPAD focus state is clearly visible.
+                focusBorderColor = content,
+                focusBorderWidth = 4.dp,
+            )
             .padding(vertical = 12.dp),
     ) {
         Icon(imageVector = icon, contentDescription = null, tint = content, modifier = Modifier.size(20.dp))
