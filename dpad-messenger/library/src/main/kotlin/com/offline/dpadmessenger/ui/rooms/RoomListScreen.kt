@@ -214,6 +214,25 @@ fun RoomListScreen(
                             else entryRowFocus.requestFocus()
                         }
                     },
+                    // DPAD-Up: return to the chat you were last on (the
+                    // last-opened row) so you can back out of the compose button
+                    // to where you came from without opening "new message".
+                    // Falls back to the top row, or the settings cog when the
+                    // list is empty. Retried across a few frames because the
+                    // target row may not be attached the instant we ask.
+                    onUp = {
+                        scope.launch {
+                            if (rooms.isEmpty()) {
+                                runCatching { settingsFocus.requestFocus() }
+                                return@launch
+                            }
+                            repeat(8) {
+                                withFrameNanos {}
+                                if (runCatching { entryRowFocus.requestFocus() }.isSuccess) return@launch
+                            }
+                            runCatching { firstRowFocus.requestFocus() }
+                        }
+                    },
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
                         .padding(
@@ -331,6 +350,7 @@ private fun ComposeButton(
     onClick: () -> Unit,
     focusRequester: FocusRequester,
     onLeft: () -> Unit,
+    onUp: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(
@@ -348,10 +368,20 @@ private fun ComposeButton(
             .focusable()
             .onDpadAction { onClick(); true }
             .onPreviewKeyEvent { event ->
-                if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionLeft) {
-                    onLeft()
-                    true
-                } else false
+                when {
+                    event.type == KeyEventType.KeyDown && event.key == Key.DirectionLeft -> {
+                        onLeft()
+                        true
+                    }
+                    // DPAD-Up leaves the compose button back into the list,
+                    // landing on the chat you were last on (see onUp at the call
+                    // site) rather than trapping focus on the button.
+                    event.type == KeyEventType.KeyDown && event.key == Key.DirectionUp -> {
+                        onUp()
+                        true
+                    }
+                    else -> false
+                }
             },
     ) {
         Icon(

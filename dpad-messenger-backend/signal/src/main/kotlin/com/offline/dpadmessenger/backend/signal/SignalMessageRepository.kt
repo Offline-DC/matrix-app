@@ -99,6 +99,12 @@ class SignalMessageRepository(
     private val contactsByServiceId = java.util.concurrent.ConcurrentHashMap<String, Contact>()
     /** normalized phone number → serviceId (ACI). */
     private val numberToServiceId = java.util.concurrent.ConcurrentHashMap<String, String>()
+    /** Last-seen 32-byte profile key per serviceId, captured from inbound
+     *  messages. A Signal profile name can ONLY be decrypted with this key, so
+     *  caching it lets startConversation(by number) show the contact's Signal
+     *  name. In-memory only — cleared on process death; the next message from
+     *  that contact re-populates it. */
+    private val profileKeyByServiceId = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
 
     private fun isGroupRoom(roomId: String) = roomId.startsWith(SignalGroups.ROOM_PREFIX)
 
@@ -540,12 +546,15 @@ class SignalMessageRepository(
                 numberToServiceId[normalizeNumber(destination)] = aci
             }
             ?: return null
-        // Show the saved contact name (like Signal does) rather than a bare
-        // number: prefer anything we already know for this service id, else the
-        // local address-book name for the number, else the number itself.
+        // Show a real name rather than a bare number, in priority order: a name
+        // we already know for this service id → the device address-book name →
+        // the contact's Signal profile name (only possible if we hold a profile
+        // key from an earlier message — Signal won't reveal it from a cold
+        // number lookup) → finally the number itself.
         val name = contactsByServiceId[serviceId]?.name
             ?: userCache.value[serviceId]?.displayName
             ?: localNameForNumber(destination)
+            ?: signalProfileNameFor(serviceId)
             ?: destination
         // Persist the name → service id so the room header + picker show it and
         // future lookups resolve locally.
@@ -553,6 +562,15 @@ class SignalMessageRepository(
             updateContact(serviceId = serviceId, name = name, e164 = normalizeNumber(destination))
         }
         return ensureDmRoom(serviceId, name)
+    }
+
+    /** The contact's Signal profile name, if we hold a profile key for them
+     *  (captured from an earlier inbound message). Null when we have no key, or
+     *  the fetch is throttled/fails — Signal won't reveal a profile name without
+     *  the key, so a never-messaged stranger stays nameless until they reply. */
+    private suspend fun signalProfileNameFor(serviceId: String): String? {
+        val key = profileKeyByServiceId[serviceId] ?: return null
+        return profiles?.resolveName(serviceId, key)
     }
 
     /** Best-effort: the device address-book display name for [rawNumber],
@@ -778,6 +796,12 @@ class SignalMessageRepository(
         // any existing PNI thread; during dev those get cleared with pm clear.
         if (!senderE164.isNullOrBlank()) {
             numberToServiceId[normalizeNumber(senderE164)] = senderServiceId
+        }
+
+        // Cache the profile key so a later startConversation(by number) can fetch
+        // this contact's Signal profile name (the only way to decrypt it).
+        if (profileKey != null && profileKey.size == 32) {
+            profileKeyByServiceId[senderServiceId] = profileKey
         }
 
         // Show the message INSTANTLY with whatever name we have without blocking:
