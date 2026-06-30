@@ -132,6 +132,16 @@ fun ChatScreen(
         }
         val att = msg.attachment ?: return@activate
         val path = att.localPath
+        // Voice memos play inline via the bubble's own player — never open the
+        // image/video viewer. The bubble tap only kicks off a download when the
+        // file isn't here yet.
+        if (att.kind == com.offline.dpadmessenger.data.AttachmentKind.AUDIO) {
+            val have = path != null && java.io.File(path).exists()
+            if (!have && att.downloadToken.isNotBlank() && msg.id !in downloadingMedia) {
+                viewModel.downloadMedia(msg.id)
+            }
+            return@activate
+        }
         if (path != null && java.io.File(path).exists()) {
             mediaReturnId = msg.id
             mediaViewer = path to att.kind
@@ -253,6 +263,11 @@ fun ChatScreen(
                 // UI.
                 onAttach = if (viewModel.canSendAttachments) {
                     { showMediaPicker = true }
+                } else null,
+                // Empty field shows a record (mic) button → record → preview →
+                // send a voice memo. Only when the repo can send attachments.
+                onSendVoiceMemo = if (viewModel.canSendAttachments) {
+                    { path -> viewModel.sendVoiceMemo(path) }
                 } else null,
             )
         }

@@ -27,6 +27,11 @@ android {
             // sure the build env has the NDK so AGP strips the arm64 .so.)
             abiFilters.add("armeabi-v7a")
         }
+        // Ship R8 keep rules (protobuf-lite + libsignal) to any app that
+        // minifies while depending on this module — without them a release
+        // build mangles the provisioning protobufs ("Invalid response from
+        // service"). See consumer-rules.pro.
+        consumerProguardFiles("consumer-rules.pro")
     }
     buildFeatures { compose = true }
 

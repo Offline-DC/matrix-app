@@ -191,6 +191,13 @@ class ChatViewModel(
         viewModelScope.launch { runCatching { sender.sendAttachment(roomId, contentUri) } }
     }
 
+    /** Send a recorded voice memo (local .m4a file path) as an audio attachment. */
+    fun sendVoiceMemo(filePath: String) {
+        val sender = repository as? com.offline.dpadmessenger.data.AttachmentSender ?: return
+        val uri = android.net.Uri.fromFile(java.io.File(filePath)).toString()
+        viewModelScope.launch { runCatching { sender.sendAttachment(roomId, uri) } }
+    }
+
     fun requestLoadOlder() {
         if (_isLoadingOlder.value) return
         viewModelScope.launch {

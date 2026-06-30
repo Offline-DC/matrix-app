@@ -747,6 +747,11 @@ internal class GoogleMessagesMessageRepository(
         val ext = when (att.kind) {
             AttachmentKind.IMAGE -> att.mimeType.substringAfter('/', "jpg").ifBlank { "jpg" }
             AttachmentKind.VIDEO -> att.mimeType.substringAfter('/', "mp4").ifBlank { "mp4" }
+            AttachmentKind.AUDIO -> when {
+                att.mimeType.contains("mpeg") -> "mp3"
+                att.mimeType.contains("ogg") -> "ogg"
+                else -> "m4a"
+            }
             else -> "bin"
         }
         val file = java.io.File(mediaDir, "${messageId.filter { it.isLetterOrDigit() }}.$ext")
@@ -767,12 +772,15 @@ internal class GoogleMessagesMessageRepository(
     override suspend fun sendAttachment(roomId: String, contentUri: String): Boolean {
         val uri = runCatching { android.net.Uri.parse(contentUri) }.getOrNull() ?: return false
         val resolver = appContext.contentResolver
-        val mime = resolver.getType(uri) ?: "application/octet-stream"
+        // getType() is null for file:// (e.g. a recorded voice memo) — fall back
+        // to the file extension so audio uploads with the right MIME.
+        val mime = resolver.getType(uri) ?: mimeFromExtension(contentUri) ?: "application/octet-stream"
         val bytes = kotlinx.coroutines.withContext(Dispatchers.IO) {
             runCatching { resolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
         }
         if (bytes == null) { Log.w(TAG, "sendAttachment: could not read $contentUri"); return false }
-        val name = queryDisplayName(uri) ?: "attachment"
+        val isAudio = mime.startsWith("audio/")
+        val name = queryDisplayName(uri) ?: if (isAudio) "voice.m4a" else "attachment"
         val isVideo = mime.startsWith("video/")
         val tmpId = "tmp_" + System.nanoTime()
 
@@ -787,7 +795,7 @@ internal class GoogleMessagesMessageRepository(
             timestampMs = System.currentTimeMillis(),
             status = MessageStatus.SENDING,
             isOutgoing = true,
-        )
+        ).let { if (isAudio) it.copy(body = "[voice message]") else it }
         writeLock.withLock {
             messagesByRoom.value = messagesByRoom.value +
                 (roomId to (messagesByRoom.value[roomId].orEmpty() + optimistic))
@@ -811,6 +819,18 @@ internal class GoogleMessagesMessageRepository(
         appContext.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
             ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
     }.getOrNull()
+
+    /** Best-effort MIME from a uri/path file extension, for file:// sources
+     *  (recorded voice memos) where the content resolver returns no type. */
+    private fun mimeFromExtension(uriOrPath: String): String? =
+        when (uriOrPath.substringAfterLast('.', "").lowercase()) {
+            "m4a" -> "audio/mp4"
+            "aac" -> "audio/aac"
+            "mp3" -> "audio/mpeg"
+            "ogg", "oga" -> "audio/ogg"
+            "wav" -> "audio/wav"
+            else -> null
+        }
 
     // ---- helpers -----------------------------------------------------------
 
@@ -857,6 +877,7 @@ internal class GoogleMessagesMessageRepository(
                 kind = when {
                     m.isImage -> AttachmentKind.IMAGE
                     m.isVideo -> AttachmentKind.VIDEO
+                    m.mimeType.startsWith("audio/") -> AttachmentKind.AUDIO
                     else -> AttachmentKind.OTHER
                 },
                 mimeType = m.mimeType,

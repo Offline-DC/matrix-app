@@ -30,7 +30,7 @@ enum class MessageStatus {
 }
 
 @Serializable
-enum class AttachmentKind { IMAGE, VIDEO, OTHER }
+enum class AttachmentKind { IMAGE, VIDEO, AUDIO, OTHER }
 
 /**
  * A media attachment on a message. [downloadToken] is whatever the backing

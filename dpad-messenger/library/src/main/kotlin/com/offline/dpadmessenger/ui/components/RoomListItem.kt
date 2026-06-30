@@ -134,6 +134,7 @@ private val OPTICAL_NUDGE = (-0.5).dp
 private fun mediaPreviewLabel(attachment: Attachment?): String = when (attachment?.kind) {
     AttachmentKind.IMAGE -> "📷 Photo"
     AttachmentKind.VIDEO -> "🎥 Video"
+    AttachmentKind.AUDIO -> "🎤 Voice message"
     AttachmentKind.OTHER -> "📎 Attachment"
     null -> ""
 }

@@ -17,19 +17,28 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.Color
+import com.offline.dpadmessenger.media.VoiceRecorder
+import java.io.File
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -99,9 +108,14 @@ fun DpadComposer(
      *  this on activate. DPAD-Left from the field focuses it; Left again exits
      *  via [onLeftFromField]. */
     onAttach: (() -> Unit)? = null,
+    /** When non-null, an empty text field shows a record (mic) button instead of
+     *  Send; recording → stop → a preview modal → this fires with the recorded
+     *  .m4a file path to send as a voice memo. */
+    onSendVoiceMemo: ((filePath: String) -> Unit)? = null,
     header: @Composable (() -> Unit)? = null,
 ) {
     val colors = LocalDpadMessengerColors.current
+    val context = LocalContext.current
     var fieldValue by rememberSaveable(stateSaver = TextFieldValueSaver) {
         mutableStateOf(TextFieldValue(""))
     }
@@ -154,6 +168,49 @@ fun DpadComposer(
         runCatching { fieldFr.requestFocus() }
     }
 
+    // ---- voice memo recording -------------------------------------------------
+    val recorder = remember { VoiceRecorder(context) }
+    var recording by remember { mutableStateOf(false) }
+    var recordStartMs by remember { mutableStateOf(0L) }
+    var elapsedSec by remember { mutableStateOf(0) }
+    var previewPath by remember { mutableStateOf<String?>(null) }
+
+    // Abandon any in-progress recording if the composer leaves composition.
+    DisposableEffect(Unit) { onDispose { runCatching { recorder.cancel() } } }
+
+    fun beginRecording() {
+        if (recorder.start()) {
+            recording = true
+            recordStartMs = System.currentTimeMillis()
+            elapsedSec = 0
+        }
+    }
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> if (granted) beginRecording() }
+    fun onRecordPressed() {
+        val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+            context, android.Manifest.permission.RECORD_AUDIO,
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (granted) beginRecording()
+        else micPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+    }
+    fun onStopPressed() {
+        val file = recorder.stop()
+        recording = false
+        previewPath = file?.absolutePath
+        // Return focus to the trailing button so DPAD users aren't stranded.
+        runCatching { sendFr.requestFocus() }
+    }
+    // Tick the elapsed timer while recording.
+    LaunchedEffect(recording) {
+        while (recording) {
+            elapsedSec = ((System.currentTimeMillis() - recordStartMs) / 1000).toInt()
+            delay(250)
+        }
+    }
+    val voiceEnabled = onSendVoiceMemo != null
+
     // The Scaffold's imePadding shifts content up by the keyboard height, but
     // on TCL devices the predictive/candidate strip sits ABOVE the keyboard and
     // isn't part of the IME inset — so the composer's last line gets hidden
@@ -190,6 +247,9 @@ fun DpadComposer(
                     onRight = { runCatching { fieldFr.requestFocus() } },
                 )
             }
+            if (recording) {
+                RecordingIndicator(elapsedSec = elapsedSec, modifier = Modifier.weight(1f))
+            } else {
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -287,14 +347,109 @@ fun DpadComposer(
                     },
                 )
             }
+            }
 
-            SendButton(
-                enabled = fieldValue.text.isNotBlank(),
-                onClick = { submit() },
-                focusRequester = sendFr,
-                onLeftToField = { runCatching { fieldFr.requestFocus() } },
+            when {
+                // While recording the trailing button becomes Stop.
+                recording -> RecordStopButton(
+                    recording = true,
+                    onClick = { onStopPressed() },
+                    focusRequester = sendFr,
+                    onLeftToField = {},
+                )
+                // Empty field + voice enabled → a record (mic) button.
+                voiceEnabled && fieldValue.text.isBlank() -> RecordStopButton(
+                    recording = false,
+                    onClick = { onRecordPressed() },
+                    focusRequester = sendFr,
+                    onLeftToField = { runCatching { fieldFr.requestFocus() } },
+                )
+                else -> SendButton(
+                    enabled = fieldValue.text.isNotBlank(),
+                    onClick = { submit() },
+                    focusRequester = sendFr,
+                    onLeftToField = { runCatching { fieldFr.requestFocus() } },
+                )
+            }
+        }
+
+        // Voice memo preview modal (play / discard / send).
+        previewPath?.let { p ->
+            VoiceMemoPreviewSheet(
+                path = p,
+                onSend = { onSendVoiceMemo?.invoke(p); previewPath = null },
+                onDiscard = { runCatching { File(p).delete() }; previewPath = null },
+                onDismiss = { runCatching { File(p).delete() }; previewPath = null },
             )
         }
+    }
+}
+
+/** Trailing record/stop button (mic when idle, stop while recording). */
+@Composable
+private fun RecordStopButton(
+    recording: Boolean,
+    onClick: () -> Unit,
+    focusRequester: FocusRequester,
+    onLeftToField: () -> Unit,
+) {
+    val accent = if (recording) MaterialTheme.colorScheme.error
+        else MaterialTheme.colorScheme.primary
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .size(44.dp)
+            .focusRequester(focusRequester)
+            .clip(CircleShape)
+            .background(accent)
+            .dpadFocusHighlight(
+                shape = CircleShape,
+                borderColor = MaterialTheme.colorScheme.onPrimary,
+                focusedTint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.18f),
+            )
+            .focusable()
+            .onDpadAction { onClick(); true }
+            .onPreviewKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionLeft) {
+                    onLeftToField(); true
+                } else false
+            }
+            .padding(PaddingValues(8.dp)),
+    ) {
+        Icon(
+            imageVector = if (recording) Icons.Filled.Stop else Icons.Filled.Mic,
+            contentDescription = if (recording) "Stop recording" else "Record voice message",
+            tint = MaterialTheme.colorScheme.onPrimary,
+        )
+    }
+}
+
+/** Replaces the text field while a voice memo is being recorded: a pulsing-red
+ *  dot + the elapsed time. */
+@Composable
+private fun RecordingIndicator(elapsedSec: Int, modifier: Modifier = Modifier) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = modifier
+            .heightIn(min = 44.dp)
+            .clip(RoundedCornerShape(22.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(10.dp)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.error),
+        )
+        val m = elapsedSec / 60
+        val s = elapsedSec % 60
+        Text(
+            text = "Recording…  %d:%02d".format(m, s),
+            color = MaterialTheme.colorScheme.onSurface,
+            style = MaterialTheme.typography.bodyLarge,
+        )
     }
 }
 

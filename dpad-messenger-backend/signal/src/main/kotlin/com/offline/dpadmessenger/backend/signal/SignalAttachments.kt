@@ -63,7 +63,13 @@ class SignalAttachments(
                     Log.w(TAG, "upload: could not open $contentUri")
                     return@withContext null
                 }
-            val contentType = resolver.getType(uri) ?: "application/octet-stream"
+            // contentResolver.getType() returns null for file:// URIs (e.g. a
+            // recorded voice memo from cacheDir), so fall back to the file
+            // extension — otherwise an .m4a would upload as octet-stream and
+            // render as a generic file instead of a voice message.
+            val contentType = resolver.getType(uri)
+                ?: mimeFromExtension(contentUri)
+                ?: "application/octet-stream"
             val fileName = queryDisplayName(uri)
 
             // Cache a plaintext copy for the local bubble.
@@ -142,8 +148,26 @@ class SignalAttachments(
         contentType.startsWith("image/webp") -> ".webp"
         contentType.startsWith("video/mp4") -> ".mp4"
         contentType.startsWith("video/") -> ".mov"
+        contentType.startsWith("audio/mpeg") -> ".mp3"
+        contentType.startsWith("audio/ogg") -> ".ogg"
+        contentType.startsWith("audio/") -> ".m4a"
         else -> ".bin"
     }
+
+    /** Best-effort MIME from a uri/path file extension, for file:// sources
+     *  where the content resolver can't supply a type. */
+    private fun mimeFromExtension(uriOrPath: String): String? =
+        when (uriOrPath.substringAfterLast('.', "").lowercase()) {
+            "m4a" -> "audio/mp4"
+            "aac" -> "audio/aac"
+            "mp3" -> "audio/mpeg"
+            "ogg", "oga" -> "audio/ogg"
+            "wav" -> "audio/wav"
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "mp4" -> "video/mp4"
+            else -> null
+        }
 
     companion object {
         private const val TAG = "SignalAttachments"
@@ -153,6 +177,7 @@ class SignalAttachments(
         fun kindFor(contentType: String): com.offline.dpadmessenger.data.AttachmentKind = when {
             contentType.startsWith("image/") -> com.offline.dpadmessenger.data.AttachmentKind.IMAGE
             contentType.startsWith("video/") -> com.offline.dpadmessenger.data.AttachmentKind.VIDEO
+            contentType.startsWith("audio/") -> com.offline.dpadmessenger.data.AttachmentKind.AUDIO
             else -> com.offline.dpadmessenger.data.AttachmentKind.OTHER
         }
     }

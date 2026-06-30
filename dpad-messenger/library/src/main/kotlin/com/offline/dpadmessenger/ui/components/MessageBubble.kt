@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.Icon
@@ -535,6 +536,31 @@ private fun MediaBlock(
                     color = LocalDpadMessengerColors.current.mutedText,
                 )
             }
+        }
+
+        // Voice memo: render the inline play/pause + progress control.
+        attachment.kind == com.offline.dpadmessenger.data.AttachmentKind.AUDIO && loadedPath != null ->
+            VoiceMemoPlayer(localPath = loadedPath, modifier = Modifier.padding(top = 4.dp))
+
+        // Voice memo not downloaded yet: a compact play affordance. Tapping the
+        // bubble triggers the download (see onMediaActivate); once it lands this
+        // becomes the player above.
+        attachment.kind == com.offline.dpadmessenger.data.AttachmentKind.AUDIO -> Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(top = 4.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Mic,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+            )
+            Spacer(Modifier.padding(start = 8.dp))
+            Text(
+                text = if (failed) "Couldn't load — tap to retry" else "Voice message — tap to play",
+                style = MaterialTheme.typography.labelMedium,
+                color = if (failed) MaterialTheme.colorScheme.error
+                else LocalDpadMessengerColors.current.mutedText,
+            )
         }
 
         loadedPath != null && attachment.kind == com.offline.dpadmessenger.data.AttachmentKind.IMAGE ->
