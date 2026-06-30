@@ -37,6 +37,12 @@ fun SignalApp(
     val context = LocalContext.current
     val store = remember { SignalAccountStore(context) }
     var paired by remember { mutableStateOf(store.isPaired()) }
+    // Bumped on each fresh in-session link. The chat UI below is wrapped in
+    // key(linkSession) so a re-link rebuilds it with a brand-new NavController.
+    // Without this, Compose restores the saved back stack and drops the user
+    // back into whatever chat was open before they logged out — instead of the
+    // room list, which is what they expect right after signing in.
+    var linkSession by remember { mutableStateOf(0) }
 
     if (paired) {
         val repository = remember { SignalRepository.create(context) }
@@ -69,15 +75,20 @@ fun SignalApp(
             return
         }
 
-        DpadMessengerApp(
-            repository = repository,
-            modifier = modifier,
-            onLogout = logout,
-            initialRoomId = initialRoomId,
-            initialRoomKey = initialRoomKey,
-            autoDeleteEnabled = autoDeleteEnabled,
-            onAutoDeleteChange = retention?.let { r -> { value: Boolean -> r.setAutoDeleteEnabled(value) } },
-        )
+        // key(linkSession): a fresh link bumps linkSession, forcing a new
+        // NavController so we land on the room list rather than restoring the
+        // chat that was open before logout.
+        androidx.compose.runtime.key(linkSession) {
+            DpadMessengerApp(
+                repository = repository,
+                modifier = modifier,
+                onLogout = logout,
+                initialRoomId = initialRoomId,
+                initialRoomKey = initialRoomKey,
+                autoDeleteEnabled = autoDeleteEnabled,
+                onAutoDeleteChange = retention?.let { r -> { value: Boolean -> r.setAutoDeleteEnabled(value) } },
+            )
+        }
         return
     }
 
@@ -92,6 +103,7 @@ fun SignalApp(
         // Persist the freshly-linked account, then swap to the chat UI.
         store.save(linked.account)
         SignalPairing.reset()
+        linkSession++          // force a fresh NavController → land on the room list
         paired = true
     }
 

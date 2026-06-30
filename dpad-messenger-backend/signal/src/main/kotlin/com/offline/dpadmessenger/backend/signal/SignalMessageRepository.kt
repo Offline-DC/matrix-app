@@ -677,6 +677,53 @@ class SignalMessageRepository(
         }
     }
 
+    /** Longest we'll wait on the profile fetch before posting the notification
+     *  with a placeholder. The lookup itself still finishes in the background
+     *  (and corrects the room name) if it overruns this. */
+    private val PROFILE_RESOLVE_TIMEOUT_MS = 4_000L
+
+    /**
+     * Best display name for [serviceId] *now*, in time for the room title and
+     * the incoming notification, in priority order:
+     *   1. a name we already have (persisted contact / earlier resolve),
+     *   2. the device address-book name matched on [e164],
+     *   3. the Signal profile name — **awaited** with a short timeout,
+     *   4. the phone number, else the short "Contact xxxxxxxx" ACI placeholder.
+     * Persists whatever it resolves. If the profile fetch overruns the timeout,
+     * falls back for now but kicks off the background resolve so the name still
+     * corrects on the next refresh.
+     */
+    private suspend fun resolveDisplayName(
+        serviceId: String,
+        e164: String?,
+        profileKey: ByteArray?,
+    ): String {
+        contactsByServiceId[serviceId]?.name?.takeIf { it.isNotBlank() }?.let { return it }
+
+        e164?.let { localNameForNumber(it) }?.let { name ->
+            updateContact(serviceId, name, normalizeNumber(e164))
+            return name
+        }
+
+        val p = profiles
+        if (p != null && profileKey != null && profileKey.size == 32) {
+            val name = kotlinx.coroutines.withTimeoutOrNull(PROFILE_RESOLVE_TIMEOUT_MS) {
+                p.resolveName(serviceId, profileKey)
+            }
+            if (!name.isNullOrBlank()) {
+                android.util.Log.d("SignalRepo", "profile lookup $serviceId: resolved \"$name\" before notify")
+                updateContact(serviceId, name, e164?.let { normalizeNumber(it) })
+                return name
+            }
+            // Not ready in time — return a placeholder now. The caller
+            // (receiveIncoming) schedules the background resolve and refreshes
+            // the notification once the real name lands.
+            android.util.Log.d("SignalRepo", "profile lookup $serviceId: not ready in ${PROFILE_RESOLVE_TIMEOUT_MS}ms — placeholder now")
+        }
+
+        return e164 ?: shortName(serviceId)
+    }
+
     // ---- internal -----------------------------------------------------------
 
     /** Called by [SignalChatWebSocket] when an inbound Signal message is decrypted. */
@@ -696,7 +743,7 @@ class SignalMessageRepository(
      *  - appends the message and refreshes summaries so the room-list UI
      *    pops the conversation to the top.
      */
-    internal fun receiveIncoming(
+    internal suspend fun receiveIncoming(
         senderServiceId: String,
         senderE164: String?,
         messageId: String,
@@ -719,10 +766,6 @@ class SignalMessageRepository(
         // messages, which legitimately have a blank body.
         if (body.isBlank() && attachment == null) return
 
-        // Best-effort: resolve the sender's real display name from their Signal
-        // profile (only when we don't already have an address-book name).
-        maybeResolveProfileName(senderServiceId, profileKey)
-
         // One direct-chat room per peer. Group rooms will need a different
         // id derivation (groupId from DataMessage.groupV2).
         val roomId = "sig:dm:$senderServiceId"
@@ -737,49 +780,40 @@ class SignalMessageRepository(
             numberToServiceId[normalizeNumber(senderE164)] = senderServiceId
         }
 
-        // Pick the best display name we can without contact sync:
-        //   1. Phone number from the SenderCertificate (sealed sender only)
-        //   2. A short "Contact xxxxxxxx" derived from the first 8 hex of ACI
-        // Once contact sync (SyncMessage.Contacts) is wired, this will be
-        // replaced by the primary device's name for the contact.
-        val resolvedName = senderE164 ?: shortName(senderServiceId)
+        // Show the message INSTANTLY with whatever name we have without blocking:
+        // a known/persisted name, else the number, else the short ACI placeholder.
+        // The real profile name is awaited just below — only for the room title +
+        // notification — so the chat bubble never waits on the network.
+        val knownName = contactsByServiceId[senderServiceId]?.name?.takeIf { it.isNotBlank() }
+        val provisionalName = knownName ?: senderE164 ?: shortName(senderServiceId)
 
-        // Lazy contact entry — upgrade the displayName any time a better
-        // candidate (phone number) becomes available so the room title
-        // refreshes once the first sealed envelope arrives.
-        val users = userCache.value.toMutableMap()
-        val existingUser = users[senderServiceId]
-        val betterName = when {
-            senderE164 != null -> senderE164          // always prefer phone number
-            existingUser != null -> existingUser.displayName  // keep what we had
-            else -> resolvedName
-        }
-        users[senderServiceId] = User(
-            id = senderServiceId,
-            displayName = betterName,
-            avatarColor = existingUser?.avatarColor ?: "#3A76F0",
+        val existingUser = userCache.value[senderServiceId]
+        userCache.value = userCache.value + (
+            senderServiceId to User(
+                id = senderServiceId,
+                displayName = provisionalName,
+                avatarColor = existingUser?.avatarColor ?: "#3A76F0",
+            )
         )
-        userCache.value = users
 
-        // Create the room if this is a first-touch sender — OR rename it
-        // if we've just learned a better display name.
+        // Create the room on first touch (or rename to the provisional name).
         val existing = rooms.value.firstOrNull { it.room.id == roomId }
         if (existing == null) {
             val room = Room(
                 id = roomId,
-                name = betterName,
+                name = provisionalName,
                 memberIds = listOf(currentUser.id, senderServiceId),
                 isGroup = false,
-                avatarColor = users[senderServiceId]!!.avatarColor,
+                avatarColor = userCache.value[senderServiceId]!!.avatarColor,
             )
             rooms.value = rooms.value + RoomSummary(
                 room = room,
                 lastMessage = null,
                 unreadCount = 0,
             )
-        } else if (existing.room.name != betterName) {
+        } else if (existing.room.name != provisionalName) {
             rooms.value = rooms.value.map {
-                if (it.room.id == roomId) it.copy(room = it.room.copy(name = betterName)) else it
+                if (it.room.id == roomId) it.copy(room = it.room.copy(name = provisionalName)) else it
             }
         }
 
@@ -800,12 +834,18 @@ class SignalMessageRepository(
             replyToId = replyToLocalId,
             attachment = attachment,
         )
-        appendLocal(roomId, message)
+        appendLocal(roomId, message)   // bubble shows immediately
         bumpSummary(roomId, message)
 
+        // Now resolve the real display name — instant when we already have one,
+        // otherwise awaits the profile lookup (short timeout). On success it
+        // persists the name and renames the room, so both the room list and the
+        // notification below read "Liv Rogal" rather than a number/placeholder.
+        val peerName = resolveDisplayName(senderServiceId, senderE164, profileKey)
+
         // Surface a system notification (mirrored into the launcher's
-        // Notifications tab). The room name is the best sender label we have.
-        val displayName = rooms.value.firstOrNull { it.room.id == roomId }?.room?.name ?: betterName
+        // Notifications tab) with the resolved name.
+        val displayName = rooms.value.firstOrNull { it.room.id == roomId }?.room?.name ?: peerName
         maybeNotifyIncoming(
             conversationId = roomId,
             title = displayName,
@@ -813,6 +853,34 @@ class SignalMessageRepository(
             body = notificationBody(body, attachment),
             timeMs = timestamp,
         )
+
+        // Bulletproofing: if we STILL don't have a real name (the profile fetch
+        // overran the timeout in resolveDisplayName), keep resolving in the
+        // background and, once it lands, persist it (which renames the room) AND
+        // re-post the notification so the notifications page corrects from the
+        // "Contact ab12cd34" placeholder to the real name. maybeNotifyIncoming
+        // no-ops when the user is already in the room, so this won't resurface a
+        // notification they've moved past.
+        val pk = profileKey
+        if (contactsByServiceId[senderServiceId] == null && pk != null && pk.size == 32) {
+            val p = profiles
+            if (p != null) {
+                persistScope.launch {
+                    val late = p.resolveName(senderServiceId, pk)
+                    if (!late.isNullOrBlank()) {
+                        android.util.Log.d("SignalRepo", "profile lookup $senderServiceId: late resolve \"$late\" — refreshing notification")
+                        updateContact(senderServiceId, late, senderE164?.let { normalizeNumber(it) })
+                        maybeNotifyIncoming(
+                            conversationId = roomId,
+                            title = late,
+                            senderName = late,
+                            body = notificationBody(body, attachment),
+                            timeMs = timestamp,
+                        )
+                    }
+                }
+            }
+        }
     }
 
     /** What to show as the notification body — the text, or a media placeholder. */
