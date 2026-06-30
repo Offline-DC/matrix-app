@@ -43,25 +43,23 @@ android {
         resources.excludes.add("META-INF/INDEX.LIST")
     }
 
-    // Add proto-generated Java sources to the Android java source set.
-    sourceSets.getByName("main") {
-        java.srcDirs(
-            "build/generated/source/proto/debug/java",
-            "build/generated/source/proto/release/java",
-        )
-    }
+    // Add proto-generated Java sources PER VARIANT. Each variant must see ONLY
+    // its own protoc output. Putting both debug/ and release/ on `main` makes a
+    // release compile pick up every generated proto class twice ("duplicate
+    // class") — debug builds pass only because release/java is empty then, so
+    // the bug stayed hidden until the first assembleRelease.
+    sourceSets.getByName("debug").java.srcDir("build/generated/source/proto/debug/java")
+    sourceSets.getByName("release").java.srcDir("build/generated/source/proto/release/java")
 }
 
 // The kotlin-android plugin provides a top-level `kotlin {}` extension
 // whose sourceSets DO have a `kotlin` property. Adding the protoc output
 // here makes Kotlin compile resolve the generated classes.
 kotlin {
-    sourceSets.getByName("main") {
-        kotlin.srcDirs(
-            "build/generated/source/proto/debug/java",
-            "build/generated/source/proto/release/java",
-        )
-    }
+    // Same per-variant split as the android sourceSets above — never put both
+    // proto output dirs on `main`, or release compiles see duplicate classes.
+    sourceSets.getByName("debug").kotlin.srcDir("build/generated/source/proto/debug/java")
+    sourceSets.getByName("release").kotlin.srcDir("build/generated/source/proto/release/java")
 }
 
 // Precise per-variant dependency: make compileXxxKotlin run after
