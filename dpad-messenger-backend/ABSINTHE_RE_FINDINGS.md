@@ -155,6 +155,12 @@ The Rust core (`absinthe`) is unit-tested against the same real binary and dumb
 file: OABS round-trips byte-for-byte, the fat/Mach-O parser finds the x64 slice
 and the nac prologues, and the bind interpreter resolves the IOKit imports.
 
+The Rust **emulator** (`--features emulate`) is verified too — built against
+`unicorn-engine` and run via `examples/generate.rs`, it produces the same
+**389‑byte** validation data as the Python reference from the identical binary +
+identity. So both the Python relay and the native Rust crate are proven, not
+just structurally mirrored.
+
 ## 8. Ongoing obligations & risks
 
 - **Build-pinned offsets.** New `IMDAppleServices` builds move the three

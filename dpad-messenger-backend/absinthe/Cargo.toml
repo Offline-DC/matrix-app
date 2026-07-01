@@ -45,3 +45,9 @@ plist = { version = "1.7", optional = true }
 
 [dev-dependencies]
 hex = "0.4"
+
+# The end-to-end example needs the emulator + HTTP transport; gating it keeps
+# the default `cargo test` (pure-std core) building without libunicorn/reqwest.
+[[example]]
+name = "generate"
+required-features = ["emulate", "net"]

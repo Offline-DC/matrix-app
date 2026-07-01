@@ -13,7 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use unicorn_engine::unicorn_const::{Arch, Mode, Permission};
+use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
 use unicorn_engine::{RegisterX86, Unicorn};
 
 use crate::error::{AbsintheError, Result};
@@ -63,7 +63,7 @@ impl NacSession {
             });
         }
 
-        let mut uc = Unicorn::new(Arch::X86, Mode::MODE64)
+        let mut uc = Unicorn::new(Arch::X86, Mode::MODE_64)
             .map_err(|e| AbsintheError::Emulation(format!("unicorn init: {e:?}")))?;
 
         // Map + write the binary at vmaddr 0.
@@ -218,7 +218,7 @@ impl NacSession {
 // ---- Unicorn helpers --------------------------------------------------------
 
 fn map(uc: &mut Unicorn<'_, ()>, addr: u64, size: u64) -> Result<()> {
-    uc.mem_map(addr, size as usize, Permission::ALL)
+    uc.mem_map(addr, size, Prot::ALL)
         .map_err(|e| AbsintheError::Emulation(format!("mem_map {addr:#x}: {e:?}")))
 }
 fn write(uc: &mut Unicorn<'_, ()>, addr: u64, data: &[u8]) -> Result<()> {

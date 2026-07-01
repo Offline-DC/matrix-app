@@ -32,7 +32,16 @@ const C3_SENTINEL: u64 = 0xC3C3_C3C3_C3C3_C3C3;
 enum Cf {
     Data(Vec<u8>),
     Str(String),
-    Dict(HashMap<String, DictVal>),
+    Dict(HashMap<DictKey, DictVal>),
+}
+
+/// A dict key is either a real string or an opaque pointer (some CFString
+/// constants live in the binary's data and are passed by-pointer). Mirrors
+/// pypush's `maybe_object_maybe_string`, which keys on str OR raw int.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum DictKey {
+    Str(String),
+    Raw(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -132,16 +141,15 @@ fn cstr_ptr(uc: &Emu, ptr: u64) -> Result<String> {
         .map_err(|_| AbsintheError::Emulation("cstr not utf-8".into()))
 }
 
-/// Resolve a dict key argument to a String (raw string, or a CFString handle).
-fn maybe_key(st: &HookState, val: u64) -> Result<String> {
-    if val != 0 && val as usize <= st.cf.len() {
-        if let Cf::Str(s) = st.cf_get(val)? {
-            return Ok(s.clone());
+/// Resolve a dict key argument: a CFString handle → its string; anything else
+/// (a raw pointer to a data-segment CFString constant) → an opaque `Raw` key.
+fn maybe_key(st: &HookState, val: u64) -> DictKey {
+    if val != 0 && (val as usize) <= st.cf.len() {
+        if let Some(Cf::Str(s)) = st.cf.get(val as usize - 1) {
+            return DictKey::Str(s.clone());
         }
     }
-    Err(AbsintheError::Emulation(format!(
-        "dict key {val:#x} is not a string"
-    )))
+    DictKey::Raw(val)
 }
 
 fn malloc(st: &mut HookState, size: u64) -> u64 {
@@ -235,15 +243,15 @@ pub fn dispatch(uc: &mut Emu, st: &mut HookState, sym: &str) -> Result<()> {
         "_CFDictionaryGetValue" => {
             let (dh, key_arg) = (a(uc, 0), a(uc, 1));
             let key = if key_arg == C3_SENTINEL {
-                "DADiskDescriptionVolumeUUIDKey".to_string()
+                DictKey::Str("DADiskDescriptionVolumeUUIDKey".to_string())
             } else {
-                maybe_key(st, key_arg)?
+                maybe_key(st, key_arg)
             };
             let val = match st.cf_get(dh)? {
                 Cf::Dict(d) => d
                     .get(&key)
                     .cloned()
-                    .ok_or_else(|| AbsintheError::Emulation(format!("dict key {key} not found")))?,
+                    .ok_or_else(|| AbsintheError::Emulation(format!("dict key {key:?} not found")))?,
                 _ => return Err(AbsintheError::Emulation("CFDictionaryGetValue on non-dict".into())),
             };
             let obj = match val {
@@ -258,7 +266,7 @@ pub fn dispatch(uc: &mut Emu, st: &mut HookState, sym: &str) -> Result<()> {
         }
         "_CFDictionarySetValue" => {
             let (dh, key_arg, val_arg) = (a(uc, 0), a(uc, 1), a(uc, 2));
-            let key = maybe_key(st, key_arg)?;
+            let key = maybe_key(st, key_arg);
             // Resolve value like Python's _maybe.
             let val = if val_arg != 0 && (val_arg as usize) <= st.cf.len() {
                 match st.cf_get(val_arg)? {
@@ -298,7 +306,10 @@ pub fn dispatch(uc: &mut Emu, st: &mut HookState, sym: &str) -> Result<()> {
             let name = cstr_ptr(uc, a(uc, 0))?;
             let name_h = st.cf_new(Cf::Str(name));
             let mut dict = HashMap::new();
-            dict.insert("IOProviderClass".to_string(), DictVal::Handle(name_h as usize));
+            dict.insert(
+                DictKey::Str("IOProviderClass".to_string()),
+                DictVal::Handle(name_h as usize),
+            );
             let h = st.cf_new(Cf::Dict(dict));
             set_ret(uc, h);
         }
@@ -327,7 +338,10 @@ pub fn dispatch(uc: &mut Emu, st: &mut HookState, sym: &str) -> Result<()> {
         "_DADiskCopyDescription" => {
             let uuid = st.root_disk_uuid.clone();
             let mut dict = HashMap::new();
-            dict.insert("DADiskDescriptionVolumeUUIDKey".to_string(), DictVal::Str(uuid));
+            dict.insert(
+                DictKey::Str("DADiskDescriptionVolumeUUIDKey".to_string()),
+                DictVal::Str(uuid),
+            );
             let h = st.cf_new(Cf::Dict(dict));
             set_ret(uc, h);
         }

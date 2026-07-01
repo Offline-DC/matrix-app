@@ -69,6 +69,10 @@ impl HttpTransport {
         // build their own client. (rustpush historically set verify=false.)
         let client = reqwest::blocking::Client::builder()
             .user_agent("com.apple.invitation-registration [macOS,15.3.1,24D70,Mac17,2]")
+            // Apple's identity.ess.apple.com presents a chain many stores lack;
+            // the community clients (pypush, rustpush) disable verification for
+            // these validation endpoints. Same tradeoff here.
+            .danger_accept_invalid_certs(true)
             .build()
             .map_err(|e| AbsintheError::Transport(e.to_string()))?;
         Ok(HttpTransport { client })
