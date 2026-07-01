@@ -85,7 +85,7 @@ fun SignalLinkScreen(
                 CircularProgressIndicator()
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    text = "Linked — loading your messages…",
+                    text = "Linked — finishing setup…",
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
                 )
