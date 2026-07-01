@@ -22,7 +22,11 @@ class MatrixBackendFactory : BackendFactory {
             is BackendConfig.RemoteMatrix -> config.homeserverUrl
             is BackendConfig.EmbeddedConduit -> "http://127.0.0.1:${config.port}"
             is BackendConfig.SignalBridge -> "http://127.0.0.1:${config.conduitPort}"
-            BackendConfig.Mock -> return null
+            // Not a Matrix config (Mock / SignalDirect / IMessageNative): this
+            // factory doesn't handle it — the caller falls through to the right
+            // one. `else` also keeps this `when` exhaustive as new BackendConfig
+            // variants are added.
+            else -> return null
         }
         val sessionDir = File(context.filesDir, "matrix-sessions")
         val auth = MatrixAuth(context, sessionDir)

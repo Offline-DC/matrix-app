@@ -8,11 +8,16 @@ Messenger work for the dumb-down ecosystem. Three Gradle builds:
 - **dpad-spotify/** — standalone prototype: DPAD-first Spotify client on rust
   librespot via JNI (zeroconf login handoff, search, playback). See its README.
 - **dpad-messenger-backend/** — backends: Signal (device-link provisioning,
-  chat WebSocket), Matrix, and Google Messages (`:gmessages` — QR pairing
-  against the user's primary Android phone via Google's "Messages for web"
-  relay, plus its Compose pairing/chat UI). References `../dpad-messenger`
-  (sibling in this repo), so cloning this repo alone is self-contained for
-  backend work.
+  chat WebSocket), Matrix, Google Messages (`:gmessages` — QR pairing against
+  the user's primary Android phone via Google's "Messages for web" relay, plus
+  its Compose pairing/chat UI), and iMessage (`:imessage` — native rustpush-
+  over-JNI in direct mode, currently stub/relay while the closed-source absinthe
+  validation engine is worked out). References `../dpad-messenger` (sibling in
+  this repo), so cloning this repo alone is self-contained for backend work.
+  The iMessage backend was migrated in from the standalone `imessage-app` repo;
+  its native/reverse-engineering scaffolding (`imessage-ffi/`, `relay-reference/`,
+  `IMESSAGE_NATIVE_BACKEND_PLAN.md`, `ABSINTHE_REVERSE_ENGINEERING.md`) lives
+  under `dpad-messenger-backend/`.
 
 dumb-down-launcher (separate repo) expects this repo cloned next to it. The
 launcher composite-includes the backend build (and, transitively through it,

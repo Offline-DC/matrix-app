@@ -1,0 +1,13 @@
+{
+  "name": "imessage-relay-reference",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reference iMessage relay implementing the RelayProtocol over WebSocket (for end-to-end testing the RelayWebSocketTransport client).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

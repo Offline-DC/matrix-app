@@ -7,3 +7,16 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+
+# --- absinthe / nacserver secrets: NEVER commit these -----------------------
+# The dumb file is a real Mac hardware identity; IMDAppleServices is Apple's
+# binary. Both are supplied by the operator, kept off the repo. See
+# ABSINTHE_REVERSE_ENGINEERING.md §0.
+/dumb
+*.dumb
+IMDAppleServices
+data.plist
+# Rust + Python build artifacts for the new crates
+absinthe/target/
+__pycache__/
+*.pyc

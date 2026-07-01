@@ -1,0 +1,36 @@
+{
+  "currentUserId": "me",
+  "users": [
+    { "id": "me",     "displayName": "You",            "avatarColor": "#0A84FF" },
+    { "id": "mom",    "displayName": "Mom",            "avatarColor": "#FF375F" },
+    { "id": "jules",  "displayName": "Jules",          "avatarColor": "#30D158" },
+    { "id": "sam",    "displayName": "Sam Rivera",     "avatarColor": "#5E5CE6" },
+    { "id": "priya",  "displayName": "Priya Patel",    "avatarColor": "#FF9F0A" },
+    { "id": "deliv",  "displayName": "+1 (888) 555-0142", "avatarColor": "#8E8E93" }
+  ],
+  "rooms": [
+    { "id": "r1", "name": "Mom",          "memberIds": ["mom"],                 "isGroup": false, "avatarColor": "#FF375F" },
+    { "id": "r2", "name": "Weekend Trip", "memberIds": ["jules", "sam", "priya"], "isGroup": true,  "avatarColor": "#5E5CE6" },
+    { "id": "r3", "name": "Sam Rivera",   "memberIds": ["sam"],                 "isGroup": false, "avatarColor": "#5E5CE6" },
+    { "id": "r4", "name": "+1 (888) 555-0142", "memberIds": ["deliv"],          "isGroup": false, "avatarColor": "#8E8E93" }
+  ],
+  "messages": [
+    { "id": "h01", "roomId": "r1", "senderId": "mom",  "body": "Did you make it home okay?",          "timestampMs": 1717000000000, "status": "READ", "historical": true },
+    { "id": "h02", "roomId": "r1", "senderId": "me",   "body": "Yep, just walked in.",                 "timestampMs": 1717000060000, "status": "READ", "historical": true },
+
+    { "id": "m01", "roomId": "r1", "senderId": "mom",  "body": "Call me when you get a sec ❤️",         "timestampMs": 1717100000000, "status": "READ",
+      "reactions": { "❤️": ["me"] } },
+    { "id": "m02", "roomId": "r1", "senderId": "me",   "body": "Will do after dinner!",                "timestampMs": 1717100120000, "status": "READ" },
+
+    { "id": "m10", "roomId": "r2", "senderId": "jules", "body": "Who's driving Saturday?",             "timestampMs": 1717200000000, "status": "READ" },
+    { "id": "m11", "roomId": "r2", "senderId": "sam",   "body": "I can take my car 🚗",                "timestampMs": 1717200090000, "status": "READ",
+      "reactions": { "👍": ["me", "jules"], "😂": ["priya"] } },
+    { "id": "m12", "roomId": "r2", "senderId": "priya", "body": "Booked the cabin — confirmation just came through.", "timestampMs": 1717200400000, "status": "READ" },
+    { "id": "m13", "roomId": "r2", "senderId": "me",    "body": "Amazing, thank you!!",                "timestampMs": 1717200460000, "status": "DELIVERED" },
+
+    { "id": "m20", "roomId": "r3", "senderId": "sam",  "body": "Did you see the game last night?",     "timestampMs": 1717300000000, "status": "READ" },
+    { "id": "m21", "roomId": "r3", "senderId": "me",   "body": "Unreal finish 🏀",                     "timestampMs": 1717300060000, "status": "READ" },
+
+    { "id": "m30", "roomId": "r4", "senderId": "deliv", "body": "Your package is out for delivery and will arrive by 8 PM.", "timestampMs": 1717400000000, "status": "DELIVERED" }
+  ]
+}

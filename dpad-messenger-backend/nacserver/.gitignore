@@ -1,0 +1,8 @@
+# NEVER commit Apple's binary or a real hardware identity.
+IMDAppleServices
+*.dumb
+dumb
+data.plist
+__pycache__/
+*.pyc
+.venv/

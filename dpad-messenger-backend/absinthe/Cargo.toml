@@ -1,0 +1,47 @@
+[package]
+name = "absinthe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Open reimplementation of Apple's iMessage validation-data (nac) engine via binary emulation — a drop-in for OpenBubbles' closed-source open-absinthe::nac."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# This crate is the replacement for the closed-source `open-absinthe` that
+# rustpush references (see ../ABSINTHE_REVERSE_ENGINEERING.md and
+# ../ABSINTHE_RE_FINDINGS.md). Apple's validation-data generator ("nac") lives
+# inside an obfuscated Mach-O (`IMDAppleServices`); the proven RE method
+# (pypush, OpenBubbles, Beeper) is to EMULATE that binary under a CPU emulator
+# and feed it a captured Mac hardware identity. This crate does that.
+#
+# Feature layout is deliberate so the whole crate compiles and its core is
+# unit-testable WITHOUT the native emulator or Apple's binary present:
+#
+#   (default)   hardware (OABS parse/serialize) + macho parsing + types.
+#               Pure std. `cargo test` runs here with no native deps.
+#   emulate     pulls in `unicorn-engine` and turns on the real nac engine
+#               (jelly emulator + import hooks). Needs libunicorn + cmake.
+#   net         reqwest + plist blocking HTTP transport for the two Apple
+#               validation round-trips (cert fetch + initializeValidation).
+# ─────────────────────────────────────────────────────────────────────────────
+
+[features]
+default = []
+emulate = ["dep:unicorn-engine"]
+net = ["dep:reqwest", "dep:plist"]
+
+[dependencies]
+log = "0.4"
+
+# The CPU emulator (QEMU-family). Only pulled in with `--features emulate`.
+# Building it needs cmake + a C toolchain; that's expected on a dev machine,
+# not in CI-lite. Version tracks the maintained Rust bindings.
+unicorn-engine = { version = "2.1", optional = true }
+
+# HTTP + plist only needed for the two live Apple round-trips (feature `net`).
+# On-device, rustpush already owns an HTTP client, so the phone path can use
+# the transport trait instead and skip these.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "rustls-tls"] }
+plist = { version = "1.7", optional = true }
+
+[dev-dependencies]
+hex = "0.4"

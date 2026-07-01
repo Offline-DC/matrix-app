@@ -17,6 +17,8 @@ vvi
 | `matrix/`  | `MatrixMessageRepository` via `matrix-rust-sdk` Kotlin bindings; login/restore via `MatrixAuth` | MVP done |
 | `conduit/` | Foreground-service host for an embedded Conduit homeserver | **Stub** — see `docs/CONDUIT_EMBEDDING.md` |
 | `signal/`  | libsignal-android linking + Matrix↔Signal bridge service | **Stub** — see `docs/SIGNAL_BRIDGE.md` |
+| `gmessages/` | Google Messages QR-pairing + relay client, ships its own Compose pairing/chat UI | MVP done |
+| `imessage/` | Native iMessage backend (direct mode, mirrors `:signal`): rustpush-over-JNI + `ValidationDataRelay`, ships its own Compose setup/chat UI. Runs in stub/relay mode until the native `.so` is built. | **Relay/stub** — see `IMESSAGE_NATIVE_BACKEND_PLAN.md` + `ABSINTHE_REVERSE_ENGINEERING.md` |
 
 ## How the pieces fit
 
@@ -35,8 +37,40 @@ vvi
 │  matrix/      — real client │
 │  conduit/     — embedded HS │
 │  signal/      — bridge      │
+│  gmessages/   — GMessages   │
+│  imessage/    — iMessage     │
 └────────────────────────────┘
 ```
+
+### iMessage / absinthe (migrated from the standalone `imessage-app` repo)
+
+`:imessage` is the native iMessage backend, brought in so iMessage lives
+alongside Signal and Google Messages against the same `dpad-messenger` UI
+instead of a separate app. It talks to Apple's IDS/APNs through OpenBubbles'
+`rustpush` compiled to a JNI `.so`. The one piece rustpush can't do open-source
+is **validation data** — Apple's closed-source absinthe `nac` engine — so today
+the module runs in **stub/relay mode**: registration is fed by a mockable
+`ValidationDataRelay` and the chat UI shows iMessage demo data. The seam is
+explicit (`absinthe/AbsintheStub.kt`) so the real engine drops in without
+touching the UI.
+
+The absinthe validation-data engine is **reverse-engineered and working**
+(verified end-to-end against the real Apple binary + a real Mac identity —
+see `ABSINTHE_RE_FINDINGS.md`). Supporting pieces:
+
+- `nacserver/` — **the working validation-data relay** (Python). Runs the nac
+  emulation off-device and serves validation data over the phone's
+  `ValidationDataRelay` HTTP contract. This is the production path.
+- `absinthe/` — Rust crate reimplementing `open-absinthe::nac` (OABS parse +
+  Mach-O load + Unicorn emulation). Core unit-tested against real artifacts;
+  emulator behind `--features emulate`.
+- `imessage-ffi/` — the JNI wrapper crate over `rustpush` (integration points
+  marked `RUSTPUSH:`). Build to `.so` with `scripts/build-rustpush-so.sh`.
+- `relay-reference/` — a reference relay server for the `RelayProtocol`.
+- `IMESSAGE_NATIVE_BACKEND_PLAN.md` — the full native-backend plan.
+- `RELAY_PROTOCOL.md` — the app↔relay contract (BlueBubbles-aligned).
+- `ABSINTHE_REVERSE_ENGINEERING.md` — operator "how to run it" guide.
+- `ABSINTHE_RE_FINDINGS.md` — the reverse-engineering writeup + proof.
 
 **Phase 3a (this commit):** UI + Matrix client against any remote homeserver.
 You can log into matrix.org today and the UI works.

@@ -24,6 +24,12 @@ include(":matrix")
 include(":conduit")
 include(":signal")
 include(":gmessages")
+// Native iMessage backend (migrated from the standalone imessage-app repo).
+// Ships its own Compose setup/chat-gate UI against the shared dpad-messenger
+// library, exactly like :gmessages. The rustpush `.so` it loads is built by
+// scripts/build-rustpush-so.sh from the sibling imessage-ffi crate; until then
+// it runs in stub/relay mode. See ABSINTHE_REVERSE_ENGINEERING.md.
+include(":imessage")
 include(":app")
 
 // Composite build: the UI library lives in the sibling dpad-messenger repo.
