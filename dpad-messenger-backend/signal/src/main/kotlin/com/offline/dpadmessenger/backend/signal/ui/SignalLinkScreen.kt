@@ -16,6 +16,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -23,6 +24,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.backend.signal.SignalProvisioningResult
@@ -42,6 +44,16 @@ fun SignalLinkScreen(
     /** Restart linking from the Failed state. Null hides the retry button. */
     onRetry: (() -> Unit)? = null,
 ) {
+    // Keep the display awake while the link screen is up. On a dumbphone the
+    // screen sleeps at ~30s, which tears down the provisioning socket mid-scan
+    // and invalidates the QR. Holding the screen on removes that failure mode;
+    // the flag is released automatically when we leave this screen.
+    val view = LocalView.current
+    DisposableEffect(Unit) {
+        view.keepScreenOn = true
+        onDispose { view.keepScreenOn = false }
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()

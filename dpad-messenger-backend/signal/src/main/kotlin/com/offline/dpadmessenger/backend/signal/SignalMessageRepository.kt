@@ -825,11 +825,17 @@ class SignalMessageRepository(
         // Learn this number → ACI from the reply. When you next type/search the
         // number in the picker, startConversation → resolveServiceIdForNumber
         // returns this ACI and opens THIS room, instead of re-running CDSI and
-        // getting the PNI (which would open a second, split thread). This only
-        // fixes resolution going forward — it deliberately does not back-migrate
-        // any existing PNI thread; during dev those get cleared with pm clear.
+        // getting the PNI (which would open a second, split thread). If we HAD
+        // already opened a provisional thread for this number under a different
+        // service-id (a CDSI PNI, or a stale ACI), back-migrate it now so the
+        // two threads collapse into one instead of staying split.
         if (!senderE164.isNullOrBlank()) {
-            numberToServiceId[normalizeNumber(senderE164)] = senderServiceId
+            val norm = normalizeNumber(senderE164)
+            val prior = numberToServiceId[norm]
+            if (prior != null && prior != senderServiceId) {
+                mergeRecipient(fromServiceId = prior, toServiceId = senderServiceId)
+            }
+            numberToServiceId[norm] = senderServiceId
         }
 
         // Cache the profile key so a later startConversation(by number) can fetch
@@ -1274,10 +1280,36 @@ class SignalMessageRepository(
      */
     internal fun updateContact(serviceId: String, name: String, e164: String?) {
         if (name.isBlank()) return
+
+        // Canonicalize identity. Signal keys a conversation by a single merged
+        // Recipient (ACI ∪ PNI ∪ E.164), not by a raw service-id string. So when
+        // we learn that this number already maps to a DIFFERENT service-id — the
+        // classic case being a provisional "PNI:" thread we opened by typing the
+        // number, versus the real ACI we now learn from contact sync / an inbound
+        // reply — fold the two threads into one, always keeping the ACI. This is
+        // what stops the same person showing up as two chats with two different
+        // names ("Ben Jacqmotte" on the PNI thread, "BennyJ"/profile on the ACI).
+        var canonical = serviceId
+        if (!e164.isNullOrBlank()) {
+            val norm = normalizeNumber(e164)
+            val prior = numberToServiceId[norm]
+            if (prior != null && prior != serviceId) {
+                val newIsPni = serviceId.startsWith("PNI:")
+                val priorIsPni = prior.startsWith("PNI:")
+                // Merge toward the ACI: never collapse a real ACI into a PNI.
+                canonical = when {
+                    newIsPni && !priorIsPni -> prior       // keep existing ACI
+                    else -> serviceId                       // adopt the ACI/new id
+                }
+                val from = if (canonical == serviceId) prior else serviceId
+                mergeRecipient(fromServiceId = from, toServiceId = canonical)
+            }
+        }
+
         val users = userCache.value.toMutableMap()
-        val existing = users[serviceId]
-        users[serviceId] = User(
-            id = serviceId,
+        val existing = users[canonical]
+        users[canonical] = User(
+            id = canonical,
             displayName = name,
             avatarColor = existing?.avatarColor ?: "#3A76F0",
         )
@@ -1285,21 +1317,122 @@ class SignalMessageRepository(
 
         // Record the address-book entry so the "new chat" picker can offer this
         // contact and resolve their number → ACI later.
-        contactsByServiceId[serviceId] = Contact(name, e164)
+        contactsByServiceId[canonical] = Contact(name, e164)
         if (!e164.isNullOrBlank()) {
-            numberToServiceId[normalizeNumber(e164)] = serviceId
+            numberToServiceId[normalizeNumber(e164)] = canonical
         }
 
         // Rename any existing DM room for this peer so the room list reflects
         // the new name. We deliberately don't *create* a room here — contact
         // sync delivers the entire address book, and we don't want to fill
         // the UI with empty chats for every contact.
-        val roomId = "sig:dm:$serviceId"
+        val roomId = "sig:dm:$canonical"
         rooms.value = rooms.value.map {
             if (it.room.id == roomId && it.room.name != name) {
                 it.copy(room = it.room.copy(name = name))
             } else it
         }
+    }
+
+    /**
+     * Collapse a provisional PNI-keyed conversation into the real ACI one once
+     * we learn they are the same account.
+     *
+     * Why this exists: CDSI returns only a PNI (no ACI) for a number whose owner
+     * restricts phone-number discoverability. When you start a chat by typing
+     * that number we address the first message to the PNI (`sig:dm:PNI:…`), but
+     * the reply arrives from the account's ACI (`sig:dm:<aci>`), producing two
+     * split threads — exactly the "message went to the wrong place" symptom.
+     * This moves the PNI thread's messages + metadata onto the ACI thread and
+     * repoints the number so all future traffic uses the ACI.
+     *
+     * No-op when [fromServiceId] == [toServiceId] or there's nothing to migrate.
+     * Safe to call repeatedly. In-memory only — the debounced snapshot collector
+     * persists the result automatically.
+     */
+    internal fun mergeRecipient(fromServiceId: String, toServiceId: String) {
+        if (fromServiceId == toServiceId) return
+        val fromRoom = "sig:dm:$fromServiceId"
+        val toRoom = "sig:dm:$toServiceId"
+
+        // 1) Messages: fold the PNI thread's history into the ACI thread,
+        //    re-stamping roomId (+ senderId for inbound bubbles), de-duping by
+        //    id, and keeping chronological order.
+        val map = messagesByRoom.value.toMutableMap()
+        val fromMsgs = map.remove(fromRoom).orEmpty()
+        if (fromMsgs.isNotEmpty()) {
+            val migrated = fromMsgs.map { m ->
+                m.copy(
+                    roomId = toRoom,
+                    senderId = if (m.isOutgoing) m.senderId else toServiceId,
+                )
+            }
+            val existing = map[toRoom].orEmpty()
+            val seen = existing.mapTo(HashSet()) { it.id }
+            map[toRoom] = (migrated.filter { it.id !in seen } + existing)
+                .sortedBy { it.timestampMs }
+        }
+        messagesByRoom.value = map
+
+        // 2) Contact / number bookkeeping → point everything at the ACI.
+        val fromContact = contactsByServiceId.remove(fromServiceId)
+        profileKeyByServiceId.remove(fromServiceId)?.let { pk ->
+            profileKeyByServiceId.putIfAbsent(toServiceId, pk)
+        }
+        if (contactsByServiceId[toServiceId] == null && fromContact != null) {
+            contactsByServiceId[toServiceId] = fromContact
+        }
+        // Repoint every number row that still resolves to the old id.
+        numberToServiceId.entries
+            .filter { it.value == fromServiceId }
+            .forEach { numberToServiceId[it.key] = toServiceId }
+
+        // 3) Rooms: drop the PNI room, fold its unread into the ACI room
+        //    (creating the ACI room if the merge beat its first inbound).
+        val list = rooms.value.toMutableList()
+        val fromIdx = list.indexOfFirst { it.room.id == fromRoom }
+        val fromSummary = if (fromIdx >= 0) list.removeAt(fromIdx) else null
+        val toIdx = list.indexOfFirst { it.room.id == toRoom }
+        val newLast = messagesByRoom.value[toRoom]?.maxByOrNull { it.timestampMs }
+        val mergedUnread =
+            (fromSummary?.unreadCount ?: 0) + (list.getOrNull(toIdx)?.unreadCount ?: 0)
+        if (toIdx >= 0) {
+            list[toIdx] = list[toIdx].copy(lastMessage = newLast, unreadCount = mergedUnread)
+        } else if (fromSummary != null) {
+            val name = contactsByServiceId[toServiceId]?.name
+                ?: userCache.value[toServiceId]?.displayName
+                ?: fromSummary.room.name
+            list.add(
+                0,
+                RoomSummary(
+                    room = fromSummary.room.copy(
+                        id = toRoom,
+                        name = name,
+                        memberIds = listOf(currentUser.id, toServiceId),
+                    ),
+                    lastMessage = newLast,
+                    unreadCount = mergedUnread,
+                ),
+            )
+        }
+        rooms.value = list
+
+        // 4) Users: forget the PNI placeholder; keep the ACI user as-is.
+        userCache.value = userCache.value - fromServiceId
+
+        // 5) If the user was looking at the now-defunct PNI room, follow the merge.
+        if (activeRoomId == fromRoom) activeRoomId = toRoom
+
+        // NOTE (follow-up): the PNI Signal-protocol session is left in the store.
+        // A stray PreKeySignalMessage from the PNI identity could still create a
+        // parallel session; archiving fromServiceId's session here would fully
+        // close that gap once we expose an archive hook on the protocol store.
+
+        android.util.Log.d(
+            "SignalRepo",
+            "merged recipient $fromServiceId → $toServiceId (${fromMsgs.size} msg(s))",
+        )
+        saveSnapshot()
     }
 
     /**
@@ -1417,15 +1550,17 @@ class SignalMessageRepository(
     }
 
     /**
-     * Friendlier fallback when we don't yet have a phone number or a real
-     * contact name for the sender. Turns
-     *   "1e71d4b1-ef51-4352-ab13-d1fd70f97f52"  →  "Contact 1e71d4b1"
-     * which is still anonymous but readable in the room list.
+     * Display name for a peer we have NO identifying info for — no contact
+     * name, no phone number, no resolvable profile. Signal shows such
+     * recipients as "Unknown" (not a raw UUID fragment like "Contact 1e71d4b1",
+     * which leaks the service-id and confuses users). We match that.
+     *
+     * NB: this is only reached after resolveDisplayName has already tried the
+     * contact name, address book, profile, and phone number — so seeing
+     * "Unknown" means we genuinely can't identify them yet (typically a
+     * contact that would come from Storage Service sync, not implemented).
      */
-    private fun shortName(serviceId: String): String {
-        val prefix = serviceId.substringBefore('-').take(8)
-        return if (prefix.length >= 4) "Contact $prefix" else "Signal contact"
-    }
+    private fun shortName(serviceId: String): String = "Unknown"
 
     private companion object {
         /** Max chars of the parent body echoed into an outbound reply quote. */

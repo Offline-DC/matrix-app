@@ -31,6 +31,8 @@ import java.io.IOException
 class SignalApi(
     private val okHttp: OkHttpClient,
     private val baseUrl: String = "https://chat.signal.org",
+    /** Storage Service host — separate from the chat host. */
+    private val storageUrl: String = "https://storage.signal.org",
 ) {
 
     /**
@@ -550,9 +552,73 @@ class SignalApi(
             }.getOrNull()
         }
 
+    // ---- Storage Service (contact/recipient sync) --------------------------
+
+    /**
+     * `GET /v1/storage/auth` — short-lived Basic credentials for the storage
+     * host. Auth: account Basic (`<aci>.<deviceId>:password`).
+     */
+    suspend fun getStorageAuth(login: String, password: String): StorageAuthResponse? =
+        withContext(Dispatchers.IO) {
+            val authHeader = "Basic " + Base64.encodeToString("$login:$password".toByteArray(), Base64.NO_WRAP)
+            val request = Request.Builder()
+                .url("$baseUrl/v1/storage/auth")
+                .get()
+                .header("Authorization", authHeader)
+                .header("User-Agent", "DPADMessenger/0.1")
+                .build()
+            val response = okHttp.newCall(request).execute()
+            val respText = response.body?.string().orEmpty()
+            Log.d(TAG, "getStorageAuth → HTTP ${response.code}")
+            if (!response.isSuccessful) return@withContext null
+            runCatching { JSON.decodeFromString(StorageAuthResponse.serializer(), respText) }.getOrNull()
+        }
+
+    /**
+     * `GET https://storage.signal.org/v1/storage/manifest` — the encrypted
+     * StorageManifest (protobuf bytes). [storageAuthHeader] is the Basic header
+     * built from [getStorageAuth]. Returns null on 404 (no manifest) or error.
+     */
+    suspend fun getStorageManifest(storageAuthHeader: String): ByteArray? =
+        withContext(Dispatchers.IO) {
+            val request = Request.Builder()
+                .url("$storageUrl/v1/storage/manifest")
+                .get()
+                .header("Authorization", storageAuthHeader)
+                .header("Content-Type", PROTOBUF_MEDIA_TYPE)
+                .header("User-Agent", "DPADMessenger/0.1")
+                .build()
+            val response = okHttp.newCall(request).execute()
+            val bytes = response.body?.bytes() ?: ByteArray(0)
+            Log.d(TAG, "getStorageManifest → HTTP ${response.code} (${bytes.size} bytes)")
+            if (!response.isSuccessful) return@withContext null
+            bytes
+        }
+
+    /**
+     * `PUT https://storage.signal.org/v1/storage/read` — resolve a batch of
+     * record ids. [body] is a serialized ReadOperation; returns serialized
+     * StorageItems (protobuf bytes), or null on error.
+     */
+    suspend fun readStorageItems(storageAuthHeader: String, body: ByteArray): ByteArray? =
+        withContext(Dispatchers.IO) {
+            val request = Request.Builder()
+                .url("$storageUrl/v1/storage/read")
+                .put(body.toRequestBody(PROTOBUF_MEDIA_TYPE.toMediaType()))
+                .header("Authorization", storageAuthHeader)
+                .header("User-Agent", "DPADMessenger/0.1")
+                .build()
+            val response = okHttp.newCall(request).execute()
+            val bytes = response.body?.bytes() ?: ByteArray(0)
+            Log.d(TAG, "readStorageItems → HTTP ${response.code} (${bytes.size} bytes)")
+            if (!response.isSuccessful) return@withContext null
+            bytes
+        }
+
     companion object {
         private const val TAG = "SignalApi"
         private const val MRM_MEDIA_TYPE = "application/vnd.signal-messenger.mrm"
+        private const val PROTOBUF_MEDIA_TYPE = "application/x-protobuf"
         private val JSON = Json {
             ignoreUnknownKeys = true
             // Signal's server checks for explicit presence of fields
@@ -575,6 +641,13 @@ data class SendMessageResult(val httpStatus: Int, val rawBody: String) {
 data class CdsiAuthResponse(
     val username: String,
     val password: String,
+)
+
+/** GET /v1/storage/auth response — short-lived Storage Service credentials. */
+@Serializable
+data class StorageAuthResponse(
+    val username: String = "",
+    val password: String = "",
 )
 
 /** GET /v1/profile/&lt;serviceId&gt; response (subset). `name` is the

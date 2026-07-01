@@ -64,6 +64,18 @@ object SignalRepository {
         sock.connect()
         socket = sock
         instance = repo
+
+        // Storage Service contact/recipient sync (one-shot, best-effort). This
+        // is how a linked device gets the account's unified recipient list +
+        // your saved contact names — the modern replacement for the contact
+        // sync that primaries no longer answer. Feeds ContactRecords into
+        // repo.updateContact(), which merges split PNI/ACI threads and applies
+        // your saved names. No-op (logs) if the device was linked before the
+        // accountEntropyPool was captured — those must re-link once.
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            runCatching { SignalStorageService(account, api, repo).sync() }
+                .onFailure { Log.w(TAG, "storage sync failed", it) }
+        }
         return repo
     }
 

@@ -5,7 +5,9 @@ import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -18,6 +20,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import java.util.concurrent.TimeUnit
 import org.signal.libsignal.protocol.ecc.ECKeyPair
 import org.whispersystems.signalservice.internal.push.ProvisioningProtos
 import org.whispersystems.signalservice.internal.websocket.WebSocketProtos
@@ -70,6 +73,34 @@ class SignalProvisioningClient(
     private var socket: WebSocket? = null
     private var ephemeralKeys: ECKeyPair? = null
 
+    // Provisioning sockets are single-use and the server closes them once the
+    // address goes idle (which, on a phone whose screen sleeps at ~30s, happens
+    // well before a distracted user finishes scanning). A closed socket means a
+    // DEAD QR: its provisioning UUID no longer exists server-side, so the
+    // primary's upload fails with "invalid response from service". Instead of
+    // dropping to a terminal Failed state, we transparently open a FRESH session
+    // (new ephemeral keypair → new UUID → new QR). Each session that reaches the
+    // WaitingForScan state resets the budget, so we can regenerate indefinitely
+    // while the user is still linking; only a run of consecutive connect
+    // failures that never yields an address trips the real Failed state.
+    @Volatile private var reconnectAttempts = 0
+
+    // The provisioning ADDRESS expires on a server-side timer (~1–2 min) even
+    // while the socket stays open, and a silently-dropped TCP socket may never
+    // fire onClosed/onFailure without a keepalive ping. Both leave a live-looking
+    // QR that's actually dead → the primary's scan fails with "invalid response
+    // from service". So we (a) ping to detect dead sockets, and (b) proactively
+    // reopen a fresh session on a timer, comfortably under the address TTL.
+    @Volatile private var refreshJob: Job? = null
+
+    /** OkHttp client with a keepalive ping so a dead provisioning socket is
+     *  actually surfaced as onFailure (→ regenerate) instead of hanging. */
+    private val socketClient: OkHttpClient by lazy {
+        okHttp.newBuilder()
+            .pingInterval(PING_SECONDS, TimeUnit.SECONDS)
+            .build()
+    }
+
     // Scope for the suspending confirm-device HTTPS call. WebSocket callbacks
     // arrive on OkHttp's dispatcher (not a coroutine context), so we hand off
     // to a SupervisorJob-rooted scope for the async work that follows.
@@ -77,18 +108,68 @@ class SignalProvisioningClient(
 
     suspend fun start(): SignalProvisioningResult = withContext(Dispatchers.IO) {
         cancel()
-        ephemeralKeys = ECKeyPair.generate()
-        _state.value = SignalProvisioningResult.Connecting
-
-        val request = Request.Builder().url(provisioningUrl).build()
-        socket = okHttp.newWebSocket(request, listener)
+        reconnectAttempts = 0
+        openFreshSocket()
         _state.value
     }
 
+    /** Open a brand-new provisioning socket with a fresh ephemeral keypair, and
+     *  (re)arm the periodic refresh. Used for the first connect AND for every
+     *  regenerate-the-QR path (idle-close reconnect or address-TTL refresh). */
+    private fun openFreshSocket() {
+        runCatching { socket?.close(1000, "reopening") }
+        ephemeralKeys = ECKeyPair.generate()
+        provisionMessageReceived = false
+        _state.value = SignalProvisioningResult.Connecting
+        val request = Request.Builder().url(provisioningUrl).build()
+        socket = socketClient.newWebSocket(request, listener)
+        scheduleRefresh()
+    }
+
+    /** Regenerate the QR before the server's address TTL can expire it. The
+     *  timer restarts on every openFreshSocket(), so a healthy session refreshes
+     *  every [REFRESH_SECONDS]; it's cancelled once linking actually starts. */
+    private fun scheduleRefresh() {
+        refreshJob?.cancel()
+        refreshJob = scope.launch {
+            delay(REFRESH_SECONDS * 1000L)
+            if (!provisionMessageReceived && _state.value !is SignalProvisioningResult.Linked) {
+                Log.d(TAG, "address TTL refresh (${REFRESH_SECONDS}s) — regenerating QR")
+                openFreshSocket()
+            }
+        }
+    }
+
+    /** A premature socket close/failure (before the primary's scan lands) means
+     *  the current QR is dead. Regenerate a fresh session rather than failing —
+     *  unless we've had too many consecutive failures with no address at all. */
+    private fun regenerateOrFail(why: String) {
+        if (provisionMessageReceived || _state.value is SignalProvisioningResult.Linked) return
+        if (reconnectAttempts >= MAX_RECONNECTS) {
+            _state.value = SignalProvisioningResult.Failed(
+                "Couldn't reach Signal to generate a link code ($why). " +
+                    "Check the connection and try again."
+            )
+            return
+        }
+        reconnectAttempts++
+        val backoffMs = 500L * reconnectAttempts
+        Log.d(TAG, "regenerating QR (attempt $reconnectAttempts/$MAX_RECONNECTS) after: $why")
+        scope.launch {
+            delay(backoffMs)
+            if (!provisionMessageReceived && _state.value !is SignalProvisioningResult.Linked) {
+                openFreshSocket()
+            }
+        }
+    }
+
     fun cancel() {
+        refreshJob?.cancel()
+        refreshJob = null
         socket?.close(1000, "user cancelled")
         socket = null
         ephemeralKeys = null
+        reconnectAttempts = 0
         _state.value = SignalProvisioningResult.Idle
     }
 
@@ -106,39 +187,40 @@ class SignalProvisioningClient(
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            if (webSocket !== socket) return
             Log.d(TAG, "socket onOpen — HTTP ${response.code} ${response.message}")
             _state.value = SignalProvisioningResult.WaitingForUuid
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (webSocket !== socket) return
             Log.d(TAG, "socket onMessage — ${bytes.size} bytes")
             handleBinaryFrame(webSocket, bytes.toByteArray())
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            // Ignore callbacks from a socket we've already replaced — otherwise
+            // our own close("reopening") in openFreshSocket feeds straight back
+            // into regenerate and spins an infinite loop.
+            if (webSocket !== socket) return
             Log.w(TAG, "socket onFailure — http=${response?.code} ${t::class.java.simpleName}: ${t.message}", t)
-            // Same logic as onClosed — once the provision message is in
-            // hand, any subsequent socket failure is irrelevant to linking.
-            if (provisionMessageReceived || _state.value is SignalProvisioningResult.Linked) {
-                return
-            }
-            _state.value = SignalProvisioningResult.Failed(
-                "WebSocket error: ${t.message ?: t::class.java.simpleName}"
-            )
+            // Once the provision message is in hand, any later failure is
+            // irrelevant (regenerateOrFail no-ops); otherwise the current QR is
+            // dead, so open a fresh session instead of failing.
+            regenerateOrFail("error ${t.message ?: t::class.java.simpleName}")
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            // Stale socket (we already opened a replacement, e.g. via the TTL
+            // refresh or a prior regenerate): ignore. This is the key guard —
+            // without it, the "reopening" close we trigger ourselves, and the
+            // server's own ~100s lifetime close racing our refresh, both loop
+            // back into regenerate and churn QRs forever.
+            if (webSocket !== socket) return
             Log.d(TAG, "socket onClosed — $code: $reason (provisionReceived=$provisionMessageReceived)")
-            // If we've already pulled the ProvisionMessage off the wire OR
-            // finished registration, the close is the normal end-of-handshake
-            // (we close ourselves with code 1000 right after decoding the
-            // provision body, and the server closes shortly after too).
-            if (provisionMessageReceived || _state.value is SignalProvisioningResult.Linked) {
-                return
-            }
-            _state.value = SignalProvisioningResult.Failed(
-                "WebSocket closed before linking ($code: $reason)"
-            )
+            // Otherwise the server closed our live provisioning session (idle /
+            // ~100s max lifetime): the QR is now dead, so open a fresh one.
+            regenerateOrFail("closed $code: $reason")
         }
     }
 
@@ -238,6 +320,9 @@ class SignalProvisioningClient(
             .build()
             .toString()
         Log.d("SignalProvisioning", "QR URL: $url")
+        // A fresh, live address means this session is healthy — reset the
+        // regenerate budget so a later idle-close can start the cycle over.
+        reconnectAttempts = 0
         _state.value = SignalProvisioningResult.WaitingForScan(qrUrl = url)
     }
 
@@ -270,6 +355,9 @@ class SignalProvisioningClient(
         // races us, and we don't want a spurious "WebSocket closed before
         // linking" overwriting our in-flight Linked state.
         provisionMessageReceived = true
+        // Linking is underway — stop the QR-refresh timer so it can't tear down
+        // the session mid-registration.
+        refreshJob?.cancel()
 
         // 2) Everything from here on is HTTPS + key generation — punt to
         //    the scope so the WebSocket callback returns quickly.
@@ -445,6 +533,10 @@ class SignalProvisioningClient(
             registrationId = registrationId,
             pniRegistrationId = pniRegistrationId,
             pniIdentityKeyPairBase64 = Base64.encodeToString(pniIdentity.serialize(), Base64.NO_WRAP),
+            // Root secret for the Storage Service key (contact/recipient sync).
+            // Modern Signal ships the AEP; keep it so we can derive the master +
+            // storage keys later. Absent on very old primaries — that's fine.
+            accountEntropyPool = if (msg.hasAccountEntropyPool()) msg.accountEntropyPool else "",
         )
     }
 
@@ -462,6 +554,26 @@ class SignalProvisioningClient(
             "wss://chat.signal.org/v1/websocket/provisioning/"
         /** Shown on the primary's "Linked Devices" list for this device. */
         private const val DEVICE_NAME = "Dumbphone 2"
+        /** Max consecutive connect failures (with no address issued) before we
+         *  surface a real error instead of silently regenerating forever. */
+        private const val MAX_RECONNECTS = 5
+        // Signal's provisioning session is a single socket / single QR with a
+        // ~2-minute lifetime (cf. mautrix-signal PerformProvisioning, which caps
+        // the whole flow at context.WithTimeout(2*time.Minute); first-party
+        // Desktop/iOS behave the same — one QR that "expires", then a new one).
+        // So we do NOT churn the QR on a short timer (that would create a
+        // scan-vs-swap race). The keepalive ping is the real fix: it keeps the
+        // one socket genuinely alive and turns a silent drop into onFailure →
+        // regenerate. The proactive refresh is only a safety net fired just
+        // BEFORE the ~2-min window ends, so the address can never quietly age
+        // out from under a displayed QR.
+        /** Regenerate ONE step under the server's provisioning-socket lifetime.
+         *  Measured on-device: the server closes the socket at ~99–100s (onClosed
+         *  1000: Timeout), so refresh at 80s to hand over cleanly *before* the
+         *  server close — never at the same instant (that raced and looped). */
+        private const val REFRESH_SECONDS = 80L
+        /** WebSocket keepalive ping (Signal's own sockets keep-alive ~30s). */
+        private const val PING_SECONDS = 25L
     }
 }
 

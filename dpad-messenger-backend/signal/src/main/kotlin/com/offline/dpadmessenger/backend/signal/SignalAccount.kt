@@ -37,4 +37,15 @@ data class SignalAccount(
     val pniRegistrationId: Int = 0,
     /** Base64-encoded serialized [IdentityKeyPair] for the PNI side. */
     val pniIdentityKeyPairBase64: String = "",
+    /**
+     * The account's Account Entropy Pool, delivered in the ProvisionMessage at
+     * link time. This is the root secret from which the **master key** and, in
+     * turn, the **Storage Service key** are derived — the prerequisite for
+     * Storage Service contact sync (fetching the account's unified recipient
+     * list: ACI ∪ PNI ∪ E.164 ∪ your saved contact name, for every contact).
+     *
+     * Empty for accounts linked before this field was captured — those must
+     * re-link to populate it. Never leaves the device.
+     */
+    val accountEntropyPool: String = "",
 )

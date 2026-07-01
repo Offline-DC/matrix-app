@@ -66,15 +66,25 @@ class SignalContactDiscovery(
         cache[e164]?.let { return it }
         if (e164 in notFound) return null
 
-        val aci = lookup(e164)
-        if (aci != null) {
-            cache[e164] = aci
-            Log.d(TAG, "discovered $e164 → aci=$aci")
+        val serviceId = lookup(e164)
+        if (serviceId != null) {
+            cache[e164] = serviceId
+            // NB: a "PNI:<uuid>" here is NOT an ACI — it's a phone-number
+            // identity for an account that restricts number-discoverability, so
+            // CDSI withheld the ACI. We can still address it (same account), but
+            // the reply will arrive under the real ACI and must be merged onto
+            // this thread (see SignalMessageRepository.mergeRecipient). Log it
+            // honestly rather than calling a PNI an ACI.
+            if (serviceId.startsWith("PNI:")) {
+                Log.d(TAG, "discovered $e164 → pni-only=$serviceId (ACI withheld; provisional)")
+            } else {
+                Log.d(TAG, "discovered $e164 → aci=$serviceId")
+            }
         } else {
             notFound.add(e164)
             Log.d(TAG, "no Signal account for $e164")
         }
-        return aci
+        return serviceId
     }
 
     /**
