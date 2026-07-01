@@ -723,14 +723,21 @@ data class AccountAttributes(
 
 /**
  * Capabilities the linked device claims to support. Names must match
- * Signal-Server's [`DeviceCapability`][1] enum exactly — unknown keys
- * are at best ignored, and missing a `requireForNewDevices = true`
- * capability causes the link to fail with HTTP 409 Conflict.
+ * Signal-Server's [`DeviceCapability`][1] enum exactly.
  *
- * As of 2026, the only capability flagged required-for-new-devices is
- * `spqr` (Sparse Post-Quantum Ratchet). `attachmentBackfill` is sent
- * by mautrix-signal to match the official desktop client; we mirror it
- * even though it's not strictly required to link.
+ * The link endpoint rejects with **HTTP 409 Conflict** if this set is a
+ * "capability downgrade" — i.e. it omits any capability that BOTH has
+ * `preventDowngrade = true` AND the account already has (see
+ * `DeviceController.isCapabilityDowngrade`). As of mid-2026 those are:
+ *   - `spqr` (Sparse Post-Quantum Ratchet)
+ *   - `usernameChangeSyncMessage`
+ * A modern Signal primary reports both, so a new device MUST claim both or
+ * linking 409s. We also send `attachmentBackfill` (not required, but mirrors
+ * the official desktop client / mautrix-signal).
+ *
+ * We don't actually *act* on username-change sync messages yet; claiming the
+ * capability just lets the link succeed (and the server may send us those
+ * syncs, which we currently ignore — a cosmetic gap, not a linking blocker).
  *
  * Deprecated keys that USED to be required but Signal-Server no longer
  * recognises and which cause 409 if sent: `deleteSync`,
@@ -745,6 +752,7 @@ data class AccountAttributes(
 data class Capabilities(
     val attachmentBackfill: Boolean = true,
     val spqr: Boolean = true,
+    val usernameChangeSyncMessage: Boolean = true,
 )
 
 @Serializable
