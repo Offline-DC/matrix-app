@@ -107,6 +107,17 @@ class SignalMessageRepository(
      *  that contact re-populates it. */
     private val profileKeyByServiceId = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
 
+    /** PNI service-id ("PNI:<uuid>") → the ACI it belongs to, learned from
+     *  Storage Service ContactRecords (which carry both ids for a contact).
+     *  Signal keys ONE recipient by any of ACI/PNI/E.164; this lets us route a
+     *  PNI-addressed thread/message onto the canonical ACI so the same person is
+     *  a single conversation no matter which id a given client used to send. */
+    private val pniToAci = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Resolve a service id to its canonical form: a PNI maps to its owning ACI
+     *  when we've learned the pairing, otherwise it's returned unchanged. */
+    private fun canonicalId(serviceId: String): String = pniToAci[serviceId] ?: serviceId
+
     private fun isGroupRoom(roomId: String) = roomId.startsWith(SignalGroups.ROOM_PREFIX)
 
     /** Resolve a sendable [SignalSender.GroupTarget] for a group room, or null
@@ -574,12 +585,17 @@ class SignalMessageRepository(
      * number isn't on Signal (or discovery is unavailable / failed).
      */
     override suspend fun startConversation(destination: String): String? {
-        val serviceId = resolveServiceIdForNumber(destination)
-            ?: discovery?.resolveAci(destination)?.also { aci ->
-                // Remember the mapping so future taps + receipts resolve locally.
-                numberToServiceId[normalizeNumber(destination)] = aci
-            }
-            ?: return null
+        // Canonicalize to the ACI when we've learned the PNI↔ACI pairing (from
+        // Storage Service), so a chat started by typing a number addresses the
+        // same recipient our other devices use — no PNI/ACI thread split.
+        val serviceId = canonicalId(
+            resolveServiceIdForNumber(destination)
+                ?: discovery?.resolveAci(destination)?.also { aci ->
+                    // Remember the mapping so future taps + receipts resolve locally.
+                    numberToServiceId[normalizeNumber(destination)] = aci
+                }
+                ?: return null,
+        )
         // Show a real name rather than a bare number, in priority order: a name
         // we already know for this service id → the device address-book name →
         // the contact's Signal profile name (only possible if we hold a profile
@@ -1334,6 +1350,46 @@ class SignalMessageRepository(
         }
     }
 
+    /** Record that [pni] ("PNI:<uuid>") belongs to the same account as [aci],
+     *  learned from a Storage Service ContactRecord (which carries both ids).
+     *  Folds any existing PNI-keyed thread into the ACI thread so the person is
+     *  a single conversation, and remembers the alias so a later PNI-addressed
+     *  event (e.g. a sent transcript another client addressed by ACI vs. our own
+     *  PNI-addressed send) canonicalizes onto the same ACI. */
+    internal fun learnIdentityLink(aci: String, pni: String) {
+        if (aci.isBlank() || pni.isBlank() || pni == aci || aci.startsWith("PNI:")) return
+        val prior = pniToAci.put(pni, aci)
+        // Only fold when a PNI thread actually exists — a full storage sync
+        // teaches hundreds of pairings and we don't want to churn state flows
+        // for contacts that were never split.
+        val pniRoom = "sig:dm:$pni"
+        val hasPniThread = rooms.value.any { it.room.id == pniRoom } ||
+            messagesByRoom.value.containsKey(pniRoom) ||
+            numberToServiceId.values.any { it == pni }
+        if (hasPniThread) mergeRecipient(fromServiceId = pni, toServiceId = aci)
+        if (prior != aci) Log.d(TAG, "identity link: $pni -> $aci")
+    }
+
+    /** Diagnostic: log how every DM thread is currently keyed (service-id),
+     *  its display name, message count, and any PNI→ACI alias in effect. This
+     *  is what a submitted rolling log needs to show WHY a contact is split
+     *  across threads (PNI vs ACI vs an unpaired id) — grep `THREAD-DUMP`.
+     *  Contact names appear (that's the point of the diagnostic); message
+     *  BODIES never do. */
+    fun dumpThreadKeys() {
+        val dms = rooms.value.filter { it.room.id.startsWith("sig:dm:") }
+        Log.i(TAG, "THREAD-DUMP: ${dms.size} DM threads, ${pniToAci.size} PNI->ACI aliases")
+        dms.forEach { rs ->
+            val key = rs.room.id.removePrefix("sig:dm:")
+            val count = messagesByRoom.value[rs.room.id]?.size ?: 0
+            val alias = pniToAci[key]?.let { " alias->$it" } ?: ""
+            Log.i(TAG, "THREAD-DUMP key=$key name='${rs.room.name}' msgs=$count$alias")
+        }
+        if (pniToAci.isNotEmpty()) {
+            Log.i(TAG, "THREAD-DUMP aliases: " + pniToAci.entries.joinToString { "${it.key}->${it.value}" })
+        }
+    }
+
     /**
      * Collapse a provisional PNI-keyed conversation into the real ACI one once
      * we learn they are the same account.
@@ -1457,22 +1513,27 @@ class SignalMessageRepository(
         expireTimerSeconds: Int = 0,
         expireTimerVersion: Int = 0,
     ) {
-        noteExpireTimer("sig:dm:$recipientServiceId", expireTimerSeconds, expireTimerVersion)
+        // Canonicalize PNI → owning ACI (learned from Storage Service) so a sent
+        // transcript that ANOTHER of our devices addressed by ACI lands in the
+        // same thread as our own PNI-addressed send — one conversation per
+        // person, not a split "Jack Nugent" + "Unknown".
+        val recipient = canonicalId(recipientServiceId)
+        noteExpireTimer("sig:dm:$recipient", expireTimerSeconds, expireTimerVersion)
         if (body.isBlank()) return
-        val roomId = "sig:dm:$recipientServiceId"
+        val roomId = "sig:dm:$recipient"
 
         // Create the room shell if we don't have one yet — use whatever
-        // name we have for the recipient (from contact sync, or fallback).
+        // name we have for the recipient (from storage/contact sync, or fallback).
         val existing = rooms.value.firstOrNull { it.room.id == roomId }
         if (existing == null) {
-            val resolvedName = userCache.value[recipientServiceId]?.displayName
-                ?: shortName(recipientServiceId)
+            val resolvedName = userCache.value[recipient]?.displayName
+                ?: shortName(recipient)
             // Make sure the user cache has at least a placeholder so the
             // bubble's senderId lookup doesn't fall through to a raw UUID.
-            if (userCache.value[recipientServiceId] == null) {
+            if (userCache.value[recipient] == null) {
                 userCache.value = userCache.value + (
-                    recipientServiceId to User(
-                        id = recipientServiceId,
+                    recipient to User(
+                        id = recipient,
                         displayName = resolvedName,
                         avatarColor = "#3A76F0",
                     )
@@ -1481,7 +1542,7 @@ class SignalMessageRepository(
             val room = Room(
                 id = roomId,
                 name = resolvedName,
-                memberIds = listOf(currentUser.id, recipientServiceId),
+                memberIds = listOf(currentUser.id, recipient),
                 isGroup = false,
                 avatarColor = "#3A76F0",
             )

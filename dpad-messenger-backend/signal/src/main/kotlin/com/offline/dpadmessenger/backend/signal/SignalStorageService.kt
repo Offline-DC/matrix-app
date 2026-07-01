@@ -119,21 +119,33 @@ class SignalStorageService(
             "storage sync: manifestContacts=${contactIds.size} itemsReturned=$itemsSeen " +
                 "applied=$applied decryptFail=$decryptFail noContact=$noContact skippedNoNameOrAci=$skipped",
         )
+        // Dump how every DM thread is keyed AFTER the sync merges — so a
+        // submitted rolling log shows whether a contact is unified or still
+        // split, and by which ids. (SigRepo:D is allow-listed in the tail.)
+        repository.dumpThreadKeys()
     }
 
     /** Map a ContactRecord onto the repository. Returns true if applied. */
     private fun applyContact(c: ContactRecord): Boolean {
-        // Key by ACI when the primary has resolved one; otherwise by PNI (the
-        // common case for phone contacts your primary hasn't tied to an ACI
-        // yet). Same "PNI:<uuid>" convention the rest of the app uses, so a
-        // later inbound/merge unifies the two once the ACI is learned.
-        val serviceId = when {
+        // Extract BOTH ids the primary knows for this contact. Key by ACI when
+        // present; otherwise by PNI (the common case for phone contacts the
+        // primary hasn't tied to an ACI yet). Same "PNI:<uuid>" convention the
+        // rest of the app uses.
+        val aci = when {
             c.aciBinary.size() == 16 -> uuidString(c.aciBinary.toByteArray())
             c.aci.isNotBlank() -> c.aci
+            else -> null
+        }
+        val pni = when {
             c.pniBinary.size() == 16 -> "PNI:" + uuidString(c.pniBinary.toByteArray())
             c.pni.isNotBlank() -> if (c.pni.startsWith("PNI:")) c.pni else "PNI:${c.pni}"
-            else -> return false   // no ACI or PNI to key the recipient on
+            else -> null
         }
+        val serviceId = aci ?: pni ?: return false   // nothing to key the recipient on
+        // If the primary has resolved BOTH ids, teach the repo the pairing so a
+        // PNI-addressed thread folds into the canonical ACI and later
+        // ACI-addressed sent transcripts don't spawn a second "Unknown" chat.
+        if (aci != null && pni != null) repository.learnIdentityLink(aci, pni)
         val e164 = c.e164.takeIf { it.isNotBlank() }
         // Name precedence mirrors Signal: your saved system-contact name, then
         // the contact's own profile name, then the phone number.
