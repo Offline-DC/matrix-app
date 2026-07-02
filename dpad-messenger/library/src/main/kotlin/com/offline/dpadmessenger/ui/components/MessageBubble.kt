@@ -415,7 +415,7 @@ private fun ReplyQuote(
                 .width(3.dp)
                 .padding(vertical = 14.dp),
         ) {}
-        Column {
+        Column(modifier = Modifier.weight(1f, fill = false)) {
             Text(
                 text = parentSnippet.senderName,
                 style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
@@ -429,6 +429,36 @@ private fun ReplyQuote(
                 overflow = TextOverflow.Ellipsis,
             )
         }
+        // Downloaded quoted image → small thumbnail on the right (Signal-style).
+        parentSnippet.imagePath?.let { path ->
+            QuoteThumbnail(path = path)
+        }
+    }
+}
+
+/** Tiny decoded preview of a quoted image. Silent on decode failure — the
+ *  quote's "Photo" label is already there, so no placeholder is needed. */
+@Composable
+private fun QuoteThumbnail(path: String) {
+    val bmp by androidx.compose.runtime.produceState(
+        // Synchronous cache hit renders instantly (no pop-in on scroll-back).
+        initialValue = com.offline.dpadmessenger.ui.util.cachedBitmap(path, 96),
+        path,
+    ) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            com.offline.dpadmessenger.ui.util.decodeDownscaledCached(path, maxEdge = 96)
+        }
+    }
+    bmp?.let {
+        Image(
+            bitmap = it,
+            contentDescription = null,
+            contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+            modifier = Modifier
+                .padding(start = 8.dp)
+                .size(40.dp)
+                .clip(RoundedCornerShape(4.dp)),
+        )
     }
 }
 
@@ -690,4 +720,18 @@ private const val LONG_PRESS_MS = 400L
 data class ReplyParentSnippet(
     val senderName: String,
     val bodyPreview: String,
+    /** Local file path of the quoted image, when it's already downloaded —
+     *  the quote then shows a small thumbnail (like Signal's). */
+    val imagePath: String? = null,
 )
+
+/** Short typed label for quoting a media-only message ("Photo", "Video", …).
+ *  Used by the reply quote + reply banner when the parent's body is blank. */
+fun mediaQuoteLabel(attachment: com.offline.dpadmessenger.data.Attachment?): String =
+    when (attachment?.kind) {
+        com.offline.dpadmessenger.data.AttachmentKind.IMAGE -> "Photo"
+        com.offline.dpadmessenger.data.AttachmentKind.VIDEO -> "Video"
+        com.offline.dpadmessenger.data.AttachmentKind.AUDIO -> "Voice message"
+        com.offline.dpadmessenger.data.AttachmentKind.OTHER -> "Attachment"
+        null -> ""
+    }

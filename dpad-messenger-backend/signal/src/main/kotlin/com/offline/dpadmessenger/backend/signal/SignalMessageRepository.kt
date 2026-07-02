@@ -135,6 +135,16 @@ class SignalMessageRepository(
         avatarColor = "#3A76F0",  // Signal blue
     )
 
+    /** True when [serviceId] is our own account (ACI or PNI) — the DM thread
+     *  keyed by it is "Note to Self". */
+    internal fun isSelfId(serviceId: String): Boolean {
+        val id = serviceId.removePrefix("PNI:").lowercase()
+        if (id == account.aci.lowercase()) return true
+        val pni = account.pni?.removePrefix("PNI:")?.lowercase()
+        return pni != null && id == pni
+    }
+
+
     private val rooms = MutableStateFlow<List<RoomSummary>>(emptyList())
     private val messagesByRoom = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
     private val hasMoreOlder = MutableStateFlow<Map<String, Boolean>>(emptyMap())
@@ -205,7 +215,13 @@ class SignalMessageRepository(
         mutedRooms.value = snap.mutedRooms
         rooms.value = snap.rooms.map { pr ->
             val msgs = snap.messages[pr.room.id].orEmpty()
-            RoomSummary(pr.room, lastMessage = msgs.maxByOrNull { it.timestampMs }, unreadCount = pr.unreadCount)
+            // Heal a persisted self-thread that predates Note-to-Self naming
+            // (it may have been saved under our own name/number).
+            val room = if (!pr.room.isGroup &&
+                pr.room.id.removePrefix("sig:dm:").let { isSelfId(it) } &&
+                pr.room.name != NOTE_TO_SELF
+            ) pr.room.copy(name = NOTE_TO_SELF) else pr.room
+            RoomSummary(room, lastMessage = msgs.maxByOrNull { it.timestampMs }, unreadCount = pr.unreadCount)
         }
         if (autoDelete.value) purgeOld()
     }
@@ -675,15 +691,17 @@ class SignalMessageRepository(
      *  opens (and the first send shows up in the room list). Returns the id. */
     private fun ensureDmRoom(serviceId: String, name: String): String {
         val roomId = "sig:dm:$serviceId"
+        // Our own thread is always "Note to Self", whatever the caller resolved.
+        val roomName = if (isSelfId(serviceId)) NOTE_TO_SELF else name
         if (rooms.value.none { it.room.id == roomId }) {
             if (userCache.value[serviceId] == null) {
                 userCache.value = userCache.value + (
-                    serviceId to User(id = serviceId, displayName = name, avatarColor = "#3A76F0")
+                    serviceId to User(id = serviceId, displayName = roomName, avatarColor = "#3A76F0")
                 )
             }
             val room = Room(
                 id = roomId,
-                name = name,
+                name = roomName,
                 memberIds = listOf(currentUser.id, serviceId),
                 isGroup = false,
                 avatarColor = "#3A76F0",
@@ -1341,11 +1359,13 @@ class SignalMessageRepository(
         // Rename any existing DM room for this peer so the room list reflects
         // the new name. We deliberately don't *create* a room here — contact
         // sync delivers the entire address book, and we don't want to fill
-        // the UI with empty chats for every contact.
+        // the UI with empty chats for every contact. Our OWN storage-sync
+        // record must not rename Note to Self to our profile name/number.
         val roomId = "sig:dm:$canonical"
+        val roomName = if (isSelfId(canonical)) NOTE_TO_SELF else name
         rooms.value = rooms.value.map {
-            if (it.room.id == roomId && it.room.name != name) {
-                it.copy(room = it.room.copy(name = name))
+            if (it.room.id == roomId && it.room.name != roomName) {
+                it.copy(room = it.room.copy(name = roomName))
             } else it
         }
     }
@@ -1533,8 +1553,8 @@ class SignalMessageRepository(
         // name we have for the recipient (from storage/contact sync, or fallback).
         val existing = rooms.value.firstOrNull { it.room.id == roomId }
         if (existing == null) {
-            val resolvedName = userCache.value[recipient]?.displayName
-                ?: shortName(recipient)
+            val resolvedName = if (isSelfId(recipient)) NOTE_TO_SELF
+            else userCache.value[recipient]?.displayName ?: shortName(recipient)
             // Make sure the user cache has at least a placeholder so the
             // bubble's senderId lookup doesn't fall through to a raw UUID.
             if (userCache.value[recipient] == null) {
@@ -1646,5 +1666,7 @@ class SignalMessageRepository(
         /** Max chars of the parent body echoed into an outbound reply quote. */
         const val QUOTE_PREVIEW_MAX = 120
         private const val TAG = "SigRepo"
+        /** Display name of the DM thread keyed by our own account. */
+        const val NOTE_TO_SELF = "Note to Self"
     }
 }

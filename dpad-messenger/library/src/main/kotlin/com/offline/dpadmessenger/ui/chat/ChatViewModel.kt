@@ -112,14 +112,26 @@ class ChatViewModel(
         // A quote of your own message must read "You" — senderName() resolves
         // an own senderId to the raw ACI/E.164 since there's no self contact.
         val resolved = if (parent.isOutgoing) "You" else senderName(parent.senderId)
+        // Quoted image already downloaded → the quote shows a small thumbnail.
+        val imagePath = parent.attachment
+            ?.takeIf { it.kind == com.offline.dpadmessenger.data.AttachmentKind.IMAGE }
+            ?.localPath?.takeIf { java.io.File(it).exists() }
         android.util.Log.d(
             "ChatUI",
             "reply-quote parent=$replyToId sender=${parent.senderId} " +
-                "outgoing=${parent.isOutgoing} resolved=$resolved",
+                "outgoing=${parent.isOutgoing} resolved=$resolved thumb=${imagePath != null}",
         )
         return com.offline.dpadmessenger.ui.components.ReplyParentSnippet(
             senderName = resolved,
-            bodyPreview = if (parent.isDeleted) "Message deleted" else parent.body,
+            bodyPreview = when {
+                parent.isDeleted -> "Message deleted"
+                // Media-only parent has a blank body — show a typed label
+                // ("Photo" etc.) like Signal instead of an empty line.
+                parent.body.isBlank() ->
+                    com.offline.dpadmessenger.ui.components.mediaQuoteLabel(parent.attachment)
+                else -> parent.body
+            },
+            imagePath = if (parent.isDeleted) null else imagePath,
         )
     }
 

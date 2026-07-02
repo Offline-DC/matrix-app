@@ -383,7 +383,13 @@ private fun BannerRegion(
             // number (senderNameFor resolves an own-message senderId to the raw
             // E.164 since there's no contact entry for yourself).
             senderName = if (replyTarget.isOutgoing) "You" else senderNameFor(replyTarget.senderId),
-            bodyPreview = if (replyTarget.isDeleted) "Message deleted" else replyTarget.body,
+            bodyPreview = when {
+                replyTarget.isDeleted -> "Message deleted"
+                // Media-only parent → typed label instead of an empty line.
+                replyTarget.body.isBlank() ->
+                    com.offline.dpadmessenger.ui.components.mediaQuoteLabel(replyTarget.attachment)
+                else -> replyTarget.body
+            },
             onCancel = onCancelReply,
             cancelFocusRequester = cancelFocusRequester,
             onUpFromCancel = onUpFromCancel,
