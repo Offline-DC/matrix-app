@@ -214,6 +214,11 @@ class ChatViewModel(
     val canSendAttachments: Boolean =
         repository is com.offline.dpadmessenger.data.AttachmentSender
 
+    /** True if this repo's delete is a real "delete for everyone" (drives the
+     *  context sheet's Delete action). */
+    val canDeleteForEveryone: Boolean =
+        repository is com.offline.dpadmessenger.data.RemoteDeleteCapable
+
     /** Send a picked photo/video (content:// uri) to this room. */
     fun sendAttachment(contentUri: String) {
         val sender = repository as? com.offline.dpadmessenger.data.AttachmentSender ?: return

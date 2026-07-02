@@ -70,7 +70,8 @@ class SignalMessageRepository(
      *  with a number we don't already know resolves it to an ACI via CDSI.
      *  Null in mock/unit-test paths (unknown numbers then can't be started). */
     private val discovery: SignalContactDiscovery? = null,
-) : MessageRepository, MediaDownloader, AttachmentSender, ConversationStarter, ContactsSource, RetentionSettings, ThreadActions {
+) : MessageRepository, MediaDownloader, AttachmentSender, ConversationStarter, ContactsSource,
+    RetentionSettings, ThreadActions, com.offline.dpadmessenger.data.RemoteDeleteCapable {
 
     /** masterKey per group room id — learned from inbound group messages,
      *  required to send (the room id only carries the public group id). */
@@ -389,7 +390,9 @@ class SignalMessageRepository(
         // Only our own messages can be remote-deleted.
         val msg = messagesByRoom.value[roomId]?.firstOrNull { it.id == messageId } ?: return
         if (!msg.isOutgoing) return
-        updateMessageInPlace(roomId, messageId) { it.copy(isDeleted = true, body = "") }
+        updateMessageInPlace(roomId, messageId) {
+            it.copy(isDeleted = true, body = "", attachment = null, reactions = emptyMap())
+        }
         val s = sender ?: return
         runCatching {
             if (isGroupRoom(roomId)) {
@@ -1026,6 +1029,14 @@ class SignalMessageRepository(
      * with sent-timestamp [targetTimestamp]. No-op if we don't have that
      * message locally (e.g. it predates this session).
      */
+    /** Canonicalize a DM room id (PNI → owning ACI) so interactive events
+     *  (reactions, edits, deletes) land in the unified thread even when the
+     *  envelope was addressed by the peer's PNI. Group room ids pass through. */
+    private fun canonicalRoomId(roomId: String): String {
+        val peer = roomId.removePrefix("sig:dm:")
+        return if (peer == roomId) roomId else "sig:dm:" + canonicalId(peer)
+    }
+
     internal fun applyIncomingReaction(
         roomId: String,
         reactorId: String,
@@ -1033,9 +1044,10 @@ class SignalMessageRepository(
         emoji: String,
         remove: Boolean,
     ) {
-        val target = findMessageByTimestamp(roomId, targetTimestamp) ?: return
+        val room = canonicalRoomId(roomId)
+        val target = findMessageByTimestamp(room, targetTimestamp) ?: return
         val updated = upsertReaction(target.reactions, reactorId, emoji, remove)
-        updateMessageInPlace(roomId, target.id) { it.copy(reactions = updated) }
+        updateMessageInPlace(room, target.id) { it.copy(reactions = updated) }
     }
 
     /** Apply an inbound edit: replace the body + stamp [editedAtMs]. */
@@ -1045,14 +1057,48 @@ class SignalMessageRepository(
         newBody: String,
         editedAtMs: Long,
     ) {
-        val target = findMessageByTimestamp(roomId, targetTimestamp) ?: return
-        updateMessageInPlace(roomId, target.id) { it.copy(body = newBody, editedAtMs = editedAtMs) }
+        val room = canonicalRoomId(roomId)
+        val target = findMessageByTimestamp(room, targetTimestamp) ?: return
+        updateMessageInPlace(room, target.id) { it.copy(body = newBody, editedAtMs = editedAtMs) }
     }
 
-    /** Apply an inbound "delete for everyone": tombstone the message. */
-    internal fun applyIncomingDelete(roomId: String, targetTimestamp: Long) {
-        val target = findMessageByTimestamp(roomId, targetTimestamp) ?: return
-        updateMessageInPlace(roomId, target.id) { it.copy(isDeleted = true, body = "") }
+    /**
+     * Apply an inbound "delete for everyone": tombstone the message.
+     *
+     * [authorServiceId] is who requested the delete (the envelope sender, or
+     * our own ACI for a sync transcript). Signal only allows deleting your OWN
+     * messages, so a delete whose author doesn't match the target's author is
+     * ignored — mirrors Signal-Android's RemoteDelete validation.
+     */
+    internal fun applyIncomingDelete(
+        roomId: String,
+        targetTimestamp: Long,
+        authorServiceId: String? = null,
+    ) {
+        val room = canonicalRoomId(roomId)
+        val target = findMessageByTimestamp(room, targetTimestamp)
+        if (target == null) {
+            android.util.Log.d(TAG, "delete: no local message @ $targetTimestamp in $room — skipping")
+            return
+        }
+        if (authorServiceId != null) {
+            val author = canonicalId(authorServiceId)
+            val authorOk =
+                if (author == currentUser.id) target.isOutgoing
+                else !target.isOutgoing && canonicalId(target.senderId) == author
+            if (!authorOk) {
+                android.util.Log.w(
+                    TAG,
+                    "delete: author mismatch (author=$author target.sender=${target.senderId} " +
+                        "outgoing=${target.isOutgoing}) — ignoring",
+                )
+                return
+            }
+        }
+        updateMessageInPlace(room, target.id) {
+            it.copy(isDeleted = true, body = "", attachment = null, reactions = emptyMap())
+        }
+        android.util.Log.d(TAG, "delete applied room=$room ts=$targetTimestamp")
     }
 
     /**
@@ -1200,9 +1246,13 @@ class SignalMessageRepository(
         applyIncomingEdit(roomId, targetTimestamp, newBody, editedAtMs)
     }
 
-    internal fun applyIncomingGroupDelete(masterKey: ByteArray, targetTimestamp: Long) {
+    internal fun applyIncomingGroupDelete(
+        masterKey: ByteArray,
+        targetTimestamp: Long,
+        authorServiceId: String? = null,
+    ) {
         val roomId = groups?.roomIdForMasterKey(masterKey) ?: return
-        applyIncomingDelete(roomId, targetTimestamp)
+        applyIncomingDelete(roomId, targetTimestamp, authorServiceId)
     }
 
     private fun ensureGroupRoom(roomId: String, seedMember: String?) {

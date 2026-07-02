@@ -299,11 +299,16 @@ fun ChatScreen(
     if (sel != null) {
         MessageContextSheet(
             message = sel,
-            // Texting (SMS/RCS) has no "edit sent message" operation, and
-            // delete-for-everyone isn't wired yet — both would silently do
-            // nothing, so don't offer them. (Reply + reactions remain.)
+            // Texting (SMS/RCS) has no "edit sent message" operation — it
+            // would silently do nothing, so don't offer it.
             canEdit = false,
-            canDelete = false,
+            // "Delete for everyone" — only for repos that actually implement
+            // it (Signal), only on our OWN non-deleted messages, and only
+            // within Signal's 24h delete-for-everyone window.
+            canDelete = viewModel.canDeleteForEveryone &&
+                sel.isOutgoing &&
+                !sel.isDeleted &&
+                (System.currentTimeMillis() - sel.timestampMs) < 24 * 60 * 60 * 1000L,
             onReact = { emoji -> viewModel.react(sel.id, emoji) },
             onReply = { viewModel.startReply(sel) },
             onEdit = { viewModel.startEdit(sel) },
