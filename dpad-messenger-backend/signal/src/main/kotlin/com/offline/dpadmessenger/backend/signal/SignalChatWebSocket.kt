@@ -646,7 +646,20 @@ class SignalChatWebSocket(
         // Plain outgoing message and/or media we sent from another device.
         val body = if (data.hasBody()) data.body else ""
         val attachment = if (data.attachmentsCount > 0) buildAttachment(data.getAttachments(0)) else null
-        if (body.isBlank() && attachment == null) return
+        val quotedTs = if (data.hasQuote()) data.quote.id else null
+        Log.d(
+            TAG,
+            "sync.sent dest=$destination group=${groupKey != null} body=${body.isNotBlank()} " +
+                "attachments=${data.attachmentsCount} builtAttach=${attachment != null} quote=${quotedTs != null}",
+        )
+        if (body.isBlank() && attachment == null) {
+            // Media-only transcript whose pointer we couldn't build (missing
+            // cdn/key/digest) lands here — log it so a dropped image is visible.
+            if (data.attachmentsCount > 0) {
+                Log.w(TAG, "sync.sent dropped: ${data.attachmentsCount} attachment(s), none buildable")
+            }
+            return
+        }
         val ts = if (sent.hasTimestamp()) sent.timestamp
                  else if (data.hasTimestamp()) data.timestamp
                  else System.currentTimeMillis()
@@ -676,6 +689,8 @@ class SignalChatWebSocket(
                     messageId = messageId,
                     body = body,
                     timestamp = ts,
+                    attachment = attachment,
+                    quotedTimestamp = quotedTs,
                     expireTimerSeconds = expireSeconds,
                     expireTimerVersion = expireVersion,
                 )

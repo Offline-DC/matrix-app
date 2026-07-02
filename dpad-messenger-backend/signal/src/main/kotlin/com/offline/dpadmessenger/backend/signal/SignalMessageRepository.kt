@@ -1510,6 +1510,8 @@ class SignalMessageRepository(
         messageId: String,
         body: String,
         timestamp: Long,
+        attachment: Attachment? = null,
+        quotedTimestamp: Long? = null,
         expireTimerSeconds: Int = 0,
         expireTimerVersion: Int = 0,
     ) {
@@ -1519,7 +1521,12 @@ class SignalMessageRepository(
         // person, not a split "Jack Nugent" + "Unknown".
         val recipient = canonicalId(recipientServiceId)
         noteExpireTimer("sig:dm:$recipient", expireTimerSeconds, expireTimerVersion)
-        if (body.isBlank()) return
+        // Drop only when there's genuinely nothing to render. An image/media
+        // message we sent from another device has a BLANK body but a non-null
+        // attachment — earlier this returned here and the media never appeared
+        // on the linked device. Mirror receiveOwnSentGroup: keep it if either
+        // the body or an attachment is present.
+        if (body.isBlank() && attachment == null) return
         val roomId = "sig:dm:$recipient"
 
         // Create the room shell if we don't have one yet — use whatever
@@ -1553,6 +1560,12 @@ class SignalMessageRepository(
             )
         }
 
+        // Resolve a reply: map the quoted Signal sent-timestamp to whatever
+        // local message id we already have for it (null if we never saw it).
+        val replyToLocalId = quotedTimestamp?.let { ts ->
+            messagesByRoom.value[roomId]?.firstOrNull { it.timestampMs == ts }?.id
+        }
+
         val message = Message(
             id = messageId,
             roomId = roomId,
@@ -1561,10 +1574,16 @@ class SignalMessageRepository(
             timestampMs = timestamp,
             status = MessageStatus.SENT,
             isOutgoing = true,
-            replyToId = null,
+            replyToId = replyToLocalId,
+            attachment = attachment,
         )
         appendLocal(roomId, message)
         bumpSummary(roomId, message)
+        Log.d(
+            TAG,
+            "own-sent applied room=$roomId body=${body.isNotBlank()} " +
+                "attach=${attachment != null} reply=${replyToLocalId != null}",
+        )
     }
 
     private fun appendLocal(roomId: String, m: Message) {
