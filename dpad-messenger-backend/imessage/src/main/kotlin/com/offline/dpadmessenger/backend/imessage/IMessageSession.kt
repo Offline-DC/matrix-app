@@ -2,6 +2,7 @@ package com.offline.dpadmessenger.backend.imessage
 
 import android.util.Log
 import com.offline.dpadmessenger.backend.imessage.transport.IMessageTransport
+import com.offline.dpadmessenger.backend.imessage.transport.RegisterRequest
 import com.offline.dpadmessenger.backend.imessage.transport.RegisterResult
 import com.offline.dpadmessenger.backend.imessage.transport.RelayChat
 import com.offline.dpadmessenger.backend.imessage.transport.RelayContact
@@ -80,6 +81,11 @@ class IMessageSession(
 
     suspend fun register(config: MacOSConfig, appleId: String): RegisterResult =
         transport.register(config, appleId)
+
+    /** Rich registration (password + interactive 2FA); delegates to the
+     *  transport's [RegisterRequest] overload. */
+    suspend fun register(request: RegisterRequest): RegisterResult =
+        transport.register(request)
 
     suspend fun reauth(): Boolean = transport.reauth()
 

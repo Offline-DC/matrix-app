@@ -30,18 +30,23 @@ log = "0.4"
 android_logger = "0.13"
 
 # --- OpenBubbles rustpush --------------------------------------------------
-# Pin a known-good commit and vendor it (plan §3: "do not float on main").
-# Uncomment and set the rev once you've pinned it; the lib.rs integration
-# points are marked `RUSTPUSH:` for where its API is called.
+# The phone runs rustpush for activation/APNs/auth/register/send. Build it with
+# `default-features = false` so the closed open-absinthe (macos-validation-data)
+# is NOT pulled in — this is an ARM device and validation bytes come in via
+# nativeRegister(...) from the relay (`../nacserver`). Pin a rev before shipping
+# ("do not float on main"). rustpush has git submodules — clone with
+# --recurse-submodules when you vendor it.
 #
-# rustpush = { git = "https://github.com/OpenBubbles/rustpush", rev = "<PIN>" }
+# The exact integration is the same one verified in the `../../imessage-register`
+# Mac harness (RelayOSConfig + the activate→auth→register→send flow). Port that
+# flow into the JNI functions below once the harness compiles against your pinned
+# rustpush rev — that harness is the compiler-checked reference for this wiring.
 #
-# rustpush references open-absinthe as a submodule; on the phone we DON'T run it
-# — this is an ARM device and the nac engine emulates an x86-64 Apple binary, so
-# validation bytes come in via nativeRegister(...) from the relay (`../nacserver`,
-# which IS the working open-absinthe replacement). If you ever build a native
-# desktop/server path in Rust, depend on the sibling `../absinthe` crate (a
-# drop-in for open-absinthe::nac). See ABSINTHE_RE_FINDINGS.md.
+# rustpush = { git = "https://github.com/OpenBubbles/rustpush", rev = "<PIN>", default-features = false }
+#
+# NOTE: enabling this makes the crate depend on the full rustpush build (it no
+# longer compiles standalone). Until then, lib.rs runs in stub mode and Kotlin
+# falls back to the relay/mock transport (RustPushBridge.NATIVE_AVAILABLE).
 
 [profile.release]
 opt-level = "z"     # optimize for size — these go on a 916 MB-RAM flip phone

@@ -8,6 +8,7 @@ import com.offline.dpadmessenger.backend.imessage.relay.ValidationDataRelay
 import com.offline.dpadmessenger.backend.imessage.transport.IMessageTransport
 import com.offline.dpadmessenger.backend.imessage.transport.MockRelayTransport
 import com.offline.dpadmessenger.backend.imessage.transport.NativeRustPushTransport
+import com.offline.dpadmessenger.backend.imessage.transport.RegisterRequest
 import com.offline.dpadmessenger.backend.imessage.transport.RegisterResult
 import com.offline.dpadmessenger.backend.imessage.transport.RelayWebSocketTransport
 import com.offline.dpadmessenger.data.MessageRepository
@@ -107,27 +108,63 @@ object IMessageRepository {
         val store = IMessageAccountStore(appContext)
         store.saveConfig(config)
         _status.value = IMessageStatus.REGISTERING
-        return when (val result = session().register(config, appleId)) {
-            is RegisterResult.Success -> {
-                val account = IMessageAccount(
-                    appleId = appleId,
-                    identityTokenB64 = "",
-                    pushTokenB64 = "",
-                    lastRegisteredMs = System.currentTimeMillis(),
-                    handles = result.handles,
-                )
-                store.saveAccount(account)
-                store.markRegistered(account.lastRegisteredMs)
-                IMessageRenewalWorker.schedule(appContext)
-                APNsForegroundService.start(appContext)
-                _status.value = IMessageStatus.REGISTERED
-                RegistrationResult.Success(account)
-            }
-            is RegisterResult.Failure -> {
-                _status.value = IMessageStatus.UNREGISTERED
-                Log.w(TAG, "registration failed: ${result.message}")
-                RegistrationResult.Failure(result.message)
-            }
+        return finishRegister(appContext, store, appleId, session().register(config, appleId))
+    }
+
+    /**
+     * Rich registration with an Apple ID password and interactive 2FA. Same
+     * persistence/status contract as the 3-arg [register]; the password is
+     * transient — it is passed into the [RegisterRequest] for the auth
+     * round-trip and never persisted.
+     */
+    suspend fun register(
+        context: Context,
+        config: MacOSConfig,
+        appleId: String,
+        password: String,
+        twoFactorProvider: (suspend () -> String?)? = null,
+    ): RegistrationResult {
+        val appContext = context.applicationContext
+        val store = IMessageAccountStore(appContext)
+        store.saveConfig(config)
+        _status.value = IMessageStatus.REGISTERING
+        val request = RegisterRequest(
+            config = config,
+            appleId = appleId,
+            password = password,
+            twoFactorProvider = twoFactorProvider,
+        )
+        return finishRegister(appContext, store, appleId, session().register(request))
+    }
+
+    /** Shared post-register persistence for both [register] overloads: on
+     *  success save the account, stamp it registered, schedule renewal, start
+     *  the push service, and flip [status]; on failure roll [status] back. */
+    private fun finishRegister(
+        appContext: Context,
+        store: IMessageAccountStore,
+        appleId: String,
+        result: RegisterResult,
+    ): RegistrationResult = when (result) {
+        is RegisterResult.Success -> {
+            val account = IMessageAccount(
+                appleId = appleId,
+                identityTokenB64 = "",
+                pushTokenB64 = "",
+                lastRegisteredMs = System.currentTimeMillis(),
+                handles = result.handles,
+            )
+            store.saveAccount(account)
+            store.markRegistered(account.lastRegisteredMs)
+            IMessageRenewalWorker.schedule(appContext)
+            APNsForegroundService.start(appContext)
+            _status.value = IMessageStatus.REGISTERED
+            RegistrationResult.Success(account)
+        }
+        is RegisterResult.Failure -> {
+            _status.value = IMessageStatus.UNREGISTERED
+            Log.w(TAG, "registration failed: ${result.message}")
+            RegistrationResult.Failure(result.message)
         }
     }
 
@@ -163,6 +200,18 @@ object IMessageRepository {
             IMessageAccountStore(context.applicationContext).clear()
             _status.value = IMessageStatus.UNREGISTERED
         }
+    }
+
+    /**
+     * Full re-sign-in KEEPING history: tears down the live session/transport
+     * without wiping the cached account/config, then flips [status] to
+     * UNREGISTERED so the sign-in screen shows. Unlike [shutdown] with
+     * `wipe=true`, the encrypted store is left intact, so re-registering reuses
+     * the same identity and the chat history survives.
+     */
+    fun signOutKeepingHistory(context: Context) {
+        shutdown(context, wipe = false)
+        _status.value = IMessageStatus.UNREGISTERED
     }
 
     private const val TAG = "IMsgRepoHolder"

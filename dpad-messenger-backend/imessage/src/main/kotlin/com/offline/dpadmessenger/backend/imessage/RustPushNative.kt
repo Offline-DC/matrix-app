@@ -44,14 +44,33 @@ object RustPushNative {
     external fun nativeIsConnected(): Boolean
     external fun nativeDisconnect()
 
+    // ---- Apple ID authentication (GrandSlam + 2FA) --------------------------
+    // rustpush needs an authenticated Apple ID (GSA token -> IDS auth cert)
+    // BEFORE registration. Two-step so the UI can prompt for the 2FA code Apple
+    // pushes to the user's trusted devices. Same flow verified in the
+    // ../../imessage-register Mac harness.
+
+    /**
+     * Begin Apple ID login. Returns JSON:
+     *   {"status":"ok"}         — logged in, no 2FA needed; proceed to register
+     *   {"status":"needs_2fa"}  — call [nativeSubmit2fa] with the pushed code
+     *   {"error":"…"}           — bad credentials / other failure
+     * The password is used only in-process to obtain a GrandSlam token; never
+     * persisted.
+     */
+    external fun nativeAuthenticate(appleId: String, password: String): String
+
+    /** Submit the 6-digit 2FA code. Returns {"status":"ok"} or {"error":"…"}. */
+    external fun nativeSubmit2fa(code: String): String
+
     // ---- registration (the §2.2 four-call sequence, native) -----------------
 
     /**
-     * Run device activation + Apple ID auth + IDS registration. [configJson] is
-     * the serialized [MacOSConfig] (the dumb file); [validationData] is the
-     * bytes fetched from the relay (rustpush would otherwise call the closed
-     * absinthe). Returns JSON: `{"handles":["mailto:…","tel:…"]}` on success, or
-     * `{"error":"…"}` on failure.
+     * Run device activation + IDS registration for the Apple ID authenticated
+     * via [nativeAuthenticate]/[nativeSubmit2fa]. [configJson] is the serialized
+     * [MacOSConfig] (the dumb file); [validationData] is the bytes fetched from
+     * the relay (rustpush would otherwise call the closed absinthe). Returns
+     * JSON: `{"handles":["mailto:…","tel:…"]}` on success, or `{"error":"…"}`.
      */
     external fun nativeRegister(configJson: String, appleId: String, validationData: ByteArray): String
 

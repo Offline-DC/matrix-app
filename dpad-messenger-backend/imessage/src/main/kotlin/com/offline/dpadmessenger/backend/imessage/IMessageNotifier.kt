@@ -80,8 +80,9 @@ internal class IMessageNotifier(context: Context) {
     }
 
     /** Dismiss the notification + thread history for a conversation (called when
-     *  the user opens that thread). */
-    fun clearConversation(roomId: String) {
+     *  the user opens that thread, mutes it, or deletes it). [reason] is for
+     *  logging parity with `GoogleMessagesNotifier`. */
+    fun clearConversation(roomId: String, reason: String? = null) {
         historyByRoom.remove(roomId)
         runCatching { nm.cancel(roomId.hashCode()) }
     }

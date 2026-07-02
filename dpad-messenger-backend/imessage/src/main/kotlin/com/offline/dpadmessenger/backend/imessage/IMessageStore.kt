@@ -45,12 +45,14 @@ internal class IMessageStore(context: Context) {
     private val messagesSer = MapSerializer(String.serializer(), ListSerializer(Message.serializer()))
     private val usersSer = MapSerializer(String.serializer(), User.serializer())
     private val unreadSer = MapSerializer(String.serializer(), Int.serializer())
+    private val mutedSer = ListSerializer(String.serializer())
 
     data class Snapshot(
         val rooms: List<Room>,
         val messagesByRoom: Map<String, List<Message>>,
         val usersById: Map<String, User>,
         val unreadByRoom: Map<String, Int>,
+        val mutedRooms: Set<String> = emptySet(),
     )
 
     fun load(): Snapshot? {
@@ -68,6 +70,7 @@ internal class IMessageStore(context: Context) {
                 put("messages", json.encodeToJsonElement(messagesSer, snapshot.messagesByRoom))
                 put("users", json.encodeToJsonElement(usersSer, snapshot.usersById))
                 put("unread", json.encodeToJsonElement(unreadSer, snapshot.unreadByRoom))
+                put("muted", json.encodeToJsonElement(mutedSer, snapshot.mutedRooms.toList()))
             }
             // EncryptedFile.openFileOutput() refuses to overwrite, so delete
             // first. A crash between delete and write only costs the cache
@@ -88,6 +91,7 @@ internal class IMessageStore(context: Context) {
             messagesByRoom = obj["messages"]?.let { json.decodeFromJsonElement(messagesSer, it) } ?: emptyMap(),
             usersById = obj["users"]?.let { json.decodeFromJsonElement(usersSer, it) } ?: emptyMap(),
             unreadByRoom = obj["unread"]?.let { json.decodeFromJsonElement(unreadSer, it) } ?: emptyMap(),
+            mutedRooms = obj["muted"]?.let { json.decodeFromJsonElement(mutedSer, it).toSet() } ?: emptySet(),
         )
     }
 

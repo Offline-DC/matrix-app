@@ -21,6 +21,7 @@ import com.offline.dpadmessenger.data.MessageStatus
 import com.offline.dpadmessenger.data.RetentionSettings
 import com.offline.dpadmessenger.data.Room
 import com.offline.dpadmessenger.data.RoomSummary
+import com.offline.dpadmessenger.data.ThreadActions
 import com.offline.dpadmessenger.data.User
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -57,7 +58,7 @@ internal class IMessageMessageRepository(
     private val session: IMessageSession,
     context: Context,
 ) : MessageRepository, InitialSyncAware, ConversationStarter, GroupConversationStarter,
-    ContactsSource, MediaDownloader, AttachmentSender, RetentionSettings {
+    ContactsSource, MediaDownloader, AttachmentSender, RetentionSettings, ThreadActions {
 
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -71,6 +72,7 @@ internal class IMessageMessageRepository(
     private val rooms = MutableStateFlow<List<Room>>(emptyList())
     private val messagesByRoom = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
     private val unreadByRoom = MutableStateFlow<Map<String, Int>>(emptyMap())
+    private val mutedRooms = MutableStateFlow<Set<String>>(emptySet())
     private val roomNameById = HashMap<String, String>()
     private val writeLock = Mutex()
 
@@ -121,6 +123,39 @@ internal class IMessageMessageRepository(
         if (pruned != messagesByRoom.value) { messagesByRoom.value = pruned; requestSave() }
     }
 
+    // ---- thread actions (ThreadActions) -------------------------------------
+
+    override fun observeMutedRooms(): Flow<Set<String>> = mutedRooms.asStateFlow()
+
+    override suspend fun setMuted(roomId: String, muted: Boolean) {
+        writeLock.withLock {
+            mutedRooms.value = mutedRooms.value.toMutableSet().apply {
+                if (muted) add(roomId) else remove(roomId)
+            }
+            requestSave()
+        }
+        if (muted) notifier.clearConversation(roomId, reason = "muted")
+        Log.i(TAG, "room $roomId muted=$muted")
+    }
+
+    override suspend fun deleteRoom(roomId: String) {
+        // Local delete only: drop the conversation from THIS device's list and
+        // cache. We deliberately do NOT delete on iMessage/the relay — there's
+        // no server-side thread-delete and we don't want to touch the account's
+        // real message history. Mirror of GoogleMessagesMessageRepository.
+        notifier.clearConversation(roomId, reason = "thread-deleted")
+        writeLock.withLock {
+            rooms.value = rooms.value.filterNot { it.id == roomId }
+            messagesByRoom.value = messagesByRoom.value.toMutableMap().apply { remove(roomId) }
+            unreadByRoom.value = unreadByRoom.value.toMutableMap().apply { remove(roomId) }
+            mutedRooms.value = mutedRooms.value - roomId
+            roomNameById.remove(roomId)
+            if (activeRoomId == roomId) activeRoomId = null
+            requestSave()
+        }
+        Log.i(TAG, "room $roomId deleted (local)")
+    }
+
     // ---- persistence --------------------------------------------------------
 
     private suspend fun restoreFromCache() {
@@ -132,6 +167,7 @@ internal class IMessageMessageRepository(
             rooms.value = snap.rooms
             messagesByRoom.value = snap.messagesByRoom.mapValues { (_, l) -> l.filter { it.timestampMs >= cutoff } }
             unreadByRoom.value = snap.unreadByRoom
+            mutedRooms.value = snap.mutedRooms
             snap.rooms.forEach { roomNameById[it.id] = it.name }
             if (snap.rooms.isNotEmpty()) _initialSyncComplete.value = true
         }
@@ -143,6 +179,7 @@ internal class IMessageMessageRepository(
             messagesByRoom = messagesByRoom.value,
             usersById = usersById.value,
             unreadByRoom = unreadByRoom.value,
+            mutedRooms = mutedRooms.value,
         )
         withContext(Dispatchers.IO) { cache.save(snap) }
     }
@@ -291,6 +328,7 @@ internal class IMessageMessageRepository(
 
     private fun maybeNotify(rm: RelayMessage, mapped: Message, isNew: Boolean) {
         if (!isNew || rm.isFromMe || rm.chatGuid == activeRoomId) return
+        if (rm.chatGuid in mutedRooms.value) { notifier.clearConversation(rm.chatGuid, reason = "muted"); return }
         if (mapped.timestampMs < sessionStartMs - 10_000L) return // suppress backfill
         val body = mapped.body.ifBlank { if (rm.attachments.isNotEmpty()) "Sent an attachment" else "" }
         if (body.isBlank()) return

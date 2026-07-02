@@ -40,6 +40,16 @@ interface IMessageTransport {
      *  registration, and returns the handles we can send as. */
     suspend fun register(config: MacOSConfig, appleId: String): RegisterResult
 
+    /**
+     * Rich registration entry point. Native/relay paths that need interactive
+     * auth use [RegisterRequest.password] and call
+     * [RegisterRequest.twoFactorProvider] when Apple demands a code. Defaults to
+     * the simple [register] so existing transports (mock, etc.) compile and work
+     * unchanged.
+     */
+    suspend fun register(request: RegisterRequest): RegisterResult =
+        register(request.config, request.appleId)
+
     /** Initial + on-demand conversation list. */
     suspend fun getChats(): List<RelayChat>
 
@@ -219,6 +229,21 @@ data class RelayContact(
     val name: String,
     val address: String,
     val avatarColor: String = "",
+)
+
+/**
+ * Rich registration request. Native/relay paths that need interactive auth
+ * use [password] and call [twoFactorProvider] when Apple demands a code.
+ *
+ * The password is transient — it is passed straight into the register call and
+ * never persisted (see [com.offline.dpadmessenger.backend.imessage
+ * .IMessageRepository]).
+ */
+class RegisterRequest(
+    val config: MacOSConfig,
+    val appleId: String,
+    val password: String = "",
+    val twoFactorProvider: (suspend () -> String?)? = null,
 )
 
 /** Result of [IMessageTransport.register]. */

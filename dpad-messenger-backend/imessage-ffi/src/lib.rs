@@ -130,6 +130,43 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_imessage_RustPushN
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_imessage_RustPushNative_nativeAuthenticate<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    apple_id: JString<'l>,
+    _password: JString<'l>,
+) -> jstring {
+    let apple: String = env.get_string(&apple_id).map(Into::into).unwrap_or_default();
+    let result = rt().block_on(async move {
+        // RUSTPUSH: AppleAccount::login(appleid_closure, tfa_closure, gsa_config,
+        // anisette). The 2FA closure should block on a channel whose sender is
+        // stored in AppState and fired by nativeSubmit2fa; return "needs_2fa"
+        // here and complete the login there. See the ../../imessage-register
+        // harness for the exact call sequence. Stub: pretend success.
+        log::info!("nativeAuthenticate apple={} (stub)", apple);
+        serde_json::json!({ "status": "ok" }).to_string()
+    });
+    env.new_string(result).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_imessage_RustPushNative_nativeSubmit2fa<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    code: JString<'l>,
+) -> jstring {
+    let _code: String = env.get_string(&code).map(Into::into).unwrap_or_default();
+    // RUSTPUSH: send `code` into the 2FA channel opened by nativeAuthenticate,
+    // then await login completion + collect the IDS delegate/auth cert.
+    let result = serde_json::json!({ "status": "ok" }).to_string();
+    env.new_string(result).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_offline_dpadmessenger_backend_imessage_RustPushNative_nativeRegister<
     'l,
 >(
