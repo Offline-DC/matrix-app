@@ -108,7 +108,23 @@ fun ChatScreen(
     val composerFr = remember { FocusRequester() }
     val lastBubbleFr = remember { FocusRequester() }
     val backBtnFr = remember { FocusRequester() }
+    // The reply/edit banner's Cancel X — first DPAD-Up stop from the composer
+    // while a banner is showing.
+    val bannerCancelFr = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
+
+    // Focus the most-recent bubble, retrying across a few frames: a bubble
+    // composed THIS frame isn't in the focus tree yet, so an immediate
+    // requestFocus silently no-ops (see onUpFromField below).
+    fun focusLastBubble() {
+        scope.launch {
+            repeat(8) {
+                withFrameNanos {}
+                val ok = runCatching { lastBubbleFr.requestFocus() }.isSuccess
+                if (ok) return@launch
+            }
+        }
+    }
 
     // Which bubble to refocus when the fullscreen media viewer closes — the one
     // whose photo/video was opened — so DPAD focus lands back where the user
@@ -228,8 +244,19 @@ fun ChatScreen(
                 replyTarget = replyTarget,
                 editTarget = editTarget,
                 senderNameFor = viewModel::senderName,
-                onCancelReply = viewModel::clearReply,
-                onCancelEdit = viewModel::clearEdit,
+                // Cancelling removes the banner (and the focused X with it) —
+                // hand focus back to the composer so it isn't dropped.
+                onCancelReply = {
+                    viewModel.clearReply()
+                    runCatching { composerFr.requestFocus() }
+                },
+                onCancelEdit = {
+                    viewModel.clearEdit()
+                    runCatching { composerFr.requestFocus() }
+                },
+                cancelFocusRequester = bannerCancelFr,
+                onUpFromCancel = { focusLastBubble() },
+                onDownFromCancel = { runCatching { composerFr.requestFocus() } },
             )
             DpadComposer(
                 onSend = viewModel::send,
@@ -237,18 +264,13 @@ fun ChatScreen(
                 prefillKey = editTarget?.id,
                 textFieldFocusRequester = composerFr,
                 onUpFromField = {
-                    // Move focus up to the most-recent bubble. If the user
-                    // JUST sent a message, that bubble was composed this frame
-                    // and isn't in the focus tree yet — requesting focus on it
-                    // immediately silently no-ops. Retry across a few frames
-                    // until it attaches (or we give up), so DPAD-Up reliably
-                    // lands on the new message instead of doing nothing.
-                    scope.launch {
-                        repeat(8) {
-                            withFrameNanos {}
-                            val ok = runCatching { lastBubbleFr.requestFocus() }.isSuccess
-                            if (ok) return@launch
-                        }
+                    // With a reply/edit banner up, DPAD-Up stops on its Cancel
+                    // X first (Up again continues to the timeline). Otherwise
+                    // go straight to the most-recent bubble.
+                    if (replyTarget != null || editTarget != null) {
+                        runCatching { bannerCancelFr.requestFocus() }
+                    } else {
+                        focusLastBubble()
                     }
                 },
                 onLeftFromField = { runCatching { backBtnFr.requestFocus() } },
@@ -341,6 +363,9 @@ private fun BannerRegion(
     senderNameFor: (String) -> String,
     onCancelReply: () -> Unit,
     onCancelEdit: () -> Unit,
+    cancelFocusRequester: FocusRequester? = null,
+    onUpFromCancel: (() -> Unit)? = null,
+    onDownFromCancel: (() -> Unit)? = null,
 ) {
     when {
         editTarget != null -> ReplyOrEditBanner(
@@ -348,6 +373,9 @@ private fun BannerRegion(
             senderName = senderNameFor(editTarget.senderId),
             bodyPreview = editTarget.body,
             onCancel = onCancelEdit,
+            cancelFocusRequester = cancelFocusRequester,
+            onUpFromCancel = onUpFromCancel,
+            onDownFromCancel = onDownFromCancel,
         )
         replyTarget != null -> ReplyOrEditBanner(
             kind = BannerKind.Reply,
@@ -357,6 +385,9 @@ private fun BannerRegion(
             senderName = if (replyTarget.isOutgoing) "You" else senderNameFor(replyTarget.senderId),
             bodyPreview = if (replyTarget.isDeleted) "Message deleted" else replyTarget.body,
             onCancel = onCancelReply,
+            cancelFocusRequester = cancelFocusRequester,
+            onUpFromCancel = onUpFromCancel,
+            onDownFromCancel = onDownFromCancel,
         )
     }
 }
