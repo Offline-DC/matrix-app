@@ -25,3 +25,15 @@ internal val OutgoingBubbleLight = Color(0xFFE3F2FD)
 internal val OutgoingBubbleDark = Color(0xFF1E3A8A)
 internal val IncomingBubbleLight = Color(0xFFF1F3F4)
 internal val IncomingBubbleDark = Color(0xFF2C2C2E)
+
+// ── iMessage / BlueBubbles palette (the classic blue iMessage look) ──────────
+// Sent bubbles are a blue vertical gradient (top → bottom); received bubbles are
+// the iOS gray; the accent is the iOS system blue. White text on sent bubbles.
+internal val IMessageSentTopLight = Color(0xFF3AA9FF)
+internal val IMessageSentLight = Color(0xFF0A7BFF)
+internal val IMessageSentTopDark = Color(0xFF37ABFF)
+internal val IMessageSentDark = Color(0xFF0A84FF)
+internal val IMessageReceivedLight = Color(0xFFE9E9EB)
+internal val IMessageReceivedDark = Color(0xFF26262B)
+internal val IMessageAccentLight = Color(0xFF007AFF)
+internal val IMessageAccentDark = Color(0xFF0A84FF)

@@ -7,16 +7,24 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -38,9 +46,13 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            DpadMessengerTheme {
+            val s = vm.state.collectAsState().value
+            // Use the iMessage/BlueBubbles skin whenever the iMessage backend is
+            // the active conversation source; Signal/Mock keep the default look.
+            val imessage = (s as? RepoState.Ready)?.mode == BackendMode.IMessage
+            DpadMessengerTheme(imessage = imessage) {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    when (val s = vm.state.collectAsState().value) {
+                    when (s) {
                         RepoState.Loading -> LoadingScreen()
                         is RepoState.Ready -> ReadyScreen(s, vm)
                         is RepoState.LinkingSignal -> SignalLinkScreen(s.provisioning)
@@ -61,32 +73,90 @@ private fun LoadingScreen() {
 
 @Composable
 private fun ReadyScreen(state: RepoState.Ready, vm: AppViewModel) {
-    // When the user is in Mock mode and wants to link Signal, the demo
-    // currently routes through a tiny header bar above the main UI. This
-    // is intentionally minimal — once Signal mode is live, the user lives
-    // entirely inside DpadMessengerApp and the mode-switch UI moves into
-    // Settings (TODO).
+    // In Mock mode a small header lets the user connect a real account (Signal
+    // or the iMessage relay). Once a real backend is live the user lives entirely
+    // inside the shared DpadMessengerApp UI (same UI for Signal and iMessage).
     if (state.mode == BackendMode.Mock) {
+        var showImessageConnect by remember { mutableStateOf(false) }
         Column(modifier = Modifier.fillMaxSize()) {
-            MockModeBanner(onLinkSignal = vm::linkSignalDevice)
+            if (showImessageConnect) {
+                IMessageConnectScreen(
+                    onConnect = { url, token -> vm.useIMessageBackend(url, token) },
+                    onCancel = { showImessageConnect = false },
+                )
+            } else {
+                ModeBanner(
+                    onLinkSignal = vm::linkSignalDevice,
+                    onConnectIMessage = { showImessageConnect = true },
+                )
+            }
             DpadMessengerApp(repository = state.repository, modifier = Modifier.weight(1f))
         }
     } else {
+        // Signal AND iMessage both render through the shared Signal-like UI.
         DpadMessengerApp(repository = state.repository)
     }
 }
 
 @Composable
-private fun MockModeBanner(onLinkSignal: () -> Unit) {
-    Box(modifier = Modifier.fillMaxSize().padding(8.dp)) {
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(
-                text = "Mock data — link Signal to use your real account:",
-                style = MaterialTheme.typography.labelSmall,
-            )
-            Button(onClick = onLinkSignal, modifier = Modifier.fillMaxSize().padding(top = 2.dp)) {
-                Text("Link Signal device")
-            }
+private fun ModeBanner(onLinkSignal: () -> Unit, onConnectIMessage: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            text = "Mock data — connect a real account:",
+            style = MaterialTheme.typography.labelSmall,
+        )
+        Button(onClick = onLinkSignal, modifier = Modifier.fillMaxWidth()) {
+            Text("Link Signal device")
+        }
+        Button(onClick = onConnectIMessage, modifier = Modifier.fillMaxWidth()) {
+            Text("Connect iMessage relay")
+        }
+    }
+}
+
+@Composable
+private fun IMessageConnectScreen(
+    onConnect: (String, String?) -> Unit,
+    onCancel: () -> Unit,
+) {
+    var url by remember { mutableStateOf("") }
+    var token by remember { mutableStateOf("") }
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = "Connect to your imessage-relay daemon. It handles the dumb file, " +
+                "iCloud login and 2FA (OpenBubbles-style); this phone is a thin client.",
+            style = MaterialTheme.typography.labelSmall,
+        )
+        OutlinedTextField(
+            value = url,
+            onValueChange = { url = it },
+            label = { Text("Relay URL — e.g. http://192.168.1.10:8765") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = token,
+            onValueChange = { token = it },
+            label = { Text("Bearer token (optional)") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Button(
+            onClick = { onConnect(url, token.ifBlank { null }) },
+            enabled = url.isNotBlank(),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Connect")
+        }
+        Spacer(modifier = Modifier.height(4.dp))
+        TextButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {
+            Text("Cancel")
         }
     }
 }

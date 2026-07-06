@@ -16,17 +16,28 @@ import androidx.compose.ui.graphics.Color
 
 data class DpadMessengerColors(
     val outgoingBubble: Color,
+    /** Gradient top of the outgoing bubble. Equal to [outgoingBubble] ⇒ flat.
+     *  For the iMessage skin this is a lighter blue, giving the classic gradient. */
+    val outgoingBubbleTop: Color,
     val incomingBubble: Color,
+    /** Text color on an INCOMING bubble. */
     val onBubble: Color,
+    /** Text color on an OUTGOING bubble (white on the blue iMessage bubble). */
+    val onOutgoingBubble: Color,
     val divider: Color,
     val mutedText: Color,
+    /** True for the iMessage/BlueBubbles skin — switches send-status to
+     *  "Delivered"/"Read" words and in-bubble muted text to translucent white. */
+    val imessage: Boolean = false,
 )
 
 val LocalDpadMessengerColors = staticCompositionLocalOf {
     DpadMessengerColors(
         outgoingBubble = OutgoingBubbleLight,
+        outgoingBubbleTop = OutgoingBubbleLight,
         incomingBubble = IncomingBubbleLight,
         onBubble = LightOnSurface,
+        onOutgoingBubble = LightOnSurface,
         divider = LightDivider,
         mutedText = LightOnSurfaceMuted,
     )
@@ -40,20 +51,33 @@ val LocalDpadMessengerColors = staticCompositionLocalOf {
 @Composable
 fun DpadMessengerTheme(
     darkTheme: Boolean? = null,
+    /** When true, use the iMessage/BlueBubbles skin (blue gradient bubbles, iOS
+     *  system-blue accent, "Delivered"/"Read" receipts). Set by the host app when
+     *  the iMessage backend is the active conversation source. */
+    imessage: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     val effectiveDark = darkTheme ?: isSystemInDarkTheme()
-    DpadMessengerThemeInternal(darkTheme = effectiveDark, content = content)
+    DpadMessengerThemeInternal(darkTheme = effectiveDark, imessage = imessage, content = content)
 }
 
 @Composable
 private fun DpadMessengerThemeInternal(
     darkTheme: Boolean,
+    imessage: Boolean,
     content: @Composable () -> Unit,
 ) {
+    // Accent: iOS system blue for iMessage, Signal blue otherwise.
+    val accent = when {
+        imessage && darkTheme -> IMessageAccentDark
+        imessage -> IMessageAccentLight
+        darkTheme -> SignalBlue
+        else -> SignalBlueDark
+    }
+
     val colorScheme = if (darkTheme) {
         darkColorScheme(
-            primary = SignalBlue,
+            primary = accent,
             onPrimary = Color.White,
             secondary = SignalGreen,
             background = DarkBg,
@@ -64,7 +88,7 @@ private fun DpadMessengerThemeInternal(
         )
     } else {
         lightColorScheme(
-            primary = SignalBlueDark,
+            primary = accent,
             onPrimary = Color.White,
             secondary = SignalGreen,
             background = LightBg,
@@ -75,19 +99,42 @@ private fun DpadMessengerThemeInternal(
         )
     }
 
-    val messengerColors = if (darkTheme) {
-        DpadMessengerColors(
+    val messengerColors = when {
+        imessage && darkTheme -> DpadMessengerColors(
+            outgoingBubble = IMessageSentDark,
+            outgoingBubbleTop = IMessageSentTopDark,
+            incomingBubble = IMessageReceivedDark,
+            onBubble = DarkOnSurface,
+            onOutgoingBubble = Color.White,
+            divider = DarkDivider,
+            mutedText = DarkOnSurfaceMuted,
+            imessage = true,
+        )
+        imessage -> DpadMessengerColors(
+            outgoingBubble = IMessageSentLight,
+            outgoingBubbleTop = IMessageSentTopLight,
+            incomingBubble = IMessageReceivedLight,
+            onBubble = LightOnSurface,
+            onOutgoingBubble = Color.White,
+            divider = LightDivider,
+            mutedText = LightOnSurfaceMuted,
+            imessage = true,
+        )
+        darkTheme -> DpadMessengerColors(
             outgoingBubble = OutgoingBubbleDark,
+            outgoingBubbleTop = OutgoingBubbleDark,
             incomingBubble = IncomingBubbleDark,
             onBubble = DarkOnSurface,
+            onOutgoingBubble = DarkOnSurface,
             divider = DarkDivider,
             mutedText = DarkOnSurfaceMuted,
         )
-    } else {
-        DpadMessengerColors(
+        else -> DpadMessengerColors(
             outgoingBubble = OutgoingBubbleLight,
+            outgoingBubbleTop = OutgoingBubbleLight,
             incomingBubble = IncomingBubbleLight,
             onBubble = LightOnSurface,
+            onOutgoingBubble = LightOnSurface,
             divider = LightDivider,
             mutedText = LightOnSurfaceMuted,
         )

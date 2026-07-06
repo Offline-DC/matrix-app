@@ -49,7 +49,9 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
 import kotlinx.coroutines.launch
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -140,7 +142,23 @@ fun MessageBubble(
     var bubbleTopY by remember { mutableStateOf(0f) }
     var bubbleHeightPx by remember { mutableStateOf(0) }
     var bubbleWidthPx by remember { mutableStateOf(0) }
-    val bubbleColor = if (isOutgoing) colors.outgoingBubble else colors.incomingBubble
+    // Outgoing bubbles use a vertical gradient (top → bottom). When top == bottom
+    // (the Signal/default palette) it renders flat; the iMessage skin sets a
+    // lighter top for the classic blue gradient. Incoming bubbles are a flat fill.
+    val bubbleBrush = if (isOutgoing) {
+        Brush.verticalGradient(listOf(colors.outgoingBubbleTop, colors.outgoingBubble))
+    } else {
+        SolidColor(colors.incomingBubble)
+    }
+    // Message text: white on the blue iMessage sent bubble, dark otherwise.
+    val onBubbleText = if (isOutgoing) colors.onOutgoingBubble else colors.onBubble
+    // In-bubble secondary text (timestamp/edited/deleted): translucent white on a
+    // blue iMessage sent bubble so it stays legible, else the normal muted color.
+    val bubbleMuted = if (isOutgoing && colors.imessage) {
+        colors.onOutgoingBubble.copy(alpha = 0.72f)
+    } else {
+        colors.mutedText
+    }
     val alignment = if (isOutgoing) Arrangement.End else Arrangement.Start
     val bubbleShape = RoundedCornerShape(
         topStart = 16.dp,
@@ -177,7 +195,7 @@ fun MessageBubble(
                     // Background/clip BEFORE the click handlers so the focus
                     // halo (border + tint) isn't overpainted.
                     .clip(bubbleShape)
-                    .background(bubbleColor)
+                    .background(bubbleBrush)
                     .then(extraFocusRequesters.fold(Modifier as Modifier) { acc, fr -> acc.focusRequester(fr) })
                     .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
                     .dpadFocusHighlight(shape = bubbleShape)
@@ -341,47 +359,68 @@ fun MessageBubble(
                             style = MaterialTheme.typography.bodyMedium.copy(
                                 fontStyle = FontStyle.Italic,
                             ),
-                            color = colors.mutedText,
+                            color = bubbleMuted,
                         )
                     } else if (message.body.isNotBlank()) {
                         Text(
                             text = message.body,
                             style = MaterialTheme.typography.bodyLarge,
-                            color = colors.onBubble,
+                            color = onBubbleText,
                         )
                     }
-                    Spacer(Modifier.padding(top = 4.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (message.editedAtMs != null && !message.isDeleted) {
+                    // Signal keeps the timestamp + status inline in the bubble.
+                    // iMessage hides them here (the date header carries the time;
+                    // the receipt renders BELOW the bubble) so a short bubble hugs
+                    // its text instead of stretching to fit "9:41 AM  Delivered".
+                    if (!colors.imessage) {
+                        Spacer(Modifier.padding(top = 4.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (message.editedAtMs != null && !message.isDeleted) {
+                                Text(
+                                    text = "edited · ",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = bubbleMuted,
+                                )
+                            }
                             Text(
-                                text = "edited · ",
+                                text = formatTimeShort(message.timestampMs),
                                 style = MaterialTheme.typography.labelSmall,
-                                color = colors.mutedText,
+                                color = bubbleMuted,
                             )
-                        }
-                        Text(
-                            text = formatTimeShort(message.timestampMs),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = colors.mutedText,
-                        )
-                        if (isOutgoing) {
-                            Spacer(Modifier.padding(start = 4.dp))
-                            Text(
-                                text = statusGlyph(message.status),
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontWeight = if (message.status == MessageStatus.FAILED)
-                                        FontWeight.Bold else FontWeight.Normal,
-                                ),
-                                color = when (message.status) {
-                                    MessageStatus.READ -> MaterialTheme.colorScheme.primary
-                                    // Red "!" so a failed send stands out.
-                                    MessageStatus.FAILED -> MaterialTheme.colorScheme.error
-                                    else -> colors.mutedText
-                                },
-                            )
+                            if (isOutgoing) {
+                                Spacer(Modifier.padding(start = 4.dp))
+                                Text(
+                                    text = statusGlyph(message.status, false),
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = if (message.status == MessageStatus.FAILED)
+                                            FontWeight.Bold else FontWeight.Normal,
+                                    ),
+                                    color = when (message.status) {
+                                        MessageStatus.FAILED -> MaterialTheme.colorScheme.error
+                                        MessageStatus.READ -> MaterialTheme.colorScheme.primary
+                                        else -> colors.mutedText
+                                    },
+                                )
+                            }
                         }
                     }
                 }
+            }
+            // iMessage: the delivery receipt sits BELOW the bubble, right-aligned
+            // and gray (like real iMessage), so it never widens the bubble.
+            if (colors.imessage && isOutgoing && message.status != MessageStatus.SENT &&
+                !message.isDeleted
+            ) {
+                Text(
+                    text = statusGlyph(message.status, true),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (message.status == MessageStatus.FAILED) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        colors.mutedText
+                    },
+                    modifier = Modifier.padding(top = 2.dp, end = 2.dp),
+                )
             }
             if (message.reactions.isNotEmpty() && !message.isDeleted) {
                 Spacer(Modifier.padding(top = 4.dp))
@@ -462,13 +501,21 @@ private fun ReactionsRow(
     }
 }
 
-private fun statusGlyph(status: MessageStatus): String = when (status) {
-    MessageStatus.SENDING -> "…"
-    MessageStatus.SENT -> "✓"
-    MessageStatus.DELIVERED -> "✓✓"
-    MessageStatus.READ -> "✓✓"
-    MessageStatus.FAILED -> "!"
-}
+private fun statusGlyph(status: MessageStatus, imessage: Boolean): String =
+    if (imessage) when (status) {
+        // iMessage shows the delivery state as words under the last sent bubble.
+        MessageStatus.SENDING -> "Sending…"
+        MessageStatus.SENT -> "Sent"
+        MessageStatus.DELIVERED -> "Delivered"
+        MessageStatus.READ -> "Read"
+        MessageStatus.FAILED -> "Not Delivered"
+    } else when (status) {
+        MessageStatus.SENDING -> "…"
+        MessageStatus.SENT -> "✓"
+        MessageStatus.DELIVERED -> "✓✓"
+        MessageStatus.READ -> "✓✓"
+        MessageStatus.FAILED -> "!"
+    }
 
 /** How long an id-less media placeholder may sit on "Receiving…" before we
  *  treat it as never-going-to-resolve and show a non-spinning fallback. The

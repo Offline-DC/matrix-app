@@ -572,6 +572,7 @@ internal class IMessageMessageRepository(
                 kind = when (a.kind) {
                     "image" -> AttachmentKind.IMAGE
                     "video" -> AttachmentKind.VIDEO
+                    "audio" -> AttachmentKind.AUDIO
                     else -> AttachmentKind.OTHER
                 },
                 mimeType = a.mimeType, name = a.name, downloadToken = a.guid, localPath = null,

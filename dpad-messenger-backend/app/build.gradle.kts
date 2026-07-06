@@ -45,6 +45,11 @@ dependencies {
     // and what still needs protobuf glue.
     implementation(project(":signal"))
 
+    // Native iMessage backend. The Signal-like shared UI drives it; the actual
+    // Apple registration (dumb file + Apple ID + 2FA) runs in the imessage-relay
+    // daemon (OpenBubbles-style), which this connects to over the relay WebSocket.
+    implementation(project(":imessage"))
+
     // -- Real Matrix backend ----------------------------------------------
     // Uncomment ONLY after verifying matrix-rust-sdk-android compiles
     // against your installed version (see docs/MATRIX_BACKEND_STATUS.md).
