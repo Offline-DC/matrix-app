@@ -51,6 +51,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.data.RoomSummary
+import com.offline.dpadmessenger.focus.dpadFocusRing
 import com.offline.dpadmessenger.focus.dpadRow
 import com.offline.dpadmessenger.focus.onDpadAction
 import com.offline.dpadmessenger.ui.components.CompactBarButton
@@ -392,9 +393,10 @@ private fun ComposeButton(
         modifier = modifier
             .size(52.dp)
             .focusRequester(focusRequester)
+            .dpadFocusRing(focused, ComposerButtonHighlight)
             .clip(CircleShape)
-            // Matches the in-chat composer buttons: grey at rest, signal blue
-            // when DPAD-highlighted (focused), white icon in both states.
+            // Matches the in-chat composer buttons: soft blue at rest, full
+            // signal blue when highlighted, plus a focus ring on DPAD focus.
             .background(if (focused) ComposerButtonHighlight else ComposerButtonResting)
             .onFocusChanged { focused = it.isFocused }
             .focusable()

@@ -64,10 +64,10 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.focus.dpadFocusHighlight
+import com.offline.dpadmessenger.focus.dpadFocusRing
 import com.offline.dpadmessenger.focus.onDpadAction
 import com.offline.dpadmessenger.ui.theme.ComposerButtonHighlight
 import com.offline.dpadmessenger.ui.theme.ComposerButtonResting
-import com.offline.dpadmessenger.ui.theme.ComposerButtonTyped
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 
 /**
@@ -446,6 +446,7 @@ private fun RecordStopButton(
         modifier = Modifier
             .size(44.dp)
             .focusRequester(focusRequester)
+            .dpadFocusRing(focused && !recording, ComposerButtonHighlight)
             .clip(CircleShape)
             .background(background)
             .onFocusChanged { focused = it.isFocused }
@@ -519,6 +520,7 @@ private fun AttachButton(
         modifier = Modifier
             .size(44.dp)
             .focusRequester(focusRequester)
+            .dpadFocusRing(focused, ComposerButtonHighlight)
             .clip(CircleShape)
             .background(if (focused) ComposerButtonHighlight else ComposerButtonResting)
             .onFocusChanged { focused = it.isFocused }
@@ -549,16 +551,11 @@ private fun SendButton(
     onLeftToField: () -> Unit,
 ) {
     var focused by remember { mutableStateOf(false) }
-    // Three-step blue ramp: soft resting blue with no text, a deeper "typed"
-    // blue once there's something to send, and the full signal blue when
-    // DPAD-highlighted (focused). In Signal the Send button only appears once
-    // there's text (the empty field shows the mic), so it's effectively "typed"
-    // until focused; the resting shade only shows on repos without voice/attach.
-    val background = when {
-        focused -> ComposerButtonHighlight
-        enabled -> ComposerButtonTyped
-        else -> ComposerButtonResting
-    }
+    // Full signal blue as soon as there's text to send; the soft resting blue
+    // only shows on an empty field (repos without voice/attach — in Signal the
+    // empty field shows the mic instead). DPAD focus is marked by the ring, not
+    // a colour change.
+    val background = if (enabled) ComposerButtonHighlight else ComposerButtonResting
     val iconTint = if (enabled) Color.White
         else LocalDpadMessengerColors.current.mutedText
     Box(
@@ -566,6 +563,7 @@ private fun SendButton(
         modifier = Modifier
             .size(44.dp)
             .focusRequester(focusRequester)
+            .dpadFocusRing(focused, ComposerButtonHighlight)
             .clip(CircleShape)
             .background(background)
             .onFocusChanged { focused = it.isFocused }
