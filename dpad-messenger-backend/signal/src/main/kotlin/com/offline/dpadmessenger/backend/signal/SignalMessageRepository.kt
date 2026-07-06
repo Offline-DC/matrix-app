@@ -343,6 +343,24 @@ class SignalMessageRepository(
         }
     }
 
+    /** Re-send a message that previously failed: drop the failed bubble and
+     *  send its body again as a fresh optimistic SENDING bubble, preserving any
+     *  reply target (mirrors the Google Messages repo). Without this override
+     *  the UI's "Retry send" fell through to [MessageRepository]'s no-op default
+     *  and did nothing. Media resend isn't supported yet, so attachments are
+     *  left as-is. */
+    override suspend fun resendMessage(roomId: String, messageId: String) {
+        val failed = messagesByRoom.value[roomId]?.firstOrNull { it.id == messageId } ?: return
+        if (failed.status != MessageStatus.FAILED || !failed.isOutgoing) return
+        if (failed.attachment != null) return // media resend not supported yet
+        // Remove the failed bubble; sendMessage() appends a fresh SENDING one.
+        // (Any messagesByRoom change triggers the debounced auto-save.)
+        val current = messagesByRoom.value.toMutableMap()
+        current[roomId] = current[roomId].orEmpty().filterNot { it.id == messageId }
+        messagesByRoom.value = current
+        sendMessage(roomId, failed.body, failed.replyToId)
+    }
+
     /** Flip the status (and optionally timestamp) of an in-flight message. */
     private fun updateStatus(
         roomId: String,

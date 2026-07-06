@@ -11,11 +11,11 @@ internal val SignalGreen = Color(0xFF3AA467)
 
 // Composer action buttons (attach "+", voice-memo mic, send) plus the room-list
 // "new message" button, under the messenger's forced-light theme:
-//  - Resting: a soft blue so idle buttons read as interactive/focusable. A flat
-//    grey looked disabled and got skipped past when steering the DPAD.
+//  - Resting: a soft blue so idle buttons read as interactive/focusable. DPAD
+//    focus is further marked by a ring around the focused button (see
+//    dpadFocusRing).
 //  - Highlighted: the saturated signal blue. The Send button also jumps to this
-//    as soon as there's text to send. DPAD focus itself is marked by a ring
-//    (see dpadFocusRing), not a colour change.
+//    as soon as there's text to send.
 // Icons stay white on both.
 internal val ComposerButtonResting = Color(0xFF7FA3DA)
 internal val ComposerButtonHighlight = Color(0xFF1B74E4)
