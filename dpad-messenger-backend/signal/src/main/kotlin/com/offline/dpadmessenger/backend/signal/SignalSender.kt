@@ -744,6 +744,13 @@ class SignalSender(
      *   unidentifiedStatus: [per-device delivery flags]
      * } } }
      */
+    /** ACI/PNI service-id string → its binary form (16 bytes for ACI, 1-byte
+     *  prefix + 16 for PNI), as Signal's transcripts and envelopes expect. */
+    private fun serviceIdBinary(serviceId: String): com.google.protobuf.ByteString =
+        com.google.protobuf.ByteString.copyFrom(
+            org.signal.libsignal.protocol.ServiceId.parseFromString(serviceId).toServiceIdBinary(),
+        )
+
     private suspend fun sendSentTranscript(
         recipientServiceId: String,
         dataMessage: SignalServiceProtos.DataMessage,
@@ -764,10 +771,25 @@ class SignalSender(
         // Ensure sessions exist for each sibling device.
         otherDevices.forEach { bootstrapSessionIfNeeded(account.aci, it, ourIdentityKey) }
 
+        // Address the transcript by BINARY service id AND include an
+        // unidentifiedStatus entry — exactly like Signal-Android's
+        // SignalServiceMessageSender. Modern Signal receivers (iOS/Desktop) read
+        // `destinationServiceIdBinary`, not the legacy string field, to attribute
+        // a synced sent message to a conversation. With only the string set a
+        // sibling device receives the transcript (its delivery receipt fires) but
+        // can't thread it, so the message never appears — the "sent from linked
+        // device didn't sync to my other device" bug.
+        val recipientBinary = serviceIdBinary(recipientServiceId)
         val sent = SignalServiceProtos.SyncMessage.Sent.newBuilder()
             .setDestinationServiceId(recipientServiceId)
+            .setDestinationServiceIdBinary(recipientBinary)
             .setTimestamp(timestamp)
             .setMessage(dataMessage)
+            .addUnidentifiedStatus(
+                SignalServiceProtos.SyncMessage.Sent.UnidentifiedDeliveryStatus.newBuilder()
+                    .setDestinationServiceIdBinary(recipientBinary)
+                    .setUnidentified(true),
+            )
             .build()
         val sync = SignalServiceProtos.SyncMessage.newBuilder()
             .setSent(sent)
@@ -802,7 +824,11 @@ class SignalSender(
         if (!result.isSuccess) {
             throw RuntimeException("sent-transcript HTTP ${result.httpStatus}: ${result.rawBody}")
         }
-        Log.d(TAG, "sent-transcript delivered to ${outgoing.size} sibling device(s)")
+        Log.d(
+            TAG,
+            "sent-transcript delivered to ${outgoing.size} sibling device(s) " +
+                "recipient=$recipientServiceId ts=$timestamp",
+        )
     }
 
     /**
@@ -897,10 +923,17 @@ class SignalSender(
         timestamp: Long,
         cert: SenderCertificate,
     ) {
+        val recipientBinary = serviceIdBinary(recipientServiceId)
         val sent = SignalServiceProtos.SyncMessage.Sent.newBuilder()
             .setDestinationServiceId(recipientServiceId)
+            .setDestinationServiceIdBinary(recipientBinary)
             .setTimestamp(timestamp)
             .setEditMessage(edit)
+            .addUnidentifiedStatus(
+                SignalServiceProtos.SyncMessage.Sent.UnidentifiedDeliveryStatus.newBuilder()
+                    .setDestinationServiceIdBinary(recipientBinary)
+                    .setUnidentified(true),
+            )
             .build()
         val sync = SignalServiceProtos.SyncMessage.newBuilder()
             .setSent(sent)

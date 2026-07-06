@@ -351,7 +351,10 @@ private fun BannerRegion(
         )
         replyTarget != null -> ReplyOrEditBanner(
             kind = BannerKind.Reply,
-            senderName = senderNameFor(replyTarget.senderId),
+            // Replying to your own message should read "You", not your phone
+            // number (senderNameFor resolves an own-message senderId to the raw
+            // E.164 since there's no contact entry for yourself).
+            senderName = if (replyTarget.isOutgoing) "You" else senderNameFor(replyTarget.senderId),
             bodyPreview = if (replyTarget.isDeleted) "Message deleted" else replyTarget.body,
             onCancel = onCancelReply,
         )
