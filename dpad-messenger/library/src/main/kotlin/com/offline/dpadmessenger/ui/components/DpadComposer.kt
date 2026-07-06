@@ -67,6 +67,7 @@ import com.offline.dpadmessenger.focus.dpadFocusHighlight
 import com.offline.dpadmessenger.focus.onDpadAction
 import com.offline.dpadmessenger.ui.theme.ComposerButtonHighlight
 import com.offline.dpadmessenger.ui.theme.ComposerButtonResting
+import com.offline.dpadmessenger.ui.theme.ComposerButtonTyped
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 
 /**
@@ -548,11 +549,16 @@ private fun SendButton(
     onLeftToField: () -> Unit,
 ) {
     var focused by remember { mutableStateOf(false) }
-    // Resting grey, signal blue when highlighted (focused) — matching the
-    // compose "+" and voice-memo buttons. A disabled Send (empty field, only on
-    // repos without voice/attach) dims its icon; in Signal the Send button only
-    // appears once there's text to send, so it's always enabled there.
-    val background = if (focused) ComposerButtonHighlight else ComposerButtonResting
+    // Three-step blue ramp: soft resting blue with no text, a deeper "typed"
+    // blue once there's something to send, and the full signal blue when
+    // DPAD-highlighted (focused). In Signal the Send button only appears once
+    // there's text (the empty field shows the mic), so it's effectively "typed"
+    // until focused; the resting shade only shows on repos without voice/attach.
+    val background = when {
+        focused -> ComposerButtonHighlight
+        enabled -> ComposerButtonTyped
+        else -> ComposerButtonResting
+    }
     val iconTint = if (enabled) Color.White
         else LocalDpadMessengerColors.current.mutedText
     Box(
