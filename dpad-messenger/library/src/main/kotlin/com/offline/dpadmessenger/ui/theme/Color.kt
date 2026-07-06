@@ -9,6 +9,13 @@ internal val SignalBlue = Color(0xFF2C6BED)
 internal val SignalBlueDark = Color(0xFF0F4FD0)
 internal val SignalGreen = Color(0xFF3AA467)
 
+// Composer action buttons (attach "+", voice-memo mic, send). Fixed brand
+// values from the "Signal blue" design spec so they render identically under
+// the messenger's forced-light theme: a soft blue-grey at rest, the saturated
+// signal blue when DPAD-highlighted (focused). Icons stay white in both states.
+internal val ComposerButtonResting = Color(0xFFAEB9CC)
+internal val ComposerButtonHighlight = Color(0xFF1B74E4)
+
 internal val LightBg = Color(0xFFFFFFFF)
 internal val LightSurface = Color(0xFFF6F6F8)
 internal val LightOnSurface = Color(0xFF161616)
