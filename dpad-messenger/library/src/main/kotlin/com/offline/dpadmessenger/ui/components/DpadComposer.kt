@@ -64,7 +64,10 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.focus.dpadFocusHighlight
+import com.offline.dpadmessenger.focus.dpadFocusRing
 import com.offline.dpadmessenger.focus.onDpadAction
+import com.offline.dpadmessenger.ui.theme.ComposerButtonHighlight
+import com.offline.dpadmessenger.ui.theme.ComposerButtonResting
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 
 /**
@@ -421,7 +424,10 @@ fun DpadComposer(
     }
 }
 
-/** Trailing record/stop button (mic when idle, stop while recording). */
+/** Trailing record/stop button (mic when idle, stop while recording).
+ *  The idle mic follows the composer resting/highlighted scheme (grey at rest,
+ *  signal blue when focused); the recording Stop state stays error-red so
+ *  "recording now" reads unmistakably regardless of focus. */
 @Composable
 private fun RecordStopButton(
     recording: Boolean,
@@ -429,21 +435,21 @@ private fun RecordStopButton(
     focusRequester: FocusRequester,
     onLeftToField: () -> Unit,
 ) {
-    val accent = if (recording) MaterialTheme.colorScheme.error
-        else MaterialTheme.colorScheme.primary
+    var focused by remember { mutableStateOf(false) }
+    val background = when {
+        recording -> MaterialTheme.colorScheme.error
+        focused -> ComposerButtonHighlight
+        else -> ComposerButtonResting
+    }
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
             .size(44.dp)
             .focusRequester(focusRequester)
+            .dpadFocusRing(focused && !recording, ComposerButtonHighlight)
             .clip(CircleShape)
-            .background(accent)
-            .dpadFocusHighlight(
-                shape = CircleShape,
-                borderWidth = 4.dp,
-                borderColor = MaterialTheme.colorScheme.onPrimary,
-                focusedTint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.35f),
-            )
+            .background(background)
+            .onFocusChanged { focused = it.isFocused }
             .focusable()
             .onDpadAction { onClick(); true }
             .onPreviewKeyEvent { event ->
@@ -464,7 +470,7 @@ private fun RecordStopButton(
         Icon(
             imageVector = if (recording) Icons.Filled.Stop else Icons.Filled.Mic,
             contentDescription = if (recording) "Stop recording" else "Record voice message",
-            tint = MaterialTheme.colorScheme.onPrimary,
+            tint = Color.White,
         )
     }
 }
@@ -499,7 +505,8 @@ private fun RecordingIndicator(elapsedSec: Int, modifier: Modifier = Modifier) {
 }
 
 /** "+" attach button left of the text field. DPAD: Left exits (back button),
- *  Right returns to the field, OK opens the picker. */
+ *  Right returns to the field, OK opens the picker. Grey at rest, signal blue
+ *  when highlighted (focused). */
 @Composable
 private fun AttachButton(
     onClick: () -> Unit,
@@ -507,14 +514,16 @@ private fun AttachButton(
     onLeft: () -> Unit,
     onRight: () -> Unit,
 ) {
+    var focused by remember { mutableStateOf(false) }
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
             .size(44.dp)
             .focusRequester(focusRequester)
+            .dpadFocusRing(focused, ComposerButtonHighlight)
             .clip(CircleShape)
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .dpadFocusHighlight(shape = CircleShape)
+            .background(if (focused) ComposerButtonHighlight else ComposerButtonResting)
+            .onFocusChanged { focused = it.isFocused }
             .focusable()
             .onDpadAction { onClick(); true }
             .onPreviewKeyEvent { event ->
@@ -529,7 +538,7 @@ private fun AttachButton(
         Icon(
             imageVector = Icons.Filled.Add,
             contentDescription = "Attach photo or video",
-            tint = MaterialTheme.colorScheme.onSurface,
+            tint = Color.White,
         )
     }
 }
@@ -541,26 +550,23 @@ private fun SendButton(
     focusRequester: FocusRequester,
     onLeftToField: () -> Unit,
 ) {
-    val accent = if (enabled) MaterialTheme.colorScheme.primary
-        else MaterialTheme.colorScheme.surfaceVariant
-    val iconTint = if (enabled) MaterialTheme.colorScheme.onPrimary
+    var focused by remember { mutableStateOf(false) }
+    // Full signal blue as soon as there's text to send; the soft resting blue
+    // only shows on an empty field (repos without voice/attach — in Signal the
+    // empty field shows the mic instead). DPAD focus is marked by the ring, not
+    // a colour change.
+    val background = if (enabled) ComposerButtonHighlight else ComposerButtonResting
+    val iconTint = if (enabled) Color.White
         else LocalDpadMessengerColors.current.mutedText
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
             .size(44.dp)
             .focusRequester(focusRequester)
+            .dpadFocusRing(focused, ComposerButtonHighlight)
             .clip(CircleShape)
-            .background(accent)
-            // Halo color is onPrimary (white-ish), not primary — otherwise it
-            // disappears into the blue button background. Thicker + stronger tint
-            // so the DPAD focus state on the round button reads clearly.
-            .dpadFocusHighlight(
-                shape = CircleShape,
-                borderWidth = 4.dp,
-                borderColor = MaterialTheme.colorScheme.onPrimary,
-                focusedTint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.35f),
-            )
+            .background(background)
+            .onFocusChanged { focused = it.isFocused }
             .focusable()
             .onDpadAction { if (enabled) { onClick(); true } else false }
             // DPAD-Left jumps back to the text field so the user doesn't have

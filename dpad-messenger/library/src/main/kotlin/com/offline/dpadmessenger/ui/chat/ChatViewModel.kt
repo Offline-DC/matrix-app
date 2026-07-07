@@ -109,9 +109,29 @@ class ChatViewModel(
     suspend fun parentSnippet(replyToId: String?): com.offline.dpadmessenger.ui.components.ReplyParentSnippet? {
         if (replyToId == null) return null
         val parent = repository.getMessage(roomId, replyToId) ?: return null
+        // A quote of your own message must read "You" — senderName() resolves
+        // an own senderId to the raw ACI/E.164 since there's no self contact.
+        val resolved = if (parent.isOutgoing) "You" else senderName(parent.senderId)
+        // Quoted image already downloaded → the quote shows a small thumbnail.
+        val imagePath = parent.attachment
+            ?.takeIf { it.kind == com.offline.dpadmessenger.data.AttachmentKind.IMAGE }
+            ?.localPath?.takeIf { java.io.File(it).exists() }
+        android.util.Log.d(
+            "ChatUI",
+            "reply-quote parent=$replyToId sender=${parent.senderId} " +
+                "outgoing=${parent.isOutgoing} resolved=$resolved thumb=${imagePath != null}",
+        )
         return com.offline.dpadmessenger.ui.components.ReplyParentSnippet(
-            senderName = senderName(parent.senderId),
-            bodyPreview = if (parent.isDeleted) "Message deleted" else parent.body,
+            senderName = resolved,
+            bodyPreview = when {
+                parent.isDeleted -> "Message deleted"
+                // Media-only parent has a blank body — show a typed label
+                // ("Photo" etc.) like Signal instead of an empty line.
+                parent.body.isBlank() ->
+                    com.offline.dpadmessenger.ui.components.mediaQuoteLabel(parent.attachment)
+                else -> parent.body
+            },
+            imagePath = if (parent.isDeleted) null else imagePath,
         )
     }
 
@@ -119,6 +139,12 @@ class ChatViewModel(
     fun closeMessageSheet() { _selectedMessage.value = null }
 
     fun startReply(message: Message) {
+        android.util.Log.d(
+            "ChatUI",
+            "reply-banner target=${message.id} sender=${message.senderId} " +
+                "outgoing=${message.isOutgoing} " +
+                "resolved=${if (message.isOutgoing) "You" else senderName(message.senderId)}",
+        )
         _editTarget.value = null
         _replyTarget.value = message
     }
@@ -135,13 +161,16 @@ class ChatViewModel(
         if (text.isEmpty()) return
         val replyId = _replyTarget.value?.id
         val edit = _editTarget.value
+        // Dismiss the reply/edit banner the moment send is pressed — clearing
+        // it after the repository call returns leaves the banner up for the
+        // whole network round-trip.
+        _replyTarget.value = null
+        _editTarget.value = null
         viewModelScope.launch {
             if (edit != null) {
                 repository.editMessage(roomId, edit.id, text)
-                _editTarget.value = null
             } else {
                 repository.sendMessage(roomId, text, replyId)
-                _replyTarget.value = null
             }
         }
     }
@@ -184,6 +213,11 @@ class ChatViewModel(
     /** True if this repo can send attachments (drives the composer "+" button). */
     val canSendAttachments: Boolean =
         repository is com.offline.dpadmessenger.data.AttachmentSender
+
+    /** True if this repo's delete is a real "delete for everyone" (drives the
+     *  context sheet's Delete action). */
+    val canDeleteForEveryone: Boolean =
+        repository is com.offline.dpadmessenger.data.RemoteDeleteCapable
 
     /** Send a picked photo/video (content:// uri) to this room. */
     fun sendAttachment(contentUri: String) {

@@ -42,6 +42,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -49,13 +51,15 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.data.RoomSummary
-import com.offline.dpadmessenger.focus.dpadFocusHighlight
+import com.offline.dpadmessenger.focus.dpadFocusRing
 import com.offline.dpadmessenger.focus.dpadRow
 import com.offline.dpadmessenger.focus.onDpadAction
 import com.offline.dpadmessenger.ui.components.CompactBarButton
 import com.offline.dpadmessenger.ui.components.CompactTopBar
 import com.offline.dpadmessenger.ui.components.RoomListItem
 import com.offline.dpadmessenger.ui.settings.RELINK_WARN_DAYS
+import com.offline.dpadmessenger.ui.theme.ComposerButtonHighlight
+import com.offline.dpadmessenger.ui.theme.ComposerButtonResting
 
 /**
  * Top-level room list. DPAD Up/Down moves between rooms; OK opens the chat.
@@ -383,18 +387,18 @@ private fun ComposeButton(
     onUp: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var focused by remember { mutableStateOf(false) }
     Box(
         contentAlignment = Alignment.Center,
         modifier = modifier
             .size(52.dp)
             .focusRequester(focusRequester)
+            .dpadFocusRing(focused, ComposerButtonHighlight)
             .clip(CircleShape)
-            .background(MaterialTheme.colorScheme.primary)
-            .dpadFocusHighlight(
-                shape = CircleShape,
-                borderColor = MaterialTheme.colorScheme.onPrimary,
-                focusedTint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.18f),
-            )
+            // Matches the in-chat composer buttons: soft blue at rest, full
+            // signal blue when highlighted, plus a focus ring on DPAD focus.
+            .background(if (focused) ComposerButtonHighlight else ComposerButtonResting)
+            .onFocusChanged { focused = it.isFocused }
             .focusable()
             .onDpadAction { onClick(); true }
             .onPreviewKeyEvent { event ->
@@ -417,7 +421,7 @@ private fun ComposeButton(
         Icon(
             imageVector = Icons.Filled.Create,
             contentDescription = "New message",
-            tint = MaterialTheme.colorScheme.onPrimary,
+            tint = Color.White,
             modifier = Modifier.size(24.dp),
         )
     }

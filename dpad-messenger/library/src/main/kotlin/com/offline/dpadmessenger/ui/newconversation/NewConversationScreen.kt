@@ -115,13 +115,30 @@ fun NewConversationScreen(
         contactsLoading = false
     }
 
+    // The address book, presented names-first and alphabetically. A contact
+    // saved with a real name sorts A→Z at the top; an unsaved contact whose
+    // "name" is really just its phone number has no alphabetic label and sinks
+    // below the named ones. Without this, digits and "+" sort BEFORE letters in
+    // Unicode, so bare-number entries jumped to the top and buried real names
+    // past the MAX_RESULTS cap — the picker looked like "numbers only" on open
+    // until you started typing a name.
+    val orderedContacts = remember(contacts) {
+        contacts.sortedWith(
+            // true (name contains a letter) sorts ahead of false → named first.
+            compareByDescending<ContactEntry> { it.name.any(Char::isLetter) }
+                .thenBy { it.name.trim().lowercase() }
+                .thenBy { it.number },
+        )
+    }
+
     // Filtered view of the address book, capped at MAX_RESULTS — a DPAD list
     // longer than that is unusable anyway; typing narrows it. Letters match
-    // names; digits match numbers (formatting-insensitive).
-    val filtered = remember(query, contacts) {
+    // names; digits match numbers (formatting-insensitive). The names-first,
+    // A→Z order is inherited from [orderedContacts].
+    val filtered = remember(query, orderedContacts) {
         val q = query.trim()
-        val matches = if (q.isEmpty()) contacts
-        else contacts.filter { c ->
+        val matches = if (q.isEmpty()) orderedContacts
+        else orderedContacts.filter { c ->
             c.name.contains(q, ignoreCase = true) ||
                 (q.any(Char::isDigit) &&
                     c.number.filter(Char::isDigit).contains(q.filter(Char::isDigit)))

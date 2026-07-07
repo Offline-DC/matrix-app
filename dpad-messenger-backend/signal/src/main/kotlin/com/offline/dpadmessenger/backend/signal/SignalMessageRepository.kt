@@ -70,7 +70,8 @@ class SignalMessageRepository(
      *  with a number we don't already know resolves it to an ACI via CDSI.
      *  Null in mock/unit-test paths (unknown numbers then can't be started). */
     private val discovery: SignalContactDiscovery? = null,
-) : MessageRepository, MediaDownloader, AttachmentSender, ConversationStarter, ContactsSource, RetentionSettings, ThreadActions {
+) : MessageRepository, MediaDownloader, AttachmentSender, ConversationStarter, ContactsSource,
+    RetentionSettings, ThreadActions, com.offline.dpadmessenger.data.RemoteDeleteCapable {
 
     /** masterKey per group room id — learned from inbound group messages,
      *  required to send (the room id only carries the public group id). */
@@ -134,6 +135,16 @@ class SignalMessageRepository(
         displayName = account.phoneNumber,
         avatarColor = "#3A76F0",  // Signal blue
     )
+
+    /** True when [serviceId] is our own account (ACI or PNI) — the DM thread
+     *  keyed by it is "Note to Self". */
+    internal fun isSelfId(serviceId: String): Boolean {
+        val id = serviceId.removePrefix("PNI:").lowercase()
+        if (id == account.aci.lowercase()) return true
+        val pni = account.pni?.removePrefix("PNI:")?.lowercase()
+        return pni != null && id == pni
+    }
+
 
     private val rooms = MutableStateFlow<List<RoomSummary>>(emptyList())
     private val messagesByRoom = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
@@ -205,7 +216,13 @@ class SignalMessageRepository(
         mutedRooms.value = snap.mutedRooms
         rooms.value = snap.rooms.map { pr ->
             val msgs = snap.messages[pr.room.id].orEmpty()
-            RoomSummary(pr.room, lastMessage = msgs.maxByOrNull { it.timestampMs }, unreadCount = pr.unreadCount)
+            // Heal a persisted self-thread that predates Note-to-Self naming
+            // (it may have been saved under our own name/number).
+            val room = if (!pr.room.isGroup &&
+                pr.room.id.removePrefix("sig:dm:").let { isSelfId(it) } &&
+                pr.room.name != NOTE_TO_SELF
+            ) pr.room.copy(name = NOTE_TO_SELF) else pr.room
+            RoomSummary(room, lastMessage = msgs.maxByOrNull { it.timestampMs }, unreadCount = pr.unreadCount)
         }
         if (autoDelete.value) purgeOld()
     }
@@ -326,6 +343,24 @@ class SignalMessageRepository(
         }
     }
 
+    /** Re-send a message that previously failed: drop the failed bubble and
+     *  send its body again as a fresh optimistic SENDING bubble, preserving any
+     *  reply target (mirrors the Google Messages repo). Without this override
+     *  the UI's "Retry send" fell through to [MessageRepository]'s no-op default
+     *  and did nothing. Media resend isn't supported yet, so attachments are
+     *  left as-is. */
+    override suspend fun resendMessage(roomId: String, messageId: String) {
+        val failed = messagesByRoom.value[roomId]?.firstOrNull { it.id == messageId } ?: return
+        if (failed.status != MessageStatus.FAILED || !failed.isOutgoing) return
+        if (failed.attachment != null) return // media resend not supported yet
+        // Remove the failed bubble; sendMessage() appends a fresh SENDING one.
+        // (Any messagesByRoom change triggers the debounced auto-save.)
+        val current = messagesByRoom.value.toMutableMap()
+        current[roomId] = current[roomId].orEmpty().filterNot { it.id == messageId }
+        messagesByRoom.value = current
+        sendMessage(roomId, failed.body, failed.replyToId)
+    }
+
     /** Flip the status (and optionally timestamp) of an in-flight message. */
     private fun updateStatus(
         roomId: String,
@@ -373,7 +408,9 @@ class SignalMessageRepository(
         // Only our own messages can be remote-deleted.
         val msg = messagesByRoom.value[roomId]?.firstOrNull { it.id == messageId } ?: return
         if (!msg.isOutgoing) return
-        updateMessageInPlace(roomId, messageId) { it.copy(isDeleted = true, body = "") }
+        updateMessageInPlace(roomId, messageId) {
+            it.copy(isDeleted = true, body = "", attachment = null, reactions = emptyMap())
+        }
         val s = sender ?: return
         runCatching {
             if (isGroupRoom(roomId)) {
@@ -675,15 +712,17 @@ class SignalMessageRepository(
      *  opens (and the first send shows up in the room list). Returns the id. */
     private fun ensureDmRoom(serviceId: String, name: String): String {
         val roomId = "sig:dm:$serviceId"
+        // Our own thread is always "Note to Self", whatever the caller resolved.
+        val roomName = if (isSelfId(serviceId)) NOTE_TO_SELF else name
         if (rooms.value.none { it.room.id == roomId }) {
             if (userCache.value[serviceId] == null) {
                 userCache.value = userCache.value + (
-                    serviceId to User(id = serviceId, displayName = name, avatarColor = "#3A76F0")
+                    serviceId to User(id = serviceId, displayName = roomName, avatarColor = "#3A76F0")
                 )
             }
             val room = Room(
                 id = roomId,
-                name = name,
+                name = roomName,
                 memberIds = listOf(currentUser.id, serviceId),
                 isGroup = false,
                 avatarColor = "#3A76F0",
@@ -1008,6 +1047,14 @@ class SignalMessageRepository(
      * with sent-timestamp [targetTimestamp]. No-op if we don't have that
      * message locally (e.g. it predates this session).
      */
+    /** Canonicalize a DM room id (PNI → owning ACI) so interactive events
+     *  (reactions, edits, deletes) land in the unified thread even when the
+     *  envelope was addressed by the peer's PNI. Group room ids pass through. */
+    private fun canonicalRoomId(roomId: String): String {
+        val peer = roomId.removePrefix("sig:dm:")
+        return if (peer == roomId) roomId else "sig:dm:" + canonicalId(peer)
+    }
+
     internal fun applyIncomingReaction(
         roomId: String,
         reactorId: String,
@@ -1015,9 +1062,10 @@ class SignalMessageRepository(
         emoji: String,
         remove: Boolean,
     ) {
-        val target = findMessageByTimestamp(roomId, targetTimestamp) ?: return
+        val room = canonicalRoomId(roomId)
+        val target = findMessageByTimestamp(room, targetTimestamp) ?: return
         val updated = upsertReaction(target.reactions, reactorId, emoji, remove)
-        updateMessageInPlace(roomId, target.id) { it.copy(reactions = updated) }
+        updateMessageInPlace(room, target.id) { it.copy(reactions = updated) }
     }
 
     /** Apply an inbound edit: replace the body + stamp [editedAtMs]. */
@@ -1027,14 +1075,48 @@ class SignalMessageRepository(
         newBody: String,
         editedAtMs: Long,
     ) {
-        val target = findMessageByTimestamp(roomId, targetTimestamp) ?: return
-        updateMessageInPlace(roomId, target.id) { it.copy(body = newBody, editedAtMs = editedAtMs) }
+        val room = canonicalRoomId(roomId)
+        val target = findMessageByTimestamp(room, targetTimestamp) ?: return
+        updateMessageInPlace(room, target.id) { it.copy(body = newBody, editedAtMs = editedAtMs) }
     }
 
-    /** Apply an inbound "delete for everyone": tombstone the message. */
-    internal fun applyIncomingDelete(roomId: String, targetTimestamp: Long) {
-        val target = findMessageByTimestamp(roomId, targetTimestamp) ?: return
-        updateMessageInPlace(roomId, target.id) { it.copy(isDeleted = true, body = "") }
+    /**
+     * Apply an inbound "delete for everyone": tombstone the message.
+     *
+     * [authorServiceId] is who requested the delete (the envelope sender, or
+     * our own ACI for a sync transcript). Signal only allows deleting your OWN
+     * messages, so a delete whose author doesn't match the target's author is
+     * ignored — mirrors Signal-Android's RemoteDelete validation.
+     */
+    internal fun applyIncomingDelete(
+        roomId: String,
+        targetTimestamp: Long,
+        authorServiceId: String? = null,
+    ) {
+        val room = canonicalRoomId(roomId)
+        val target = findMessageByTimestamp(room, targetTimestamp)
+        if (target == null) {
+            android.util.Log.d(TAG, "delete: no local message @ $targetTimestamp in $room — skipping")
+            return
+        }
+        if (authorServiceId != null) {
+            val author = canonicalId(authorServiceId)
+            val authorOk =
+                if (author == currentUser.id) target.isOutgoing
+                else !target.isOutgoing && canonicalId(target.senderId) == author
+            if (!authorOk) {
+                android.util.Log.w(
+                    TAG,
+                    "delete: author mismatch (author=$author target.sender=${target.senderId} " +
+                        "outgoing=${target.isOutgoing}) — ignoring",
+                )
+                return
+            }
+        }
+        updateMessageInPlace(room, target.id) {
+            it.copy(isDeleted = true, body = "", attachment = null, reactions = emptyMap())
+        }
+        android.util.Log.d(TAG, "delete applied room=$room ts=$targetTimestamp")
     }
 
     /**
@@ -1182,9 +1264,13 @@ class SignalMessageRepository(
         applyIncomingEdit(roomId, targetTimestamp, newBody, editedAtMs)
     }
 
-    internal fun applyIncomingGroupDelete(masterKey: ByteArray, targetTimestamp: Long) {
+    internal fun applyIncomingGroupDelete(
+        masterKey: ByteArray,
+        targetTimestamp: Long,
+        authorServiceId: String? = null,
+    ) {
         val roomId = groups?.roomIdForMasterKey(masterKey) ?: return
-        applyIncomingDelete(roomId, targetTimestamp)
+        applyIncomingDelete(roomId, targetTimestamp, authorServiceId)
     }
 
     private fun ensureGroupRoom(roomId: String, seedMember: String?) {
@@ -1341,11 +1427,13 @@ class SignalMessageRepository(
         // Rename any existing DM room for this peer so the room list reflects
         // the new name. We deliberately don't *create* a room here — contact
         // sync delivers the entire address book, and we don't want to fill
-        // the UI with empty chats for every contact.
+        // the UI with empty chats for every contact. Our OWN storage-sync
+        // record must not rename Note to Self to our profile name/number.
         val roomId = "sig:dm:$canonical"
+        val roomName = if (isSelfId(canonical)) NOTE_TO_SELF else name
         rooms.value = rooms.value.map {
-            if (it.room.id == roomId && it.room.name != name) {
-                it.copy(room = it.room.copy(name = name))
+            if (it.room.id == roomId && it.room.name != roomName) {
+                it.copy(room = it.room.copy(name = roomName))
             } else it
         }
     }
@@ -1533,8 +1621,8 @@ class SignalMessageRepository(
         // name we have for the recipient (from storage/contact sync, or fallback).
         val existing = rooms.value.firstOrNull { it.room.id == roomId }
         if (existing == null) {
-            val resolvedName = userCache.value[recipient]?.displayName
-                ?: shortName(recipient)
+            val resolvedName = if (isSelfId(recipient)) NOTE_TO_SELF
+            else userCache.value[recipient]?.displayName ?: shortName(recipient)
             // Make sure the user cache has at least a placeholder so the
             // bubble's senderId lookup doesn't fall through to a raw UUID.
             if (userCache.value[recipient] == null) {
@@ -1646,5 +1734,7 @@ class SignalMessageRepository(
         /** Max chars of the parent body echoed into an outbound reply quote. */
         const val QUOTE_PREVIEW_MAX = 120
         private const val TAG = "SigRepo"
+        /** Display name of the DM thread keyed by our own account. */
+        const val NOTE_TO_SELF = "Note to Self"
     }
 }

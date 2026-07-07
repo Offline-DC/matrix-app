@@ -108,7 +108,23 @@ fun ChatScreen(
     val composerFr = remember { FocusRequester() }
     val lastBubbleFr = remember { FocusRequester() }
     val backBtnFr = remember { FocusRequester() }
+    // The reply/edit banner's Cancel X — first DPAD-Up stop from the composer
+    // while a banner is showing.
+    val bannerCancelFr = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
+
+    // Focus the most-recent bubble, retrying across a few frames: a bubble
+    // composed THIS frame isn't in the focus tree yet, so an immediate
+    // requestFocus silently no-ops (see onUpFromField below).
+    fun focusLastBubble() {
+        scope.launch {
+            repeat(8) {
+                withFrameNanos {}
+                val ok = runCatching { lastBubbleFr.requestFocus() }.isSuccess
+                if (ok) return@launch
+            }
+        }
+    }
 
     // Which bubble to refocus when the fullscreen media viewer closes — the one
     // whose photo/video was opened — so DPAD focus lands back where the user
@@ -228,8 +244,19 @@ fun ChatScreen(
                 replyTarget = replyTarget,
                 editTarget = editTarget,
                 senderNameFor = viewModel::senderName,
-                onCancelReply = viewModel::clearReply,
-                onCancelEdit = viewModel::clearEdit,
+                // Cancelling removes the banner (and the focused X with it) —
+                // hand focus back to the composer so it isn't dropped.
+                onCancelReply = {
+                    viewModel.clearReply()
+                    runCatching { composerFr.requestFocus() }
+                },
+                onCancelEdit = {
+                    viewModel.clearEdit()
+                    runCatching { composerFr.requestFocus() }
+                },
+                cancelFocusRequester = bannerCancelFr,
+                onUpFromCancel = { focusLastBubble() },
+                onDownFromCancel = { runCatching { composerFr.requestFocus() } },
             )
             DpadComposer(
                 onSend = viewModel::send,
@@ -237,18 +264,13 @@ fun ChatScreen(
                 prefillKey = editTarget?.id,
                 textFieldFocusRequester = composerFr,
                 onUpFromField = {
-                    // Move focus up to the most-recent bubble. If the user
-                    // JUST sent a message, that bubble was composed this frame
-                    // and isn't in the focus tree yet — requesting focus on it
-                    // immediately silently no-ops. Retry across a few frames
-                    // until it attaches (or we give up), so DPAD-Up reliably
-                    // lands on the new message instead of doing nothing.
-                    scope.launch {
-                        repeat(8) {
-                            withFrameNanos {}
-                            val ok = runCatching { lastBubbleFr.requestFocus() }.isSuccess
-                            if (ok) return@launch
-                        }
+                    // With a reply/edit banner up, DPAD-Up stops on its Cancel
+                    // X first (Up again continues to the timeline). Otherwise
+                    // go straight to the most-recent bubble.
+                    if (replyTarget != null || editTarget != null) {
+                        runCatching { bannerCancelFr.requestFocus() }
+                    } else {
+                        focusLastBubble()
                     }
                 },
                 onLeftFromField = { runCatching { backBtnFr.requestFocus() } },
@@ -277,11 +299,16 @@ fun ChatScreen(
     if (sel != null) {
         MessageContextSheet(
             message = sel,
-            // Texting (SMS/RCS) has no "edit sent message" operation, and
-            // delete-for-everyone isn't wired yet — both would silently do
-            // nothing, so don't offer them. (Reply + reactions remain.)
+            // Texting (SMS/RCS) has no "edit sent message" operation — it
+            // would silently do nothing, so don't offer it.
             canEdit = false,
-            canDelete = false,
+            // "Delete for everyone" — only for repos that actually implement
+            // it (Signal), only on our OWN non-deleted messages, and only
+            // within Signal's 24h delete-for-everyone window.
+            canDelete = viewModel.canDeleteForEveryone &&
+                sel.isOutgoing &&
+                !sel.isDeleted &&
+                (System.currentTimeMillis() - sel.timestampMs) < 24 * 60 * 60 * 1000L,
             onReact = { emoji -> viewModel.react(sel.id, emoji) },
             onReply = { viewModel.startReply(sel) },
             onEdit = { viewModel.startEdit(sel) },
@@ -341,6 +368,9 @@ private fun BannerRegion(
     senderNameFor: (String) -> String,
     onCancelReply: () -> Unit,
     onCancelEdit: () -> Unit,
+    cancelFocusRequester: FocusRequester? = null,
+    onUpFromCancel: (() -> Unit)? = null,
+    onDownFromCancel: (() -> Unit)? = null,
 ) {
     when {
         editTarget != null -> ReplyOrEditBanner(
@@ -348,6 +378,9 @@ private fun BannerRegion(
             senderName = senderNameFor(editTarget.senderId),
             bodyPreview = editTarget.body,
             onCancel = onCancelEdit,
+            cancelFocusRequester = cancelFocusRequester,
+            onUpFromCancel = onUpFromCancel,
+            onDownFromCancel = onDownFromCancel,
         )
         replyTarget != null -> ReplyOrEditBanner(
             kind = BannerKind.Reply,
@@ -355,8 +388,17 @@ private fun BannerRegion(
             // number (senderNameFor resolves an own-message senderId to the raw
             // E.164 since there's no contact entry for yourself).
             senderName = if (replyTarget.isOutgoing) "You" else senderNameFor(replyTarget.senderId),
-            bodyPreview = if (replyTarget.isDeleted) "Message deleted" else replyTarget.body,
+            bodyPreview = when {
+                replyTarget.isDeleted -> "Message deleted"
+                // Media-only parent → typed label instead of an empty line.
+                replyTarget.body.isBlank() ->
+                    com.offline.dpadmessenger.ui.components.mediaQuoteLabel(replyTarget.attachment)
+                else -> replyTarget.body
+            },
             onCancel = onCancelReply,
+            cancelFocusRequester = cancelFocusRequester,
+            onUpFromCancel = onUpFromCancel,
+            onDownFromCancel = onDownFromCancel,
         )
     }
 }

@@ -19,6 +19,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -36,6 +42,12 @@ fun ReplyOrEditBanner(
     bodyPreview: String,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
+    /** Lets the caller (composer DPAD-Up) land focus on the Cancel X. */
+    cancelFocusRequester: FocusRequester? = null,
+    /** DPAD-Up while the X is focused (→ last message bubble). */
+    onUpFromCancel: (() -> Unit)? = null,
+    /** DPAD-Down while the X is focused (→ back to the composer). */
+    onDownFromCancel: (() -> Unit)? = null,
 ) {
     val accent = MaterialTheme.colorScheme.primary
     Row(
@@ -58,7 +70,10 @@ fun ReplyOrEditBanner(
             Column {
                 Text(
                     text = when (kind) {
-                        BannerKind.Reply -> "Replying to $senderName"
+                        // Self-reply reads just "You" — "Replying to You" is
+                        // awkward (caller passes "You" for own messages).
+                        BannerKind.Reply ->
+                            if (senderName == "You") "You" else "Replying to $senderName"
                         BannerKind.Edit -> "Editing message"
                     },
                     style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
@@ -72,19 +87,40 @@ fun ReplyOrEditBanner(
                 )
             }
         }
-        CancelButton(onClick = onCancel)
+        CancelButton(
+            onClick = onCancel,
+            focusRequester = cancelFocusRequester,
+            onUp = onUpFromCancel,
+            onDown = onDownFromCancel,
+        )
     }
 }
 
 @Composable
-private fun CancelButton(onClick: () -> Unit) {
+private fun CancelButton(
+    onClick: () -> Unit,
+    focusRequester: FocusRequester? = null,
+    onUp: (() -> Unit)? = null,
+    onDown: (() -> Unit)? = null,
+) {
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
             .size(36.dp)
             .clip(CircleShape)
             .background(MaterialTheme.colorScheme.surface)
-            .dpadRow(onClick = onClick, shape = CircleShape),
+            // Route DPAD Up/Down explicitly: Up → last message bubble,
+            // Down → composer. Default focus search is unreliable across the
+            // LazyColumn boundary, so the caller supplies both hops.
+            .onPreviewKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when (event.key) {
+                    Key.DirectionUp -> { onUp?.invoke(); onUp != null }
+                    Key.DirectionDown -> { onDown?.invoke(); onDown != null }
+                    else -> false
+                }
+            }
+            .dpadRow(onClick = onClick, focusRequester = focusRequester, shape = CircleShape),
     ) {
         Icon(
             imageVector = Icons.Filled.Close,

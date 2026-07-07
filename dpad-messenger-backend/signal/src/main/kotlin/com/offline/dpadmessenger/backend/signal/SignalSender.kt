@@ -136,6 +136,42 @@ class SignalSender(
     private fun groupRoomId(target: GroupTarget): String? =
         groups?.roomIdForMasterKey(target.masterKey)
 
+    /** True when the DM target is our own account — "Note to Self". */
+    private fun isSelfSend(recipientServiceId: String): Boolean {
+        val id = recipientServiceId.removePrefix("PNI:").lowercase()
+        return id == account.aci.lowercase() ||
+            id == account.pni?.removePrefix("PNI:")?.lowercase()
+    }
+
+    /**
+     * Deliver a DM DataMessage + mirror it to our own linked devices.
+     *
+     * Note to Self is special-cased the way Signal-Android's MessageSender
+     * does it: there is NO DataMessage delivery to ourselves at all (the
+     * server rejects a payload addressed to the sending device, so a normal
+     * send can only fail). Instead the SyncMessage.Sent transcript IS the
+     * delivery — sibling devices thread it into their own Note to Self. For
+     * self-sends transcript failure is therefore a real send failure and
+     * propagates; for normal sends it's log-and-swallow (the recipient
+     * already got the message).
+     */
+    private suspend fun deliverDmWithSync(
+        recipientServiceId: String,
+        content: SignalServiceProtos.Content,
+        dataMessage: SignalServiceProtos.DataMessage,
+        timestamp: Long,
+        cert: SenderCertificate,
+    ) {
+        if (isSelfSend(recipientServiceId)) {
+            Log.d(TAG, "note-to-self: skipping DataMessage, sync transcript only @ $timestamp")
+            sendSentTranscript(account.aci, dataMessage, timestamp, cert)
+            return
+        }
+        encryptAndSendContent(recipientServiceId, content, timestamp, cert)
+        runCatching { sendSentTranscript(recipientServiceId, dataMessage, timestamp, cert) }
+            .onFailure { Log.w(TAG, "sent-transcript sync failed (recipient still got the message)", it) }
+    }
+
     /**
      * Send `body` to a single direct recipient identified by ACI/PNI.
      * Optionally carries a [quote] so the recipient renders it as a reply.
@@ -173,18 +209,8 @@ class SignalSender(
             .setDataMessage(dataMessage)
             .build()
 
-        encryptAndSendContent(recipientServiceId, content, timestamp, cert)
+        deliverDmWithSync(recipientServiceId, content, dataMessage, timestamp, cert)
         Log.d(TAG, "sent to $recipientServiceId @ $timestamp")
-
-        // Mirror the message back to our other linked devices (primary
-        // phone, desktop, etc.) via a SyncMessage.Sent transcript. Without
-        // this, the message lives only on this device + the recipient's
-        // device — the primary's chat history would diverge. Failure here
-        // shouldn't fail the user-visible send (the message DID go out to
-        // the recipient), so we log + swallow.
-        runCatching { sendSentTranscript(recipientServiceId, dataMessage, timestamp, cert) }
-            .onFailure { Log.w(TAG, "sent-transcript sync failed (recipient still got the message)", it) }
-
         return timestamp
     }
 
@@ -217,9 +243,7 @@ class SignalSender(
         val content = SignalServiceProtos.Content.newBuilder()
             .setDataMessage(dataMessage)
             .build()
-        encryptAndSendContent(recipientServiceId, content, timestamp, cert)
-        runCatching { sendSentTranscript(recipientServiceId, dataMessage, timestamp, cert) }
-            .onFailure { Log.w(TAG, "reaction sent-transcript sync failed", it) }
+        deliverDmWithSync(recipientServiceId, content, dataMessage, timestamp, cert)
         Log.d(TAG, "reaction '$emoji' (remove=$remove) → $recipientServiceId for $targetAuthorAci@$targetSentTimestamp")
         return timestamp
     }
@@ -246,9 +270,7 @@ class SignalSender(
         val content = SignalServiceProtos.Content.newBuilder()
             .setDataMessage(dataMessage)
             .build()
-        encryptAndSendContent(recipientServiceId, content, timestamp, cert)
-        runCatching { sendSentTranscript(recipientServiceId, dataMessage, timestamp, cert) }
-            .onFailure { Log.w(TAG, "delete sent-transcript sync failed", it) }
+        deliverDmWithSync(recipientServiceId, content, dataMessage, timestamp, cert)
         Log.d(TAG, "remote-delete → $recipientServiceId for @$targetSentTimestamp")
         return timestamp
     }
@@ -278,9 +300,16 @@ class SignalSender(
         val content = SignalServiceProtos.Content.newBuilder()
             .setEditMessage(edit)
             .build()
-        encryptAndSendContent(recipientServiceId, content, timestamp, cert)
-        runCatching { sendEditTranscript(recipientServiceId, edit, timestamp, cert) }
-            .onFailure { Log.w(TAG, "edit sent-transcript sync failed", it) }
+        if (isSelfSend(recipientServiceId)) {
+            // Note to Self: the edit transcript IS the delivery (see
+            // deliverDmWithSync) — no DataMessage to ourselves.
+            Log.d(TAG, "note-to-self edit: sync transcript only @ $timestamp")
+            sendEditTranscript(account.aci, edit, timestamp, cert)
+        } else {
+            encryptAndSendContent(recipientServiceId, content, timestamp, cert)
+            runCatching { sendEditTranscript(recipientServiceId, edit, timestamp, cert) }
+                .onFailure { Log.w(TAG, "edit sent-transcript sync failed", it) }
+        }
         Log.d(TAG, "edit → $recipientServiceId for @$targetSentTimestamp")
         return timestamp
     }
@@ -315,9 +344,7 @@ class SignalSender(
         val content = SignalServiceProtos.Content.newBuilder()
             .setDataMessage(dataMessage)
             .build()
-        encryptAndSendContent(recipientServiceId, content, timestamp, cert)
-        runCatching { sendSentTranscript(recipientServiceId, dataMessage, timestamp, cert) }
-            .onFailure { Log.w(TAG, "attachment sent-transcript sync failed", it) }
+        deliverDmWithSync(recipientServiceId, content, dataMessage, timestamp, cert)
         Log.d(TAG, "sent attachment (${uploaded.size}b, ${uploaded.contentType}) → $recipientServiceId @ $timestamp")
         return timestamp
     }

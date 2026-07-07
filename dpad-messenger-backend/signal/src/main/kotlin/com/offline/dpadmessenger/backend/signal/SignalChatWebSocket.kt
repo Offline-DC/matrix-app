@@ -437,8 +437,8 @@ class SignalChatWebSocket(
                 val targetTs = data.delete.targetSentTimestamp
                 scope.launch {
                     runCatching {
-                        if (groupKey != null) repository.applyIncomingGroupDelete(groupKey, targetTs)
-                        else repository.applyIncomingDelete(roomId, targetTs)
+                        if (groupKey != null) repository.applyIncomingGroupDelete(groupKey, targetTs, sourceServiceId)
+                        else repository.applyIncomingDelete(roomId, targetTs, sourceServiceId)
                     }.onFailure { Log.w(TAG, "applyIncomingDelete failed", it) }
                 }
                 return
@@ -636,8 +636,8 @@ class SignalChatWebSocket(
             val targetTs = data.delete.targetSentTimestamp
             scope.launch {
                 runCatching {
-                    if (groupKey != null) repository.applyIncomingGroupDelete(groupKey, targetTs)
-                    else if (!destination.isNullOrBlank()) repository.applyIncomingDelete("sig:dm:$destination", targetTs)
+                    if (groupKey != null) repository.applyIncomingGroupDelete(groupKey, targetTs, selfAci)
+                    else if (!destination.isNullOrBlank()) repository.applyIncomingDelete("sig:dm:$destination", targetTs, selfAci)
                 }.onFailure { Log.w(TAG, "sent-transcript delete failed", it) }
             }
             return

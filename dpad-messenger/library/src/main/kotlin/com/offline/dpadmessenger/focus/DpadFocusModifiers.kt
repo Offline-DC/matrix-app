@@ -19,10 +19,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.isUnspecified
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -76,6 +78,29 @@ fun Modifier.dpadFocusHighlight(
         // BasicTextField inside a styled Box — still draws the highlight on
         // the wrapper.
         .onFocusChanged { focused = it.hasFocus }
+}
+
+/**
+ * A d-pad focus ring: a stroked circle sitting just OUTSIDE this element's
+ * bounds — a small [gap], then the ring — drawn only when [focused]. Unlike
+ * [dpadFocusHighlight], which borders the shape's own edge, this renders a
+ * distinct halo outside a filled button so focus reads clearly on top of a
+ * solid fill. Chain it BEFORE any `.clip()` so the outer ring isn't clipped.
+ *
+ * @param color the ring color (typically the highlight/accent).
+ * @param ringWidth stroke width of the ring.
+ * @param gap space between the element's edge and the ring.
+ */
+fun Modifier.dpadFocusRing(
+    focused: Boolean,
+    color: Color,
+    ringWidth: Dp = 3.dp,
+    gap: Dp = 2.dp,
+): Modifier = drawBehind {
+    if (!focused) return@drawBehind
+    val stroke = ringWidth.toPx()
+    val radius = size.minDimension / 2f + gap.toPx() + stroke / 2f
+    drawCircle(color = color, radius = radius, style = Stroke(width = stroke))
 }
 
 /**
