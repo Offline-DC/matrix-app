@@ -19,6 +19,11 @@ internal val SignalGreen = Color(0xFF3AA467)
 // Icons stay white on both.
 internal val ComposerButtonResting = Color(0xFF7FA3DA)
 internal val ComposerButtonHighlight = Color(0xFF1B74E4)
+// Neutral grey for the "+" attach button, so it reads as a secondary action
+// distinct from the blue Send button (matches how iMessage greys the "+").
+// A mid grey (iOS systemGray3-ish) so it stays visible on the light composer
+// surface; the focus ring still marks DPAD selection.
+internal val ComposerButtonNeutral = Color(0xFFC7C7CC)
 
 internal val LightBg = Color(0xFFFFFFFF)
 internal val LightSurface = Color(0xFFF6F6F8)
@@ -48,3 +53,13 @@ internal val IMessageReceivedLight = Color(0xFFE9E9EB)
 internal val IMessageReceivedDark = Color(0xFF26262B)
 internal val IMessageAccentLight = Color(0xFF007AFF)
 internal val IMessageAccentDark = Color(0xFF0A84FF)
+
+// iMessage renders every initials-avatar as the same neutral gray circle (it
+// doesn't color-code contacts), so the skin overrides the per-contact avatar
+// color with this single iOS system gray.
+internal val IMessageAvatarGray = Color(0xFF8E8E93)
+
+// DPAD focus outline for the blue iMessage SENT bubble. A white ring looked
+// harsh; a very dark navy reads as a deeper shade of the bubble instead, so the
+// focus highlight looks integrated.
+internal val IMessageFocusBorder = Color(0xFF002147)

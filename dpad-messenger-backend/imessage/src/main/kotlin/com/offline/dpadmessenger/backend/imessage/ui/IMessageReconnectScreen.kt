@@ -5,7 +5,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -13,6 +12,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.offline.dpadmessenger.ui.components.DpadButton
 
 /**
  * Shown when the relay link drops and can't be auto-recovered (the transport
@@ -30,13 +30,17 @@ fun IMessageReconnectScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("iMessage disconnected", style = MaterialTheme.typography.headlineSmall)
+        Text("smart txt disconnected", style = MaterialTheme.typography.headlineSmall)
         Text(
-            "The connection to the relay was lost and couldn't be refreshed " +
-                "automatically. Reconnect to keep sending and receiving.",
+            "The connection was lost and couldn't be refreshed automatically. " +
+                "Reconnect to keep sending and receiving.",
             style = MaterialTheme.typography.bodyMedium,
             textAlign = TextAlign.Center,
         )
-        Button(onClick = onReconnect, modifier = Modifier.fillMaxWidth()) { Text("Reconnect") }
+        DpadButton(
+            text = "Reconnect",
+            onClick = onReconnect,
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }

@@ -29,7 +29,13 @@ fun InitialsAvatar(
     modifier: Modifier = Modifier,
     size: Dp = 44.dp,
 ) {
-    val bg = parseHexColor(colorHex)
+    // iMessage doesn't color-code contacts — every avatar is the same neutral
+    // gray circle. In that skin, ignore the per-contact color; otherwise use it.
+    val bg = if (com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors.current.imessage) {
+        com.offline.dpadmessenger.ui.theme.IMessageAvatarGray
+    } else {
+        parseHexColor(colorHex)
+    }
     Box(
         modifier = modifier
             .size(size)

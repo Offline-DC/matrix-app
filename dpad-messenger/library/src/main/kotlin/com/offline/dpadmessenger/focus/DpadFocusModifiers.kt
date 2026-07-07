@@ -23,6 +23,9 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.isUnspecified
@@ -101,6 +104,40 @@ fun Modifier.dpadFocusRing(
     val stroke = ringWidth.toPx()
     val radius = size.minDimension / 2f + gap.toPx() + stroke / 2f
     drawCircle(color = color, radius = radius, style = Stroke(width = stroke))
+}
+
+/**
+ * The rounded-rectangle sibling of [dpadFocusRing]: a stroked rounded rect
+ * sitting just OUTSIDE this element's bounds, drawn only when [focused]. Use it
+ * on wide/pill-shaped focusable elements (buttons, bubbles) where a circular
+ * ring would be wrong. Chain it BEFORE any `.clip()`/`.background()` so the
+ * outset ring isn't clipped away. Same "halo on top of a solid fill" role the
+ * circular ring plays for round buttons.
+ *
+ * @param color the ring color (typically the accent/highlight).
+ * @param cornerRadius corner radius of the element being ringed (the ring's own
+ *                     radius is expanded to stay concentric).
+ * @param ringWidth stroke width of the ring.
+ * @param gap space between the element's edge and the ring.
+ */
+fun Modifier.dpadFocusRingRect(
+    focused: Boolean,
+    color: Color,
+    cornerRadius: Dp,
+    ringWidth: Dp = 3.dp,
+    gap: Dp = 2.dp,
+): Modifier = drawBehind {
+    if (!focused) return@drawBehind
+    val stroke = ringWidth.toPx()
+    val outset = gap.toPx() + stroke / 2f
+    val r = cornerRadius.toPx() + outset
+    drawRoundRect(
+        color = color,
+        topLeft = Offset(-outset, -outset),
+        size = Size(size.width + outset * 2f, size.height + outset * 2f),
+        cornerRadius = CornerRadius(r, r),
+        style = Stroke(width = stroke),
+    )
 }
 
 /**

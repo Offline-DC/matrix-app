@@ -32,10 +32,10 @@ internal class IMessageNotifier(context: Context) {
         if (mgr.getNotificationChannel(CHANNEL_ID) != null) return
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "iMessage",
+            "smart txt",
             NotificationManager.IMPORTANCE_HIGH,
         ).apply {
-            description = "Incoming iMessages"
+            description = "Incoming smart txt"
             enableVibration(true)
             enableLights(true)
             setShowBadge(true)
@@ -56,7 +56,11 @@ internal class IMessageNotifier(context: Context) {
 
         val me = Person.Builder().setName("You").build()
         val style = NotificationCompat.MessagingStyle(me)
-            .setConversationTitle(title)
+            // Only set a conversation title when it differs from the sender
+            // (i.e. a group). For a 1:1 the title IS the sender, and setting
+            // both makes the launcher's notification list render the name twice
+            // ("Sam Rivera: Sam Rivera"). Mirrors GoogleMessagesNotifier.
+            .setConversationTitle(title.takeIf { it != sender })
             .setGroupConversation(false)
         lines.forEach { line ->
             val person = Person.Builder().setName(line.sender).build()
@@ -66,6 +70,12 @@ internal class IMessageNotifier(context: Context) {
         val builder = NotificationCompat.Builder(ctx, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.sym_action_chat)
             .setStyle(style)
+            // Also set the legacy title/text fields. MessagingStyle populates its
+            // own structures, but the launcher's notifications page + flip-phone
+            // cover displays read contentTitle/contentText from the extras — so
+            // the name shows once, from here. Mirrors GoogleMessagesNotifier.
+            .setContentTitle(title)
+            .setContentText(body)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             // Group all new-message notifications the way OpenBubbles/BlueBubbles

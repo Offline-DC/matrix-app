@@ -112,7 +112,7 @@ private fun ModeBanner(onLinkSignal: () -> Unit, onConnectIMessage: () -> Unit) 
             Text("Link Signal device")
         }
         Button(onClick = onConnectIMessage, modifier = Modifier.fillMaxWidth()) {
-            Text("Connect iMessage relay")
+            Text("Connect smart txt relay")
         }
     }
 }
@@ -129,7 +129,7 @@ private fun IMessageConnectScreen(
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Text(
-            text = "Connect to your imessage-relay daemon. It handles the dumb file, " +
+            text = "Connect to your smart txt relay daemon. It handles the dumb file, " +
                 "iCloud login and 2FA (OpenBubbles-style); this phone is a thin client.",
             style = MaterialTheme.typography.labelSmall,
         )

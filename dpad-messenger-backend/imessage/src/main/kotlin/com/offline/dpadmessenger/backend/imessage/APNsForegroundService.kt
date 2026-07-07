@@ -55,7 +55,7 @@ class APNsForegroundService : Service() {
     private fun buildNotification(): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("iMessage")
+            .setContentTitle("smart txt")
             .setContentText("Connected")
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -68,9 +68,9 @@ class APNsForegroundService : Service() {
         mgr.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
-                "iMessage connection",
+                "smart txt connection",
                 NotificationManager.IMPORTANCE_LOW,
-            ).apply { description = "Keeps iMessage connected in the background" },
+            ).apply { description = "Keeps smart txt connected in the background" },
         )
     }
 

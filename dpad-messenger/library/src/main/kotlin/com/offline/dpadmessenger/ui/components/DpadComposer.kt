@@ -67,6 +67,7 @@ import com.offline.dpadmessenger.focus.dpadFocusHighlight
 import com.offline.dpadmessenger.focus.dpadFocusRing
 import com.offline.dpadmessenger.focus.onDpadAction
 import com.offline.dpadmessenger.ui.theme.ComposerButtonHighlight
+import com.offline.dpadmessenger.ui.theme.ComposerButtonNeutral
 import com.offline.dpadmessenger.ui.theme.ComposerButtonResting
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 
@@ -520,9 +521,11 @@ private fun AttachButton(
         modifier = Modifier
             .size(44.dp)
             .focusRequester(focusRequester)
-            .dpadFocusRing(focused, ComposerButtonHighlight)
+            // At rest it blends into the composer — same grey as the input bar —
+            // so it reads as a bare "+" with no circle. Only on DPAD focus does
+            // the grey circle appear to mark selection (no blue, unlike Send).
             .clip(CircleShape)
-            .background(if (focused) ComposerButtonHighlight else ComposerButtonResting)
+            .background(if (focused) ComposerButtonNeutral else MaterialTheme.colorScheme.surfaceVariant)
             .onFocusChanged { focused = it.isFocused }
             .focusable()
             .onDpadAction { onClick(); true }
@@ -538,7 +541,7 @@ private fun AttachButton(
         Icon(
             imageVector = Icons.Filled.Add,
             contentDescription = "Attach photo or video",
-            tint = Color.White,
+            tint = MaterialTheme.colorScheme.onSurface,
         )
     }
 }

@@ -3,9 +3,11 @@ package com.offline.dpadmessenger.ui.components
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Image
@@ -25,6 +27,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -62,6 +65,7 @@ import com.offline.dpadmessenger.focus.DpadFireGate
 import com.offline.dpadmessenger.focus.OkKeys
 import com.offline.dpadmessenger.focus.dpadFocusHighlight
 import com.offline.dpadmessenger.focus.onDpadAction
+import com.offline.dpadmessenger.ui.theme.IMessageFocusBorder
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 import com.offline.dpadmessenger.ui.util.formatTimeShort
 
@@ -190,6 +194,9 @@ fun MessageBubble(
             // Avoids a fixed max-width that would overflow tiny screens.
             modifier = Modifier.fillMaxWidth(0.82f),
         ) {
+            // Wrapper so the iMessage tapback badge can overlap the bubble's top
+            // corner (it's drawn outside the bubble's own clip).
+            Box {
             Box(
                 modifier = Modifier
                     // Background/clip BEFORE the click handlers so the focus
@@ -198,7 +205,21 @@ fun MessageBubble(
                     .background(bubbleBrush)
                     .then(extraFocusRequesters.fold(Modifier as Modifier) { acc, fr -> acc.focusRequester(fr) })
                     .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
-                    .dpadFocusHighlight(shape = bubbleShape)
+                    // On the blue iMessage outgoing bubble the default primary
+                    // (blue) halo blends into the fill; outline it in a very dark
+                    // navy (a deeper shade of the bubble) so the DPAD focus state
+                    // reads clearly without the harsh white ring. Incoming bubbles
+                    // — and every bubble in the Signal/default skin, whose pale
+                    // outgoing fill already contrasts with the blue border — keep
+                    // the primary border.
+                    .dpadFocusHighlight(
+                        shape = bubbleShape,
+                        borderColor = if (isOutgoing && colors.imessage) IMessageFocusBorder
+                            else Color.Unspecified,
+                        focusedTint = if (isOutgoing && colors.imessage)
+                            IMessageFocusBorder.copy(alpha = 0.18f)
+                            else Color.Unspecified,
+                    )
                     // Read-scroll: when this bubble is taller than the chat
                     // viewport, DPAD Up/Down nudges the list to reveal the
                     // clipped top/bottom of THIS bubble (a chunk per press)
@@ -406,6 +427,18 @@ fun MessageBubble(
                     }
                 }
             }
+                // iMessage tapback: reactions overlap the bubble's top corner
+                // (BlueBubbles/iMessage style) instead of a chip row below it.
+                if (colors.imessage && message.reactions.isNotEmpty() && !message.isDeleted) {
+                    TapbackOverlay(
+                        reactions = message.reactions,
+                        isOutgoing = isOutgoing,
+                        modifier = Modifier.align(
+                            if (isOutgoing) Alignment.TopStart else Alignment.TopEnd,
+                        ),
+                    )
+                }
+            }
             // iMessage: the delivery receipt sits BELOW the bubble, right-aligned
             // and gray (like real iMessage), so it never widens the bubble.
             if (colors.imessage && isOutgoing && message.status != MessageStatus.SENT &&
@@ -422,7 +455,9 @@ fun MessageBubble(
                     modifier = Modifier.padding(top = 2.dp, end = 2.dp),
                 )
             }
-            if (message.reactions.isNotEmpty() && !message.isDeleted) {
+            // Non-iMessage skins keep the reaction chip row below the bubble;
+            // the iMessage skin renders them as a corner tapback overlay above.
+            if (!colors.imessage && message.reactions.isNotEmpty() && !message.isDeleted) {
                 Spacer(Modifier.padding(top = 4.dp))
                 ReactionsRow(
                     reactions = message.reactions,
@@ -526,6 +561,45 @@ private fun ReactionsRow(
                     style = MaterialTheme.typography.labelSmall,
                     color = if (isMine) accent else LocalDpadMessengerColors.current.mutedText,
                 )
+            }
+        }
+    }
+}
+
+/**
+ * iMessage/BlueBubbles-style "tapback": reactions rendered as a small badge
+ * overlapping the bubble's top corner (top-leading on your outgoing bubble,
+ * top-trailing on an incoming one) rather than a chip row below. Decorative —
+ * not focusable.
+ */
+@Composable
+private fun TapbackOverlay(
+    reactions: Map<String, List<String>>,
+    isOutgoing: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalDpadMessengerColors.current
+    Row(
+        // Nudge the badge up and outward so it straddles the bubble's corner.
+        modifier = modifier.offset(
+            x = if (isOutgoing) (-10).dp else 10.dp,
+            y = (-10).dp,
+        ),
+        horizontalArrangement = Arrangement.spacedBy((-8).dp),
+    ) {
+        // One badge per distinct emoji (iMessage stacks tapbacks by type). The
+        // grey fill + surface-colored outline reads on both the blue outgoing
+        // bubble and the neutral incoming one.
+        reactions.keys.take(3).forEach { emoji ->
+            Box(
+                modifier = Modifier
+                    .size(22.dp)
+                    .clip(CircleShape)
+                    .background(colors.incomingBubble)
+                    .border(1.5.dp, MaterialTheme.colorScheme.surface, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(emoji, style = MaterialTheme.typography.labelSmall)
             }
         }
     }
