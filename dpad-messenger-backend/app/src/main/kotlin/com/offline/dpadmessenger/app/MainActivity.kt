@@ -47,10 +47,10 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             val s = vm.state.collectAsState().value
-            // Use the iMessage/BlueBubbles skin whenever the iMessage backend is
+            // Use the SmartTxt/BlueBubbles skin whenever the SmartTxt backend is
             // the active conversation source; Signal/Mock keep the default look.
-            val imessage = (s as? RepoState.Ready)?.mode == BackendMode.IMessage
-            DpadMessengerTheme(imessage = imessage) {
+            val smarttxt = (s as? RepoState.Ready)?.mode == BackendMode.SmartTxt
+            DpadMessengerTheme(smarttxt = smarttxt) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     when (s) {
                         RepoState.Loading -> LoadingScreen()
@@ -74,32 +74,32 @@ private fun LoadingScreen() {
 @Composable
 private fun ReadyScreen(state: RepoState.Ready, vm: AppViewModel) {
     // In Mock mode a small header lets the user connect a real account (Signal
-    // or the iMessage relay). Once a real backend is live the user lives entirely
-    // inside the shared DpadMessengerApp UI (same UI for Signal and iMessage).
+    // or the SmartTxt relay). Once a real backend is live the user lives entirely
+    // inside the shared DpadMessengerApp UI (same UI for Signal and SmartTxt).
     if (state.mode == BackendMode.Mock) {
-        var showImessageConnect by remember { mutableStateOf(false) }
+        var showSmarttxtConnect by remember { mutableStateOf(false) }
         Column(modifier = Modifier.fillMaxSize()) {
-            if (showImessageConnect) {
-                IMessageConnectScreen(
-                    onConnect = { url, token -> vm.useIMessageBackend(url, token) },
-                    onCancel = { showImessageConnect = false },
+            if (showSmarttxtConnect) {
+                SmartTxtConnectScreen(
+                    onConnect = { url, token -> vm.useSmartTxtBackend(url, token) },
+                    onCancel = { showSmarttxtConnect = false },
                 )
             } else {
                 ModeBanner(
                     onLinkSignal = vm::linkSignalDevice,
-                    onConnectIMessage = { showImessageConnect = true },
+                    onConnectSmartTxt = { showSmarttxtConnect = true },
                 )
             }
             DpadMessengerApp(repository = state.repository, modifier = Modifier.weight(1f))
         }
     } else {
-        // Signal AND iMessage both render through the shared Signal-like UI.
+        // Signal AND SmartTxt both render through the shared Signal-like UI.
         DpadMessengerApp(repository = state.repository)
     }
 }
 
 @Composable
-private fun ModeBanner(onLinkSignal: () -> Unit, onConnectIMessage: () -> Unit) {
+private fun ModeBanner(onLinkSignal: () -> Unit, onConnectSmartTxt: () -> Unit) {
     Column(
         modifier = Modifier.fillMaxWidth().padding(8.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -111,14 +111,14 @@ private fun ModeBanner(onLinkSignal: () -> Unit, onConnectIMessage: () -> Unit) 
         Button(onClick = onLinkSignal, modifier = Modifier.fillMaxWidth()) {
             Text("Link Signal device")
         }
-        Button(onClick = onConnectIMessage, modifier = Modifier.fillMaxWidth()) {
+        Button(onClick = onConnectSmartTxt, modifier = Modifier.fillMaxWidth()) {
             Text("Connect smart txt relay")
         }
     }
 }
 
 @Composable
-private fun IMessageConnectScreen(
+private fun SmartTxtConnectScreen(
     onConnect: (String, String?) -> Unit,
     onCancel: () -> Unit,
 ) {

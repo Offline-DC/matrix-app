@@ -2,7 +2,7 @@
 
 Runs the nac emulation off-device (the flip phone can't emulate an x86-64 Apple
 binary) and serves validation data over the exact HTTP contract the Android
-client speaks (`imessage/.../relay/HttpValidationDataRelay.kt`):
+client speaks (`smarttxt/.../relay/HttpValidationDataRelay.kt`):
 
     GET  /health           -> 200 {"status":"ok"}
     POST /validation-data  -> 200 {"validationDataB64": "<base64>"}
@@ -113,7 +113,7 @@ def make_handler(gen: Generator, token: str | None):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="iMessage validation-data relay (nac emulation)")
+    p = argparse.ArgumentParser(description="SmartTxt validation-data relay (nac emulation)")
     p.add_argument("--dumb", required=True, help="path to the OABS dumb file (base64)")
     p.add_argument("--binary", required=True, help="path to the fat IMDAppleServices binary")
     p.add_argument("--host", default="127.0.0.1")

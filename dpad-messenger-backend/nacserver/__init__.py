@@ -1,4 +1,4 @@
-"""nacserver — an open validation-data ("nac"/absinthe) relay for iMessage.
+"""nacserver — an open validation-data ("nac"/absinthe) relay for SmartTxt.
 
 Runs Apple's obfuscated validation-data generator under CPU emulation and serves
 the result over the ValidationDataRelay HTTP contract. See README.md and

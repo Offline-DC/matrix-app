@@ -17,18 +17,18 @@ import androidx.compose.ui.graphics.Color
 data class DpadMessengerColors(
     val outgoingBubble: Color,
     /** Gradient top of the outgoing bubble. Equal to [outgoingBubble] ⇒ flat.
-     *  For the iMessage skin this is a lighter blue, giving the classic gradient. */
+     *  For the SmartTxt skin this is a lighter blue, giving the classic gradient. */
     val outgoingBubbleTop: Color,
     val incomingBubble: Color,
     /** Text color on an INCOMING bubble. */
     val onBubble: Color,
-    /** Text color on an OUTGOING bubble (white on the blue iMessage bubble). */
+    /** Text color on an OUTGOING bubble (white on the blue SmartTxt bubble). */
     val onOutgoingBubble: Color,
     val divider: Color,
     val mutedText: Color,
-    /** True for the iMessage/BlueBubbles skin — switches send-status to
+    /** True for the SmartTxt/BlueBubbles skin — switches send-status to
      *  "Delivered"/"Read" words and in-bubble muted text to translucent white. */
-    val imessage: Boolean = false,
+    val smarttxt: Boolean = false,
 )
 
 val LocalDpadMessengerColors = staticCompositionLocalOf {
@@ -51,26 +51,26 @@ val LocalDpadMessengerColors = staticCompositionLocalOf {
 @Composable
 fun DpadMessengerTheme(
     darkTheme: Boolean? = null,
-    /** When true, use the iMessage/BlueBubbles skin (blue gradient bubbles, iOS
+    /** When true, use the SmartTxt/BlueBubbles skin (blue gradient bubbles, iOS
      *  system-blue accent, "Delivered"/"Read" receipts). Set by the host app when
-     *  the iMessage backend is the active conversation source. */
-    imessage: Boolean = false,
+     *  the SmartTxt backend is the active conversation source. */
+    smarttxt: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     val effectiveDark = darkTheme ?: isSystemInDarkTheme()
-    DpadMessengerThemeInternal(darkTheme = effectiveDark, imessage = imessage, content = content)
+    DpadMessengerThemeInternal(darkTheme = effectiveDark, smarttxt = smarttxt, content = content)
 }
 
 @Composable
 private fun DpadMessengerThemeInternal(
     darkTheme: Boolean,
-    imessage: Boolean,
+    smarttxt: Boolean,
     content: @Composable () -> Unit,
 ) {
-    // Accent: iOS system blue for iMessage, Signal blue otherwise.
+    // Accent: iOS system blue for SmartTxt, Signal blue otherwise.
     val accent = when {
-        imessage && darkTheme -> IMessageAccentDark
-        imessage -> IMessageAccentLight
+        smarttxt && darkTheme -> SmartTxtAccentDark
+        smarttxt -> SmartTxtAccentLight
         darkTheme -> SignalBlue
         else -> SignalBlueDark
     }
@@ -100,25 +100,25 @@ private fun DpadMessengerThemeInternal(
     }
 
     val messengerColors = when {
-        imessage && darkTheme -> DpadMessengerColors(
-            outgoingBubble = IMessageSentDark,
-            outgoingBubbleTop = IMessageSentTopDark,
-            incomingBubble = IMessageReceivedDark,
+        smarttxt && darkTheme -> DpadMessengerColors(
+            outgoingBubble = SmartTxtSentDark,
+            outgoingBubbleTop = SmartTxtSentTopDark,
+            incomingBubble = SmartTxtReceivedDark,
             onBubble = DarkOnSurface,
             onOutgoingBubble = Color.White,
             divider = DarkDivider,
             mutedText = DarkOnSurfaceMuted,
-            imessage = true,
+            smarttxt = true,
         )
-        imessage -> DpadMessengerColors(
-            outgoingBubble = IMessageSentLight,
-            outgoingBubbleTop = IMessageSentTopLight,
-            incomingBubble = IMessageReceivedLight,
+        smarttxt -> DpadMessengerColors(
+            outgoingBubble = SmartTxtSentLight,
+            outgoingBubbleTop = SmartTxtSentTopLight,
+            incomingBubble = SmartTxtReceivedLight,
             onBubble = LightOnSurface,
             onOutgoingBubble = Color.White,
             divider = LightDivider,
             mutedText = LightOnSurfaceMuted,
-            imessage = true,
+            smarttxt = true,
         )
         darkTheme -> DpadMessengerColors(
             outgoingBubble = OutgoingBubbleDark,

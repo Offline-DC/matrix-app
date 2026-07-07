@@ -1,10 +1,10 @@
-# Progress — iMessage backend + absinthe reverse engineering
+# Progress — SmartTxt backend + absinthe reverse engineering
 
-Branch: `feat/imessage-backend`  ·  last updated: 2026-07-01
+Branch: `feat/smarttxt-backend`  ·  last updated: 2026-07-01
 
 Two pieces of work landed on this branch:
 
-1. **Migrated the iMessage backend into `dpad-messenger-backend`** so it lives
+1. **Migrated the SmartTxt backend into `dpad-messenger-backend`** so it lives
    next to Signal and Google Messages against the shared `dpad-messenger` UI.
 2. **Reverse-engineered Apple's validation-data ("nac" / absinthe) engine** and
    implemented it — verified working end-to-end against the real Apple binary
@@ -16,13 +16,13 @@ Two pieces of work landed on this branch:
 
 | Area | State |
 |---|---|
-| `:imessage` module migrated + registered in the Gradle build | ✅ done |
-| `BackendConfig.IMessageNative` added to `:core` | ✅ done |
+| `:smarttxt` module migrated + registered in the Gradle build | ✅ done |
+| `BackendConfig.SmartTxtNative` added to `:core` | ✅ done |
 | Absinthe/nac reverse engineering | ✅ **working, verified** |
 | `nacserver/` — runnable validation-data relay (Python) | ✅ verified (real binary + real identity → valid 389-byte blob) |
 | `absinthe/` — Rust crate (drop-in for `open-absinthe::nac`) | ✅ core unit-tested green; emulator behind `--features emulate` |
 | Relay deployment (where it runs) | ⬜ **open decision** — see "What's left" |
-| Actual iMessage registration (Apple ID + 2FA, rustpush side) | ⬜ downstream, not started |
+| Actual SmartTxt registration (Apple ID + 2FA, rustpush side) | ⬜ downstream, not started |
 | Committed to git | ⬜ left uncommitted in the working tree (per request) |
 
 ---
@@ -30,18 +30,18 @@ Two pieces of work landed on this branch:
 ## Part 1 — the migration
 
 The standalone `imessage-app` repo was built to mirror the gmessages/signal
-pattern already (same package namespace `com.offline.dpadmessenger.backend.imessage`,
+pattern already (same package namespace `com.offline.dpadmessenger.backend.smarttxt`,
 same composite-build wiring, same `:core`/`:app` shape), so it dropped in
 cleanly:
 
-- Copied the `:imessage` module (rustpush-over-JNI backend + its own Compose
-  setup/chat-gate UI) into `dpad-messenger-backend/imessage/`.
-- `include(":imessage")` in `settings.gradle.kts`.
-- Merged `IMessageNative` into `:core`'s sealed `BackendConfig` (kept every
+- Copied the `:smarttxt` module (rustpush-over-JNI backend + its own Compose
+  setup/chat-gate UI) into `dpad-messenger-backend/smarttxt/`.
+- `include(":smarttxt")` in `settings.gradle.kts`.
+- Merged `SmartTxtNative` into `:core`'s sealed `BackendConfig` (kept every
   existing Matrix/Signal variant).
 - Fixed a latent compile bug this exposed: `MatrixBackendFactory`'s
   `when(config)` was exhaustive-without-`else` — added `else -> return null`.
-- Brought the native/RE scaffolding across (`imessage-ffi/`, `relay-reference/`,
+- Brought the native/RE scaffolding across (`smarttxt-ffi/`, `relay-reference/`,
   the plan + protocol docs) and fixed relative paths.
 - `imessage-app` left untouched as a backup.
 
@@ -135,7 +135,7 @@ internet access at registration/renewal (that's the one online dependency —
   Fly.io / Railway — **not** merged into `offline-dc-twilio` (different runtime,
   Heroku only routes the `web` process, and it's a production Stripe/Twilio
   service — keep blast radius isolated). Optionally add a thin
-  `POST /imessage/validation-data` proxy route in `offline-dc-twilio` so the
+  `POST /smarttxt/validation-data` proxy route in `offline-dc-twilio` so the
   phone uses the existing `offline.community` domain with existing auth, while
   the risky workload stays in its own service.
 - **Binary provenance.** Using the pinned build (already verified) works today.
@@ -144,7 +144,7 @@ internet access at registration/renewal (that's the one online dependency —
 - **Identity.** Confirm the `dumb` file is a valid Mac fingerprint you're OK
   registering with (ideally the Mac mini's own). Rotate/add more if wanted.
 - **Actual registration (downstream, rustpush side).** Apple ID + one-time 2FA,
-  the `register` call signing (push + auth keys), and the `IMessageRenewalWorker`
+  the `register` call signing (push + auth keys), and the `SmartTxtRenewalWorker`
   cadence. Validation data is done; this is the next layer.
 - **Rust `emulate` feature** hasn't been compiled here (needs libunicorn/cmake);
   it mirrors the verified Python 1:1 and should be built + smoke-tested on a dev
@@ -159,5 +159,5 @@ are `.gitignore`d. Keep it that way.
 - `absinthe/` — Rust crate.
 - `ABSINTHE_RE_FINDINGS.md` — the RE writeup + proof.
 - `ABSINTHE_REVERSE_ENGINEERING.md` — operator "how to run it" guide.
-- `IMESSAGE_NATIVE_BACKEND_PLAN.md` — the full native-backend plan (context).
-- `imessage/` — the migrated Android backend module.
+- `SMARTTXT_NATIVE_BACKEND_PLAN.md` — the full native-backend plan (context).
+- `smarttxt/` — the migrated Android backend module.

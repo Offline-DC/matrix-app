@@ -1,9 +1,9 @@
 # nacserver — open validation-data ("nac"/absinthe) relay
 
-Generates iMessage **validation data** for the `:imessage` backend by running
+Generates SmartTxt **validation data** for the `:smarttxt` backend by running
 Apple's obfuscated generator (`IMDAppleServices`) under CPU emulation, and
 serves it over the HTTP contract the Android client already speaks
-(`imessage/.../relay/HttpValidationDataRelay.kt`).
+(`smarttxt/.../relay/HttpValidationDataRelay.kt`).
 
 This is the runtime-verified reference implementation of the reverse
 engineering. It was run end-to-end against a real binary and a real Mac17,2
@@ -47,8 +47,8 @@ python -m nacserver.server \
 Point the phone at it by setting, in the app:
 
 ```kotlin
-IMessageConfig.validationRelayBaseUrl  = "https://relay.example.com"
-IMessageConfig.validationRelayAuthToken = RELAY_SHARED_SECRET
+SmartTxtConfig.validationRelayBaseUrl  = "https://relay.example.com"
+SmartTxtConfig.validationRelayAuthToken = RELAY_SHARED_SECRET
 ```
 
 ## HTTP contract

@@ -29,10 +29,10 @@ fun InitialsAvatar(
     modifier: Modifier = Modifier,
     size: Dp = 44.dp,
 ) {
-    // iMessage doesn't color-code contacts — every avatar is the same neutral
+    // SmartTxt doesn't color-code contacts — every avatar is the same neutral
     // gray circle. In that skin, ignore the per-contact color; otherwise use it.
-    val bg = if (com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors.current.imessage) {
-        com.offline.dpadmessenger.ui.theme.IMessageAvatarGray
+    val bg = if (com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors.current.smarttxt) {
+        com.offline.dpadmessenger.ui.theme.SmartTxtAvatarGray
     } else {
         parseHexColor(colorHex)
     }

@@ -1,10 +1,10 @@
-# iMessage relay protocol
+# SmartTxt relay protocol
 
 The contract between the app (`RelayWebSocketTransport`) and a relay server.
 A reference implementation is in [`relay-reference/server.js`](relay-reference/server.js);
 the canonical types are in
-[`transport/IMessageTransport.kt`](imessage/src/main/kotlin/com/offline/dpadmessenger/backend/imessage/transport/IMessageTransport.kt)
-and [`transport/RelayProtocol.kt`](imessage/src/main/kotlin/com/offline/dpadmessenger/backend/imessage/transport/RelayProtocol.kt).
+[`transport/SmartTxtTransport.kt`](smarttxt/src/main/kotlin/com/offline/dpadmessenger/backend/smarttxt/transport/SmartTxtTransport.kt)
+and [`transport/RelayProtocol.kt`](smarttxt/src/main/kotlin/com/offline/dpadmessenger/backend/smarttxt/transport/RelayProtocol.kt).
 
 The relay holds the parts that must run next to Apple — the closed-source
 absinthe validation engine and a live Apple/IDS connection (e.g. rustpush on a
@@ -14,7 +14,7 @@ BlueBubbles/OpenBubbles relay maps in with a thin adapter.
 
 ## Connection
 
-- One **WebSocket** per device: `GET {baseUrl}/imessage/v1/socket`, `http(s)` is
+- One **WebSocket** per device: `GET {baseUrl}/smarttxt/v1/socket`, `http(s)` is
   upgraded to `ws(s)` by the client.
 - Auth: `Authorization: Bearer <token>` header if `relayAuthToken` is set.
 - The client sends `{"type":"ping"}` every ~25s; the relay may ignore it.
@@ -64,7 +64,7 @@ All frames are single JSON objects.
 
 **Chat**
 ```jsonc
-{ "guid": "iMessage;-;+15551234567",   // or "iMessage;+;chat<id>" for groups
+{ "guid": "SmartTxt;-;+15551234567",   // or "SmartTxt;+;chat<id>" for groups
   "displayName": "Mom", "isGroup": false,
   "participants": [{ "address": "tel:+15551234567", "displayName": "Mom",
                      "avatarColor": "", "isMe": false }],
@@ -73,7 +73,7 @@ All frames are single JSON objects.
 
 **Message** (BlueBubbles-shaped)
 ```jsonc
-{ "guid": "abc", "chatGuid": "iMessage;-;+1555", "tempGuid": "tmp_…",
+{ "guid": "abc", "chatGuid": "SmartTxt;-;+1555", "tempGuid": "tmp_…",
   "senderAddress": "tel:+1555", "isFromMe": false,
   "text": "hi", "timestampMs": 1736000000000,
   "dateDelivered": 0, "dateRead": 0,        // status derived: read>delivered>sent
@@ -104,12 +104,12 @@ is set (folded onto `associatedMessageGuid`):
 | ‼️ emphasize | 2004 | 3004 |
 | ❓ question | 2005 | 3005 |
 
-Arbitrary-emoji tapbacks (modern iMessage stickers) carry no classic code — pass
+Arbitrary-emoji tapbacks (modern SmartTxt stickers) carry no classic code — pass
 the raw emoji through.
 
 ## Timestamps
 
-All times on the wire are **Unix milliseconds**. iMessage/rustpush internally
+All times on the wire are **Unix milliseconds**. SmartTxt/rustpush internally
 use Apple Cocoa-epoch nanoseconds (2001-01-01); convert at the relay
 (`unixMs = cocoaNs/1e6 + 978307200000`). The client has the same helper
 (`AppleEpoch`) for the native path.

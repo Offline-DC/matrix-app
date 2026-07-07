@@ -18,7 +18,7 @@ vvi
 | `conduit/` | Foreground-service host for an embedded Conduit homeserver | **Stub** — see `docs/CONDUIT_EMBEDDING.md` |
 | `signal/`  | libsignal-android linking + Matrix↔Signal bridge service | **Stub** — see `docs/SIGNAL_BRIDGE.md` |
 | `gmessages/` | Google Messages QR-pairing + relay client, ships its own Compose pairing/chat UI | MVP done |
-| `imessage/` | Native iMessage backend (direct mode, mirrors `:signal`): rustpush-over-JNI + `ValidationDataRelay`, ships its own Compose setup/chat UI. Runs in stub/relay mode until the native `.so` is built. | **Relay/stub** — see `IMESSAGE_NATIVE_BACKEND_PLAN.md` + `ABSINTHE_REVERSE_ENGINEERING.md` |
+| `smarttxt/` | Native SmartTxt backend (direct mode, mirrors `:signal`): rustpush-over-JNI + `ValidationDataRelay`, ships its own Compose setup/chat UI. Runs in stub/relay mode until the native `.so` is built. | **Relay/stub** — see `SMARTTXT_NATIVE_BACKEND_PLAN.md` + `ABSINTHE_REVERSE_ENGINEERING.md` |
 
 ## How the pieces fit
 
@@ -38,19 +38,19 @@ vvi
 │  conduit/     — embedded HS │
 │  signal/      — bridge      │
 │  gmessages/   — GMessages   │
-│  imessage/    — iMessage     │
+│  smarttxt/    — SmartTxt     │
 └────────────────────────────┘
 ```
 
-### iMessage / absinthe (migrated from the standalone `imessage-app` repo)
+### SmartTxt / absinthe (migrated from the standalone `imessage-app` repo)
 
-`:imessage` is the native iMessage backend, brought in so iMessage lives
+`:smarttxt` is the native SmartTxt backend, brought in so SmartTxt lives
 alongside Signal and Google Messages against the same `dpad-messenger` UI
 instead of a separate app. It talks to Apple's IDS/APNs through OpenBubbles'
 `rustpush` compiled to a JNI `.so`. The one piece rustpush can't do open-source
 is **validation data** — Apple's closed-source absinthe `nac` engine — so today
 the module runs in **stub/relay mode**: registration is fed by a mockable
-`ValidationDataRelay` and the chat UI shows iMessage demo data. The seam is
+`ValidationDataRelay` and the chat UI shows SmartTxt demo data. The seam is
 explicit (`absinthe/AbsintheStub.kt`) so the real engine drops in without
 touching the UI.
 
@@ -64,10 +64,10 @@ see `ABSINTHE_RE_FINDINGS.md`). Supporting pieces:
 - `absinthe/` — Rust crate reimplementing `open-absinthe::nac` (OABS parse +
   Mach-O load + Unicorn emulation). Core unit-tested against real artifacts;
   emulator behind `--features emulate`.
-- `imessage-ffi/` — the JNI wrapper crate over `rustpush` (integration points
+- `smarttxt-ffi/` — the JNI wrapper crate over `rustpush` (integration points
   marked `RUSTPUSH:`). Build to `.so` with `scripts/build-rustpush-so.sh`.
 - `relay-reference/` — a reference relay server for the `RelayProtocol`.
-- `IMESSAGE_NATIVE_BACKEND_PLAN.md` — the full native-backend plan.
+- `SMARTTXT_NATIVE_BACKEND_PLAN.md` — the full native-backend plan.
 - `RELAY_PROTOCOL.md` — the app↔relay contract (BlueBubbles-aligned).
 - `ABSINTHE_REVERSE_ENGINEERING.md` — operator "how to run it" guide.
 - `ABSINTHE_RE_FINDINGS.md` — the reverse-engineering writeup + proof.
@@ -178,3 +178,14 @@ iteration without touching the wired app.
   memory on a small homeserver is ~50–100 MB. On 1 GB-RAM devices this
   is tolerable but you should not run anything else memory-heavy in the
   same process.
+
+## License
+
+Licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0-only) —
+see [`../LICENSE`](../LICENSE). The `signal/` module links
+`libsignal-android`, which is AGPL-3.0; because the wired `:app` combines that
+module with the rest of the backend into a single work, the whole is conveyed
+under AGPL-3.0. If you deploy a modified version that users interact with over
+a network, AGPL §13 requires you to offer them its corresponding source. The
+Rust crates `absinthe/` and `smarttxt-ffi/` carry `license = "AGPL-3.0-only"`
+in their `Cargo.toml`.

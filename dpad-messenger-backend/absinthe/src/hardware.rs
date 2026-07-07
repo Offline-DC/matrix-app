@@ -20,7 +20,7 @@ pub const OABS_MAGIC: &[u8; 5] = b"OABS\0";
 
 /// The hardware fingerprint. Field numbers match the OABS protobuf `inner`
 /// message. The five oddly-named `Vec<u8>` fields are Apple's deliberately
-/// obfuscated "derived iMessage keys" (17 bytes each) read from `IOPower:/`;
+/// obfuscated "derived SmartTxt keys" (17 bytes each) read from `IOPower:/`;
 /// we carry them opaquely and hand them straight back to the binary.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HardwareConfig {

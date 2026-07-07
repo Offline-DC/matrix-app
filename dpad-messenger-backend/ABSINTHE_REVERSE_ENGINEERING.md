@@ -9,10 +9,10 @@
 > Read §0 first. You still supply your own `IMDAppleServices` + dumb file;
 > neither is shipped here.
 
-This is the launch pad for the one unsolved piece of the native iMessage
-backend (`:imessage`): getting **valid validation data** without OpenBubbles'
+This is the launch pad for the one unsolved piece of the native SmartTxt
+backend (`:smarttxt`): getting **valid validation data** without OpenBubbles'
 closed-source absinthe `nac` engine. The full context is in
-[`IMESSAGE_NATIVE_BACKEND_PLAN.md`](IMESSAGE_NATIVE_BACKEND_PLAN.md) §2.5–§2.6;
+[`SMARTTXT_NATIVE_BACKEND_PLAN.md`](SMARTTXT_NATIVE_BACKEND_PLAN.md) §2.5–§2.6;
 this doc is the shorter "here's where the seams are and here's how to start"
 map.
 
@@ -27,11 +27,11 @@ map.
   This repo's approach is a *clean-room reimplementation* of the `nac`
   algorithm (option 3a) or a *relay* (option 2) — not extraction.
 - Keep everything behind the existing seams. Nothing that talks to Apple lands
-  outside `imessage-ffi/` (Rust) and the `absinthe/` package (Kotlin).
+  outside `smarttxt-ffi/` (Rust) and the `absinthe/` package (Kotlin).
 
 ## 1. What "absinthe" actually is
 
-Apple's iMessage registration (`IDS register`) requires **validation data**: a
+Apple's SmartTxt registration (`IDS register`) requires **validation data**: a
 signed blob proving the request comes from genuine Apple hardware. It's produced
 by an Apple routine (historically in `IMDAppleServices` / `identityservicesd`)
 that takes hardware identifiers (serial, MLB, ROM, board id, OS build) and does
@@ -77,12 +77,12 @@ both sides of the JNI boundary:
 
 | Layer | File | What it is |
 |---|---|---|
-| Kotlin stub | `imessage/src/main/kotlin/.../absinthe/AbsintheStub.kt` | Mirrors the Rust stub: `ValidationCtx.new/keyEstablishment/sign` + `hardwareConfigFromValidationData` all throw `AbsintheUnavailableException`. `IS_REAL_IMPLEMENTATION = false`. Catching that exception is the signal to fall back to the relay. |
-| Kotlin bridge | `imessage/src/main/kotlin/.../RustPushBridge.kt`, `RustPushNative.kt` | The `external fun native*` surface. `RustPushNative.loaded` flips true once the `.so` is present. |
-| Rust FFI | `imessage-ffi/src/lib.rs` | JNI plumbing is complete; integration points are marked `RUSTPUSH:`. `nativeRegister(...)` already takes `validation_data: JByteArray` — i.e. the seam accepts externally-produced validation bytes. |
-| Relay fallback | `imessage/src/main/kotlin/.../relay/ValidationDataRelay.kt` (+ `Http`/`Stub` impls) | The §2.6 **option 2** path: get validation bytes from a Mac-backed service instead of computing them on-device. |
+| Kotlin stub | `smarttxt/src/main/kotlin/.../absinthe/AbsintheStub.kt` | Mirrors the Rust stub: `ValidationCtx.new/keyEstablishment/sign` + `hardwareConfigFromValidationData` all throw `AbsintheUnavailableException`. `IS_REAL_IMPLEMENTATION = false`. Catching that exception is the signal to fall back to the relay. |
+| Kotlin bridge | `smarttxt/src/main/kotlin/.../RustPushBridge.kt`, `RustPushNative.kt` | The `external fun native*` surface. `RustPushNative.loaded` flips true once the `.so` is present. |
+| Rust FFI | `smarttxt-ffi/src/lib.rs` | JNI plumbing is complete; integration points are marked `RUSTPUSH:`. `nativeRegister(...)` already takes `validation_data: JByteArray` — i.e. the seam accepts externally-produced validation bytes. |
+| Relay fallback | `smarttxt/src/main/kotlin/.../relay/ValidationDataRelay.kt` (+ `Http`/`Stub` impls) | The §2.6 **option 2** path: get validation bytes from a Mac-backed service instead of computing them on-device. |
 | Relay contract | [`RELAY_PROTOCOL.md`](RELAY_PROTOCOL.md), `relay-reference/server.js` | BlueBubbles-aligned wire format + a reference server to test against. |
-| Native build | `scripts/build-rustpush-so.sh`, `imessage-ffi/Cargo.toml` | Cross-compiles the FFI crate to `arm64-v8a` + `armeabi-v7a`, drops into `imessage/src/main/jniLibs/`. |
+| Native build | `scripts/build-rustpush-so.sh`, `smarttxt-ffi/Cargo.toml` | Cross-compiles the FFI crate to `arm64-v8a` + `armeabi-v7a`, drops into `smarttxt/src/main/jniLibs/`. |
 
 The three decision paths (pick before writing code) are the plan's §2.6:
 **1) hybrid** (keep OB headless), **2) full-native + validation relay**,
@@ -108,7 +108,7 @@ you actually fill in the marked integration points.
    git -C vendor/rustpush checkout <PIN>      # record the rev
    ```
    Then uncomment and point the `rustpush = { git = ..., rev = "<PIN>" }` line in
-   `imessage-ffi/Cargo.toml`.
+   `smarttxt-ffi/Cargo.toml`.
 3. **Pick the validation-data source:**
    - *Option 2 (relay):* stand up a Mac/BlueBubbles-backed relay implementing
      `RELAY_PROTOCOL.md`. Test the client against `relay-reference/server.js`
@@ -118,7 +118,7 @@ you actually fill in the marked integration points.
      that implements `nac` (port from the pypush "Absinthe" lineage). Wire it in
      place of the stub submodule, and flip `AbsintheStub.IS_REAL_IMPLEMENTATION`
      semantics by routing through it instead of the relay.
-4. **Fill the `RUSTPUSH:`-marked integration points** in `imessage-ffi/src/lib.rs`
+4. **Fill the `RUSTPUSH:`-marked integration points** in `smarttxt-ffi/src/lib.rs`
    (activate → authenticate_apple → validation → register; send/recv; poll). The
    JNI signatures already match `RustPushNative`'s `external fun`s, so the Kotlin
    side needs no changes.
@@ -126,7 +126,7 @@ you actually fill in the marked integration points.
    ```bash
    ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/26.x.x ./scripts/build-rustpush-so.sh
    ```
-   Outputs land in `imessage/src/main/jniLibs/{arm64-v8a,armeabi-v7a}/libimessage_ffi.so`;
+   Outputs land in `smarttxt/src/main/jniLibs/{arm64-v8a,armeabi-v7a}/libsmarttxt_ffi.so`;
    `RustPushNative.loaded` then flips true and the app takes the native path.
 6. **Register a throwaway Apple ID** end-to-end and watch for IDS invalidation
    (plan §8). Iterate.
@@ -136,15 +136,15 @@ you actually fill in the marked integration points.
 - Don't uncomment the `rustpush` dependency or run the build on CI/shared infra
   until a commit is pinned and reviewed.
 - Don't wire real Apple credentials anywhere in this repo; account state belongs
-  in `IMessageAccountStore` (EncryptedSharedPreferences) at runtime only.
+  in `SmartTxtAccountStore` (EncryptedSharedPreferences) at runtime only.
 - Don't attempt option 3b (extracting OB's compiled absinthe). See §0.
 
 ## 5. Pointers
 
-- Plan & blocker analysis: `IMESSAGE_NATIVE_BACKEND_PLAN.md` §2.5 (proof it's
+- Plan & blocker analysis: `SMARTTXT_NATIVE_BACKEND_PLAN.md` §2.5 (proof it's
   closed source), §2.6 (the three ways through), §3 (embedding rustpush).
 - Relay path: `RELAY_PROTOCOL.md` + `relay-reference/`.
 - Stubs to replace: `absinthe/AbsintheStub.kt`, the `RUSTPUSH:` markers in
-  `imessage-ffi/src/lib.rs`.
+  `smarttxt-ffi/src/lib.rs`.
 - Upstream: OpenBubbles `rustpush`, `OpenBubbles/OpenAbsinthe-Stub` (mock),
   JJTech `pypush` (the Absinthe RE reference).

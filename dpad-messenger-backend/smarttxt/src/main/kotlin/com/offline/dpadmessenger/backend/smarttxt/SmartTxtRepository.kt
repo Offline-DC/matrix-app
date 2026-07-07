@@ -1,0 +1,230 @@
+package com.offline.dpadmessenger.backend.smarttxt
+
+import android.content.Context
+import android.util.Log
+import com.offline.dpadmessenger.backend.smarttxt.relay.HttpValidationDataRelay
+import com.offline.dpadmessenger.backend.smarttxt.relay.StubValidationDataRelay
+import com.offline.dpadmessenger.backend.smarttxt.relay.ValidationDataRelay
+import com.offline.dpadmessenger.backend.smarttxt.transport.SmartTxtTransport
+import com.offline.dpadmessenger.backend.smarttxt.transport.MockRelayTransport
+import com.offline.dpadmessenger.backend.smarttxt.transport.NativeRustPushTransport
+import com.offline.dpadmessenger.backend.smarttxt.transport.RegisterRequest
+import com.offline.dpadmessenger.backend.smarttxt.transport.RegisterResult
+import com.offline.dpadmessenger.backend.smarttxt.transport.RelayWebSocketTransport
+import com.offline.dpadmessenger.data.MessageRepository
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/**
+ * Factory + process-scoped holder for the SmartTxt backend. Mirror of
+ * `GoogleMessagesRepository`.
+ *
+ * Owns the singleton chain transport → [SmartTxtSession] → repository (a
+ * per-caller instance would open duplicate connections and double-notify), the
+ * [register]/[renew] entry points the setup screen + renewal worker call, and
+ * the [status] the UI gates on.
+ *
+ * The transport is chosen from [SmartTxtConfig.transportMode]/[relayBaseUrl]:
+ *  - a real [RelayWebSocketTransport] when a relay URL is set,
+ *  - a [NativeRustPushTransport] for the on-device rustpush path (Phase B),
+ *  - otherwise the in-process [MockRelayTransport] so the whole stack runs and
+ *    is testable today.
+ */
+object SmartTxtRepository {
+
+    @Volatile private var transport: SmartTxtTransport? = null
+    @Volatile private var session: SmartTxtSession? = null
+    @Volatile private var instance: MessageRepository? = null
+    @Volatile private var bridge: RustPushBridge? = null
+
+    private val _status = MutableStateFlow(SmartTxtStatus.UNREGISTERED)
+    val status: StateFlow<SmartTxtStatus> = _status.asStateFlow()
+
+    /** Validation-data relay for the NATIVE path only (the WebSocket relay does
+     *  validation server-side). */
+    private fun buildValidationRelay(): ValidationDataRelay {
+        val base = SmartTxtConfig.validationRelayBaseUrl
+        return if (base.isNotBlank()) HttpValidationDataRelay(base, SmartTxtConfig.validationRelayAuthToken)
+        else StubValidationDataRelay()
+    }
+
+    @Synchronized
+    fun bridge(): RustPushBridge = bridge ?: RustPushBridge(buildValidationRelay()).also { bridge = it }
+
+    /** Build the active transport from config. Relay URL set ⇒ real relay;
+     *  NATIVE mode ⇒ rustpush bridge; else the in-process mock. */
+    @Synchronized
+    private fun transport(): SmartTxtTransport = transport ?: run {
+        val mode = when {
+            SmartTxtConfig.relayBaseUrl.isNotBlank() -> SmartTxtConfig.TransportMode.RELAY
+            else -> SmartTxtConfig.transportMode
+        }
+        val t: SmartTxtTransport = when (mode) {
+            SmartTxtConfig.TransportMode.RELAY ->
+                RelayWebSocketTransport(SmartTxtConfig.relayBaseUrl, SmartTxtConfig.relayAuthToken)
+            SmartTxtConfig.TransportMode.NATIVE ->
+                if (RustPushBridge.NATIVE_AVAILABLE) NativeRustPushTransport(bridge()) else MockRelayTransport()
+            SmartTxtConfig.TransportMode.MOCK -> MockRelayTransport()
+        }
+        Log.i(TAG, "transport = ${t::class.java.simpleName} (mode=$mode)")
+        t.also { transport = it }
+    }
+
+    @Synchronized
+    fun session(): SmartTxtSession = session ?: SmartTxtSession(transport()).also { session = it }
+
+    /**
+     * The shared repository. Builds the transport+session on first call and
+     * connects. Returns the chat repository regardless of registration state —
+     * the UI gates the chat behind [status].
+     */
+    @Synchronized
+    fun create(context: Context): MessageRepository {
+        instance?.let { return it }
+        val appContext = context.applicationContext
+        val store = SmartTxtAccountStore(appContext)
+        _status.value = when {
+            store.isRegistered() -> SmartTxtStatus.REGISTERED
+            store.isSeeded() -> SmartTxtStatus.SEEDED
+            else -> SmartTxtStatus.UNREGISTERED
+        }
+        return SmartTxtMessageRepository(session(), appContext).also { instance = it }
+    }
+
+    /** Observe whether the link died (so the UI can show a reconnect prompt). */
+    fun authExpiredFlow(): StateFlow<Boolean>? =
+        (instance as? SmartTxtMessageRepository)?.authExpired
+
+    /**
+     * Register this identity with Apple via the active transport (the relay
+     * obtains validation data + runs IDS registration; the native path runs the
+     * §2.2 four-call sequence on-device). Persists the dumb file + account,
+     * stamps it registered, schedules renewal, starts the push service, and
+     * flips [status] to REGISTERED.
+     */
+    suspend fun register(context: Context, config: MacOSConfig, appleId: String): RegistrationResult {
+        val appContext = context.applicationContext
+        val store = SmartTxtAccountStore(appContext)
+        store.saveConfig(config)
+        _status.value = SmartTxtStatus.REGISTERING
+        return finishRegister(appContext, store, appleId, session().register(config, appleId))
+    }
+
+    /**
+     * Rich registration with an Apple ID password and interactive 2FA. Same
+     * persistence/status contract as the 3-arg [register]; the password is
+     * transient — it is passed into the [RegisterRequest] for the auth
+     * round-trip and never persisted.
+     */
+    suspend fun register(
+        context: Context,
+        config: MacOSConfig,
+        appleId: String,
+        password: String,
+        twoFactorProvider: (suspend () -> String?)? = null,
+    ): RegistrationResult {
+        val appContext = context.applicationContext
+        val store = SmartTxtAccountStore(appContext)
+        store.saveConfig(config)
+        _status.value = SmartTxtStatus.REGISTERING
+        val request = RegisterRequest(
+            config = config,
+            appleId = appleId,
+            password = password,
+            twoFactorProvider = twoFactorProvider,
+        )
+        return finishRegister(appContext, store, appleId, session().register(request))
+    }
+
+    /** Shared post-register persistence for both [register] overloads: on
+     *  success save the account, stamp it registered, schedule renewal, start
+     *  the push service, and flip [status]; on failure roll [status] back. */
+    private fun finishRegister(
+        appContext: Context,
+        store: SmartTxtAccountStore,
+        appleId: String,
+        result: RegisterResult,
+    ): RegistrationResult = when (result) {
+        is RegisterResult.Success -> {
+            val account = SmartTxtAccount(
+                appleId = appleId,
+                identityTokenB64 = "",
+                pushTokenB64 = "",
+                lastRegisteredMs = System.currentTimeMillis(),
+                handles = result.handles,
+            )
+            store.saveAccount(account)
+            store.markRegistered(account.lastRegisteredMs)
+            SmartTxtRenewalWorker.schedule(appContext)
+            APNsForegroundService.start(appContext)
+            _status.value = SmartTxtStatus.REGISTERED
+            RegistrationResult.Success(account)
+        }
+        is RegisterResult.Failure -> {
+            _status.value = SmartTxtStatus.UNREGISTERED
+            Log.w(TAG, "registration failed: ${result.message}")
+            RegistrationResult.Failure(result.message)
+        }
+    }
+
+    /** Re-register (renewal). Called by [SmartTxtRenewalWorker]. */
+    suspend fun renew(context: Context): RegistrationResult {
+        val store = SmartTxtAccountStore(context.applicationContext)
+        val config = store.loadConfig() ?: return RegistrationResult.Failure("no dumb file to renew from")
+        val account = store.loadAccount() ?: return RegistrationResult.Failure("no account to renew")
+        return when (val r = session().register(config, account.appleId)) {
+            is RegisterResult.Success -> {
+                val updated = account.copy(lastRegisteredMs = System.currentTimeMillis(), handles = r.handles)
+                store.saveAccount(updated); store.markRegistered(updated.lastRegisteredMs)
+                RegistrationResult.Success(updated)
+            }
+            is RegisterResult.Failure -> RegistrationResult.Failure(r.message)
+        }
+    }
+
+    /** Connect the live session (called by the foreground service / on create). */
+    fun connect(context: Context) {
+        create(context) // building the repository connects the session
+    }
+
+    @Synchronized
+    fun shutdown(context: Context, wipe: Boolean) {
+        (instance as? SmartTxtMessageRepository)?.shutdown(clearCache = wipe)
+        session?.shutdown()
+        instance = null
+        session = null
+        transport = null
+        bridge = null
+        if (wipe) {
+            SmartTxtAccountStore(context.applicationContext).clear()
+            _status.value = SmartTxtStatus.UNREGISTERED
+        }
+    }
+
+    /**
+     * Full re-sign-in KEEPING history: tears down the live session/transport
+     * without wiping the cached account/config, then flips [status] to
+     * UNREGISTERED so the sign-in screen shows. Unlike [shutdown] with
+     * `wipe=true`, the encrypted store is left intact, so re-registering reuses
+     * the same identity and the chat history survives.
+     */
+    fun signOutKeepingHistory(context: Context) {
+        shutdown(context, wipe = false)
+        _status.value = SmartTxtStatus.UNREGISTERED
+    }
+
+    private const val TAG = "IMsgRepoHolder"
+}
+
+/** Where the SmartTxt identity is in its lifecycle. The UI gates on this. */
+enum class SmartTxtStatus {
+    /** No dumb file / account. Show setup. */
+    UNREGISTERED,
+    /** Dumb file + account imported but `register` not yet run. */
+    SEEDED,
+    /** Registration in progress. */
+    REGISTERING,
+    /** Registered with IDS — show the chat. */
+    REGISTERED,
+}

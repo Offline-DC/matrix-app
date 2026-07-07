@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
- * Reference iMessage relay server implementing the RelayProtocol that
+ * Reference SmartTxt relay server implementing the RelayProtocol that
  * RelayWebSocketTransport speaks (transport/RelayProtocol.kt + RELAY_PROTOCOL.md).
  *
  * It is the network-path twin of the in-process MockRelayTransport: demo chats,
@@ -10,9 +10,9 @@
  *
  *   npm install && node server.js          # listens on ws://localhost:8765
  *
- * Point the app at it:  IMessageConfig.relayBaseUrl = "http://<host>:8765"
+ * Point the app at it:  SmartTxtConfig.relayBaseUrl = "http://<host>:8765"
  * (or type the URL on the setup screen). The client upgrades http→ws and
- * connects to /imessage/v1/socket.
+ * connects to /smarttxt/v1/socket.
  *
  * A REAL relay replaces the demo data + the simulate loop with calls into
  * rustpush/absinthe on a Mac (or the BlueBubbles server). The frame contract
@@ -22,7 +22,7 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8765;
-const PATH = "/imessage/v1/socket";
+const PATH = "/smarttxt/v1/socket";
 const ME = "me";
 
 // ---- demo state ------------------------------------------------------------

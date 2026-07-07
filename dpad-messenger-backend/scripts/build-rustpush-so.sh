@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Phase B: cross-compile the imessage-ffi crate (rustpush wrapper) to Android
-# .so files and drop them into the :imessage module's jniLibs. After this runs,
+# Phase B: cross-compile the smarttxt-ffi crate (rustpush wrapper) to Android
+# .so files and drop them into the :smarttxt module's jniLibs. After this runs,
 # RustPushNative.loaded flips true automatically and the app uses the native
-# iMessage path. (IMESSAGE_NATIVE_BACKEND_PLAN.md §3.)
+# SmartTxt path. (SMARTTXT_NATIVE_BACKEND_PLAN.md §3.)
 #
 # Requirements (NOT available in the cowork sandbox — run on your dev machine):
 #   - Rust toolchain (https://rustup.rs)
@@ -15,9 +15,9 @@
 #
 set -euo pipefail
 
-CRATE_DIR="$(cd "$(dirname "$0")/../imessage-ffi" && pwd)"
-JNILIBS="$(cd "$(dirname "$0")/.." && pwd)/imessage/src/main/jniLibs"
-LIB_NAME="libimessage_ffi.so"
+CRATE_DIR="$(cd "$(dirname "$0")/../smarttxt-ffi" && pwd)"
+JNILIBS="$(cd "$(dirname "$0")/.." && pwd)/smarttxt/src/main/jniLibs"
+LIB_NAME="libsmarttxt_ffi.so"
 MIN_SDK="${MIN_SDK:-24}"
 
 : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to your NDK path}"
@@ -55,4 +55,4 @@ build_one armv7-linux-androideabi armv7a-linux-androideabi armeabi-v7a
 
 echo
 echo "Done. Rebuild the app (./gradlew :app:assembleDebug) — RustPushNative will"
-echo "now load the .so and the native iMessage transport becomes available."
+echo "now load the .so and the native SmartTxt transport becomes available."

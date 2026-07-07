@@ -8,8 +8,8 @@ import com.offline.dpadmessenger.backend.core.BackendConfig
 import com.offline.dpadmessenger.backend.core.BackendFactory
 import com.offline.dpadmessenger.backend.core.MockBackendFactory
 import com.offline.dpadmessenger.backend.core.SessionStore
-import com.offline.dpadmessenger.backend.imessage.IMessageBackendFactory
-import com.offline.dpadmessenger.backend.imessage.IMessageConfig
+import com.offline.dpadmessenger.backend.smarttxt.SmartTxtBackendFactory
+import com.offline.dpadmessenger.backend.smarttxt.SmartTxtConfig
 import com.offline.dpadmessenger.backend.signal.SignalAccountStore
 import com.offline.dpadmessenger.backend.signal.SignalBackendFactory
 import com.offline.dpadmessenger.backend.signal.SignalProvisioningClient
@@ -44,10 +44,10 @@ class AppViewModel(
 
     private val sessionStore = SessionStore(appContext)
     private val signalAccountStore = SignalAccountStore(appContext)
-    private val imessageRelayStore = IMessageRelayStore(appContext)
+    private val smarttxtRelayStore = SmartTxtRelayStore(appContext)
     private val mockFactory: BackendFactory = MockBackendFactory()
     private val signalFactory: BackendFactory = SignalBackendFactory()
-    private val imessageFactory: BackendFactory = IMessageBackendFactory()
+    private val smarttxtFactory: BackendFactory = SmartTxtBackendFactory()
     private val matrixFactory: BackendFactory? = matrixFactoryOrNull()
 
     private val _state = MutableStateFlow<RepoState>(RepoState.Loading)
@@ -58,15 +58,15 @@ class AppViewModel(
 
     init {
         viewModelScope.launch {
-            // Order: Signal first (most specific), then iMessage (if a relay is
+            // Order: Signal first (most specific), then SmartTxt (if a relay is
             // configured), then Matrix, then mock.
             val signalRepo = trySignal()
             if (signalRepo != null) {
                 _state.value = RepoState.Ready(signalRepo, mode = BackendMode.Signal)
             } else {
-                val imessageRepo = tryIMessage()
-                if (imessageRepo != null) {
-                    _state.value = RepoState.Ready(imessageRepo, mode = BackendMode.IMessage)
+                val smarttxtRepo = trySmartTxt()
+                if (smarttxtRepo != null) {
+                    _state.value = RepoState.Ready(smarttxtRepo, mode = BackendMode.SmartTxt)
                 } else {
                     val matrixRepo = matrixFactory?.let { tryRestoreMatrix(it) }
                     if (matrixRepo != null) {
@@ -84,7 +84,7 @@ class AppViewModel(
         viewModelScope.launch {
             sessionStore.clear()
             signalAccountStore.clear()
-            imessageRelayStore.clear()
+            smarttxtRelayStore.clear()
             provisioningClient?.cancel()
             provisioningClient = null
             loadMock()
@@ -92,33 +92,33 @@ class AppViewModel(
     }
 
     /**
-     * Connect to a running `imessage-relay` daemon and switch to iMessage mode.
+     * Connect to a running `smarttxt-relay` daemon and switch to SmartTxt mode.
      * The daemon owns Apple registration (dumb file + Apple ID + 2FA), so all
      * this needs is the daemon's URL (e.g. `http://192.168.1.10:8765`) and its
-     * optional bearer token. The Signal-like shared UI then drives iMessage.
+     * optional bearer token. The Signal-like shared UI then drives SmartTxt.
      * The connection is persisted so the app reconnects on boot.
      */
-    fun useIMessageBackend(relayBaseUrl: String, authToken: String?) {
+    fun useSmartTxtBackend(relayBaseUrl: String, authToken: String?) {
         viewModelScope.launch {
             _state.value = RepoState.Loading
-            IMessageConfig.relayBaseUrl = relayBaseUrl.trim()
-            IMessageConfig.relayAuthToken = authToken?.trim()?.ifBlank { null }
-            IMessageConfig.transportMode =
-                if (relayBaseUrl.isNotBlank()) IMessageConfig.TransportMode.RELAY
-                else IMessageConfig.TransportMode.MOCK
-            imessageRelayStore.save(relayBaseUrl, authToken)
+            SmartTxtConfig.relayBaseUrl = relayBaseUrl.trim()
+            SmartTxtConfig.relayAuthToken = authToken?.trim()?.ifBlank { null }
+            SmartTxtConfig.transportMode =
+                if (relayBaseUrl.isNotBlank()) SmartTxtConfig.TransportMode.RELAY
+                else SmartTxtConfig.TransportMode.MOCK
+            smarttxtRelayStore.save(relayBaseUrl, authToken)
             val repo = runCatching {
-                imessageFactory.create(appContext, BackendConfig.IMessageNative)
+                smarttxtFactory.create(appContext, BackendConfig.SmartTxtNative)
             }.getOrElse {
                 _state.value = RepoState.Error(
-                    "iMessage connect failed: ${it.message ?: it::class.java.simpleName}"
+                    "SmartTxt connect failed: ${it.message ?: it::class.java.simpleName}"
                 )
                 return@launch
             }
             if (repo != null) {
-                _state.value = RepoState.Ready(repo, mode = BackendMode.IMessage)
+                _state.value = RepoState.Ready(repo, mode = BackendMode.SmartTxt)
             } else {
-                _state.value = RepoState.Error("iMessage backend returned no repository.")
+                _state.value = RepoState.Error("SmartTxt backend returned no repository.")
             }
         }
     }
@@ -193,12 +193,12 @@ class AppViewModel(
             .getOrNull()
     }
 
-    private suspend fun tryIMessage(): MessageRepository? {
-        val url = imessageRelayStore.url() ?: return null
-        IMessageConfig.relayBaseUrl = url
-        IMessageConfig.relayAuthToken = imessageRelayStore.token()
-        IMessageConfig.transportMode = IMessageConfig.TransportMode.RELAY
-        return runCatching { imessageFactory.create(appContext, BackendConfig.IMessageNative) }
+    private suspend fun trySmartTxt(): MessageRepository? {
+        val url = smarttxtRelayStore.url() ?: return null
+        SmartTxtConfig.relayBaseUrl = url
+        SmartTxtConfig.relayAuthToken = smarttxtRelayStore.token()
+        SmartTxtConfig.transportMode = SmartTxtConfig.TransportMode.RELAY
+        return runCatching { smarttxtFactory.create(appContext, BackendConfig.SmartTxtNative) }
             .getOrNull()
     }
 
@@ -238,7 +238,7 @@ sealed class RepoState {
     data class Error(val message: String) : RepoState()
 }
 
-enum class BackendMode { Mock, Matrix, Signal, IMessage }
+enum class BackendMode { Mock, Matrix, Signal, SmartTxt }
 
 class AppViewModelFactory(private val context: Context) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")

@@ -3,7 +3,8 @@ name = "absinthe"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Open reimplementation of Apple's iMessage validation-data (nac) engine via binary emulation — a drop-in for OpenBubbles' closed-source open-absinthe::nac."
+license = "AGPL-3.0-only"
+description = "Open reimplementation of Apple's SmartTxt validation-data (nac) engine via binary emulation — a drop-in for OpenBubbles' closed-source open-absinthe::nac."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # This crate is the replacement for the closed-source `open-absinthe` that

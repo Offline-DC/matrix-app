@@ -1,8 +1,9 @@
 {
-  "name": "imessage-relay-reference",
+  "name": "smarttxt-relay-reference",
   "version": "0.1.0",
   "private": true,
-  "description": "Reference iMessage relay implementing the RelayProtocol over WebSocket (for end-to-end testing the RelayWebSocketTransport client).",
+  "license": "AGPL-3.0-only",
+  "description": "Reference SmartTxt relay implementing the RelayProtocol over WebSocket (for end-to-end testing the RelayWebSocketTransport client).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

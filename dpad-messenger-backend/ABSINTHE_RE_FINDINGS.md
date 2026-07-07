@@ -1,6 +1,6 @@
 # Absinthe / nac — reverse-engineering findings
 
-Status: **working, verified end-to-end.** This documents how Apple's iMessage
+Status: **working, verified end-to-end.** This documents how Apple's SmartTxt
 validation-data ("nac" / "absinthe") generation works, and how it's implemented
 here. The implementation was run against the real binary and a real Mac identity
 and produced valid validation data (see §7).
@@ -119,7 +119,7 @@ MacOSConfig
        #6  board_id               "Mac-22000000"       -> board-id (+NUL, CFData)
        #7  os_build_num           "24D70"              -> (client-info headers)
        #8  gq3489ugfi             <17 bytes>  ┐
-       #9  fyp98tpgj              <17 bytes>  │ obfuscated "derived iMessage
+       #9  fyp98tpgj              <17 bytes>  │ obfuscated "derived SmartTxt
        #10 kbjfrfpoju             <17 bytes>  │ keys" (IOPower:/), returned
        #12 oycqazlotndm           <17 bytes>  │ verbatim as CFData
        #14 abkpld1ecmni           <17 bytes>  ┘

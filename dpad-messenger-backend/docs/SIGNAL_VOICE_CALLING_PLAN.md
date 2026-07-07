@@ -172,7 +172,7 @@ pure-Kotlin (libsignal dropped; X25519 = TweetNaCl port; hand-rolled protobuf).
 Everything heavy is a **separate, on-demand-installed app**, fetched from GitHub
 Releases and installed via `PackageInstaller`. The model already in the tree:
 
-- **OpenBubbles** (`com.openbubbles.messaging`, iMessage) ships as a **`.zip`
+- **OpenBubbles** (`com.openbubbles.messaging`, SmartTxt) ships as a **`.zip`
   of split APKs** (`base.apk` + `config.*` — the per-device set an App Bundle
   produces) and is sideloaded by `update/SplitApkInstaller.installFromZip`, so a
   **one-ABI, Google-signed set** installs instead of the ~400 MB universal APK.

@@ -20,7 +20,7 @@ internal val SignalGreen = Color(0xFF3AA467)
 internal val ComposerButtonResting = Color(0xFF7FA3DA)
 internal val ComposerButtonHighlight = Color(0xFF1B74E4)
 // Neutral grey for the "+" attach button, so it reads as a secondary action
-// distinct from the blue Send button (matches how iMessage greys the "+").
+// distinct from the blue Send button (matches how SmartTxt greys the "+").
 // A mid grey (iOS systemGray3-ish) so it stays visible on the light composer
 // surface; the focus ring still marks DPAD selection.
 internal val ComposerButtonNeutral = Color(0xFFC7C7CC)
@@ -42,24 +42,24 @@ internal val OutgoingBubbleDark = Color(0xFF1E3A8A)
 internal val IncomingBubbleLight = Color(0xFFF1F3F4)
 internal val IncomingBubbleDark = Color(0xFF2C2C2E)
 
-// ── iMessage / BlueBubbles palette (the classic blue iMessage look) ──────────
+// ── SmartTxt / BlueBubbles palette (the classic blue SmartTxt look) ──────────
 // Sent bubbles are a blue vertical gradient (top → bottom); received bubbles are
 // the iOS gray; the accent is the iOS system blue. White text on sent bubbles.
-internal val IMessageSentTopLight = Color(0xFF3AA9FF)
-internal val IMessageSentLight = Color(0xFF0A7BFF)
-internal val IMessageSentTopDark = Color(0xFF37ABFF)
-internal val IMessageSentDark = Color(0xFF0A84FF)
-internal val IMessageReceivedLight = Color(0xFFE9E9EB)
-internal val IMessageReceivedDark = Color(0xFF26262B)
-internal val IMessageAccentLight = Color(0xFF007AFF)
-internal val IMessageAccentDark = Color(0xFF0A84FF)
+internal val SmartTxtSentTopLight = Color(0xFF3AA9FF)
+internal val SmartTxtSentLight = Color(0xFF0A7BFF)
+internal val SmartTxtSentTopDark = Color(0xFF37ABFF)
+internal val SmartTxtSentDark = Color(0xFF0A84FF)
+internal val SmartTxtReceivedLight = Color(0xFFE9E9EB)
+internal val SmartTxtReceivedDark = Color(0xFF26262B)
+internal val SmartTxtAccentLight = Color(0xFF007AFF)
+internal val SmartTxtAccentDark = Color(0xFF0A84FF)
 
-// iMessage renders every initials-avatar as the same neutral gray circle (it
+// SmartTxt renders every initials-avatar as the same neutral gray circle (it
 // doesn't color-code contacts), so the skin overrides the per-contact avatar
 // color with this single iOS system gray.
-internal val IMessageAvatarGray = Color(0xFF8E8E93)
+internal val SmartTxtAvatarGray = Color(0xFF8E8E93)
 
-// DPAD focus outline for the blue iMessage SENT bubble. A white ring looked
+// DPAD focus outline for the blue SmartTxt SENT bubble. A white ring looked
 // harsh; a very dark navy reads as a deeper shade of the bubble instead, so the
 // focus highlight looks integrated.
-internal val IMessageFocusBorder = Color(0xFF002147)
+internal val SmartTxtFocusBorder = Color(0xFF002147)

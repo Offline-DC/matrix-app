@@ -130,11 +130,11 @@ launcher:
 ```
 
 ### Branch note
-These edits were made while checked out on `feat/imessage-backend`, with `main`'s
+These edits were made while checked out on `feat/smarttxt-backend`, with `main`'s
 Signal files pulled into the working tree (no merge commit). To land on `main`:
 commit the Signal + ChatScreen changes there (they originate from `main`'s code),
 and separately commit the launcher `RebootLoggingConfig.kt` change in the launcher
-repo. Keep the uncommitted **iMessage** changes on `feat/imessage-backend` out of
+repo. Keep the uncommitted **SmartTxt** changes on `feat/smarttxt-backend` out of
 the Signal commit.
 
 ---

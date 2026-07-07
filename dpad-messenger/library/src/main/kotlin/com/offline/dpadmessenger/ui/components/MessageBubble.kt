@@ -65,7 +65,7 @@ import com.offline.dpadmessenger.focus.DpadFireGate
 import com.offline.dpadmessenger.focus.OkKeys
 import com.offline.dpadmessenger.focus.dpadFocusHighlight
 import com.offline.dpadmessenger.focus.onDpadAction
-import com.offline.dpadmessenger.ui.theme.IMessageFocusBorder
+import com.offline.dpadmessenger.ui.theme.SmartTxtFocusBorder
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 import com.offline.dpadmessenger.ui.util.formatTimeShort
 
@@ -147,18 +147,18 @@ fun MessageBubble(
     var bubbleHeightPx by remember { mutableStateOf(0) }
     var bubbleWidthPx by remember { mutableStateOf(0) }
     // Outgoing bubbles use a vertical gradient (top → bottom). When top == bottom
-    // (the Signal/default palette) it renders flat; the iMessage skin sets a
+    // (the Signal/default palette) it renders flat; the SmartTxt skin sets a
     // lighter top for the classic blue gradient. Incoming bubbles are a flat fill.
     val bubbleBrush = if (isOutgoing) {
         Brush.verticalGradient(listOf(colors.outgoingBubbleTop, colors.outgoingBubble))
     } else {
         SolidColor(colors.incomingBubble)
     }
-    // Message text: white on the blue iMessage sent bubble, dark otherwise.
+    // Message text: white on the blue SmartTxt sent bubble, dark otherwise.
     val onBubbleText = if (isOutgoing) colors.onOutgoingBubble else colors.onBubble
     // In-bubble secondary text (timestamp/edited/deleted): translucent white on a
-    // blue iMessage sent bubble so it stays legible, else the normal muted color.
-    val bubbleMuted = if (isOutgoing && colors.imessage) {
+    // blue SmartTxt sent bubble so it stays legible, else the normal muted color.
+    val bubbleMuted = if (isOutgoing && colors.smarttxt) {
         colors.onOutgoingBubble.copy(alpha = 0.72f)
     } else {
         colors.mutedText
@@ -194,7 +194,7 @@ fun MessageBubble(
             // Avoids a fixed max-width that would overflow tiny screens.
             modifier = Modifier.fillMaxWidth(0.82f),
         ) {
-            // Wrapper so the iMessage tapback badge can overlap the bubble's top
+            // Wrapper so the SmartTxt tapback badge can overlap the bubble's top
             // corner (it's drawn outside the bubble's own clip).
             Box {
             Box(
@@ -205,7 +205,7 @@ fun MessageBubble(
                     .background(bubbleBrush)
                     .then(extraFocusRequesters.fold(Modifier as Modifier) { acc, fr -> acc.focusRequester(fr) })
                     .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
-                    // On the blue iMessage outgoing bubble the default primary
+                    // On the blue SmartTxt outgoing bubble the default primary
                     // (blue) halo blends into the fill; outline it in a very dark
                     // navy (a deeper shade of the bubble) so the DPAD focus state
                     // reads clearly without the harsh white ring. Incoming bubbles
@@ -214,10 +214,10 @@ fun MessageBubble(
                     // the primary border.
                     .dpadFocusHighlight(
                         shape = bubbleShape,
-                        borderColor = if (isOutgoing && colors.imessage) IMessageFocusBorder
+                        borderColor = if (isOutgoing && colors.smarttxt) SmartTxtFocusBorder
                             else Color.Unspecified,
-                        focusedTint = if (isOutgoing && colors.imessage)
-                            IMessageFocusBorder.copy(alpha = 0.18f)
+                        focusedTint = if (isOutgoing && colors.smarttxt)
+                            SmartTxtFocusBorder.copy(alpha = 0.18f)
                             else Color.Unspecified,
                     )
                     // Read-scroll: when this bubble is taller than the chat
@@ -390,10 +390,10 @@ fun MessageBubble(
                         )
                     }
                     // Signal keeps the timestamp + status inline in the bubble.
-                    // iMessage hides them here (the date header carries the time;
+                    // SmartTxt hides them here (the date header carries the time;
                     // the receipt renders BELOW the bubble) so a short bubble hugs
                     // its text instead of stretching to fit "9:41 AM  Delivered".
-                    if (!colors.imessage) {
+                    if (!colors.smarttxt) {
                         Spacer(Modifier.padding(top = 4.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             if (message.editedAtMs != null && !message.isDeleted) {
@@ -427,9 +427,9 @@ fun MessageBubble(
                     }
                 }
             }
-                // iMessage tapback: reactions overlap the bubble's top corner
-                // (BlueBubbles/iMessage style) instead of a chip row below it.
-                if (colors.imessage && message.reactions.isNotEmpty() && !message.isDeleted) {
+                // SmartTxt tapback: reactions overlap the bubble's top corner
+                // (BlueBubbles/SmartTxt style) instead of a chip row below it.
+                if (colors.smarttxt && message.reactions.isNotEmpty() && !message.isDeleted) {
                     TapbackOverlay(
                         reactions = message.reactions,
                         isOutgoing = isOutgoing,
@@ -439,9 +439,9 @@ fun MessageBubble(
                     )
                 }
             }
-            // iMessage: the delivery receipt sits BELOW the bubble, right-aligned
-            // and gray (like real iMessage), so it never widens the bubble.
-            if (colors.imessage && isOutgoing && message.status != MessageStatus.SENT &&
+            // SmartTxt: the delivery receipt sits BELOW the bubble, right-aligned
+            // and gray (like real SmartTxt), so it never widens the bubble.
+            if (colors.smarttxt && isOutgoing && message.status != MessageStatus.SENT &&
                 !message.isDeleted
             ) {
                 Text(
@@ -455,9 +455,9 @@ fun MessageBubble(
                     modifier = Modifier.padding(top = 2.dp, end = 2.dp),
                 )
             }
-            // Non-iMessage skins keep the reaction chip row below the bubble;
-            // the iMessage skin renders them as a corner tapback overlay above.
-            if (!colors.imessage && message.reactions.isNotEmpty() && !message.isDeleted) {
+            // Non-SmartTxt skins keep the reaction chip row below the bubble;
+            // the SmartTxt skin renders them as a corner tapback overlay above.
+            if (!colors.smarttxt && message.reactions.isNotEmpty() && !message.isDeleted) {
                 Spacer(Modifier.padding(top = 4.dp))
                 ReactionsRow(
                     reactions = message.reactions,
@@ -567,7 +567,7 @@ private fun ReactionsRow(
 }
 
 /**
- * iMessage/BlueBubbles-style "tapback": reactions rendered as a small badge
+ * SmartTxt/BlueBubbles-style "tapback": reactions rendered as a small badge
  * overlapping the bubble's top corner (top-leading on your outgoing bubble,
  * top-trailing on an incoming one) rather than a chip row below. Decorative —
  * not focusable.
@@ -587,7 +587,7 @@ private fun TapbackOverlay(
         ),
         horizontalArrangement = Arrangement.spacedBy((-8).dp),
     ) {
-        // One badge per distinct emoji (iMessage stacks tapbacks by type). The
+        // One badge per distinct emoji (SmartTxt stacks tapbacks by type). The
         // grey fill + surface-colored outline reads on both the blue outgoing
         // bubble and the neutral incoming one.
         reactions.keys.take(3).forEach { emoji ->
@@ -605,9 +605,9 @@ private fun TapbackOverlay(
     }
 }
 
-private fun statusGlyph(status: MessageStatus, imessage: Boolean): String =
-    if (imessage) when (status) {
-        // iMessage shows the delivery state as words under the last sent bubble.
+private fun statusGlyph(status: MessageStatus, smarttxt: Boolean): String =
+    if (smarttxt) when (status) {
+        // SmartTxt shows the delivery state as words under the last sent bubble.
         MessageStatus.SENDING -> "Sending…"
         MessageStatus.SENT -> "Sent"
         MessageStatus.DELIVERED -> "Delivered"

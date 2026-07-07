@@ -1,12 +1,12 @@
 //! # absinthe
 //!
-//! An open reimplementation of Apple's iMessage **validation-data** generator
+//! An open reimplementation of Apple's SmartTxt **validation-data** generator
 //! (the "nac" / "Absinthe" routines) for interoperability clients — a drop-in
 //! for OpenBubbles' closed-source `open-absinthe::nac`.
 //!
 //! ## Why this exists
 //!
-//! iMessage registration (`IDS register`) requires a signed *validation data*
+//! SmartTxt registration (`IDS register`) requires a signed *validation data*
 //! blob proving the request comes from genuine Apple hardware. Apple generates
 //! it inside an **obfuscated** routine in `IMDAppleServices` (Apple ships this
 //! through a custom VM obfuscator). Nobody has a clean-room re-implementation of
