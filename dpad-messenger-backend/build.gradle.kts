@@ -1,3 +1,21 @@
+buildscript {
+    repositories {
+        mavenCentral()
+        google()
+    }
+    dependencies {
+        // ObjectBox Gradle plugin — applied in :signal via
+        // `apply(plugin = "io.objectbox")`. The plugin adds the ObjectBox
+        // runtime (objectbox-android + objectbox-kotlin) and the KAPT
+        // annotation processor to :signal automatically.
+        //
+        // Pinned to a 4.0.x that predates ObjectBox's move to requiring AGP 9
+        // (this project is on AGP 8.13). If the plugin errors against AGP 8.13,
+        // bump to the newest 4.x that still lists AGP 8 support.
+        classpath("io.objectbox:objectbox-gradle-plugin:4.0.3")
+    }
+}
+
 plugins {
     // Bumped 8.7.3 → 8.13.2 to align with the dumb-down-launcher repo,
     // which composite-includes this backend (and via it, ../dpad-messenger).
@@ -18,6 +36,9 @@ plugins {
     // root Kotlin version).
     id("org.jetbrains.kotlin.plugin.compose") version "2.1.10" apply false
     id("com.google.protobuf") version "0.9.4" apply false
+    // KAPT — required by ObjectBox's annotation processor (ObjectBox has no KSP
+    // processor yet). Applied only in :signal, the sole module using ObjectBox.
+    id("org.jetbrains.kotlin.kapt") version "2.1.10" apply false
 }
 
 allprojects {

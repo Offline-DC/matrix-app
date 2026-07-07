@@ -20,3 +20,16 @@
 -keep class org.whispersystems.signalservice.** { *; }
 -keep class com.offline.dpadmessenger.backend.signal.groupsproto.** { *; }
 -dontwarn org.whispersystems.signalservice.**
+
+# ObjectBox (message store). The objectbox-android AAR ships its own consumer
+# rules for the io.objectbox runtime, but our @Entity classes and the generated
+# `MyObjectBox` / per-entity `<Entity>_` metadata are accessed by the native
+# binding via field names, so they must survive minification. Keep the whole
+# store package (entities + generated code both live under it).
+-keep class com.offline.dpadmessenger.backend.signal.store.** { *; }
+-keepclassmembers class com.offline.dpadmessenger.backend.signal.store.** { *; }
+-keep @io.objectbox.annotation.Entity class * { *; }
+-keepclassmembers class * {
+    @io.objectbox.annotation.Id <fields>;
+}
+-dontwarn io.objectbox.**

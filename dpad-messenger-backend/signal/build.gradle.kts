@@ -10,7 +10,19 @@ plugins {
     // Compiler plugin. The Compose runtime/ui artifacts come transitively via
     // api(project(":core")) → the dpad-messenger UI library.
     id("org.jetbrains.kotlin.plugin.compose")
+    // KAPT for the ObjectBox annotation processor (generates MyObjectBox +
+    // the per-entity Cursor/`_` metadata classes). ObjectBox has no KSP
+    // processor yet. Under Kotlin 2.1 this runs in K1-kapt compatibility mode;
+    // the "falling back to 1.9" kapt warning is expected and harmless.
+    id("org.jetbrains.kotlin.kapt")
 }
+
+// ObjectBox database (message store persistence). Applied here — after the
+// Android + Kotlin + kapt plugins above — as required by ObjectBox. The plugin
+// auto-adds the ObjectBox runtime (objectbox-android + objectbox-kotlin) and the
+// kapt processor to this module, so no explicit objectbox dependencies are
+// needed below. The plugin classpath is declared in the root build.gradle.kts.
+apply(plugin = "io.objectbox")
 
 android {
     namespace = "com.offline.dpadmessenger.backend.signal"
