@@ -9,7 +9,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import com.offline.dpadmessenger.backend.imessage.IMessageAccountStore
 import com.offline.dpadmessenger.backend.imessage.IMessageMessageRepository
 import com.offline.dpadmessenger.backend.imessage.IMessageRepository
 import com.offline.dpadmessenger.backend.imessage.IMessageStatus
@@ -65,22 +64,14 @@ fun IMessageApp(
                 mutableStateOf(saved)
             }
 
-            // Whole days since the last successful registration, for the
-            // Settings "last linked" row / day-13 re-link banner. Null when
-            // there's no account yet.
-            val linkAgeDays = remember {
-                IMessageAccountStore(context).loadAccount()?.lastRegisteredMs?.let { last ->
-                    ((System.currentTimeMillis() - last) / (24L * 60L * 60L * 1000L)).toInt()
-                }
-            }
-
             DpadMessengerApp(
                 repository = repository,
                 modifier = modifier,
                 onLogout = { IMessageRepository.shutdown(context, wipe = true) },
-                onRelink = { scope.launch { IMessageRepository.session().reauth() } },
-                onFreshRelink = { IMessageRepository.signOutKeepingHistory(context) },
-                linkAgeDays = linkAgeDays,
+                // "Re-link phone" and "Days since last link" are intentionally
+                // left off for the demo: omitting onRelink/onFreshRelink/
+                // linkAgeDays (all default to null) hides both Settings rows.
+                // There's no real ~2-week IDS session to renew here.
                 autoDeleteEnabled = autoDelete,
                 onAutoDeleteChange = retention?.let { r -> { enabled: Boolean -> r.setAutoDeleteEnabled(enabled) } },
                 use24HourTime = use24Hour,
