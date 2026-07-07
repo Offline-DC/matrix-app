@@ -36,13 +36,56 @@ in the app's `objectbox/dpad-signal-obx/` files directory.
 `MetaEntity.legacyImported`):
 
 1. Opens the old `dpad_signal_messages` / `snapshot_v1` `EncryptedSharedPreferences`.
-2. Decodes the old `Snapshot` JSON and writes every row into ObjectBox.
+2. Decodes the old `Snapshot` JSON and writes every row into ObjectBox in one
+   transaction.
 3. Carries over the auto-delete flag, then sets `legacyImported = true`.
 
-It is idempotent across crashes (the import is one transaction; the flag is set
-after). A deliberate `clear()` (unlink) keeps `legacyImported = true`, so the old
-blob is never re-imported. The old encrypted prefs file is left in place
-untouched (safe to delete manually later if desired).
+Failure handling: a TRANSIENT failure (can't open the encrypted prefs, or the
+ObjectBox write fails) does NOT set `legacyImported`, so the next launch retries
+rather than silently losing history — this is a linked device, so Signal won't
+backfill old messages. A genuinely empty store, a successful import, or an
+unrecoverable corrupt/undecodable blob all mark migration done so it never loops.
+A deliberate `clear()` (unlink) keeps `legacyImported = true`, so the old blob is
+never re-imported. The old encrypted prefs file is left in place untouched (safe
+to delete manually later if desired).
+
+### Watching it happen (logs)
+
+All migration lines use the `SignalStore` tag. Add `SignalStore:D` to the
+launcher's `ROLLING_LOGCAT_FILTERSPEC` so they reach quack (as was done for
+`SignalChatWS:D`). Grep target: `obx migration`.
+
+    SignalStore  BoxStore opened (dpad-signal-obx)
+    SignalStore  obx migration: legacy found — importing rooms=4 messages=137 users=51
+    SignalStore  obx migration: imported OK in 42ms
+    SignalStore  obx migration: no legacy store — fresh start
+    SignalStore  obx migration: legacy read FAILED — will retry next launch     (W)
+    SignalStore  obx migration: legacy store unrecoverable — giving up ...       (E)
+    SignalStore  loadSnapshot: 4 rooms / 137 messages (objectbox)
+
+A successful migration is silent in the UI (no spinner) and, for a 3-day store,
+effectively instant — the user just sees their conversations. A FAILED migration
+is user-visible (missing conversations), which is why it retries and logs W/E.
+
+## Failure behavior (hardening)
+
+The store is best-effort and never crashes the Signal backend:
+
+- **Open failure degrades, not crashes.** `SignalObjectBox.get()` returns null
+  (rather than throwing) if the database can't be opened — missing native lib
+  (`UnsatisfiedLinkError`), locked directory, disk full. `SignalMessageStore`
+  then treats a null store as "persistence unavailable": every method is a
+  no-op / default, so the app runs with in-memory-only messages instead of
+  crashing. This matters because the store is built inside
+  `SignalRepository.create` on the main thread.
+- **Saves never throw.** `saveSnapshot` (and `clear`) wrap the ObjectBox write in
+  `runCatching`, so a write error can't escape into the repository's debounced
+  auto-save coroutine and kill the collector (which would silently stop all
+  persistence for the session). The migration import uses the same underlying
+  `writeSnapshot` but checks its result so it can retry on failure.
+- **Single meta row.** `MetaEntity` uses `@Id(assignable = true)` and is pinned
+  to id 1, so concurrent first-access can't create duplicate meta rows (which
+  would make `legacyImported` / the auto-delete flag read off the wrong row).
 
 ## Build & verify on-device (no Android SDK in the authoring env)
 
@@ -65,6 +108,14 @@ First build regenerates the ObjectBox code, so:
 
 ## Follow-ups (not done)
 
+- **First load + migration run on the main thread.** The repository reads the
+  store during construction (`isAutoDeleteEnabled()` at field init, then
+  `loadFromStore()`), and that construction happens in `SignalApp`'s
+  `remember { SignalRepository.create(context) }` — i.e. on the UI thread. Open
+  failure no longer crashes (see hardening above), but a large first import is
+  still synchronous work on the main thread (jank/ANR risk for a near-cap
+  history). Fix would move first-load/migration onto `Dispatchers.IO`, which
+  touches the repository's init/threading — deferred as a larger change.
 - Incremental per-row upserts + a query-based retention delete
   (`timestampMs` is already indexed) instead of the current transactional
   full-replace in `saveSnapshot`. This would only touch `SignalMessageStore`

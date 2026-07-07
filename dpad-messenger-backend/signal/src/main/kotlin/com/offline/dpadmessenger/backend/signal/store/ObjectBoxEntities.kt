@@ -114,7 +114,9 @@ data class MutedRoomEntity(
  */
 @Entity
 data class MetaEntity(
-    @Id var obxId: Long = 0,
+    // Assignable so the store can pin this to a fixed id (=1) and guarantee a
+    // single meta row even under concurrent first-access.
+    @Id(assignable = true) var obxId: Long = 0,
     var autoDeleteEnabled: Boolean = true,
     var legacyImported: Boolean = false,
 )

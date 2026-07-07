@@ -1,6 +1,8 @@
 package com.offline.dpadmessenger.backend.signal
 
 import android.content.Context
+import android.os.SystemClock
+import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.offline.dpadmessenger.backend.signal.store.ContactEntity
@@ -19,26 +21,31 @@ import com.offline.dpadmessenger.backend.signal.store.toEntity
 import com.offline.dpadmessenger.data.Message
 import com.offline.dpadmessenger.data.Room
 import com.offline.dpadmessenger.data.User
-import io.objectbox.Box
 import io.objectbox.BoxStore
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 
 /**
- * On-disk persistence for [SignalMessageRepository], now backed by an ObjectBox
- * database (a real embedded store with per-message / per-room rows and indexed
- * lookups) instead of the previous single encrypted-JSON blob.
+ * On-disk persistence for [SignalMessageRepository], backed by an ObjectBox
+ * database (real per-message / per-room rows with indexed lookups) instead of
+ * the previous single encrypted-JSON blob.
  *
  * The public API — [loadSnapshot], [saveSnapshot], [isAutoDeleteEnabled],
- * [setAutoDeleteEnabled], [clear], and the nested `Snapshot`/`Persisted*` types
- * plus [RETENTION_MS] — is deliberately identical to the old blob store, so
- * [SignalMessageRepository] and the UI/factory call sites are unchanged. Only
- * the storage mechanism swapped underneath.
+ * [setAutoDeleteEnabled], [clear], the nested `Snapshot`/`Persisted*` types and
+ * [RETENTION_MS] — is identical to the old blob store, so [SignalMessageRepository]
+ * and the UI/factory call sites are unchanged.
  *
- * The database is PLAINTEXT (unencrypted). The free ObjectBox core has no
- * built-in at-rest encryption; message bodies now live unencrypted in the app's
- * `objectbox/` files directory. This is a deliberate choice for this build.
+ * The database is PLAINTEXT (unencrypted): the free ObjectBox core has no
+ * built-in at-rest encryption, so message bodies live unencrypted in the app's
+ * `objectbox/` files directory. Deliberate choice for this build.
+ *
+ * Best-effort by design: if ObjectBox can't be opened ([boxStore] is null),
+ * every method degrades to a no-op / default so the app keeps running with
+ * in-memory-only messages. The store never throws out of its constructor or its
+ * save path (matching the old blob store's always-safe behaviour) — important
+ * because it is built inside `SignalRepository.create` on the main thread, where
+ * an exception would take down the whole Signal backend rather than fall back.
  *
  * On first use, any conversations from the previous encrypted-JSON store are
  * imported once (see [ensureMigrated]) so existing users keep their history.
@@ -46,12 +53,12 @@ import kotlinx.serialization.json.Json
 class SignalMessageStore(context: Context) {
 
     private val appContext = context.applicationContext
-    private val boxStore: BoxStore = SignalObjectBox.get(appContext)
-    private val json = Json { ignoreUnknownKeys = true }
 
-    // The persisted shapes below are unchanged from the blob store. They remain
-    // @Serializable because the one-time legacy import decodes the old JSON into
-    // exactly these types before writing them into ObjectBox.
+    /** Shared ObjectBox store, or null if it couldn't be opened. Null degrades
+     *  every method to a safe no-op / default instead of throwing. */
+    private val boxStore: BoxStore? = SignalObjectBox.get(appContext)
+
+    private val json = Json { ignoreUnknownKeys = true }
 
     @Serializable
     data class PersistedRoom(val room: Room, val unreadCount: Int)
@@ -76,29 +83,19 @@ class SignalMessageStore(context: Context) {
         val mutedRooms: Set<String> = emptySet(),
     )
 
-    // ---- boxes ---------------------------------------------------------------
-
-    private val messageBox: Box<MessageEntity> get() = boxStore.boxFor(MessageEntity::class.java)
-    private val roomBox: Box<RoomEntity> get() = boxStore.boxFor(RoomEntity::class.java)
-    private val userBox: Box<UserEntity> get() = boxStore.boxFor(UserEntity::class.java)
-    private val contactBox: Box<ContactEntity> get() = boxStore.boxFor(ContactEntity::class.java)
-    private val groupKeyBox: Box<GroupKeyEntity> get() = boxStore.boxFor(GroupKeyEntity::class.java)
-    private val expireTimerBox: Box<ExpireTimerEntity> get() = boxStore.boxFor(ExpireTimerEntity::class.java)
-    private val mutedBox: Box<MutedRoomEntity> get() = boxStore.boxFor(MutedRoomEntity::class.java)
-    private val metaBox: Box<MetaEntity> get() = boxStore.boxFor(MetaEntity::class.java)
-
     // ---- public API (unchanged signatures) -----------------------------------
 
     fun loadSnapshot(): Snapshot? {
-        ensureMigrated()
+        val store = boxStore ?: return null
+        ensureMigrated(store)
 
-        val roomRows = roomBox.all
-        val messageRows = messageBox.all
-        val userRows = userBox.all
-        val contactRows = contactBox.all
-        val groupKeyRows = groupKeyBox.all
-        val timerRows = expireTimerBox.all
-        val mutedRows = mutedBox.all
+        val roomRows = store.boxFor(RoomEntity::class.java).all
+        val messageRows = store.boxFor(MessageEntity::class.java).all
+        val userRows = store.boxFor(UserEntity::class.java).all
+        val contactRows = store.boxFor(ContactEntity::class.java).all
+        val groupKeyRows = store.boxFor(GroupKeyEntity::class.java).all
+        val timerRows = store.boxFor(ExpireTimerEntity::class.java).all
+        val mutedRows = store.boxFor(MutedRoomEntity::class.java).all
 
         // Match the old store: a completely empty database reads back as null so
         // the repository treats it as a fresh install.
@@ -114,6 +111,7 @@ class SignalMessageStore(context: Context) {
             .groupBy { it.roomId }
             .mapValues { (_, rows) -> rows.map { it.toDomain(json) } }
 
+        Log.d(TAG, "loadSnapshot: ${roomRows.size} rooms / ${messageRows.size} messages (objectbox)")
         return Snapshot(
             rooms = roomRows.map { PersistedRoom(it.toDomainRoom(json), it.unreadCount) },
             messages = messagesByRoom,
@@ -126,14 +124,68 @@ class SignalMessageStore(context: Context) {
     }
 
     /**
-     * Persist the whole snapshot. Implemented as a transactional replace: the
-     * data volume is small (3-day retention keeps it to tens–low-hundreds of
-     * rows) so wiping and re-inserting inside one transaction is simple and
-     * atomic. Incremental per-row upserts are a natural follow-up that would
-     * only touch this method (the callers stay the same).
+     * Persist the whole snapshot (transactional replace). Wrapped so it NEVER
+     * throws: the repository collects this in a coroutine flow, and an escaping
+     * exception would kill the collector and silently stop all future saves.
      */
     fun saveSnapshot(snapshot: Snapshot) {
-        boxStore.runInTx {
+        val store = boxStore ?: return
+        runCatching { writeSnapshot(store, snapshot) }
+            .onFailure { Log.w(TAG, "saveSnapshot failed — state not persisted this cycle", it) }
+    }
+
+    /** Auto-delete retention flag (default true). */
+    fun isAutoDeleteEnabled(): Boolean {
+        val store = boxStore ?: return true
+        ensureMigrated(store)
+        return meta(store).autoDeleteEnabled
+    }
+
+    fun setAutoDeleteEnabled(enabled: Boolean) {
+        val store = boxStore ?: return
+        runCatching {
+            ensureMigrated(store)
+            val m = meta(store)
+            m.autoDeleteEnabled = enabled
+            store.boxFor(MetaEntity::class.java).put(m)
+        }.onFailure { Log.w(TAG, "setAutoDeleteEnabled failed", it) }
+    }
+
+    fun clear() {
+        val store = boxStore ?: return
+        runCatching {
+            store.runInTx {
+                store.boxFor(MessageEntity::class.java).removeAll()
+                store.boxFor(RoomEntity::class.java).removeAll()
+                store.boxFor(UserEntity::class.java).removeAll()
+                store.boxFor(ContactEntity::class.java).removeAll()
+                store.boxFor(GroupKeyEntity::class.java).removeAll()
+                store.boxFor(ExpireTimerEntity::class.java).removeAll()
+                store.boxFor(MutedRoomEntity::class.java).removeAll()
+                // Reset the toggle to default but KEEP legacyImported = true so a
+                // deliberate wipe (unlink) never re-imports the old prefs blob.
+                val m = meta(store)
+                m.autoDeleteEnabled = true
+                m.legacyImported = true
+                store.boxFor(MetaEntity::class.java).put(m)
+            }
+        }.onFailure { Log.w(TAG, "clear failed", it) }
+    }
+
+    // ---- internals -----------------------------------------------------------
+
+    /** The transactional full-replace write; throws on failure so callers can
+     *  decide (saveSnapshot swallows; the migration import retries). */
+    private fun writeSnapshot(store: BoxStore, snapshot: Snapshot) {
+        store.runInTx {
+            val messageBox = store.boxFor(MessageEntity::class.java)
+            val roomBox = store.boxFor(RoomEntity::class.java)
+            val userBox = store.boxFor(UserEntity::class.java)
+            val contactBox = store.boxFor(ContactEntity::class.java)
+            val groupKeyBox = store.boxFor(GroupKeyEntity::class.java)
+            val expireTimerBox = store.boxFor(ExpireTimerEntity::class.java)
+            val mutedBox = store.boxFor(MutedRoomEntity::class.java)
+
             messageBox.removeAll()
             roomBox.removeAll()
             userBox.removeAll()
@@ -142,21 +194,16 @@ class SignalMessageStore(context: Context) {
             expireTimerBox.removeAll()
             mutedBox.removeAll()
 
-            val messageEntities = snapshot.messages.flatMap { (roomId, list) ->
-                list.map { it.toEntity(roomId, json) }
-            }
-            messageBox.put(messageEntities)
+            messageBox.put(
+                snapshot.messages.flatMap { (roomId, list) -> list.map { it.toEntity(roomId, json) } },
+            )
             roomBox.put(snapshot.rooms.map { roomEntityOf(it.room, it.unreadCount, json) })
             userBox.put(snapshot.users.values.map { it.toEntity() })
             contactBox.put(
-                snapshot.contacts.map { (sid, c) ->
-                    ContactEntity(serviceId = sid, name = c.name, e164 = c.e164)
-                },
+                snapshot.contacts.map { (sid, c) -> ContactEntity(serviceId = sid, name = c.name, e164 = c.e164) },
             )
             groupKeyBox.put(
-                snapshot.groupMasterKeysB64.map { (roomId, b64) ->
-                    GroupKeyEntity(roomId = roomId, masterKeyB64 = b64)
-                },
+                snapshot.groupMasterKeysB64.map { (roomId, b64) -> GroupKeyEntity(roomId = roomId, masterKeyB64 = b64) },
             )
             expireTimerBox.put(
                 snapshot.expireTimers.map { (roomId, t) ->
@@ -167,74 +214,100 @@ class SignalMessageStore(context: Context) {
         }
     }
 
-    /** Auto-delete retention flag (default true). */
-    fun isAutoDeleteEnabled(): Boolean {
-        ensureMigrated()
-        return meta().autoDeleteEnabled
+    /**
+     * The single meta row, keyed by a fixed id ([META_ID]) so there is exactly
+     * one even under concurrent first-access (both writers target id 1). Relies
+     * on `MetaEntity`'s `@Id(assignable = true)`.
+     */
+    private fun meta(store: BoxStore): MetaEntity {
+        val box = store.boxFor(MetaEntity::class.java)
+        return box.get(META_ID) ?: MetaEntity(obxId = META_ID).also { box.put(it) }
     }
-
-    fun setAutoDeleteEnabled(enabled: Boolean) {
-        ensureMigrated()
-        val m = meta()
-        m.autoDeleteEnabled = enabled
-        metaBox.put(m)
-    }
-
-    fun clear() {
-        boxStore.runInTx {
-            messageBox.removeAll()
-            roomBox.removeAll()
-            userBox.removeAll()
-            contactBox.removeAll()
-            groupKeyBox.removeAll()
-            expireTimerBox.removeAll()
-            mutedBox.removeAll()
-            // Reset the toggle to its default but KEEP legacyImported = true so a
-            // deliberate wipe (e.g. unlink) never re-imports the old prefs blob.
-            val m = meta()
-            m.autoDeleteEnabled = true
-            m.legacyImported = true
-            metaBox.put(m)
-        }
-    }
-
-    // ---- meta (single-row) ---------------------------------------------------
-
-    /** Returns the one meta row, creating and persisting it on first access. */
-    private fun meta(): MetaEntity =
-        metaBox.all.firstOrNull() ?: MetaEntity().also { metaBox.put(it) }
 
     // ---- one-time migration from the legacy encrypted-JSON store -------------
 
-    /**
-     * Import conversations saved by the previous [EncryptedSharedPreferences]
-     * blob store into ObjectBox exactly once. Guarded by [MetaEntity.legacyImported]
-     * so it runs at most once ever, and idempotent across crashes because the
-     * import itself is a single transaction ([saveSnapshot]) and the flag is set
-     * afterwards.
-     */
-    private fun ensureMigrated() {
-        if (meta().legacyImported) return
+    /** Outcome of reading the legacy blob store — drives retry vs. give-up. */
+    private sealed interface LegacyRead {
+        /** No legacy store present (genuine fresh install) — mark migration done. */
+        object None : LegacyRead
 
-        val (legacySnapshot, legacyAutoDelete) = runCatching { readLegacy() }
-            .getOrDefault(null to null)
+        /** Legacy snapshot decoded and ready to import. */
+        data class Loaded(val snapshot: Snapshot, val autoDelete: Boolean?) : LegacyRead
 
-        if (legacySnapshot != null) {
-            saveSnapshot(legacySnapshot)
-        }
-
-        val m = meta()
-        m.legacyImported = true
-        if (legacyAutoDelete != null) m.autoDeleteEnabled = legacyAutoDelete
-        metaBox.put(m)
+        /**
+         * Could not read the legacy store. [recoverable] = likely transient
+         * (e.g. Keystore not ready) so retry next launch; otherwise give up
+         * (e.g. a corrupt blob that will never decode).
+         */
+        data class Failed(val recoverable: Boolean) : LegacyRead
     }
 
     /**
-     * Read the old encrypted-JSON snapshot + auto-delete flag, if present.
-     * Returns (null, null) when there is nothing to migrate or the prefs can't
-     * be opened/decoded (e.g. fresh install).
+     * Import conversations saved by the previous [EncryptedSharedPreferences]
+     * blob store into ObjectBox exactly once. Guarded by [MetaEntity.legacyImported].
+     *
+     * Failure handling: a TRANSIENT failure (couldn't open the encrypted prefs,
+     * or the import write failed) does NOT set `legacyImported`, so the next
+     * launch retries instead of silently losing the user's history — this is a
+     * linked device and Signal won't backfill old messages. A genuinely empty
+     * store, a successful import, or an unrecoverable corrupt blob all mark
+     * migration done so we don't loop forever.
      */
-    private fun readLegacy(): Pair<Snapshot?, Boolean?> {
+    private fun ensureMigrated(store: BoxStore) {
+        if (meta(store).legacyImported) return
+
+        when (val legacy = readLegacy()) {
+            is LegacyRead.Failed -> {
+                if (legacy.recoverable) {
+                    // Leave legacyImported = false so the next launch retries.
+                    Log.w(TAG, "obx migration: legacy read FAILED — will retry next launch")
+                } else {
+                    Log.e(TAG, "obx migration: legacy store unrecoverable — giving up (history not imported)")
+                    markImported(store, autoDelete = null)
+                }
+            }
+
+            LegacyRead.None -> {
+                Log.i(TAG, "obx migration: no legacy store — fresh start")
+                markImported(store, autoDelete = null)
+            }
+
+            is LegacyRead.Loaded -> {
+                val snap = legacy.snapshot
+                val messageCount = snap.messages.values.sumOf { it.size }
+                Log.i(
+                    TAG,
+                    "obx migration: legacy found — importing rooms=${snap.rooms.size} " +
+                        "messages=$messageCount users=${snap.users.size}",
+                )
+                val started = SystemClock.elapsedRealtime()
+                val wrote = runCatching { writeSnapshot(store, snap) }
+                if (wrote.isFailure) {
+                    // Transient DB write problem — retry next launch rather than
+                    // mark done with a half/empty import.
+                    Log.w(
+                        TAG,
+                        "obx migration: import write FAILED — will retry next launch",
+                        wrote.exceptionOrNull(),
+                    )
+                    return
+                }
+                Log.i(TAG, "obx migration: imported OK in ${SystemClock.elapsedRealtime() - started}ms")
+                markImported(store, autoDelete = legacy.autoDelete)
+            }
+        }
+    }
+
+    /** Persist the "migration done" marker (+ carried-over auto-delete flag). */
+    private fun markImported(store: BoxStore, autoDelete: Boolean?) {
+        val m = meta(store)
+        m.legacyImported = true
+        if (autoDelete != null) m.autoDeleteEnabled = autoDelete
+        store.boxFor(MetaEntity::class.java).put(m)
+    }
+
+    /** Read the old encrypted-JSON snapshot + auto-delete flag. */
+    private fun readLegacy(): LegacyRead {
         val prefs = runCatching {
             val masterKey = MasterKey.Builder(appContext)
                 .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
@@ -246,18 +319,35 @@ class SignalMessageStore(context: Context) {
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
             )
-        }.getOrNull() ?: return null to null
+        }.getOrElse {
+            // Opening the encrypted prefs failed (e.g. Keystore not ready).
+            // Treat as recoverable so we retry — NOT as "no legacy".
+            Log.w(TAG, "obx migration: opening legacy prefs failed", it)
+            return LegacyRead.Failed(recoverable = true)
+        }
 
-        val snapshot = prefs.getString(LEGACY_KEY_SNAPSHOT, null)
-            ?.let { runCatching { json.decodeFromString<Snapshot>(it) }.getOrNull() }
+        val snapString = prefs.getString(LEGACY_KEY_SNAPSHOT, null)
+            ?: return LegacyRead.None  // genuinely nothing to migrate
+
+        val snapshot = runCatching { json.decodeFromString<Snapshot>(snapString) }.getOrElse {
+            // The blob exists but won't decode — corrupt; retrying won't help.
+            Log.e(TAG, "obx migration: legacy snapshot present but failed to decode", it)
+            return LegacyRead.Failed(recoverable = false)
+        }
+
         val autoDelete =
             if (prefs.contains(LEGACY_KEY_AUTO_DELETE)) prefs.getBoolean(LEGACY_KEY_AUTO_DELETE, true)
             else null
 
-        return snapshot to autoDelete
+        return LegacyRead.Loaded(snapshot, autoDelete)
     }
 
     companion object {
+        private const val TAG = "SignalStore"
+
+        /** Fixed id for the single meta row (needs MetaEntity `@Id(assignable = true)`). */
+        private const val META_ID = 1L
+
         // Legacy EncryptedSharedPreferences store (blob format) — read once for
         // the one-time import, then never written to again.
         private const val LEGACY_FILE_NAME = "dpad_signal_messages"
