@@ -13,7 +13,12 @@ import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -35,16 +40,21 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.offline.dpadmessenger.backend.smarttxt.R
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtRepository
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtStatus
 import com.offline.dpadmessenger.backend.smarttxt.MacOSConfig
 import com.offline.dpadmessenger.backend.smarttxt.RegistrationResult
 import com.offline.dpadmessenger.ui.components.DpadButton
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -78,6 +88,7 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
 
     var appleId by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var passwordVisible by remember { mutableStateOf(false) }
 
     var twoFactorCode by remember { mutableStateOf("") }
     // Set while the 2FA provider is awaiting a code from the UI; Verify/Back
@@ -85,12 +96,19 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
     var pending2fa by remember { mutableStateOf<CompletableDeferred<String?>?>(null) }
 
     var error by remember { mutableStateOf<String?>(null) }
+    // Loading shown ON the buttons (Sign in / Verify) instead of a full-screen
+    // "Registering…" page between steps.
+    var signingIn by remember { mutableStateOf(false) }
+    var verifying by remember { mutableStateOf(false) }
 
     // DPAD focus handles so the hardware pad moves predictably down the form.
     val getStartedFr = remember { FocusRequester() }
     val appleIdFr = remember { FocusRequester() }
     val passwordFr = remember { FocusRequester() }
     val continueFr = remember { FocusRequester() }
+    val eyeFr = remember { FocusRequester() }
+    val twoFactorFr = remember { FocusRequester() }
+    val verifyFr = remember { FocusRequester() }
 
     // The chat unlocks the instant the repository flips REGISTERED (the gate
     // swaps this screen out); mirror that here so the flow shows SUCCESS.
@@ -102,25 +120,33 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
         error = null
         twoFactorCode = ""
         pending2fa = null
-        step = SignInStep.REGISTERING
-        scope.launch {
+        // Loading shows on the Sign in button; we stay on the CREDENTIALS page.
+        signingIn = true
+        // Dispatchers.IO: the native login blocks the calling thread; keep it OFF
+        // the main thread so the UI stays responsive (Compose state writes are
+        // safe from a background thread).
+        scope.launch(Dispatchers.IO) {
             val result = SmartTxtRepository.register(
                 context = context,
                 config = MacOSConfig.placeholder(),
                 appleId = appleId.trim().ifBlank { "demo@icloud.com" },
                 password = password,
                 twoFactorProvider = {
-                    // Suspend until the UI collects a code. The Verify button
-                    // completes the deferred with the entered code; Back
-                    // completes it with null (cancel).
+                    // Login succeeded and Apple wants a code: go STRAIGHT to the 2FA
+                    // page (no REGISTERING page), and suspend until the UI collects
+                    // it. Verify completes it with the code; Back completes it with
+                    // null (cancel).
                     val deferred = CompletableDeferred<String?>()
                     pending2fa = deferred
                     twoFactorCode = ""
+                    signingIn = false
                     step = SignInStep.TWO_FACTOR
                     deferred.await()
                 },
             )
             pending2fa = null
+            signingIn = false
+            verifying = false
             when (result) {
                 is RegistrationResult.Failure -> {
                     error = result.message
@@ -135,7 +161,22 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    Box(modifier = modifier.fillMaxSize().padding(24.dp)) {
+    // Use the launcher's Helvetica (Helvetica Now Text) across the whole sign-in
+    // flow by overriding the typography styles this screen, DpadButton, and
+    // OutlinedTextField read from the ambient MaterialTheme.
+    val helvetica = remember { FontFamily(Font(R.font.helvetica_now_text_black)) }
+    val typo = MaterialTheme.typography
+    MaterialTheme(
+        typography = typo.copy(
+            headlineSmall = typo.headlineSmall.copy(fontFamily = helvetica),
+            titleSmall = typo.titleSmall.copy(fontFamily = helvetica),
+            bodyLarge = typo.bodyLarge.copy(fontFamily = helvetica),
+            bodyMedium = typo.bodyMedium.copy(fontFamily = helvetica),
+            bodySmall = typo.bodySmall.copy(fontFamily = helvetica),
+            labelLarge = typo.labelLarge.copy(fontFamily = helvetica),
+        ),
+    ) {
+    Box(modifier = modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 12.dp)) {
         when (step) {
             SignInStep.INTRO -> {
                 AutoFocus(getStartedFr)
@@ -146,8 +187,7 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                 ) {
                     Text("Set up smart txt", style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        "Connect your Apple ID to send and receive smart txt on " +
-                            "this device.",
+                        "Connect your Apple ID to sync your messages on this device.",
                         style = MaterialTheme.typography.bodyMedium,
                         textAlign = TextAlign.Center,
                     )
@@ -166,12 +206,13 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                 // when DPAD focus lands on it (the form is taller than the flip
                 // phone's viewport).
                 val bivSignIn = remember { BringIntoViewRequester() }
+                val bivError = remember { BringIntoViewRequester() }
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
                         .verticalScroll(rememberScrollState()),
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     Text("Sign in", style = MaterialTheme.typography.headlineSmall)
                     Text(
@@ -180,53 +221,117 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                         textAlign = TextAlign.Center,
                     )
 
-                    OutlinedTextField(
-                        value = appleId,
-                        onValueChange = { appleId = it; error = null },
-                        label = { Text("Apple ID") },
-                        placeholder = { Text("you@icloud.com") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .focusRequester(appleIdFr)
-                            // DPAD-Down leaves the (single-line) Apple ID field
-                            // for the Password field — the reported "can't dpad
-                            // down to password" fix.
-                            .onPreviewKeyEvent { e ->
-                                if (e.type == KeyEventType.KeyDown && e.key == Key.DirectionDown) {
-                                    runCatching { passwordFr.requestFocus() }
-                                    true
-                                } else {
-                                    false
-                                }
-                            },
-                    )
+                    // Apple ID — static label above + matching placeholder (no
+                    // Material floating label).
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            "Apple ID",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.fillMaxWidth(),
+                            textAlign = TextAlign.Start,
+                        )
+                        OutlinedTextField(
+                            value = appleId,
+                            onValueChange = { appleId = it; error = null },
+                            placeholder = { Text("Apple ID") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .focusRequester(appleIdFr)
+                                // DPAD-Down leaves the (single-line) Apple ID field
+                                // for the Password field.
+                                .onPreviewKeyEvent { e ->
+                                    if (e.type == KeyEventType.KeyDown && e.key == Key.DirectionDown) {
+                                        runCatching { passwordFr.requestFocus() }
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                },
+                        )
+                    }
 
-                    OutlinedTextField(
-                        value = password,
-                        onValueChange = { password = it; error = null },
-                        label = { Text("Password") },
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .focusRequester(passwordFr)
-                            // Up → back to Apple ID, Down → the Sign in button.
-                            .onPreviewKeyEvent { e ->
-                                if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                                when (e.key) {
-                                    Key.DirectionUp -> {
-                                        runCatching { appleIdFr.requestFocus() }; true
-                                    }
-                                    Key.DirectionDown -> {
-                                        runCatching { continueFr.requestFocus() }; true
-                                    }
-                                    else -> false
+                    // Password — static label above + placeholder; a reveal (eye)
+                    // trailing icon you can DPAD-Right onto and press to toggle.
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            "Password",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.fillMaxWidth(),
+                            textAlign = TextAlign.Start,
+                        )
+                        var eyeFocused by remember { mutableStateOf(false) }
+                        OutlinedTextField(
+                            value = password,
+                            onValueChange = { password = it; error = null },
+                            placeholder = { Text("Password") },
+                            singleLine = true,
+                            visualTransformation = if (passwordVisible)
+                                VisualTransformation.None else PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            trailingIcon = {
+                                IconButton(
+                                    onClick = { passwordVisible = !passwordVisible },
+                                    modifier = Modifier
+                                        .focusRequester(eyeFr)
+                                        .onFocusEvent { eyeFocused = it.isFocused }
+                                        // Left → back to the password field,
+                                        // Down → the Sign in button.
+                                        .onPreviewKeyEvent { e ->
+                                            if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                                            when (e.key) {
+                                                Key.DirectionLeft -> {
+                                                    runCatching { passwordFr.requestFocus() }; true
+                                                }
+                                                Key.DirectionDown -> {
+                                                    runCatching { continueFr.requestFocus() }; true
+                                                }
+                                                else -> false
+                                            }
+                                        },
+                                ) {
+                                    Icon(
+                                        imageVector = if (passwordVisible)
+                                            Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                        contentDescription = if (passwordVisible)
+                                            "Hide password" else "Show password",
+                                        tint = if (eyeFocused)
+                                            MaterialTheme.colorScheme.primary
+                                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
                                 }
                             },
-                    )
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .focusRequester(passwordFr)
+                                // Up → Apple ID, Right → the reveal (eye) icon,
+                                // Down → the Sign in button.
+                                .onPreviewKeyEvent { e ->
+                                    if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                                    when (e.key) {
+                                        Key.DirectionUp -> {
+                                            runCatching { appleIdFr.requestFocus() }; true
+                                        }
+                                        Key.DirectionRight -> {
+                                            runCatching { eyeFr.requestFocus() }; true
+                                        }
+                                        Key.DirectionDown -> {
+                                            runCatching { continueFr.requestFocus() }; true
+                                        }
+                                        else -> false
+                                    }
+                                },
+                        )
+                    }
 
                     // Always enabled so DPAD-Down from the password field can
                     // always land on it (a disabled button isn't focusable); a
@@ -235,6 +340,7 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                     DpadButton(
                         text = "Sign in",
                         onClick = { startRegistration() },
+                        loading = signingIn,
                         modifier = Modifier
                             .fillMaxWidth()
                             .bringIntoViewRequester(bivSignIn)
@@ -243,23 +349,24 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                     )
 
                     error?.let {
+                        // The error sits below the Sign in button, off the bottom of
+                        // the small screen — scroll it into view when it appears.
+                        LaunchedEffect(it) { bivError.bringIntoView() }
                         Text(
                             it,
                             color = MaterialTheme.colorScheme.error,
                             style = MaterialTheme.typography.bodySmall,
                             textAlign = TextAlign.Center,
-                        )
-                        DpadButton(
-                            text = "Retry",
-                            onClick = { error = null },
-                            modifier = Modifier.fillMaxWidth(),
-                            primary = false,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .bringIntoViewRequester(bivError),
                         )
                     }
                 }
             }
 
             SignInStep.TWO_FACTOR -> {
+                AutoFocus(twoFactorFr)
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -275,28 +382,57 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                         textAlign = TextAlign.Center,
                     )
 
-                    OutlinedTextField(
-                        value = twoFactorCode,
-                        onValueChange = { new ->
-                            twoFactorCode = new.filter { it.isDigit() }.take(6)
-                            error = null
-                        },
-                        label = { Text("Verification code") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    // Verification code — static label above + placeholder (like the
+                    // Apple ID / Password fields), focused on entry, DPAD-Down → Verify.
+                    Column(
                         modifier = Modifier.fillMaxWidth(),
-                    )
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            "Verification code",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.fillMaxWidth(),
+                            textAlign = TextAlign.Start,
+                        )
+                        OutlinedTextField(
+                            value = twoFactorCode,
+                            onValueChange = { new ->
+                                twoFactorCode = new.filter { it.isDigit() }.take(6)
+                                error = null
+                            },
+                            placeholder = { Text("Verification code") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .focusRequester(twoFactorFr)
+                                // DPAD-Down from the code field → the Verify button.
+                                .onPreviewKeyEvent { e ->
+                                    if (e.type == KeyEventType.KeyDown && e.key == Key.DirectionDown) {
+                                        runCatching { verifyFr.requestFocus() }
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                },
+                        )
+                    }
 
+                    // Always focusable (not gated on `enabled`) so DPAD-Down from the
+                    // code field always lands here; the guard is inside onClick.
                     DpadButton(
                         text = "Verify",
                         onClick = {
-                            val deferred = pending2fa
-                            pending2fa = null
-                            step = SignInStep.REGISTERING
-                            deferred?.complete(twoFactorCode)
+                            if (twoFactorCode.length == 6 && pending2fa != null) {
+                                val deferred = pending2fa
+                                pending2fa = null
+                                step = SignInStep.REGISTERING
+                                deferred?.complete(twoFactorCode)
+                            }
                         },
                         modifier = Modifier.fillMaxWidth(),
-                        enabled = twoFactorCode.length == 6 && pending2fa != null,
+                        focusRequester = verifyFr,
                     )
 
                     DpadButton(
@@ -354,6 +490,7 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                 }
             }
         }
+    }
     }
 }
 

@@ -162,15 +162,17 @@ fun MessageContextSheet(
             // Failed send: surface the error here, below the actions, so tapping
             // the message with a red "!" explains what went wrong.
             if (message.status == MessageStatus.FAILED) {
-                FailedNotice()
+                FailedNotice(reason = message.errorReason)
             }
         }
     }
 }
 
-/** Error notice shown in the context sheet for a message that failed to send. */
+/** Error notice shown in the context sheet for a message that failed to send.
+ *  [reason] is the specific failure (e.g. "SMS forwarding isn't on…") when the
+ *  backend supplied one; otherwise a generic connectivity hint. */
 @Composable
-private fun FailedNotice() {
+private fun FailedNotice(reason: String?) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
@@ -192,7 +194,8 @@ private fun FailedNotice() {
                 color = MaterialTheme.colorScheme.onErrorContainer,
             )
             Text(
-                text = "Check your connection — if it keeps failing, re-link your phone.",
+                text = reason?.takeIf { it.isNotBlank() }
+                    ?: "Check your connection — if it keeps failing, re-link your phone.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onErrorContainer,
             )

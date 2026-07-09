@@ -88,13 +88,9 @@ fun RoomListItem(
                 overflow = TextOverflow.Ellipsis,
             )
             val preview = summary.lastMessage?.let { msg ->
-                val prefix = if (summary.room.isGroup && !msg.isOutgoing) {
-                    "${senderNameFor(msg.senderId)}: "
-                } else if (msg.isOutgoing) "You: " else ""
-                // Media-only messages have a blank body; show a typed label
-                // ("📷 Photo" etc.) instead of an empty preview line.
-                val text = msg.body.ifBlank { mediaPreviewLabel(msg.attachment) }
-                "$prefix$text"
+                // No "You:" / sender-name prefix — just the message text (media-only
+                // messages have a blank body, so show a typed label instead).
+                msg.body.ifBlank { mediaPreviewLabel(msg.attachment) }
             } ?: "No messages yet"
             Text(
                 text = preview,

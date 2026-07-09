@@ -82,6 +82,12 @@ fun DpadMessengerApp(
     /** 24-hour clock setting (hidden when change handler is null). */
     use24HourTime: Boolean = false,
     onUse24HourTimeChange: ((Boolean) -> Unit)? = null,
+    /** iMessage "send from" handles + current default. When [sendHandles] is
+     *  non-empty and [onDefaultSendHandleChange] is set, Settings shows a picker
+     *  to change the default number/email outgoing texts are sent from. */
+    sendHandles: List<String> = emptyList(),
+    defaultSendHandle: String = "",
+    onDefaultSendHandleChange: ((String) -> Unit)? = null,
     /** Deep link: open this conversation on top of the room list (set when
      *  the user tapped a message notification). [initialRoomKey] must change
      *  per tap so a fresh notification re-navigates. */
@@ -217,6 +223,9 @@ fun DpadMessengerApp(
                     onAutoDeleteChange = onAutoDeleteChange,
                     use24HourTime = use24HourTime,
                     onUse24HourTimeChange = onUse24HourTimeChange,
+                    sendHandles = sendHandles,
+                    defaultSendHandle = defaultSendHandle,
+                    onDefaultSendHandleChange = onDefaultSendHandleChange,
                 )
             }
         }

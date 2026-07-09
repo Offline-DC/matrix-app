@@ -89,6 +89,9 @@ fun MessageBubble(
     senderName: String?,
     showSenderName: Boolean,
     parentSnippet: ReplyParentSnippet?,
+    /** Only the newest outgoing message shows the delivery receipt (iMessage
+     *  style), so "Delivered"/"Read" doesn't repeat under every prior sent one. */
+    showReceipt: Boolean = true,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     focusRequester: FocusRequester? = null,
@@ -149,10 +152,13 @@ fun MessageBubble(
     // Outgoing bubbles use a vertical gradient (top → bottom). When top == bottom
     // (the Signal/default palette) it renders flat; the SmartTxt skin sets a
     // lighter top for the classic blue gradient. Incoming bubbles are a flat fill.
-    val bubbleBrush = if (isOutgoing) {
-        Brush.verticalGradient(listOf(colors.outgoingBubbleTop, colors.outgoingBubble))
-    } else {
-        SolidColor(colors.incomingBubble)
+    val bubbleBrush = when {
+        // Outgoing green SMS (forwarded via the iPhone) — the "green bubble".
+        isOutgoing && message.isSms ->
+            Brush.verticalGradient(listOf(Color(0xFF4CD964), Color(0xFF34C759)))
+        isOutgoing ->
+            Brush.verticalGradient(listOf(colors.outgoingBubbleTop, colors.outgoingBubble))
+        else -> SolidColor(colors.incomingBubble)
     }
     // Message text: white on the blue SmartTxt sent bubble, dark otherwise.
     val onBubbleText = if (isOutgoing) colors.onOutgoingBubble else colors.onBubble
@@ -358,8 +364,11 @@ fun MessageBubble(
                     if (parentSnippet != null) {
                         ReplyQuote(
                             parentSnippet = parentSnippet,
-                            accent = MaterialTheme.colorScheme.primary,
-                            mutedColor = colors.mutedText,
+                            // On a colored (blue/green) sent bubble a blue accent +
+                            // dark text is nearly invisible — use the bubble's own
+                            // on-color so the quote stays legible on any background.
+                            accent = if (isOutgoing) onBubbleText else MaterialTheme.colorScheme.primary,
+                            mutedColor = if (isOutgoing) bubbleMuted else colors.mutedText,
                         )
                         Spacer(Modifier.padding(top = 4.dp))
                     }
@@ -441,7 +450,7 @@ fun MessageBubble(
             }
             // SmartTxt: the delivery receipt sits BELOW the bubble, right-aligned
             // and gray (like real SmartTxt), so it never widens the bubble.
-            if (colors.smarttxt && isOutgoing && message.status != MessageStatus.SENT &&
+            if (colors.smarttxt && isOutgoing && showReceipt && message.status != MessageStatus.SENT &&
                 !message.isDeleted
             ) {
                 Text(
@@ -476,8 +485,8 @@ private fun ReplyQuote(
 ) {
     Row(
         modifier = Modifier
-            .clip(RoundedCornerShape(6.dp))
-            .background(accent.copy(alpha = 0.10f))
+            .clip(RoundedCornerShape(8.dp))
+            .background(accent.copy(alpha = 0.16f))
             .padding(start = 8.dp, top = 6.dp, end = 8.dp, bottom = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

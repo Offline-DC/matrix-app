@@ -31,12 +31,14 @@ class APNsForegroundService : Service() {
         super.onCreate()
         ensureChannel()
         startForeground(NOTIF_ID, buildNotification())
-        // Bring up the live session (relay WebSocket / native APNs socket) and
-        // keep it alive for the life of the process so SmartTxts arrive with the
-        // UI closed. The session is the process-scoped singleton in
-        // SmartTxtRepository; connecting here is idempotent.
-        runCatching { SmartTxtRepository.connect(applicationContext) }
-            .onFailure { Log.w(TAG, "session connect failed: ${it.message}") }
+        // Bring up the live session on a BACKGROUND thread — connect() does the
+        // heavy one-time nativeInit (file I/O + keystore + tokio runtime); running
+        // it on the service's main thread blocks the UI and ANRs at startup. The
+        // session is the process-scoped singleton; connecting is idempotent.
+        Thread {
+            runCatching { SmartTxtRepository.connect(applicationContext) }
+                .onFailure { Log.w(TAG, "session connect failed: ${it.message}") }
+        }.start()
         Log.i(TAG, "SmartTxt push service started")
     }
 
@@ -55,10 +57,12 @@ class APNsForegroundService : Service() {
     private fun buildNotification(): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("smart txt")
-            .setContentText("Connected")
+            // A foreground service MUST have a notification, but we keep it out of
+            // sight: no title/text, MIN priority + MIN-importance channel → no
+            // status-bar icon and no "Connected" banner in the shade.
+            .setPriority(NotificationCompat.PRIORITY_MIN)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setShowWhen(false)
             .build()
 
     private fun ensureChannel() {
@@ -69,14 +73,20 @@ class APNsForegroundService : Service() {
             NotificationChannel(
                 CHANNEL_ID,
                 "smart txt connection",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply { description = "Keeps smart txt connected in the background" },
+                // MIN so the mandatory foreground notification stays hidden.
+                NotificationManager.IMPORTANCE_MIN,
+            ).apply {
+                description = "Keeps smart txt connected in the background"
+                setShowBadge(false)
+            },
         )
     }
 
     companion object {
         private const val TAG = "APNsService"
-        private const val CHANNEL_ID = "smarttxt_connection_v1"
+        // v2: recreated at IMPORTANCE_MIN (channel importance is immutable once
+        // created, so the id must change to drop the old visible "Connected" one).
+        private const val CHANNEL_ID = "smarttxt_connection_v2"
         private const val NOTIF_ID = 0x1305
 
         fun start(context: Context) {

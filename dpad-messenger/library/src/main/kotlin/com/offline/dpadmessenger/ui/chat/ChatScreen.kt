@@ -96,6 +96,7 @@ fun ChatScreen(
     val loading by viewModel.loading.collectAsState()
     val replyTarget by viewModel.replyTarget.collectAsState()
     val editTarget by viewModel.editTarget.collectAsState()
+    val isSms by viewModel.isSms.collectAsState()
     val selected by viewModel.selectedMessage.collectAsState()
 
     val downloadingMedia by viewModel.downloadingMedia.collectAsState()
@@ -260,6 +261,7 @@ fun ChatScreen(
             )
             DpadComposer(
                 onSend = viewModel::send,
+                isSms = isSms,
                 prefill = editTarget?.body,
                 prefillKey = editTarget?.id,
                 textFieldFocusRequester = composerFr,
@@ -472,6 +474,11 @@ private fun Timeline(
     // Gets the FocusRequester so the composer's DPAD-Up lands on it.
     val lastMessageId = (timeline.lastOrNull { it is TimelineItem.MessageItem }
         as? TimelineItem.MessageItem)?.message?.id
+    // The newest OUTGOING message — only IT shows the delivery receipt (iMessage
+    // style), so "Delivered/Read" doesn't repeat under every prior sent message.
+    val lastOutgoingId = (timeline.lastOrNull {
+        it is TimelineItem.MessageItem && it.message.isOutgoing
+    } as? TimelineItem.MessageItem)?.message?.id
 
     // Keep the newest message fully on-screen when the timeline grows while
     // the user is already at the bottom — e.g. they just sent a message, or a
@@ -517,6 +524,7 @@ private fun Timeline(
                         message = msg,
                         senderName = if (msg.isOutgoing) null else senderNameFor(msg.senderId),
                         showSenderName = isGroup && !msg.isOutgoing,
+                        showReceipt = msg.id == lastOutgoingId,
                         parentSnippet = parent,
                         onClick = { onBubbleClick(msg) },
                         // Last bubble gets the composer's DPAD-Up requester; the

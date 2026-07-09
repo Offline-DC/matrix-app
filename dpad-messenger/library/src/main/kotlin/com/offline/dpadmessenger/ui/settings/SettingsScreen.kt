@@ -12,7 +12,11 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.foundation.layout.Box
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -21,7 +25,10 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -66,6 +73,12 @@ fun SettingsScreen(
     /** 24-hour clock toggle. Hidden when [onUse24HourTimeChange] is null. */
     use24HourTime: Boolean = false,
     onUse24HourTimeChange: ((Boolean) -> Unit)? = null,
+    /** The handles the user can send FROM (raw form, e.g. "tel:+1…"/"mailto:…").
+     *  When non-empty and [onDefaultSendHandleChange] is set, Settings shows a
+     *  "Send from" picker (the iMessage default number/email). */
+    sendHandles: List<String> = emptyList(),
+    defaultSendHandle: String = "",
+    onDefaultSendHandleChange: ((String) -> Unit)? = null,
 ) {
     // Land focus on the back button on entry, so the screen has a visible
     // highlight and DPAD navigation works immediately (every other screen sets
@@ -131,8 +144,16 @@ fun SettingsScreen(
                     )
                 }
             }
-            if (onAutoDeleteChange != null) {
+            val showHandlePicker = onDefaultSendHandleChange != null && sendHandles.isNotEmpty()
+            if (onAutoDeleteChange != null || showHandlePicker) {
                 SettingHeader("Messages")
+                if (showHandlePicker) {
+                    HandlePickerRow(
+                        handles = sendHandles,
+                        selected = defaultSendHandle.ifBlank { sendHandles.first() },
+                        onSelect = onDefaultSendHandleChange!!,
+                    )
+                }
                 if (onAutoDeleteChange != null) {
                     ToggleRow(
                         title = "Auto-delete old messages",
@@ -143,9 +164,6 @@ fun SettingsScreen(
                     )
                 }
             }
-            SettingHeader("About")
-            StaticRow(title = "Version", subtitle = "0.2.0 — Phase 2 demo")
-            StaticRow(title = "Repository", subtitle = "dpad-messenger")
             // Log out kept last so it's the bottom-most action.
             SettingHeader("Account")
             if (onRelink != null) {
@@ -241,6 +259,50 @@ private fun ActionRow(
         }
     }
 }
+
+/** "Send from" default-handle chooser: a focusable row showing the current
+ *  number/email, opening a dropdown of the other registered handles on OK. */
+@Composable
+private fun HandlePickerRow(
+    handles: List<String>,
+    selected: String,
+    onSelect: (String) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .dpadRow(onClick = { expanded = true }, shape = RoundedCornerShape(10.dp))
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Send from", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    prettyHandle(selected),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LocalDpadMessengerColors.current.mutedText,
+                )
+            }
+            Icon(Icons.Filled.ArrowDropDown, contentDescription = "Change send number or email")
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            handles.forEach { h ->
+                DropdownMenuItem(
+                    text = { Text(prettyHandle(h)) },
+                    onClick = {
+                        onSelect(h)
+                        expanded = false
+                    },
+                )
+            }
+        }
+    }
+}
+
+/** "tel:+1…" → "+1…", "mailto:x@y" → "x@y". */
+private fun prettyHandle(h: String): String = h.removePrefix("tel:").removePrefix("mailto:")
 
 @Composable
 private fun StaticRow(title: String, subtitle: String) {

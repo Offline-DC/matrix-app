@@ -85,7 +85,43 @@ object ChatGuid {
     /** The address/identifier portion (a handle for DMs, a group id for groups). */
     fun identifier(guid: String): String = guid.substringAfterLast(';', guid)
 
-    fun forDm(address: String, service: String = "iMessage"): String = "$service;-;$address"
+    /** Canonicalise the address so a DM's guid matches the one the native side
+     *  emits for the same person (phone/email/format variants collapse). */
+    fun forDm(address: String, service: String = "iMessage"): String = "$service;-;${Handles.canon(address)}"
+
+    /** Group guid from a member set: "iMessage;+;a,b,c" (canon + deduped +
+     *  sorted), matching the native receive path (counterparts sorted) so a group
+     *  you create threads with the inbound messages for the same people. */
+    fun forGroup(members: List<String>, service: String = "iMessage"): String =
+        "$service;+;" + members.map { Handles.canon(it) }.filter { it.isNotBlank() }
+            .distinct().sorted().joinToString(",")
+}
+
+/**
+ * Canonical handle key. MUST match the Rust `canon` in `smarttxt-ffi/src/lib.rs`
+ * byte-for-byte, so a person's inbound thread, outbound thread, and contact entry
+ * all key identically: scheme stripped, email lowercased, phone reduced to
+ * "+<digits>" (a US 10-digit number gets a +1). This is what fixes the thread
+ * splitting and the contact-name resolution.
+ */
+object Handles {
+    fun canon(handle: String): String {
+        var s = handle.trim()
+        s = when {
+            s.startsWith("tel:") -> s.removePrefix("tel:")
+            s.startsWith("mailto:") -> s.removePrefix("mailto:")
+            else -> s
+        }.trim()
+        if (s.contains('@')) return s.lowercase()
+        val digits = s.filter { it.isDigit() }
+        return when {
+            s.startsWith('+') -> "+$digits"
+            digits.length == 10 -> "+1$digits"
+            digits.length == 11 && digits.startsWith('1') -> "+$digits"
+            digits.isEmpty() -> s.lowercase()
+            else -> "+$digits"
+        }
+    }
 }
 
 /** SmartTxt services: blue (SmartTxt) vs green (SMS/RCS relayed). */

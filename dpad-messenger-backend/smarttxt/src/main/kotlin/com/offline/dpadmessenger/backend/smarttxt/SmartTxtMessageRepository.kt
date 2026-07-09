@@ -2,6 +2,8 @@ package com.offline.dpadmessenger.backend.smarttxt
 
 import android.content.Context
 import android.util.Log
+import com.offline.dpadmessenger.backend.smarttxt.transport.ChatGuid
+import com.offline.dpadmessenger.backend.smarttxt.transport.Handles
 import com.offline.dpadmessenger.backend.smarttxt.transport.RelayChat
 import com.offline.dpadmessenger.backend.smarttxt.transport.RelayMessage
 import com.offline.dpadmessenger.backend.smarttxt.transport.Tapback
@@ -20,6 +22,7 @@ import com.offline.dpadmessenger.data.MessageRepository
 import com.offline.dpadmessenger.data.MessageStatus
 import com.offline.dpadmessenger.data.RetentionSettings
 import com.offline.dpadmessenger.data.Room
+import com.offline.dpadmessenger.data.SmsThreadInfo
 import com.offline.dpadmessenger.data.RoomSummary
 import com.offline.dpadmessenger.data.ThreadActions
 import com.offline.dpadmessenger.data.User
@@ -58,7 +61,7 @@ internal class SmartTxtMessageRepository(
     private val session: SmartTxtSession,
     context: Context,
 ) : MessageRepository, InitialSyncAware, ConversationStarter, GroupConversationStarter,
-    ContactsSource, MediaDownloader, AttachmentSender, RetentionSettings, ThreadActions {
+    ContactsSource, MediaDownloader, AttachmentSender, RetentionSettings, ThreadActions, SmsThreadInfo {
 
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -73,6 +76,12 @@ internal class SmartTxtMessageRepository(
     private val messagesByRoom = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
     private val unreadByRoom = MutableStateFlow<Map<String, Int>>(emptyMap())
     private val mutedRooms = MutableStateFlow<Set<String>>(emptySet())
+    // Latest non-message activity (a received tapback) per room: its real time AND
+    // a preview string ("Molly emphasized …"), so a reaction both bumps the chat
+    // like iMessage AND shows in the row — even though we fold reactions into the
+    // target bubble instead of adding a standalone message.
+    private data class ReactionActivity(val timestampMs: Long, val preview: String)
+    private val roomActivity = MutableStateFlow<Map<String, ReactionActivity>>(emptyMap())
     private val roomNameById = HashMap<String, String>()
     private val writeLock = Mutex()
 
@@ -163,12 +172,17 @@ internal class SmartTxtMessageRepository(
         writeLock.withLock {
             if (rooms.value.isNotEmpty() || messagesByRoom.value.isNotEmpty()) return@withLock
             val cutoff = if (_autoDelete.value) System.currentTimeMillis() - AUTO_DELETE_AGE_MS else 0L
-            usersById.value = snap.usersById + (ME to currentUser)
-            rooms.value = snap.rooms
-            messagesByRoom.value = snap.messagesByRoom.mapValues { (_, l) -> l.filter { it.timestampMs >= cutoff } }
+            // Sanitize any legacy cache written before display names were
+            // scheme-stripped, so a persisted "tel:+…"/"mailto:…" never resurfaces.
+            usersById.value = snap.usersById.mapValues { (_, u) -> u.copy(displayName = stripScheme(u.displayName)) } + (ME to currentUser)
+            rooms.value = snap.rooms.map { it.copy(name = stripScheme(it.name)) }
+            messagesByRoom.value = snap.messagesByRoom.mapValues { (_, l) ->
+                val kept = l.filter { it.timestampMs >= cutoff }
+                if (kept.size > MAX_MESSAGES_PER_ROOM) kept.takeLast(MAX_MESSAGES_PER_ROOM) else kept
+            }
             unreadByRoom.value = snap.unreadByRoom
             mutedRooms.value = snap.mutedRooms
-            snap.rooms.forEach { roomNameById[it.id] = it.name }
+            rooms.value.forEach { roomNameById[it.id] = it.name }
             if (snap.rooms.isNotEmpty()) _initialSyncComplete.value = true
         }
     }
@@ -196,8 +210,10 @@ internal class SmartTxtMessageRepository(
         when (e) {
             is TransportEvent.ChatsUpdated -> { onChats(e.chats); _initialSyncComplete.value = true }
             is TransportEvent.MessagesUpdated -> onMessages(e.messages)
-            is TransportEvent.MessageStatusChanged -> onStatus(e)
-            is TransportEvent.TapbackUpdated -> onTapback(e)
+            is TransportEvent.MessageStatusChanged -> onStatuses(listOf(e))
+            is TransportEvent.MessageStatusBatch -> onStatuses(e.items)
+            is TransportEvent.TapbackUpdated -> onTapbacks(listOf(e))
+            is TransportEvent.TapbackBatch -> onTapbacks(e.items)
             is TransportEvent.TypingChanged -> { /* no UI slot yet; ignore */ }
             TransportEvent.Connected -> { Log.i(TAG, "session connected"); _authExpired.value = false }
             TransportEvent.Disconnected -> Log.i(TAG, "session disconnected")
@@ -238,9 +254,11 @@ internal class SmartTxtMessageRepository(
     }
 
     private suspend fun onMessages(msgs: List<RelayMessage>) = writeLock.withLock {
+        if (msgs.isEmpty()) return@withLock
         val byRoom = messagesByRoom.value.toMutableMap()
         val unread = unreadByRoom.value.toMutableMap()
         val users = usersById.value.toMutableMap()
+        val touched = HashSet<String>()   // rooms to sort + cap ONCE at the end
         val cutoff = if (_autoDelete.value) System.currentTimeMillis() - AUTO_DELETE_AGE_MS else 0L
         for (rm in msgs) {
             if (rm.timestampMs in 1 until cutoff) continue
@@ -261,6 +279,7 @@ internal class SmartTxtMessageRepository(
                     if (next.isEmpty()) map.remove(emoji) else map[emoji] = next
                     list[ti] = m.copy(reactions = map)
                     byRoom[rm.chatGuid] = list
+                    touched.add(rm.chatGuid)
                 }
                 continue
             }
@@ -279,21 +298,92 @@ internal class SmartTxtMessageRepository(
             }
             val isNew = idx < 0
             val preserved = if (idx >= 0) {
+                val prevTs = list[idx].timestampMs
                 val prevAtt = list[idx].attachment
                 val newAtt = mapped.attachment
-                if (prevAtt?.localPath != null && newAtt != null) mapped.copy(attachment = newAtt.copy(localPath = prevAtt.localPath))
-                else mapped
+                val withAtt = if (prevAtt?.localPath != null && newAtt != null) mapped.copy(attachment = newAtt.copy(localPath = prevAtt.localPath))
+                    else mapped
+                // Keep the FIRST-seen sort key. APS redelivers, and rustpush can
+                // re-emit the same guid with a slightly different sent_timestamp;
+                // letting that overwrite timestampMs would re-sort an existing
+                // bubble — the "message jumped below its own reply" reordering.
+                withAtt.copy(timestampMs = prevTs)
             } else mapped
             if (idx >= 0) list[idx] = preserved else list.add(preserved)
-            list.sortBy { it.timestampMs }
             byRoom[rm.chatGuid] = list
+            touched.add(rm.chatGuid)   // sorted + capped once after the loop
             if (!rm.isFromMe && rm.chatGuid != activeRoomId) {
                 unread[rm.chatGuid] = (unread[rm.chatGuid] ?: 0) + (if (isNew) 1 else 0)
             }
             if (rooms.value.none { it.id == rm.chatGuid }) {
-                rooms.value = rooms.value + Room(id = rm.chatGuid, name = roomNameById[rm.chatGuid] ?: rm.chatGuid)
+                // Friendly room name: for a group use its name (cv_name) or the
+                // member list; for a 1:1 the contact name / pretty number-email —
+                // never the raw "iMessage;-;+1…" guid.
+                val roomName = roomNameById[rm.chatGuid] ?: when {
+                    rm.chatName.isNotBlank() -> rm.chatName
+                    ChatGuid.isGroup(rm.chatGuid) ->
+                        ChatGuid.identifier(rm.chatGuid).split(",").filter { it.isNotBlank() }
+                            .joinToString(", ") { contactName(it) ?: prettyHandle(it) }
+                    else -> {
+                        // Name a 1:1 after the OTHER party — always the chat guid's
+                        // tail (iMessage;-;<counterpart>). Do NOT use senderAddress:
+                        // on an outbound / self-synced message that's OUR OWN handle,
+                        // which would title the thread with the user's own number or
+                        // email (the reported "message from myself" bug).
+                        val addr = rm.chatGuid.substringAfterLast(';')
+                        contactName(addr) ?: prettyHandle(addr)
+                    }
+                }
+                roomNameById[rm.chatGuid] = roomName
+                // Mark the room as a group so the chat UI shows per-message sender
+                // names (showSenderName = isGroup && !isOutgoing). Message-driven
+                // rooms defaulted isGroup=false, which hid the senders.
+                val isGroupRoom = ChatGuid.isGroup(rm.chatGuid)
+                rooms.value = rooms.value + Room(
+                    id = rm.chatGuid,
+                    name = roomName,
+                    isGroup = isGroupRoom,
+                    memberIds = if (isGroupRoom) {
+                        ChatGuid.identifier(rm.chatGuid).split(",").filter { it.isNotBlank() }
+                            .map { handleToUserId(it) }
+                    } else {
+                        emptyList()
+                    },
+                )
+            } else if (ChatGuid.isGroup(rm.chatGuid)) {
+                // Heal a group room saved before isGroup was set (senders were hidden).
+                val existing = rooms.value.firstOrNull { it.id == rm.chatGuid }
+                if (existing != null && !existing.isGroup) {
+                    rooms.value = rooms.value.map { if (it.id == rm.chatGuid) it.copy(isGroup = true) else it }
+                }
+            } else {
+                // Self-heal a 1:1 room whose saved name is wrong: blank, a raw
+                // number, or — the reported bug — the user's OWN handle (a thread
+                // first created by an outbound/self-synced message used to be named
+                // after senderAddress = us). A 1:1 is always named after the
+                // counterpart, so replace any handle-looking title (starts with '+'
+                // or contains '@') with the counterpart's contact name / number.
+                val addr = rm.chatGuid.substringAfterLast(';')
+                val cur = roomNameById[rm.chatGuid]
+                val looksLikeHandle = cur != null &&
+                    Handles.canon(cur).let { it.startsWith("+") || it.contains("@") }
+                if (cur == null || cur.isBlank() || looksLikeHandle) {
+                    val better = contactName(addr) ?: prettyHandle(addr)
+                    if (better.isNotBlank() && better != cur) {
+                        roomNameById[rm.chatGuid] = better
+                        rooms.value = rooms.value.map { if (it.id == rm.chatGuid) it.copy(name = better) else it }
+                    }
+                }
             }
             maybeNotify(rm, mapped, isNew)
+        }
+        // Sort + cap each touched room ONCE per batch. Stable sortedBy keeps
+        // equal-millisecond messages in arrival order. During a bulk catch-up this
+        // turns O(N²) per-message sorting into O(N + m log m); the cap bounds RAM and
+        // the on-disk save so a huge history can't balloon on a 1 GB device.
+        for (room in touched) {
+            val sorted = byRoom[room]?.sortedBy { it.timestampMs } ?: continue
+            byRoom[room] = if (sorted.size > MAX_MESSAGES_PER_ROOM) sorted.takeLast(MAX_MESSAGES_PER_ROOM) else sorted
         }
         usersById.value = users
         messagesByRoom.value = byRoom
@@ -301,37 +391,136 @@ internal class SmartTxtMessageRepository(
         requestSave()
     }
 
-    private suspend fun onStatus(e: TransportEvent.MessageStatusChanged) = writeLock.withLock {
-        val status = statusFromWire(e.status)
-        val list = messagesByRoom.value[e.chatGuid].orEmpty().toMutableList()
-        val idx = list.indexOfFirst { it.id == e.guid || (e.tempGuid != null && it.id == e.tempGuid) }
-        if (idx < 0) return@withLock
-        // Reconcile the optimistic id → server guid, and only advance status.
-        val cur = list[idx]
-        val advanced = if (statusRank(status) >= statusRank(cur.status)) status else cur.status
-        list[idx] = cur.copy(id = e.guid.ifBlank { cur.id }, status = advanced)
-        messagesByRoom.value = messagesByRoom.value + (e.chatGuid to list)
-        requestSave()
+    /** Apply a whole batch of status changes with a SINGLE state update. */
+    private suspend fun onStatuses(items: List<TransportEvent.MessageStatusChanged>) = writeLock.withLock {
+        if (items.isEmpty()) return@withLock
+        val byRoom = messagesByRoom.value.toMutableMap()
+        var changed = false
+        for (e in items) {
+            val status = statusFromWire(e.status)
+            val list = byRoom[e.chatGuid].orEmpty().toMutableList()
+            val idx = list.indexOfFirst { it.id == e.guid || (e.tempGuid != null && it.id == e.tempGuid) }
+            if (idx < 0) continue
+            // Reconcile the optimistic id → server guid, and only advance status.
+            val cur = list[idx]
+            val advanced = if (statusRank(status) >= statusRank(cur.status)) status else cur.status
+            list[idx] = cur.copy(id = e.guid.ifBlank { cur.id }, status = advanced, isSms = cur.isSms || e.service == "SMS")
+            byRoom[e.chatGuid] = list
+            changed = true
+        }
+        if (changed) { messagesByRoom.value = byRoom; requestSave() }
     }
 
-    private suspend fun onTapback(e: TransportEvent.TapbackUpdated) = writeLock.withLock {
-        val reactorId = if (e.isFromMe) ME else handleToUserId(e.senderAddress)
-        updateMessage(e.chatGuid, e.targetGuid) { m ->
-            val reactors = m.reactions[e.emoji].orEmpty()
-            val next = if (e.remove) reactors - reactorId else (reactors + reactorId).distinct()
-            val map = m.reactions.toMutableMap()
-            if (next.isEmpty()) map.remove(e.emoji) else map[e.emoji] = next
-            m.copy(reactions = map)
+    /** Apply a whole batch of tapbacks with a SINGLE state update (plus one
+     *  activity-map update). Fresh reactions bump the chat + notify like iMessage;
+     *  the bump uses each reaction's REAL send time (max) so a backlog synced on
+     *  launch can't reorder the list. */
+    private suspend fun onTapbacks(items: List<TransportEvent.TapbackUpdated>) = writeLock.withLock {
+        if (items.isEmpty()) return@withLock
+        val byRoom = messagesByRoom.value.toMutableMap()
+        val activity = roomActivity.value.toMutableMap()
+        val toNotify = ArrayList<Pair<TransportEvent.TapbackUpdated, String>>()
+        var msgsChanged = false
+        var activityChanged = false
+        for (e in items) {
+            val reactorId = if (e.isFromMe) ME else handleToUserId(e.senderAddress)
+            val list = byRoom[e.chatGuid].orEmpty().toMutableList()
+            val ti = list.indexOfFirst { it.id == e.targetGuid }
+            var targetBody = ""
+            if (ti >= 0) {
+                val m = list[ti]
+                targetBody = m.body
+                val reactors = m.reactions[e.emoji].orEmpty()
+                val next = if (e.remove) reactors - reactorId else (reactors + reactorId).distinct()
+                val map = m.reactions.toMutableMap()
+                if (next.isEmpty()) map.remove(e.emoji) else map[e.emoji] = next
+                list[ti] = m.copy(reactions = map)
+                byRoom[e.chatGuid] = list
+                msgsChanged = true
+            }
+            if (!e.remove && !e.isFromMe) {
+                // Bump the chat by the reaction's REAL send time only — NO "now"
+                // fallback. An unknown (0) or old timestamp must never shove a chat
+                // up: that's the catch-up reorder bug (a backlog of old reactions
+                // stamped "now" jumps a stale group above a chat you just texted).
+                // The summary then lifts the chat + shows the reaction preview only
+                // when the reaction is genuinely newer than its last message.
+                if (e.timestampMs > (activity[e.chatGuid]?.timestampMs ?: 0L)) {
+                    activity[e.chatGuid] = ReactionActivity(
+                        timestampMs = e.timestampMs,
+                        preview = tapbackSummary(e.senderAddress, e.emoji, targetBody),
+                    )
+                    activityChanged = true
+                }
+                toNotify.add(e to targetBody)
+            }
         }
-        requestSave()
+        if (msgsChanged) messagesByRoom.value = byRoom
+        if (activityChanged) roomActivity.value = activity
+        if (msgsChanged || activityChanged) requestSave()
+        for ((e, body) in toNotify) notifyTapback(e, body)
+    }
+
+    /** iMessage-style tapback alert: "Diego liked "Like on signal"". Gated the same
+     *  way as message alerts (skip the actively-viewed chat when the screen is on,
+     *  and muted threads). */
+    private fun notifyTapback(e: TransportEvent.TapbackUpdated, targetBody: String) {
+        val screenOn = runCatching {
+            (appContext.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager).isInteractive
+        }.getOrDefault(true)
+        if (screenOn && e.chatGuid == activeRoomId) return
+        if (e.chatGuid in mutedRooms.value) return
+        // Don't alert for a backlog of old reactions synced on launch — only ones
+        // that happened this session (mirrors maybeNotify's backfill guard).
+        if (e.timestampMs in 1 until (sessionStartMs - 10_000L)) return
+        val reactor = contactName(e.senderAddress) ?: prettyHandle(e.senderAddress)
+        notifier.notifyIncoming(
+            roomId = e.chatGuid,
+            title = roomNameById[e.chatGuid] ?: reactor,
+            sender = reactor,
+            body = tapbackSummary(e.senderAddress, e.emoji, targetBody),
+        )
+    }
+
+    /** iMessage-style one-liner for a received reaction, e.g.
+     *  Molly emphasized "Your only living grandparent…". Used for BOTH the
+     *  notification and the chat-list preview so they read identically. */
+    private fun tapbackSummary(senderAddress: String, emoji: String, targetBody: String): String {
+        val reactor = contactName(senderAddress) ?: prettyHandle(senderAddress)
+        val snippet = targetBody.ifBlank { "your message" }
+            .let { if (it.length > 30) it.take(30).trim() + "…" else it }
+        return "$reactor ${tapbackVerb(emoji)} “$snippet”"
+    }
+
+    /** English verb for a tapback emoji (matches the FFI's reaction_emoji set). */
+    private fun tapbackVerb(emoji: String): String = when (emoji) {
+        "❤️", "♥️" -> "loved"
+        "👍" -> "liked"
+        "👎" -> "disliked"
+        "😂", "😆" -> "laughed at"
+        "‼️", "❗", "❗️" -> "emphasized"
+        "❓", "❔" -> "questioned"
+        else -> "reacted $emoji to"
     }
 
     private fun maybeNotify(rm: RelayMessage, mapped: Message, isNew: Boolean) {
-        if (!isNew || rm.isFromMe || rm.chatGuid == activeRoomId) return
+        if (!isNew || rm.isFromMe) return
+        // Suppress only when the user is actually LOOKING at this chat: screen ON
+        // AND it's the active room. With the screen off / lid down, notify even for
+        // the active room — a chat left open when the lid closed shouldn't swallow
+        // its own alerts (the reported bug).
+        val screenOn = runCatching {
+            (appContext.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager).isInteractive
+        }.getOrDefault(true)
+        if (screenOn && rm.chatGuid == activeRoomId) { Log.d(TAG, "notify skip: active room ${rm.chatGuid}"); return }
         if (rm.chatGuid in mutedRooms.value) { notifier.clearConversation(rm.chatGuid, reason = "muted"); return }
-        if (mapped.timestampMs < sessionStartMs - 10_000L) return // suppress backfill
+        if (mapped.timestampMs < sessionStartMs - 10_000L) {
+            Log.d(TAG, "notify skip: backfill ts=${mapped.timestampMs} sessionStart=$sessionStartMs")
+            return
+        }
         val body = mapped.body.ifBlank { if (rm.attachments.isNotEmpty()) "Sent an attachment" else "" }
-        if (body.isBlank()) return
+        if (body.isBlank()) { Log.d(TAG, "notify skip: blank body ${rm.chatGuid}"); return }
+        Log.i(TAG, "notify: room=${rm.chatGuid} screenOn=$screenOn body='${body.take(24)}'")
         notifier.notifyIncoming(
             roomId = rm.chatGuid,
             title = roomNameById[rm.chatGuid] ?: userById(mapped.senderId).displayName,
@@ -343,13 +532,30 @@ internal class SmartTxtMessageRepository(
     // ---- MessageRepository reads -------------------------------------------
 
     override fun userById(id: String): User =
-        usersById.value[id] ?: User(id = id, displayName = prettyHandle(id), avatarColor = "#9E9E9E")
+        usersById.value[id]?.let { it.copy(displayName = stripScheme(it.displayName)) }
+            ?: User(id = id, displayName = prettyHandle(id), avatarColor = "#9E9E9E")
 
     override fun observeRoomSummaries(): Flow<List<RoomSummary>> =
-        combine(rooms, messagesByRoom, unreadByRoom) { rs, msgs, unread ->
+        combine(rooms, messagesByRoom, unreadByRoom, roomActivity) { rs, msgs, unread, activity ->
             rs.map { room ->
                 val last = msgs[room.id]?.lastOrNull { !it.isDeleted } ?: msgs[room.id]?.lastOrNull()
-                RoomSummary(room = room, lastMessage = last, unreadCount = unread[room.id] ?: 0)
+                val react = activity[room.id]
+                // If a received reaction is newer than the last real message, surface
+                // it AS the row's preview: a synthetic "<name> emphasized …" message
+                // stamped at the reaction's time. It lives only in this summary (never
+                // in the chat timeline), so the row shows the reaction text + time and
+                // sorts by it, exactly like iMessage.
+                val preview = if (react != null && react.timestampMs > (last?.timestampMs ?: 0L)) {
+                    Message(
+                        id = "reaction:${room.id}",
+                        roomId = room.id,
+                        senderId = "",
+                        body = react.preview,
+                        timestampMs = react.timestampMs,
+                        isOutgoing = false,
+                    )
+                } else last
+                RoomSummary(room = room, lastMessage = preview, unreadCount = unread[room.id] ?: 0)
             }.sortedByDescending { it.lastMessage?.timestampMs ?: 0L }
         }.onStart { activeRoomId = null }
 
@@ -365,12 +571,33 @@ internal class SmartTxtMessageRepository(
 
     // ---- MessageRepository writes ------------------------------------------
 
+    /**
+     * Sort timestamp for a NEW outgoing message. Clamped to at least 1ms after
+     * the newest message already in the thread.
+     *
+     * Received messages are ordered by Apple's `sent_timestamp` (the sender's
+     * clock); an outgoing optimistic bubble is stamped with THIS device's clock.
+     * If the flip phone's clock runs behind the sender's, a reply fired right
+     * after an incoming text would get a smaller number and sort ABOVE the very
+     * message it's replying to — and because Apple never echoes a same-device
+     * send back with an authoritative time, that skew would be permanent. The
+     * clamp guarantees a fresh send always lands at the bottom of the thread.
+     */
+    private fun nextOutgoingTimestamp(roomId: String): Long {
+        val now = System.currentTimeMillis()
+        val last = messagesByRoom.value[roomId]?.maxOfOrNull { it.timestampMs } ?: 0L
+        return maxOf(now, last + 1)
+    }
+
     override suspend fun sendMessage(roomId: String, body: String, replyToId: String?): Message {
         val tmpId = "tmp_" + System.nanoTime()
         val optimistic = Message(
             id = tmpId, roomId = roomId, senderId = ME, body = body,
-            timestampMs = System.currentTimeMillis(), status = MessageStatus.SENDING,
+            timestampMs = nextOutgoingTimestamp(roomId), status = MessageStatus.SENDING,
             isOutgoing = true, replyToId = replyToId,
+            // Green immediately on an SMS thread (from the composer's probe / prior
+            // SMS in the thread) so it doesn't flash blue before the delivered event.
+            isSms = smsThreadCache[roomId] == true || messagesByRoom.value[roomId]?.any { it.isSms } == true,
         )
         writeLock.withLock {
             messagesByRoom.value = messagesByRoom.value + (roomId to (messagesByRoom.value[roomId].orEmpty() + optimistic))
@@ -384,6 +611,7 @@ internal class SmartTxtMessageRepository(
                     it.copy(
                         id = ack.guid ?: it.id,
                         status = if (ack.ok) MessageStatus.SENT else MessageStatus.FAILED,
+                        errorReason = if (ack.ok) null else ack.error,
                     )
                 }
                 requestSave()
@@ -485,6 +713,31 @@ internal class SmartTxtMessageRepository(
         return chat.guid
     }
 
+    // ---- SmsThreadInfo ------------------------------------------------------
+
+    /** Cached "is this thread green SMS?" per room — filled by the composer's probe
+     *  ([isSmsThread]) so a fresh outgoing message can be colored green immediately
+     *  instead of flashing blue until the delivered event reports the service. */
+    private val smsThreadCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+    override suspend fun isSmsThread(roomId: String): Boolean {
+        val result = when {
+            // Any SMS message already in the thread → definitely green.
+            messagesByRoom.value[roomId]?.any { it.isSms } == true -> true
+            // Groups are iMessage/MMS — treat as blue.
+            ChatGuid.isGroup(roomId) -> false
+            else -> {
+                // Ask the native side whether the recipient is on iMessage (a network
+                // lookup, off the main thread). Not on iMessage → green SMS.
+                val addr = roomId.substringAfterLast(';')
+                if (addr.isBlank()) false
+                else !withContext(Dispatchers.IO) { RustPushNative.runCatchingNativeIsImessage(addr) }
+            }
+        }
+        smsThreadCache[roomId] = result
+        return result
+    }
+
     // ---- ContactsSource -----------------------------------------------------
 
     private var cachedContacts: List<ContactEntry>? = null
@@ -492,9 +745,9 @@ internal class SmartTxtMessageRepository(
     override suspend fun listContacts(): List<ContactEntry> {
         cachedContacts?.let { return it }
         val local = withContext(Dispatchers.IO) { SmartTxtContacts.read(appContext) }
-            .map { ContactEntry(name = it.name, number = it.handle) }
+            .map { ContactEntry(name = it.name, number = stripScheme(it.handle)) }
         val relay = runCatching { session.listContacts() }.getOrDefault(emptyList())
-            .map { ContactEntry(it.name.ifBlank { prettyHandle(it.address) }, it.address, it.avatarColor.ifBlank { "#7E57C2" }) }
+            .map { ContactEntry(it.name.ifBlank { prettyHandle(it.address) }, stripScheme(it.address), it.avatarColor.ifBlank { "#7E57C2" }) }
         val byKey = LinkedHashMap<String, ContactEntry>()
         for (c in local + relay) {
             val key = handleKey(c.number)
@@ -513,50 +766,114 @@ internal class SmartTxtMessageRepository(
     private val mediaDir by lazy { java.io.File(appContext.cacheDir, "smarttxt_media").apply { mkdirs() } }
 
     override suspend fun downloadMedia(roomId: String, messageId: String): String? {
-        val msg = messagesByRoom.value[roomId]?.firstOrNull { it.id == messageId } ?: return null
-        val att = msg.attachment ?: return null
-        att.localPath?.let { if (java.io.File(it).exists()) return it }
-        val bytes = runCatching { session.downloadAttachment(att.downloadToken) }.getOrNull() ?: return null
+        val msg = messagesByRoom.value[roomId]?.firstOrNull { it.id == messageId }
+        if (msg == null) { Log.w(TAG, "downloadMedia: no message $messageId in room $roomId"); return null }
+        val att = msg.attachment
+        if (att == null) { Log.w(TAG, "downloadMedia: message $messageId has no attachment"); return null }
+        att.localPath?.let {
+            if (java.io.File(it).exists()) { Log.i(TAG, "downloadMedia: already have local $it"); return it }
+            Log.i(TAG, "downloadMedia: localPath set but file missing ($it) — re-downloading")
+        }
+        Log.i(TAG, "downloadMedia: fetch msg=$messageId token='${att.downloadToken}' kind=${att.kind} mime=${att.mimeType}")
+        if (att.downloadToken.isBlank()) {
+            Log.w(TAG, "downloadMedia: blank downloadToken for $messageId — nothing to fetch")
+            return null
+        }
+        val bytes = runCatching { session.downloadAttachment(att.downloadToken) }
+            .onFailure { Log.e(TAG, "downloadMedia: downloadAttachment threw for token='${att.downloadToken}'", it) }
+            .getOrNull()
+        if (bytes == null || bytes.isEmpty()) {
+            Log.w(TAG, "downloadMedia: downloadAttachment returned ${if (bytes == null) "null" else "empty"} for token='${att.downloadToken}' (msg=$messageId) — see smarttxt_ffi log for the native reason")
+            return null
+        }
+        Log.i(TAG, "downloadMedia: got ${bytes.size} bytes for msg=$messageId")
         val ext = when (att.kind) {
             AttachmentKind.IMAGE -> att.mimeType.substringAfter('/', "jpg").ifBlank { "jpg" }
             AttachmentKind.VIDEO -> att.mimeType.substringAfter('/', "mp4").ifBlank { "mp4" }
+            AttachmentKind.AUDIO -> "m4a"
             else -> "bin"
         }
         val file = java.io.File(mediaDir, "${messageId.filter { it.isLetterOrDigit() }}.$ext")
-        runCatching { file.writeBytes(bytes) }.getOrElse { Log.e(TAG, "media write failed", it); return null }
+        runCatching { file.writeBytes(bytes) }.getOrElse { Log.e(TAG, "downloadMedia: media write failed", it); return null }
         val path = file.absolutePath
         writeLock.withLock {
             updateMessage(roomId, messageId) { m -> m.copy(attachment = m.attachment?.copy(localPath = path)) }
             requestSave()
         }
+        Log.i(TAG, "downloadMedia: saved $path for msg=$messageId")
         return path
     }
 
-    override suspend fun sendAttachment(roomId: String, contentUri: String): Boolean {
-        val uri = runCatching { android.net.Uri.parse(contentUri) }.getOrNull() ?: return false
-        val resolver = appContext.contentResolver
-        val mime = resolver.getType(uri) ?: "application/octet-stream"
-        val bytes = withContext(Dispatchers.IO) {
-            runCatching { resolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
-        } ?: return false
-        val name = queryDisplayName(uri) ?: "attachment"
-        val tmpId = "tmp_" + System.nanoTime()
-        val optimistic = Message(
-            id = tmpId, roomId = roomId, senderId = ME,
-            body = if (mime.startsWith("video/")) "[video]" else "[photo]",
-            timestampMs = System.currentTimeMillis(), status = MessageStatus.SENDING, isOutgoing = true,
-        )
-        writeLock.withLock {
-            messagesByRoom.value = messagesByRoom.value + (roomId to (messagesByRoom.value[roomId].orEmpty() + optimistic))
-            requestSave()
+    // Whole body runs OFF the main thread: the content-resolver queries and —
+    // critically — session.sendAttachment (the MMCS network upload, which blocks
+    // on a tokio runtime) would ANR the UI if run on the caller's Main dispatcher.
+    override suspend fun sendAttachment(roomId: String, contentUri: String): Boolean =
+        withContext(Dispatchers.IO) {
+            val uri = runCatching { android.net.Uri.parse(contentUri) }.getOrNull()
+                ?: return@withContext false
+            val resolver = appContext.contentResolver
+            val name = queryDisplayName(uri) ?: uri.lastPathSegment ?: "attachment"
+            // getType() is null/octet-stream for the file:// URIs voice memos use, so
+            // fall back to the extension — the FFI keys voice-message + UTI off mime.
+            val mime = resolver.getType(uri)?.takeIf { it != "application/octet-stream" }
+                ?: guessMimeFromName(name)
+            val bytes = runCatching { resolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
+                ?: return@withContext false
+            val tmpId = "tmp_" + System.nanoTime()
+            // Copy the outgoing bytes into our media cache and attach them locally,
+            // so the SENDER sees their own photo / can play their own voice memo.
+            val kind = when {
+                mime.startsWith("image/") -> AttachmentKind.IMAGE
+                mime.startsWith("video/") -> AttachmentKind.VIDEO
+                mime.startsWith("audio/") -> AttachmentKind.AUDIO
+                else -> AttachmentKind.OTHER
+            }
+            val ext = mime.substringAfterLast('/', "bin").substringBefore(';').ifBlank { "bin" }
+            val localCopy = java.io.File(mediaDir, "${tmpId.filter { it.isLetterOrDigit() }}.$ext")
+            val localPath = runCatching { localCopy.writeBytes(bytes); localCopy.absolutePath }.getOrNull()
+            val optimistic = Message(
+                id = tmpId, roomId = roomId, senderId = ME,
+                body = if (localPath != null) "" else when {
+                    mime.startsWith("video/") -> "[video]"
+                    mime.startsWith("audio/") -> "[voice message]"
+                    else -> "[photo]"
+                },
+                attachment = Attachment(kind = kind, mimeType = mime, name = name, localPath = localPath),
+                timestampMs = nextOutgoingTimestamp(roomId), status = MessageStatus.SENDING, isOutgoing = true,
+            )
+            writeLock.withLock {
+                messagesByRoom.value = messagesByRoom.value + (roomId to (messagesByRoom.value[roomId].orEmpty() + optimistic))
+                requestSave()
+            }
+            val ack = runCatching { session.sendAttachment(roomId, tmpId, bytes, mime, name) }
+                .getOrElse { com.offline.dpadmessenger.backend.smarttxt.transport.SendAck(false) }
+            writeLock.withLock {
+                updateMessage(roomId, tmpId) { it.copy(id = ack.guid ?: it.id, status = if (ack.ok) MessageStatus.SENT else MessageStatus.FAILED, errorReason = if (ack.ok) null else ack.error) }
+                requestSave()
+            }
+            ack.ok
         }
-        val ack = runCatching { session.sendAttachment(roomId, tmpId, bytes, mime, name) }
-            .getOrElse { com.offline.dpadmessenger.backend.smarttxt.transport.SendAck(false) }
-        writeLock.withLock {
-            updateMessage(roomId, tmpId) { it.copy(id = ack.guid ?: it.id, status = if (ack.ok) MessageStatus.SENT else MessageStatus.FAILED) }
-            requestSave()
+
+    /** Extension → mime fallback for when the resolver can't type the URI (voice
+     *  memos come in as a file:// path ending .m4a, which the FFI must see as audio). */
+    private fun guessMimeFromName(name: String): String {
+        return when (name.substringAfterLast('.', "").lowercase()) {
+            "m4a", "mp4a" -> "audio/mp4"
+            "aac" -> "audio/aac"
+            "amr" -> "audio/amr"
+            "caf" -> "audio/x-caf"
+            "mp3" -> "audio/mpeg"
+            "wav" -> "audio/wav"
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "gif" -> "image/gif"
+            "heic" -> "image/heic"
+            "mp4", "m4v" -> "video/mp4"
+            "mov" -> "video/quicktime"
+            else -> android.webkit.MimeTypeMap.getSingleton()
+                .getMimeTypeFromExtension(name.substringAfterLast('.', "").lowercase())
+                ?: "application/octet-stream"
         }
-        return ack.ok
     }
 
     private fun queryDisplayName(uri: android.net.Uri): String? = runCatching {
@@ -604,6 +921,7 @@ internal class SmartTxtMessageRepository(
             editedAtMs = editedAtMs.takeIf { it > 0 },
             isDeleted = isUnsent,
             attachment = att,
+            isSms = service.equals("SMS", ignoreCase = true),
         )
     }
 
@@ -634,6 +952,14 @@ internal class SmartTxtMessageRepository(
         return h.ifBlank { idOrHandle }
     }
 
+    /** Display form of a stored name/handle: drop the "tel:"/"mailto:" scheme so
+     *  an unresolved contact reads as a plain number/email
+     *  ("tel:+12489046456" → "+12489046456"). Scheme-specific (unlike
+     *  prettyHandle's substringAfter) so a real contact name containing a colon
+     *  is left intact. */
+    private fun stripScheme(s: String): String =
+        s.removePrefix("tel:").removePrefix("mailto:")
+
     private fun normalizeHandle(input: String): String = when {
         input.isBlank() -> ""
         input.contains('@') -> if (input.startsWith("mailto:")) input else "mailto:$input"
@@ -645,9 +971,31 @@ internal class SmartTxtMessageRepository(
         return if (h.contains('@')) h.lowercase() else h.filter { it.isDigit() }.takeLast(7).ifBlank { h }
     }
 
+    @Volatile private var contactIndexCache: Map<String, String>? = null
+
+    /** Device address book indexed by [Handles.canon], so a thread/list resolves
+     *  a name for any number/email format — the same source the new-message
+     *  picker reads, which is why names showed there but not in threads. */
+    private fun contactIndex(): Map<String, String> {
+        contactIndexCache?.let { if (it.isNotEmpty()) return it }
+        val m = HashMap<String, String>()
+        runCatching { SmartTxtContacts.read(appContext) }.getOrDefault(emptyList()).forEach { e ->
+            val key = Handles.canon(e.handle)
+            if (key.isNotBlank() && e.name.isNotBlank() && e.name != prettyHandle(e.handle)) m.putIfAbsent(key, e.name)
+        }
+        if (m.isNotEmpty()) contactIndexCache = m
+        Log.i(TAG, "contactIndex: ${m.size} entries; sample keys=${m.keys.take(6)}")
+        return m
+    }
+
     private fun contactName(handle: String): String? {
         val uid = handleToUserId(handle)
-        return usersById.value[uid]?.displayName?.takeIf { it != prettyHandle(handle) }
+        usersById.value[uid]?.displayName?.let { stripScheme(it) }
+            ?.takeIf { it != prettyHandle(handle) }?.let { return it }
+        val key = Handles.canon(handle)
+        val hit = contactIndex()[key]
+        if (hit == null) Log.d(TAG, "contactName miss: handle=$handle canon=$key")
+        return hit
     }
 
     private fun colorFor(id: String): String {
@@ -678,5 +1026,10 @@ internal class SmartTxtMessageRepository(
         private const val KEY_AUTO_DELETE = "autoDeleteOldMessages"
         private const val KEY_READ_RECEIPTS = "sendReadReceipts"
         private const val AUTO_DELETE_AGE_MS = 30L * 24 * 60 * 60 * 1000 // 30 days
+        // Hard cap on messages kept IN MEMORY (and persisted) per conversation, so a
+        // very chatty thread can't balloon RAM / the on-disk snapshot on a 1 GB
+        // device. The chat view is a lazy list; older history stays reachable on the
+        // real service, not here.
+        private const val MAX_MESSAGES_PER_ROOM = 300
     }
 }

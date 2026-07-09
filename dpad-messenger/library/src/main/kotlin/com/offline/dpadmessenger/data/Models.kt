@@ -69,6 +69,12 @@ data class Message(
     val isDeleted: Boolean = false,
     /** Media attachment, if this message carries one. */
     val attachment: Attachment? = null,
+    /** Why a [MessageStatus.FAILED] send failed, shown in the long-press modal
+     *  (e.g. "SMS forwarding isn't on…"). Null when there's no specific reason. */
+    val errorReason: String? = null,
+    /** True for a green SMS (forwarded via the iPhone) vs a blue iMessage. Drives
+     *  the outgoing bubble color. */
+    val isSms: Boolean = false,
 )
 
 @Serializable

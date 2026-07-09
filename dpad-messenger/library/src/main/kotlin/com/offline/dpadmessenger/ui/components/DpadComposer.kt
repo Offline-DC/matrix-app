@@ -116,6 +116,8 @@ fun DpadComposer(
      *  Send; recording → stop → a preview modal → this fires with the recorded
      *  .m4a file path to send as a voice memo. */
     onSendVoiceMemo: ((filePath: String) -> Unit)? = null,
+    /** True on a green SMS thread — the Send button uses SMS green, not iMessage blue. */
+    isSms: Boolean = false,
     header: @Composable (() -> Unit)? = null,
 ) {
     val colors = LocalDpadMessengerColors.current
@@ -395,6 +397,7 @@ fun DpadComposer(
                     onClick = { submit() },
                     focusRequester = sendFr,
                     onLeftToField = { runCatching { fieldFr.requestFocus() } },
+                    accent = if (isSms) Color(0xFF34C759) else ComposerButtonHighlight,
                 )
             }
         }
@@ -447,7 +450,8 @@ private fun RecordStopButton(
         modifier = Modifier
             .size(44.dp)
             .focusRequester(focusRequester)
-            .dpadFocusRing(focused && !recording, ComposerButtonHighlight)
+            // Show the blue halo while recording too (this is the stop button).
+            .dpadFocusRing(focused, ComposerButtonHighlight)
             .clip(CircleShape)
             .background(background)
             .onFocusChanged { focused = it.isFocused }
@@ -552,13 +556,14 @@ private fun SendButton(
     onClick: () -> Unit,
     focusRequester: FocusRequester,
     onLeftToField: () -> Unit,
+    accent: Color = ComposerButtonHighlight,
 ) {
     var focused by remember { mutableStateOf(false) }
     // Full signal blue as soon as there's text to send; the soft resting blue
     // only shows on an empty field (repos without voice/attach — in Signal the
     // empty field shows the mic instead). DPAD focus is marked by the ring, not
     // a colour change.
-    val background = if (enabled) ComposerButtonHighlight else ComposerButtonResting
+    val background = if (enabled) accent else ComposerButtonResting
     val iconTint = if (enabled) Color.White
         else LocalDpadMessengerColors.current.mutedText
     Box(
@@ -566,7 +571,7 @@ private fun SendButton(
         modifier = Modifier
             .size(44.dp)
             .focusRequester(focusRequester)
-            .dpadFocusRing(focused, ComposerButtonHighlight)
+            .dpadFocusRing(focused, accent)
             .clip(CircleShape)
             .background(background)
             .onFocusChanged { focused = it.isFocused }

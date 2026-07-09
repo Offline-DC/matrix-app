@@ -17,9 +17,9 @@ import android.util.Log
  * it. Incoming pushes are queued in Rust and drained by [nativePollEvents],
  * which the bridge polls on a background coroutine.
  *
- * Validation data is NOT produced here (open-absinthe is closed source) — Kotlin
- * fetches it from the `ValidationDataRelay` and passes the bytes into
- * [nativeRegister], keeping the §2.6 relay seam even on the native path.
+ * Device identity AND validation data come from the OpenBubbles relay
+ * (https://hw.openbubbles.app) via rustpush's built-in RelayConfig, configured in
+ * [nativeInit]. Kotlin no longer fetches validation data — the relay supplies it.
  */
 object RustPushNative {
 
@@ -35,9 +35,14 @@ object RustPushNative {
 
     // ---- lifecycle ----------------------------------------------------------
 
-    /** Initialise the rustpush runtime, restoring any persisted IDS state from
-     *  [filesDir]. Call once before anything else. Returns false on failure. */
-    external fun nativeInit(filesDir: String): Boolean
+    /** Initialise the rustpush runtime + build the OpenBubbles RelayConfig
+     *  ([relayHost] + pairing [relayCode], e.g. https://hw.openbubbles.app and
+     *  CFOT-…), restoring any persisted IDS state from [filesDir]. Call once
+     *  before anything else. Returns false on failure. */
+    external fun nativeInit(filesDir: String, relayHost: String, relayCode: String): Boolean
+
+    /** True once a registration exists (fresh, or restored from [filesDir]). */
+    external fun nativeIsRegistered(): Boolean
 
     /** Open the APNs courier socket (rustpush `APNSConnection`). */
     external fun nativeConnect(): Boolean
@@ -67,17 +72,32 @@ object RustPushNative {
 
     /**
      * Run device activation + IDS registration for the Apple ID authenticated
-     * via [nativeAuthenticate]/[nativeSubmit2fa]. [configJson] is the serialized
-     * [MacOSConfig] (the dumb file); [validationData] is the bytes fetched from
-     * the relay (rustpush would otherwise call the closed absinthe). Returns
-     * JSON: `{"handles":["mailto:…","tel:…"]}` on success, or `{"error":"…"}`.
+     * via [nativeAuthenticate]/[nativeSubmit2fa]. Device identity AND validation
+     * data come from the OpenBubbles relay configured in [nativeInit] (rustpush
+     * RelayConfig) — no dumb file, no local absinthe. Returns JSON:
+     * `{"handles":["mailto:…","tel:…"]}` on success, or `{"error":"…"}`.
      */
-    external fun nativeRegister(configJson: String, appleId: String, validationData: ByteArray): String
+    external fun nativeRegister(appleId: String): String
 
     // ---- messaging ----------------------------------------------------------
 
     /** Send a text. Returns the server message guid, or "" on failure. */
     external fun nativeSendText(chatGuid: String, text: String, tempGuid: String, replyToGuid: String): String
+
+    /** Upload [data] to MMCS and send it as an attachment. An audio [mimeType]
+     *  is sent as a voice message. Returns the server guid, or "" on failure. */
+    external fun nativeSendAttachment(chatGuid: String, tempGuid: String, data: ByteArray, mimeType: String, name: String): String
+
+    /** Download a received attachment by the guid from [nativePollEvents]; null on failure. */
+    external fun nativeDownloadAttachment(guid: String): ByteArray?
+
+    /** Set the handle outgoing messages are sent FROM (raw form, e.g. "tel:+1…"
+     *  or "mailto:…"). Empty clears it (falls back to the first handle). */
+    external fun nativeSetSendHandle(handle: String)
+
+    /** True if [handle] is on iMessage (blue); false = would send as SMS (green).
+     *  Lets the composer show the right color before anything is sent. */
+    external fun nativeIsIMessage(handle: String): Boolean
 
     /** Send a tapback using a BlueBubbles associatedMessageType code. */
     external fun nativeSendTapback(chatGuid: String, targetGuid: String, associatedMessageType: Int): Boolean
@@ -93,6 +113,25 @@ object RustPushNative {
     fun runCatchingNativeTapback(chatGuid: String, targetGuid: String, associatedMessageType: Int): Boolean =
         if (loaded) runCatching { nativeSendTapback(chatGuid, targetGuid, associatedMessageType) }.getOrDefault(false)
         else false
+
+    /** Null-safe attachment send: "" when the `.so` isn't loaded or the send fails. */
+    fun runCatchingNativeSendAttachment(chatGuid: String, tempGuid: String, data: ByteArray, mimeType: String, name: String): String =
+        if (loaded) runCatching { nativeSendAttachment(chatGuid, tempGuid, data, mimeType, name) }.getOrDefault("")
+        else ""
+
+    /** Null-safe attachment download: null when the `.so` isn't loaded or the fetch fails. */
+    fun runCatchingNativeDownloadAttachment(guid: String): ByteArray? =
+        if (loaded) runCatching { nativeDownloadAttachment(guid) }.getOrNull() else null
+
+    /** Null-safe send-handle setter: no-op when the `.so` isn't loaded. */
+    fun runCatchingNativeSetSendHandle(handle: String) {
+        if (loaded) runCatching { nativeSetSendHandle(handle) }
+    }
+
+    /** Null-safe iMessage check: defaults to true (iMessage/blue) when the `.so`
+     *  isn't loaded or the lookup fails, so we never wrongly show a green composer. */
+    fun runCatchingNativeIsImessage(handle: String): Boolean =
+        if (loaded) runCatching { nativeIsIMessage(handle) }.getOrDefault(true) else true
 
     private const val TAG = "RustPushNative"
 }

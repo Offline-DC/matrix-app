@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.offline.dpadmessenger.data.Message
 import com.offline.dpadmessenger.data.MessageRepository
 import com.offline.dpadmessenger.data.Room
+import com.offline.dpadmessenger.data.SmsThreadInfo
 import com.offline.dpadmessenger.data.TimelineItem
 import com.offline.dpadmessenger.ui.util.buildTimeline
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -72,10 +73,26 @@ class ChatViewModel(
         // flow cold.)
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
+    private val _isSmsProbe = MutableStateFlow(false)
+
+    /** True when this thread sends as green SMS. Combines any SMS message already
+     *  in the thread with a one-shot probe of the recipient, so a brand-new SMS
+     *  thread reads green (and colors the send button) BEFORE the first send. */
+    val isSms: StateFlow<Boolean> = combine(
+        repository.observeMessages(roomId),
+        _isSmsProbe,
+    ) { messages, probe -> probe || messages.any { it.isSms } }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
     init {
         viewModelScope.launch {
             _room.value = repository.getRoom(roomId)
             repository.markRoomRead(roomId)
+        }
+        viewModelScope.launch {
+            (repository as? SmsThreadInfo)?.let {
+                _isSmsProbe.value = runCatching { it.isSmsThread(roomId) }.getOrDefault(false)
+            }
         }
         viewModelScope.launch {
             // Consider the room loaded once messages first arrive, or after a
@@ -190,14 +207,29 @@ class ChatViewModel(
     /** Download an attachment (first tap on a media bubble). The repository
      *  updates the message's localPath in the flow when it finishes. */
     fun downloadMedia(messageId: String) {
-        val downloader = repository as? com.offline.dpadmessenger.data.MediaDownloader ?: return
-        if (messageId in _downloadingMedia.value) return
+        val downloader = repository as? com.offline.dpadmessenger.data.MediaDownloader
+        if (downloader == null) {
+            android.util.Log.w("ChatVM", "downloadMedia: repository is not a MediaDownloader — can't fetch $messageId")
+            return
+        }
+        if (messageId in _downloadingMedia.value) {
+            android.util.Log.d("ChatVM", "downloadMedia: already downloading $messageId — ignoring retry")
+            return
+        }
         viewModelScope.launch {
+            android.util.Log.i("ChatVM", "downloadMedia: start $messageId")
             _failedMedia.value = _failedMedia.value - messageId
             _downloadingMedia.value = _downloadingMedia.value + messageId
-            val path = runCatching { downloader.downloadMedia(roomId, messageId) }.getOrNull()
+            val path = runCatching { downloader.downloadMedia(roomId, messageId) }
+                .onFailure { android.util.Log.e("ChatVM", "downloadMedia: threw for $messageId", it) }
+                .getOrNull()
             _downloadingMedia.value = _downloadingMedia.value - messageId
-            if (path == null) _failedMedia.value = _failedMedia.value + messageId
+            if (path == null) {
+                android.util.Log.w("ChatVM", "downloadMedia: FAILED $messageId (path null)")
+                _failedMedia.value = _failedMedia.value + messageId
+            } else {
+                android.util.Log.i("ChatVM", "downloadMedia: OK $messageId -> $path")
+            }
         }
     }
 

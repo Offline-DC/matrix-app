@@ -1,6 +1,8 @@
 package com.offline.dpadmessenger.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,15 +23,22 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
-import com.offline.dpadmessenger.focus.dpadRow
+import com.offline.dpadmessenger.focus.dpadFocusRingRect
+import com.offline.dpadmessenger.focus.onDpadAction
+import com.offline.dpadmessenger.ui.theme.ComposerButtonHighlight
 
 /**
  * Modal shown after a voice memo is recorded: preview-play it, then discard or
@@ -102,21 +111,21 @@ private fun PreviewActionButton(
     modifier: Modifier = Modifier,
     focusRequester: FocusRequester? = null,
 ) {
+    var focused by remember { mutableStateOf(false) }
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.Center,
         modifier = modifier
+            // Outset blue halo (matching the composer / DpadButton) so focus reads
+            // on top of the fill — including the blue Send button.
+            .dpadFocusRingRect(focused, ComposerButtonHighlight, cornerRadius = 12.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(container)
-            .dpadRow(
-                onClick = onClick,
-                focusRequester = focusRequester,
-                shape = RoundedCornerShape(12.dp),
-                // Border in the button's content color (white on the blue Send
-                // button) so the DPAD focus state is clearly visible.
-                focusBorderColor = content,
-                focusBorderWidth = 4.dp,
-            )
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .onFocusChanged { focused = it.isFocused }
+            .focusable()
+            .onDpadAction { onClick(); true }
+            .clickable { onClick() }
             .padding(vertical = 12.dp),
     ) {
         Icon(imageVector = icon, contentDescription = null, tint = content, modifier = Modifier.size(20.dp))

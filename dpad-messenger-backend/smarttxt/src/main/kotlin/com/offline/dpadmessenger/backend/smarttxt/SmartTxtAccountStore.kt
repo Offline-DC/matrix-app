@@ -74,10 +74,12 @@ class SmartTxtAccountStore(context: Context) {
 
     fun lastRegisteredMs(): Long = loadAccount()?.lastRegisteredMs ?: 0L
 
-    /** True only when there's a loadable dumb file + account that has
-     *  registered at least once. The UI gate. */
-    fun isRegistered(): Boolean =
-        loadConfig() != null && (loadAccount()?.lastRegisteredMs ?: 0L) > 0L
+    /** True once the account has registered at least once. The UI gate.
+     *  (In the relay/native flow device identity comes from OpenBubbles, so there
+     *  is no real "dumb file" — gating on a MacOSConfig would wrongly bounce a
+     *  signed-in user back to setup on relaunch. The account's registration stamp
+     *  is the source of truth; the native IDS state persists in filesDir.) */
+    fun isRegistered(): Boolean = (loadAccount()?.lastRegisteredMs ?: 0L) > 0L
 
     /** True when a dumb file + account exist but registration hasn't completed
      *  — i.e. setup was started/seeded but `register` hasn't run yet. */
@@ -87,10 +89,33 @@ class SmartTxtAccountStore(context: Context) {
         prefs.edit().clear().apply()
     }
 
+    // ---- sending-handle selection (post-login picker) -----------------------
+
+    /** True once the user has confirmed their sending handles on the picker.
+     *  Cleared by [clear], so a wiped sign-out re-shows the picker. */
+    fun handlesConfigured(): Boolean = prefs.getBoolean(KEY_HANDLES_CONFIGURED, false)
+
+    /** Persist the chosen sending handles + the default, and mark configured. */
+    fun saveHandleSelection(enabled: List<String>, default: String) {
+        prefs.edit()
+            .putStringSet(KEY_ENABLED_HANDLES, enabled.toSet())
+            .putString(KEY_DEFAULT_HANDLE, default)
+            .putBoolean(KEY_HANDLES_CONFIGURED, true)
+            .apply()
+    }
+
+    /** The handle new messages are sent from (null until the picker is confirmed). */
+    fun defaultHandle(): String? = prefs.getString(KEY_DEFAULT_HANDLE, null)
+
+    fun enabledHandles(): Set<String> = prefs.getStringSet(KEY_ENABLED_HANDLES, null) ?: emptySet()
+
     private companion object {
         const val SCHEMA_VERSION = 1
         const val KEY_SCHEMA_VERSION = "schemaVersion"
         const val KEY_MACOS_CONFIG = "macOsConfig"
         const val KEY_ACCOUNT = "appleIdAccount"
+        const val KEY_HANDLES_CONFIGURED = "handlesConfigured"
+        const val KEY_ENABLED_HANDLES = "enabledHandles"
+        const val KEY_DEFAULT_HANDLE = "defaultHandle"
     }
 }

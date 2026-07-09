@@ -125,6 +125,9 @@ sealed class TransportEvent {
         val guid: String,
         val tempGuid: String?,
         val status: String,
+        /** "SMS" (green) or "iMessage" (blue); lets an optimistic bubble adopt its
+         *  real color once the native side reports how it actually sent. */
+        val service: String = "iMessage",
     ) : TransportEvent()
 
     /** A tapback was added/removed on a message. */
@@ -135,7 +138,16 @@ sealed class TransportEvent {
         val senderAddress: String,
         val isFromMe: Boolean,
         val remove: Boolean,
+        /** The reaction's real send time (ms). 0 if unknown. Used to bump the chat
+         *  list by when the reaction happened, not when it was received. */
+        val timestampMs: Long = 0L,
     ) : TransportEvent()
+
+    /** A whole poll cycle's worth of status changes / tapbacks, so a bulk
+     *  catch-up applies them with ONE state update instead of one per item
+     *  (avoids N recompositions during a burst on low-RAM devices). */
+    data class MessageStatusBatch(val items: List<MessageStatusChanged>) : TransportEvent()
+    data class TapbackBatch(val items: List<TapbackUpdated>) : TransportEvent()
 
     /** Typing indicator toggled in a chat. */
     data class TypingChanged(val chatGuid: String, val typing: Boolean) : TransportEvent()
@@ -206,6 +218,8 @@ data class RelayMessage(
     val attachments: List<RelayAttachment> = emptyList(),
     val editedAtMs: Long = 0L,
     val isUnsent: Boolean = false,
+    /** Group conversation display name (iMessage cv_name); blank for 1:1. */
+    val chatName: String = "",
 )
 
 @Serializable

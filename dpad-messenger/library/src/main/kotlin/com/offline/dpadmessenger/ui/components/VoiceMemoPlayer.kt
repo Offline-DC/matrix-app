@@ -30,10 +30,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
-import com.offline.dpadmessenger.focus.dpadFocusHighlight
+import com.offline.dpadmessenger.focus.dpadFocusRing
 import com.offline.dpadmessenger.focus.onDpadAction
+import com.offline.dpadmessenger.ui.theme.ComposerButtonHighlight
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -66,6 +68,7 @@ fun VoiceMemoPlayer(
     var loading by remember { mutableStateOf(false) }
     var positionMs by remember { mutableStateOf(0) }
     var durationMs by remember { mutableStateOf(0) }
+    var playFocused by remember { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
         onDispose { runCatching { player?.release() } }
@@ -130,9 +133,12 @@ fun VoiceMemoPlayer(
             modifier = Modifier
                 .size(40.dp)
                 .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+                // Outset blue halo (matching the composer buttons) instead of the
+                // inset border, so it reads on top of the filled circle.
+                .dpadFocusRing(playFocused, ComposerButtonHighlight)
                 .clip(CircleShape)
                 .background(accent)
-                .dpadFocusHighlight(shape = CircleShape, borderColor = onColor)
+                .onFocusChanged { playFocused = it.isFocused }
                 .focusable()
                 .onDpadAction { toggle(); true },
         ) {

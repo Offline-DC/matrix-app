@@ -5,7 +5,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -49,6 +51,7 @@ fun DpadButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     primary: Boolean = true,
+    loading: Boolean = false,
     focusRequester: FocusRequester? = null,
 ) {
     var focused by remember { mutableStateOf(false) }
@@ -77,20 +80,31 @@ fun DpadButton(
             .onFocusChanged { focused = it.isFocused }
             // clickable already makes the node focusable + handles touch; the
             // DPAD-OK KeyDown is added on top via onDpadAction.
+            // While loading, stay focusable + clickable so DPAD focus doesn't jump
+            // back to the previous input — but swallow the click (no-op) so the user
+            // just sees the spinner instead of the action re-firing.
             .clickable(
                 interactionSource = interaction,
                 indication = null,
                 enabled = enabled,
-                onClick = onClick,
+                onClick = { if (!loading) onClick() },
             )
-            .onDpadAction { if (enabled) { onClick(); true } else false }
+            .onDpadAction { if (enabled) { if (!loading) onClick(); true } else false }
             .padding(PaddingValues(horizontal = 20.dp, vertical = 12.dp)),
     ) {
-        Text(
-            text = text,
-            color = contentColor,
-            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
-            textAlign = TextAlign.Center,
-        )
+        if (loading) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(20.dp),
+                color = contentColor,
+                strokeWidth = 2.dp,
+            )
+        } else {
+            Text(
+                text = text,
+                color = contentColor,
+                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                textAlign = TextAlign.Center,
+            )
+        }
     }
 }

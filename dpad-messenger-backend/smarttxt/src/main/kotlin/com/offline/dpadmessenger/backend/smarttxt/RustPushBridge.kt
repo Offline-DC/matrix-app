@@ -62,7 +62,7 @@ class RustPushBridge(
     // ---- registration (§2.2) -----------------------------------------------
 
     suspend fun register(config: MacOSConfig, appleId: String): RegistrationResult {
-        if (NATIVE_AVAILABLE) return nativeRegisterFlow(config, appleId)
+        if (NATIVE_AVAILABLE) return nativeRegisterFlow(appleId)
         return try {
             val pushToken = activate(config)
             val identityToken = authenticateApple(config, appleId)
@@ -78,33 +78,73 @@ class RustPushBridge(
     }
 
     /**
-     * Native registration: fetch validation data from the relay (rustpush can't
-     * run the closed absinthe), then hand the dumb file + appleId + validation
-     * bytes to rustpush via JNI. rustpush does activate → authenticate → IDS
-     * register internally and returns the handles.
+     * Native registration for an already-authenticated Apple ID (or a warm-start
+     * resume). Device identity AND validation data come from the OpenBubbles relay
+     * configured in `nativeInit` (rustpush RelayConfig) — no dumb file, no local
+     * absinthe. For a fresh interactive sign-in use [registerWithLogin].
      */
-    private suspend fun nativeRegisterFlow(config: MacOSConfig, appleId: String): RegistrationResult {
+    private suspend fun nativeRegisterFlow(appleId: String): RegistrationResult {
         return try {
-            val validationData = generateValidationData(config) // relay
-            val configJson = json.encodeToString(MacOSConfig.serializer(), config)
-            val resultJson = RustPushNative.nativeRegister(configJson, appleId, validationData)
-            val obj = json.parseToJsonElement(resultJson).jsonObject
-            obj["error"]?.jsonPrimitive?.content?.let { return RegistrationResult.Failure("rustpush: $it") }
-            val handles = obj["handles"]?.jsonArray?.map { it.jsonPrimitive.content } ?: listOf("mailto:$appleId")
-            RegistrationResult.Success(
-                SmartTxtAccount(
-                    appleId = appleId,
-                    identityTokenB64 = "",
-                    pushTokenB64 = "",
-                    lastRegisteredMs = System.currentTimeMillis(),
-                    handles = handles,
-                ),
-            )
-        } catch (e: RelayException) {
-            RegistrationResult.Failure("Validation relay error: ${e.message}", e)
+            parseRegisterResult(appleId, RustPushNative.nativeRegister(appleId))
         } catch (e: Throwable) {
             RegistrationResult.Failure("Native registration failed: ${e.message}", e)
         }
+    }
+
+    /**
+     * Full native sign-in: (connect) → authenticate → interactive 2FA → register,
+     * with [twoFactorProvider] supplying the code Apple pushes to trusted devices.
+     * The OpenBubbles relay (configured in `nativeInit`) provides the device
+     * identity + validation data. This is the path the setup screen drives.
+     */
+    suspend fun registerWithLogin(
+        appleId: String,
+        password: String,
+        twoFactorProvider: (suspend () -> String?)?,
+    ): RegistrationResult {
+        if (!NATIVE_AVAILABLE) return RegistrationResult.Failure("native library not loaded")
+        return try {
+            if (!RustPushNative.nativeIsConnected() && !RustPushNative.nativeConnect()) {
+                return RegistrationResult.Failure("APNs connect failed")
+            }
+            // Login. The remote anisette server (v3) can transiently fail
+            // provisioning (e.g. EndProvisioningError → ErrorGettingAnisette). Retry
+            // the login once — which re-provisions, the same thing a manual re-tap
+            // does — so it succeeds on the first Sign in.
+            var auth = json.parseToJsonElement(RustPushNative.nativeAuthenticate(appleId, password)).jsonObject
+            var authErr = auth["error"]?.jsonPrimitive?.content
+            if (authErr != null && (authErr.contains("anisette", true) || authErr.contains("provision", true))) {
+                Log.w(TAG, "anisette provisioning failed; retrying login once: $authErr")
+                auth = json.parseToJsonElement(RustPushNative.nativeAuthenticate(appleId, password)).jsonObject
+                authErr = auth["error"]?.jsonPrimitive?.content
+            }
+            if (authErr != null) return RegistrationResult.Failure("Login failed: $authErr")
+            if (auth["status"]?.jsonPrimitive?.content == "needs_2fa") {
+                val code = twoFactorProvider?.invoke()
+                    ?: return RegistrationResult.Failure("Two-factor code required")
+                val verify = json.parseToJsonElement(RustPushNative.nativeSubmit2fa(code)).jsonObject
+                verify["error"]?.jsonPrimitive?.content?.let { return RegistrationResult.Failure("2FA failed: $it") }
+            }
+            parseRegisterResult(appleId, RustPushNative.nativeRegister(appleId))
+        } catch (e: Throwable) {
+            RegistrationResult.Failure("Native sign-in failed: ${e.message}", e)
+        }
+    }
+
+    /** Parse the `{"handles":[…]}` / `{"error":…}` JSON from `nativeRegister`. */
+    private fun parseRegisterResult(appleId: String, resultJson: String): RegistrationResult {
+        val obj = json.parseToJsonElement(resultJson).jsonObject
+        obj["error"]?.jsonPrimitive?.content?.let { return RegistrationResult.Failure("rustpush: $it") }
+        val handles = obj["handles"]?.jsonArray?.map { it.jsonPrimitive.content } ?: listOf("mailto:$appleId")
+        return RegistrationResult.Success(
+            SmartTxtAccount(
+                appleId = appleId,
+                identityTokenB64 = "",
+                pushTokenB64 = "",
+                lastRegisteredMs = System.currentTimeMillis(),
+                handles = handles,
+            ),
+        )
     }
 
     private fun activate(config: MacOSConfig): ByteArray =
@@ -147,9 +187,9 @@ class RustPushBridge(
 
     /** Send a text. Native: rustpush send; returns the server guid (echoed back
      *  to the optimistic bubble). Stub: echo a delivered status. */
-    suspend fun sendText(roomId: String, body: String, localId: String): String {
+    suspend fun sendText(roomId: String, body: String, localId: String, replyToGuid: String = ""): String {
         if (NATIVE_AVAILABLE) {
-            return RustPushNative.nativeSendText(roomId, body, localId, "")
+            return RustPushNative.nativeSendText(roomId, body, localId, replyToGuid)
         }
         _inbound.emit(BridgeEvent.MessageStatusChanged(roomId, localId, delivered = true))
         return localId

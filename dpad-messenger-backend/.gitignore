@@ -20,3 +20,9 @@ data.plist
 absinthe/target/
 __pycache__/
 *.pyc
+
+# smarttxt-ffi (rustpush JNI) build output. The .so is a build artifact produced
+# by scripts/build-rustpush-so.sh / cargo-ndk — rebuild it per machine rather than
+# committing it. (Remove the jniLibs line if you'd rather ship a prebuilt .so.)
+smarttxt-ffi/target/
+smarttxt/src/main/jniLibs/**/*.so

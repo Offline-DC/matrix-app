@@ -78,10 +78,13 @@ internal class SmartTxtNotifier(context: Context) {
             .setContentText(body)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            // Group all new-message notifications the way OpenBubbles/BlueBubbles
-            // does (groupKey NOTIFICATION_GROUP_NEW_MESSAGES), one per
-            // conversation, so the shade collapses them per-thread.
-            .setGroup(GROUP_NEW_MESSAGES)
+            // Deliberately NOT grouped. A shared group key makes Android
+            // auto-generate a blank group-summary notification once 2+
+            // conversations are showing, and the launcher's notification list
+            // renders that summary as a stray, title-less
+            // "com.offlineinc.dumbdownlauncher" row. Posting each conversation
+            // standalone means no summary is ever generated — the same reason the
+            // podcast player keeps its media notification out of a multi-item group.
             .setAutoCancel(true)
 
         tapIntent(roomId)?.let { builder.setContentIntent(it) }
@@ -111,8 +114,6 @@ internal class SmartTxtNotifier(context: Context) {
 
     companion object {
         private const val CHANNEL_ID = "smarttxt_texts_v1"
-        // Mirrors OpenBubbles/BlueBubbles' new-message notification group.
-        private const val GROUP_NEW_MESSAGES = "NOTIFICATION_GROUP_NEW_MESSAGES"
         private const val MAX_LINES = 6
     }
 }

@@ -37,9 +37,18 @@ object SmartTxtRepository {
     @Volatile private var session: SmartTxtSession? = null
     @Volatile private var instance: MessageRepository? = null
     @Volatile private var bridge: RustPushBridge? = null
+    @Volatile private var nativeInited = false
 
     private val _status = MutableStateFlow(SmartTxtStatus.UNREGISTERED)
     val status: StateFlow<SmartTxtStatus> = _status.asStateFlow()
+
+    /** Non-null when the NATIVE transport couldn't start (native library missing,
+     *  or relay/init failure). The UI shows this error instead of silently falling
+     *  back to the mock demo transport. */
+    private val _nativeError = MutableStateFlow<String?>(null)
+    val nativeError: StateFlow<String?> = _nativeError.asStateFlow()
+
+    fun clearNativeError() { _nativeError.value = null }
 
     /** Validation-data relay for the NATIVE path only (the WebSocket relay does
      *  validation server-side). */
@@ -51,6 +60,21 @@ object SmartTxtRepository {
 
     @Synchronized
     fun bridge(): RustPushBridge = bridge ?: RustPushBridge(buildValidationRelay()).also { bridge = it }
+
+    /** Initialise the native rustpush runtime ONCE with the OpenBubbles relay
+     *  (host + pairing code from [SmartTxtConfig], e.g. https://hw.openbubbles.app
+     *  / CFOT-…). No-op unless `libsmarttxt_ffi.so` loaded. Must run before
+     *  nativeConnect/authenticate/register. */
+    @Synchronized
+    private fun ensureNativeInit(appContext: Context): Boolean {
+        if (nativeInited) return true
+        if (!RustPushBridge.NATIVE_AVAILABLE) return false
+        val host = SmartTxtConfig.validationRelayBaseUrl.ifBlank { "https://hw.openbubbles.app" }
+        val code = SmartTxtConfig.validationRelayAuthToken ?: ""
+        nativeInited = RustPushNative.nativeInit(appContext.filesDir.absolutePath, host, code)
+        Log.i(TAG, "nativeInit($host) = $nativeInited")
+        return nativeInited
+    }
 
     /** Build the active transport from config. Relay URL set ⇒ real relay;
      *  NATIVE mode ⇒ rustpush bridge; else the in-process mock. */
@@ -64,7 +88,9 @@ object SmartTxtRepository {
             SmartTxtConfig.TransportMode.RELAY ->
                 RelayWebSocketTransport(SmartTxtConfig.relayBaseUrl, SmartTxtConfig.relayAuthToken)
             SmartTxtConfig.TransportMode.NATIVE ->
-                if (RustPushBridge.NATIVE_AVAILABLE) NativeRustPushTransport(bridge()) else MockRelayTransport()
+                // Never fall back to the mock here: create() guards NATIVE
+                // availability + init and surfaces an error instead.
+                NativeRustPushTransport(bridge())
             SmartTxtConfig.TransportMode.MOCK -> MockRelayTransport()
         }
         Log.i(TAG, "transport = ${t::class.java.simpleName} (mode=$mode)")
@@ -79,10 +105,56 @@ object SmartTxtRepository {
      * connects. Returns the chat repository regardless of registration state —
      * the UI gates the chat behind [status].
      */
+    /** Restore [status] from persisted state on a fresh process. This object is a
+     *  process-scoped singleton, so [_status] resets to UNREGISTERED on every cold
+     *  start and nothing re-reads the store until [create] — which the UI only calls
+     *  once it's ALREADY REGISTERED. Without this a signed-in user is bounced back
+     *  to the setup screen on relaunch. Call this early (the entry composable). */
+    fun restoreStatus(context: Context) {
+        if (_status.value != SmartTxtStatus.UNREGISTERED) return
+        val store = SmartTxtAccountStore(context.applicationContext)
+        _status.value = when {
+            store.isRegistered() -> SmartTxtStatus.REGISTERED
+            store.isSeeded() -> SmartTxtStatus.SEEDED
+            else -> SmartTxtStatus.UNREGISTERED
+        }
+        Log.i(TAG, "restoreStatus → ${_status.value}")
+    }
+
     @Synchronized
-    fun create(context: Context): MessageRepository {
+    fun create(context: Context): MessageRepository? {
         instance?.let { return it }
         val appContext = context.applicationContext
+        // The real path is NATIVE. Require the engine + a successful init and NEVER
+        // fall back to the mock demo transport — surface the reason instead.
+        val mode = if (SmartTxtConfig.relayBaseUrl.isNotBlank()) SmartTxtConfig.TransportMode.RELAY
+            else SmartTxtConfig.transportMode
+        if (mode == SmartTxtConfig.TransportMode.NATIVE) {
+            if (!RustPushBridge.NATIVE_AVAILABLE) {
+                _nativeError.value = "iMessage engine isn't available on this device (the native library failed to load)."
+                Log.e(TAG, "create: native library not available")
+                return null
+            }
+            if (!ensureNativeInit(appContext)) {
+                _nativeError.value = "Couldn't start iMessage — the relay may be unreachable. Check your connection and retry."
+                Log.e(TAG, "create: nativeInit failed")
+                return null
+            }
+        } else {
+            ensureNativeInit(appContext)
+        }
+        _nativeError.value = null
+        // One-time purge of the demo/mock chats that earlier MOCK runs persisted to
+        // the on-disk cache, so the real (native) path starts blank. Guarded by a
+        // flag so real message history isn't wiped on later launches.
+        if (RustPushBridge.NATIVE_AVAILABLE) {
+            val flags = appContext.getSharedPreferences("smarttxt_flags", Context.MODE_PRIVATE)
+            if (!flags.getBoolean("purged_demo_cache_v2", false)) {
+                SmartTxtStore(appContext).clear()
+                flags.edit().putBoolean("purged_demo_cache_v2", true).apply()
+                Log.i(TAG, "purged leftover demo chat cache (first native run)")
+            }
+        }
         val store = SmartTxtAccountStore(appContext)
         _status.value = when {
             store.isRegistered() -> SmartTxtStatus.REGISTERED
@@ -105,6 +177,7 @@ object SmartTxtRepository {
      */
     suspend fun register(context: Context, config: MacOSConfig, appleId: String): RegistrationResult {
         val appContext = context.applicationContext
+        ensureNativeInit(appContext)
         val store = SmartTxtAccountStore(appContext)
         store.saveConfig(config)
         _status.value = SmartTxtStatus.REGISTERING
@@ -125,6 +198,7 @@ object SmartTxtRepository {
         twoFactorProvider: (suspend () -> String?)? = null,
     ): RegistrationResult {
         val appContext = context.applicationContext
+        ensureNativeInit(appContext)
         val store = SmartTxtAccountStore(appContext)
         store.saveConfig(config)
         _status.value = SmartTxtStatus.REGISTERING
@@ -186,6 +260,24 @@ object SmartTxtRepository {
     /** Connect the live session (called by the foreground service / on create). */
     fun connect(context: Context) {
         create(context) // building the repository connects the session
+    }
+
+    /** Bring the background push connection up on launcher start if the user is
+     *  already signed in, so messages sync whenever the launcher process and the
+     *  phone are on — not only while the Smart Txt screen is open. Safe to call on
+     *  every launch: the foreground service (START_STICKY) and connect are
+     *  idempotent. Missed messages from while the phone was OFF aren't backfilled,
+     *  but anything APNs queued while briefly disconnected replays on reconnect. */
+    fun startBackgroundSyncIfRegistered(context: Context) {
+        val appContext = context.applicationContext
+        // Off the main thread so reading EncryptedSharedPreferences + starting the
+        // service never blocks the launcher's Application.onCreate (ANR risk).
+        Thread {
+            if (!SmartTxtAccountStore(appContext).isRegistered()) return@Thread
+            restoreStatus(appContext)
+            runCatching { APNsForegroundService.start(appContext) }
+                .onFailure { Log.w(TAG, "background sync start on boot failed: ${it.message}") }
+        }.start()
     }
 
     @Synchronized

@@ -50,7 +50,9 @@ build_one() {
   echo "    -> $JNILIBS/$abi_dir/$LIB_NAME"
 }
 
-build_one aarch64-linux-android   aarch64-linux-android   arm64-v8a
+# Target is armeabi-v7a (32-bit). Anisette is remote-anisette-v3 (a remote server),
+# which is arch-independent — unlike ClearADI, which only has arm64/x86_64 ADI libs.
+# Change the triple if you target a different ABI.
 build_one armv7-linux-androideabi armv7a-linux-androideabi armeabi-v7a
 
 echo
