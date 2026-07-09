@@ -61,18 +61,22 @@ object SmartTxtRepository {
     @Synchronized
     fun bridge(): RustPushBridge = bridge ?: RustPushBridge(buildValidationRelay()).also { bridge = it }
 
-    /** Initialise the native rustpush runtime ONCE with the OpenBubbles relay
-     *  (host + pairing code from [SmartTxtConfig], e.g. https://hw.openbubbles.app
-     *  / CFOT-…). No-op unless `libsmarttxt_ffi.so` loaded. Must run before
+    /** Initialise the native rustpush runtime ONCE. Validation runs exclusively
+     *  through MacOSConfigRemote (the NAC server) using the migrated OpenBubbles
+     *  identity + dumb file — the hardware relay has been removed, so nativeInit
+     *  fails if os_config.plist / dumb aren't present. The host/code args are
+     *  ignored by the native layer (kept only for signature compatibility). No-op
+     *  unless `libsmarttxt_ffi.so` loaded. Must run before
      *  nativeConnect/authenticate/register. */
     @Synchronized
     private fun ensureNativeInit(appContext: Context): Boolean {
         if (nativeInited) return true
         if (!RustPushBridge.NATIVE_AVAILABLE) return false
-        val host = SmartTxtConfig.validationRelayBaseUrl.ifBlank { "https://hw.openbubbles.app" }
-        val code = SmartTxtConfig.validationRelayAuthToken ?: ""
-        nativeInited = RustPushNative.nativeInit(appContext.filesDir.absolutePath, host, code)
-        Log.i(TAG, "nativeInit($host) = $nativeInited")
+        // host/code are IGNORED by the native layer (the relay has been removed —
+        // validation runs through MacOSConfigRemote/NAC). Passed only to satisfy the
+        // existing JNI signature.
+        nativeInited = RustPushNative.nativeInit(appContext.filesDir.absolutePath, "", "")
+        Log.i(TAG, "nativeInit(MacOSConfigRemote/NAC) = $nativeInited")
         return nativeInited
     }
 
@@ -136,8 +140,8 @@ object SmartTxtRepository {
                 return null
             }
             if (!ensureNativeInit(appContext)) {
-                _nativeError.value = "Couldn't start iMessage — the relay may be unreachable. Check your connection and retry."
-                Log.e(TAG, "create: nativeInit failed")
+                _nativeError.value = IDENTITY_MISSING_MESSAGE
+                Log.e(TAG, "create: nativeInit failed (no migrated identity/dumb)")
                 return null
             }
         } else {
@@ -177,7 +181,10 @@ object SmartTxtRepository {
      */
     suspend fun register(context: Context, config: MacOSConfig, appleId: String): RegistrationResult {
         val appContext = context.applicationContext
-        ensureNativeInit(appContext)
+        if (!ensureNativeInit(appContext)) {
+            Log.e(TAG, "register: nativeInit failed — no migrated identity/dumb")
+            return RegistrationResult.Failure(IDENTITY_MISSING_MESSAGE)
+        }
         val store = SmartTxtAccountStore(appContext)
         store.saveConfig(config)
         _status.value = SmartTxtStatus.REGISTERING
@@ -198,7 +205,10 @@ object SmartTxtRepository {
         twoFactorProvider: (suspend () -> String?)? = null,
     ): RegistrationResult {
         val appContext = context.applicationContext
-        ensureNativeInit(appContext)
+        if (!ensureNativeInit(appContext)) {
+            Log.e(TAG, "register: nativeInit failed — no migrated identity/dumb")
+            return RegistrationResult.Failure(IDENTITY_MISSING_MESSAGE)
+        }
         val store = SmartTxtAccountStore(appContext)
         store.saveConfig(config)
         _status.value = SmartTxtStatus.REGISTERING
@@ -257,6 +267,18 @@ object SmartTxtRepository {
         }
     }
 
+    /** Mark the identity REGISTERED after an out-of-band sign-in (the OpenBubbles
+     *  migration): the account store + native files are already written, so just
+     *  flip [status], schedule renewal, and start the push service — the same tail
+     *  as [finishRegister] minus the live register call. */
+    fun markRegisteredExternally(context: Context) {
+        val appContext = context.applicationContext
+        SmartTxtRenewalWorker.schedule(appContext)
+        APNsForegroundService.start(appContext)
+        _status.value = SmartTxtStatus.REGISTERED
+        Log.i(TAG, "markRegisteredExternally → REGISTERED")
+    }
+
     /** Connect the live session (called by the foreground service / on create). */
     fun connect(context: Context) {
         create(context) // building the repository connects the session
@@ -307,6 +329,14 @@ object SmartTxtRepository {
     }
 
     private const val TAG = "IMsgRepoHolder"
+
+    /** Shown whenever nativeInit fails. With the relay removed, that happens for
+     *  exactly one reason: the migrated device identity (os_config.plist) and/or the
+     *  `dumb` file aren't on disk, so NAC validation can't run. Naming the dumb file
+     *  makes the real cause obvious instead of a downstream "APNs connect failed". */
+    const val IDENTITY_MISSING_MESSAGE =
+        "Can't start iMessage — the device identity (the OpenBubbles “dumb” file) wasn't transferred. " +
+        "Reopen the app to run the OpenBubbles transfer (OpenBubbles must be installed and signed in), then try again."
 }
 
 /** Where the SmartTxt identity is in its lifecycle. The UI gates on this. */

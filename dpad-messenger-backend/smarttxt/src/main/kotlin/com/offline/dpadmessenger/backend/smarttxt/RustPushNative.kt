@@ -17,9 +17,11 @@ import android.util.Log
  * it. Incoming pushes are queued in Rust and drained by [nativePollEvents],
  * which the bridge polls on a background coroutine.
  *
- * Device identity AND validation data come from the OpenBubbles relay
- * (https://hw.openbubbles.app) via rustpush's built-in RelayConfig, configured in
- * [nativeInit]. Kotlin no longer fetches validation data — the relay supplies it.
+ * Device identity comes from the migrated OpenBubbles os_config (os_config.plist),
+ * and validation data is produced by the self-hosted NAC server (driven by the
+ * device `dumb` file) via rustpush's `MacOSConfigRemote`, configured in
+ * [nativeInit]. The hardware relay has been removed — there is no relay fallback,
+ * and Kotlin never fetches validation data.
  */
 object RustPushNative {
 
@@ -35,14 +37,30 @@ object RustPushNative {
 
     // ---- lifecycle ----------------------------------------------------------
 
-    /** Initialise the rustpush runtime + build the OpenBubbles RelayConfig
-     *  ([relayHost] + pairing [relayCode], e.g. https://hw.openbubbles.app and
-     *  CFOT-…), restoring any persisted IDS state from [filesDir]. Call once
-     *  before anything else. Returns false on failure. */
+    /** Initialise the rustpush runtime + build `MacOSConfigRemote` from the migrated
+     *  identity in [filesDir] (os_config.plist + dumb), restoring any persisted IDS
+     *  state. Validation runs through the NAC server; there is NO relay, so this
+     *  returns false if the identity/dumb are missing. [relayHost]/[relayCode] are
+     *  ignored (kept for signature compatibility). Call once before anything else. */
     external fun nativeInit(filesDir: String, relayHost: String, relayCode: String): Boolean
 
     /** True once a registration exists (fresh, or restored from [filesDir]). */
     external fun nativeIsRegistered(): Boolean
+
+    /** Repackage an existing OpenBubbles registration (its plists staged in
+     *  [obFilesDir]) into OUR files under [outDir] (config.plist + keystore.plist
+     *  + os_config.plist) so the app resumes that session with no re-login.
+     *  Returns JSON `{"ok":true,"handles":[…],"appleId":"…"}` or
+     *  `{"ok":false,"error":"…"}`. */
+    external fun nativeImportOpenBubbles(obFilesDir: String, outDir: String): String
+
+    /** Stage ONLY the NAC device identity: read hw_info.plist staged in
+     *  [obFilesDir] and write os_config.plist into [outDir]. This is the hard
+     *  prerequisite for MacOSConfigRemote and is done BEFORE (independently of) the
+     *  login import, so a failed login can still fall back to manual sign-in that
+     *  validates through the NAC server. The `dumb` file is copied by the migrator.
+     *  Returns JSON `{"ok":true}` or `{"ok":false,"error":"…"}`. */
+    external fun nativeStageIdentity(obFilesDir: String, outDir: String): String
 
     /** Open the APNs courier socket (rustpush `APNSConnection`). */
     external fun nativeConnect(): Boolean
@@ -72,10 +90,10 @@ object RustPushNative {
 
     /**
      * Run device activation + IDS registration for the Apple ID authenticated
-     * via [nativeAuthenticate]/[nativeSubmit2fa]. Device identity AND validation
-     * data come from the OpenBubbles relay configured in [nativeInit] (rustpush
-     * RelayConfig) — no dumb file, no local absinthe. Returns JSON:
-     * `{"handles":["mailto:…","tel:…"]}` on success, or `{"error":"…"}`.
+     * via [nativeAuthenticate]/[nativeSubmit2fa]. Device identity comes from the
+     * migrated os_config.plist and validation data from the NAC server (driven by
+     * the `dumb` file) via MacOSConfigRemote — no relay, no local absinthe. Returns
+     * JSON: `{"handles":["mailto:…","tel:…"]}` on success, or `{"error":"…"}`.
      */
     external fun nativeRegister(appleId: String): String
 
@@ -132,6 +150,20 @@ object RustPushNative {
      *  isn't loaded or the lookup fails, so we never wrongly show a green composer. */
     fun runCatchingNativeIsImessage(handle: String): Boolean =
         if (loaded) runCatching { nativeIsIMessage(handle) }.getOrDefault(true) else true
+
+    /** Null-safe OpenBubbles import: returns an error JSON when the `.so` isn't
+     *  loaded or the native call throws, so the migrator can fall back to setup. */
+    fun runCatchingNativeImportOpenBubbles(obFilesDir: String, outDir: String): String =
+        if (loaded) runCatching { nativeImportOpenBubbles(obFilesDir, outDir) }
+            .getOrElse { """{"ok":false,"error":"${it.message?.replace('"', '\'')}"}""" }
+        else """{"ok":false,"error":"native library not loaded"}"""
+
+    /** Null-safe identity staging: returns an error JSON when the `.so` isn't
+     *  loaded or the native call throws, so the migrator treats it as a hard fail. */
+    fun runCatchingNativeStageIdentity(obFilesDir: String, outDir: String): String =
+        if (loaded) runCatching { nativeStageIdentity(obFilesDir, outDir) }
+            .getOrElse { """{"ok":false,"error":"${it.message?.replace('"', '\'')}"}""" }
+        else """{"ok":false,"error":"native library not loaded"}"""
 
     private const val TAG = "RustPushNative"
 }

@@ -49,14 +49,20 @@ rustls = { version = "0.23", features = ["ring"] }
 # default-features = false DROPS the `macos-validation-data` feature, so
 # open-absinthe (and its `unicorn-engine` C dep, which will NOT cross-compile to
 # Android) is never compiled. rustpush already gates its ONLY open-absinthe
-# reference (the `AbsintheError` use + variant in error.rs) behind that feature,
-# and we use `RelayConfig` (not `MacOSConfig`), so nothing here needs it. This is
-# exactly what makes the crate cross-compile to Android.
+# reference (the `AbsintheError` use + variant in error.rs) behind that feature.
+#
+# `macos-remote-validation` turns on `MacOSConfigRemote` (macos_remote.rs), which
+# reuses the migrated OpenBubbles device identity but offloads NAC create/sign to
+# the LAN validation server. That module is FULLY self-contained — its own
+# `HardwareConfig`, and it pulls in NEITHER open-absinthe NOR unicorn — so the
+# feature is `[]` (adds no deps) and the crate still cross-compiles to Android.
+# nativeInit prefers it when a migrated os_config + dumb are present, else falls
+# back to `RelayConfig`.
 #
 # Path points at the vendored ~/repos/rustpush (the compiler-checked reference is
 # ../../imessage-register). To pin a git rev, swap `path` for `git`/`rev` —
 # rustpush has submodules, so clone with --recurse-submodules.
-rustpush = { path = "../../../rustpush", default-features = false, features = ["remote-anisette-v3"] }
+rustpush = { path = "../../../rustpush", default-features = false, features = ["remote-anisette-v3", "macos-remote-validation"] }
 omnisette = { path = "../../../rustpush/apple-private-apis/omnisette", features = ["remote-anisette-v3"] }
 keystore = { path = "../../../rustpush/keystore" }
 

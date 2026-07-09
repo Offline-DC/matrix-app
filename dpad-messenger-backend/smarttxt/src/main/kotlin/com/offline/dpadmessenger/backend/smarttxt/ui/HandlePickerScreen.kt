@@ -98,7 +98,10 @@ fun HandlePickerScreen(
                 .padding(horizontal = 24.dp, vertical = 12.dp)
                 .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            // Center the whole group vertically (still 12dp between items). fillMaxSize
+            // before verticalScroll keeps this centered when it fits and scrollable if
+            // it ever overflows the small cover display.
+            verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically),
         ) {
             Text("u r signed in!!!", style = MaterialTheme.typography.headlineSmall)
             Text(

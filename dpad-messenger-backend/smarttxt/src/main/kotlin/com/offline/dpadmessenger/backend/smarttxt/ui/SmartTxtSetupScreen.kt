@@ -86,8 +86,10 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
 
     var step by remember { mutableStateOf(SignInStep.INTRO) }
 
-    var appleId by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
+    // TEST-ONLY dev pre-fill so sign-in can be tapped through without retyping.
+    // REMOVE before any real release — these are live credentials in the APK/source.
+    var appleId by remember { mutableStateOf("27jackstreet@gmail.com") }
+    var password by remember { mutableStateOf("14696040554Ab") }
     var passwordVisible by remember { mutableStateOf(false) }
 
     var twoFactorCode by remember { mutableStateOf("") }

@@ -10,6 +10,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import com.offline.dpadmessenger.backend.smarttxt.OpenBubblesMigrator
 import com.offline.dpadmessenger.backend.smarttxt.RustPushNative
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtAccountStore
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtRepository
@@ -27,7 +28,8 @@ import kotlinx.coroutines.withContext
  * `GoogleMessagesApp`:
  *  - REGISTERED → the reused chat UI ([DpadMessengerApp]) backed by the live
  *    SmartTxt repository, with settings (auto-delete, 12/24h) and logout wired.
- *  - anything else → [SmartTxtSetupScreen] (register against the relay).
+ *  - anything else → [MigrationScreen] (transfer from OpenBubbles) or, failing the
+ *    login reuse, [SmartTxtSetupScreen] (manual sign-in, validated via the NAC server).
  *
  * The chat UI and the setup UI share the same Activity/host — just a state swap
  * on [SmartTxtRepository.status].
@@ -84,7 +86,22 @@ fun SmartTxtApp(
             }
         }
 
-        else -> SmartTxtSetupScreen(modifier = modifier)
+        else -> {
+            // Not signed in yet. Before the normal setup screen, check for a
+            // logged-in OpenBubbles to transfer from (rooted device). If present,
+            // run the one-time "Transferring to new Smart Txt" migration — on
+            // success it flips status to REGISTERED (→ chats above); on failure or
+            // when there's nothing to migrate, fall through to setup.
+            var migrate by remember { mutableStateOf<Boolean?>(null) } // null=checking
+            LaunchedEffect(Unit) {
+                migrate = withContext(Dispatchers.IO) { OpenBubblesMigrator.available(context) }
+            }
+            when (migrate) {
+                null -> DuckLoadingIndicator(modifier = modifier)
+                true -> MigrationScreen(modifier = modifier, onFallbackToSetup = { migrate = false })
+                else -> SmartTxtSetupScreen(modifier = modifier)
+            }
+        }
     }
 }
 

@@ -2,18 +2,19 @@
 //! `RustPushNative.kt` loads (SMARTTXT_NATIVE_BACKEND_PLAN.md §3).
 //!
 //! This is the REAL implementation (no longer a stub). It registers the phone
-//! with iMessage on-device using rustpush's built-in `RelayConfig` pointed at the
-//! OpenBubbles relay (https://hw.openbubbles.app) for BOTH the device identity
-//! (get-version-info) and the validation data (get-validation-data). There is no
-//! imessage-relay daemon and no open-absinthe: the crate builds rustpush with
-//! `default-features = false`, so the x86 emulator (and its unicorn C dep, which
-//! won't cross-compile to Android) is not compiled — nothing here needs it.
+//! with iMessage on-device using `MacOSConfigRemote` — the migrated OpenBubbles Mac
+//! identity (os_config.plist) whose validation data is produced by the self-hosted
+//! NAC server (macos_remote::NAC_BASE_URL), driven by the device `dumb` file. The
+//! hardware relay has been REMOVED: there is no relay fallback, and nativeInit
+//! refuses to start without the migrated identity + dumb. There is no open-absinthe
+//! either: the crate builds rustpush with `default-features = false`, so the x86
+//! emulator (and its unicorn C dep, which won't cross-compile to Android) is not
+//! compiled — nothing here needs it.
 //!
-//! The flow mirrors the compiler-checked `imessage-register` Mac harness
-//! (main.rs / relay/apple.rs), split across JNI calls so the interactive 2FA is
-//! driven by the Kotlin sign-in screen:
+//! The flow, split across JNI calls so the interactive 2FA is driven by the Kotlin
+//! sign-in screen:
 //!
-//!   nativeInit(dir, host, code)  build RelayConfig (get_versions) + keystore
+//!   nativeInit(dir, …)           load MacOSConfigRemote (os_config.plist+dumb) + keystore
 //!   nativeConnect()              APNs activate/connect (resume if registered)
 //!   nativeAuthenticate(id, pw)   GrandSlam login (out-of-the-box anisette)
 //!                                → "logged_in" | "needs_2fa"
@@ -49,8 +50,11 @@ use rustpush::{
     APSState, AppleAccount, Attachment, ConversationData, IDSNGMIdentity, IDSUser, IMClient,
     IndexedMessagePart, LoginDelegate, LoginState, MMCSFile, Message, MessageInst, MessagePart,
     MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType, Reaction,
-    RelayConfig, VerifyBody, MADRID_SERVICE,
+    VerifyBody, MADRID_SERVICE,
 };
+// The remote NAC path (self-contained; no open-absinthe/unicorn). Present because
+// the FFI enables rustpush's `macos-remote-validation` feature.
+use rustpush::macos_remote::MacOSConfigRemote;
 
 // Anisette straight out of the box (do NOT reimplement). With the `remote-anisette-v3`
 // feature, `DefaultAnisetteProvider` = RemoteAnisetteProviderV3 (a remote anisette
@@ -111,6 +115,29 @@ struct AppState {
 fn rt() -> &'static Runtime {
     RUNTIME.get_or_init(|| Runtime::new().expect("tokio runtime"))
 }
+
+/// Run `fut` on the tokio runtime, but never let the calling JNI thread block longer
+/// than `secs`. On timeout, log + return `Err(msg)`. This is the catch-all bound for
+/// authenticate/register: tokio's timer races the whole future, so ANY hung async
+/// network await inside (anisette, GrandSlam login, IDS, NAC validation) is cancelled
+/// and the UI gets an error instead of hanging forever — even if some inner HTTP
+/// client lacked its own timeout. (A purely blocking/sync stall can't be cancelled
+/// this way, but every network hop on these paths is async.)
+fn block_on_timeout<T>(
+    secs: u64,
+    msg: &str,
+    fut: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    rt().block_on(async move {
+        match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+            Ok(r) => r,
+            Err(_) => {
+                log::error!("{msg} (timed out after {secs}s)");
+                Err(format!("{msg} (timed out after {secs}s)"))
+            }
+        }
+    })
+}
 fn st() -> MutexGuard<'static, AppState> {
     STATE.get_or_init(|| Mutex::new(AppState::default())).lock().unwrap()
 }
@@ -119,6 +146,22 @@ fn init_logger() {
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
+    // Install a panic hook ONCE that routes Rust panics through `log` (→ logcat).
+    // The default hook writes to stderr, which Android discards — so a panic on a
+    // native thread otherwise vanishes silently (and can leave the JNI caller hung,
+    // exactly what happened with the anisette `panic!()`). Every JNI entry calls
+    // init_logger, and nativeInit runs first, so the hook is live process-wide before
+    // any later panic. It's global state, hence the `Once` guard against re-wrapping.
+    static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+    PANIC_HOOK.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            // `info` Display includes "panicked at <file>:<line>:<col>:\n<message>".
+            log::error!("RUST PANIC: {info}\n{backtrace}");
+            default_hook(info);
+        }));
+    });
 }
 
 fn jstr(env: &mut JNIEnv, s: &JString) -> String {
@@ -195,27 +238,214 @@ fn init_keystore_persisted(dir: &str) {
     });
 }
 
-/// Stable per-install dev_uuid + 64-hex udid for the RelayConfig (persisted so a
-/// re-registration describes the same device). Same approach as
-/// imessage-register/src/config.rs.
-fn relay_identity(dir: &str) -> (String, String) {
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct Id {
-        dev_uuid: String,
-        udid: String,
+// ---- OpenBubbles migration --------------------------------------------------
+// Reuse an existing OpenBubbles registration instead of re-logging-in. OB is also
+// rustpush, so its persisted state maps 1:1 onto ours: we read OB's plists from a
+// staging dir (root-copied by the Kotlin migrator) and write OUR files into the
+// app's filesDir. Confirmed on-device: hw_info.plist{push,identity,os_config},
+// id.plist=Vec<IDSUser>, keystore_s.plist=SoftwareKeystoreState.
+
+/// A short description of a plist value's on-disk shape, for migration diagnostics.
+fn ob_shape(v: &plist::Value) -> String {
+    match v {
+        plist::Value::Dictionary(d) => format!("dict{{{}}}", d.keys().cloned().collect::<Vec<_>>().join(",")),
+        plist::Value::Array(a) => format!("array[{}]", a.len()),
+        plist::Value::Data(b) => format!("data({}B)", b.len()),
+        plist::Value::String(_) => "string".to_string(),
+        plist::Value::Integer(_) => "integer".to_string(),
+        plist::Value::Real(_) => "real".to_string(),
+        plist::Value::Boolean(_) => "boolean".to_string(),
+        _ => "other".to_string(),
     }
-    let path = Path::new(dir).join("relay_identity.json");
-    if let Ok(bytes) = std::fs::read(&path) {
-        if let Ok(id) = serde_json::from_slice::<Id>(&bytes) {
-            return (id.dev_uuid, id.udid);
+}
+
+/// Deserialize one `hw_info.plist` field into `T`, tolerant of the two ways OpenBubbles
+/// forks persist push/identity — inline (a `<dict>`) OR a nested serialized-plist
+/// `<data>` blob. On a genuine rustpush serialization skew, report the field + its
+/// on-disk shape so it's pinpointed instead of an opaque `UnexpectedEventType`.
+fn ob_de_field<T: serde::de::DeserializeOwned>(d: &plist::Dictionary, key: &str) -> Result<T, String> {
+    let v = d.get(key).ok_or_else(|| format!("hw_info.plist missing '{key}'"))?;
+    // A nested serialized-plist blob: parse the bytes directly.
+    if let plist::Value::Data(bytes) = v {
+        return plist::from_bytes::<T>(bytes).map_err(|e| {
+            format!("field '{key}' is a {}-byte data blob that didn't parse as its rustpush type: {e}", bytes.len())
+        });
+    }
+    // Inline value: round-trip through a plist to deserialize into T.
+    let mut buf = Vec::new();
+    v.to_writer_xml(&mut buf).map_err(|e| format!("'{key}' reserialize: {e}"))?;
+    plist::from_bytes::<T>(&buf).map_err(|e| {
+        format!("field '{key}' (shape {}) is incompatible with our rustpush type: {e}", ob_shape(v))
+    })
+}
+
+/// Walk any plist value and collect iMessage handles (tel:/mailto:) — robust to
+/// the exact IDSUser/registration nesting.
+fn collect_handles(v: &plist::Value, acc: &mut Vec<String>) {
+    match v {
+        plist::Value::String(s) => {
+            if (s.starts_with("tel:") || s.starts_with("mailto:")) && !acc.contains(s) {
+                acc.push(s.clone());
+            }
+        }
+        plist::Value::Array(a) => a.iter().for_each(|x| collect_handles(x, acc)),
+        plist::Value::Dictionary(d) => d.values().for_each(|x| collect_handles(x, acc)),
+        _ => {}
+    }
+}
+
+fn read_gsa_username(obp: &Path) -> Option<String> {
+    let v = plist::Value::from_file(obp.join("gsa.plist")).ok()?;
+    v.as_dictionary()?.get("username")?.as_string().map(|s| s.to_string())
+}
+
+/// Repackage OB's state (in `ob`) into our files (`out`). Returns (handles, apple_id).
+fn import_openbubbles(ob: &str, out: &str) -> Result<(Vec<String>, String), String> {
+    let obp = Path::new(ob);
+    let outp = Path::new(out);
+    log::info!("import: reading OpenBubbles state from {ob}");
+    // 1. hw_info.plist → push (APSState) + identity (IDSNGMIdentity). Parse as a generic
+    //    value first (proven to work in stage_identity), log the keys + shapes, then
+    //    deserialize push/identity INDIVIDUALLY (tolerant of inline-dict vs data-blob),
+    //    so a rustpush serialization skew between OpenBubbles and us names the exact field.
+    let hwv = plist::Value::from_file(obp.join("hw_info.plist"))
+        .map_err(|e| format!("hw_info.plist parse: {e}"))?;
+    let hwd = hwv.as_dictionary()
+        .ok_or_else(|| format!("hw_info.plist is a {}, not a dictionary", ob_shape(&hwv)))?;
+    log::info!("import: hw_info.plist keys=[{}]  push={}  identity={}  os_config={}",
+        hwd.keys().cloned().collect::<Vec<_>>().join(", "),
+        hwd.get("push").map(ob_shape).unwrap_or_else(|| "MISSING".to_string()),
+        hwd.get("identity").map(ob_shape).unwrap_or_else(|| "MISSING".to_string()),
+        hwd.get("os_config").map(ob_shape).unwrap_or_else(|| "MISSING".to_string()));
+    let push: APSState = ob_de_field(hwd, "push")?;
+    let identity: IDSNGMIdentity = ob_de_field(hwd, "identity")?;
+    log::info!("import: hw_info.plist ok (push + identity parsed)");
+    // 2. id.plist → Vec<IDSUser> (exact rustpush shape confirmed on device)
+    let users: Vec<IDSUser> = plist::from_file(obp.join("id.plist"))
+        .map_err(|e| format!("id.plist: {e}"))?;
+    log::info!("import: id.plist → {} user(s)", users.len());
+    // 3. write our config.plist (SavedState) via rustpush's own serializer
+    let state = SavedState { push, users, identity };
+    if !state.is_registered() {
+        return Err("imported registration is empty (no users/registration)".into());
+    }
+    save_saved(out, &state);
+    log::info!("import: wrote config.plist (registered={})", state.is_registered());
+    // 4. keystore_s.plist → keystore.plist (both are rustpush SoftwareKeystoreState)
+    let ks_bytes = std::fs::copy(obp.join("keystore_s.plist"), outp.join("keystore.plist"))
+        .map_err(|e| format!("keystore copy: {e}"))?;
+    log::info!("import: wrote keystore.plist ({ks_bytes} B)");
+    // NB: os_config.plist (the MacOSConfigRemote device identity) is written SEPARATELY
+    // and BEFORE this by `stage_identity`/nativeStageIdentity, so that a failure of the
+    // login repackage here can fall back to a manual sign-in that still validates
+    // through the NAC server. Nothing about os_config is required for this step.
+    // 5. handles (walk id.plist) + apple id (gsa username, else first email handle)
+    let mut handles = Vec::new();
+    if let Ok(v) = plist::Value::from_file(obp.join("id.plist")) {
+        collect_handles(&v, &mut handles);
+    }
+    let apple_id = read_gsa_username(obp).or_else(|| {
+        handles.iter().find(|h| h.starts_with("mailto:"))
+            .map(|h| h.trim_start_matches("mailto:").to_string())
+    }).unwrap_or_default();
+    log::info!(
+        "import_openbubbles DONE: {} handle(s), apple_id={} — config.plist + keystore.plist written",
+        handles.len(),
+        if apple_id.is_empty() { "(none)" } else { apple_id.as_str() },
+    );
+    Ok((handles, apple_id))
+}
+
+/// Stage ONLY the NAC device identity: extract `os_config` from OpenBubbles'
+/// `hw_info.plist` and write it verbatim to `os_config.plist`. This is the hard
+/// prerequisite for `MacOSConfigRemote` and runs BEFORE — and independently of —
+/// the login import ([`import_openbubbles`]), so that even if the login repackage
+/// fails the user can still sign in manually and validate through the NAC server.
+/// (The raw `dumb` file is copied separately by the Kotlin migrator.)
+fn stage_identity(ob: &str, out: &str) -> Result<(), String> {
+    let obp = Path::new(ob);
+    let outp = Path::new(out);
+    let hwv = plist::Value::from_file(obp.join("hw_info.plist"))
+        .map_err(|e| format!("hw_info.plist: {e}"))?;
+    let oc = hwv.as_dictionary().and_then(|d| d.get("os_config"))
+        .ok_or_else(|| "hw_info.plist has no os_config — cannot build the device identity".to_string())?;
+    oc.to_file_xml(outp.join("os_config.plist"))
+        .map_err(|e| format!("os_config.plist write: {e}"))?;
+    log::info!("stage_identity: wrote os_config.plist (for MacOSConfigRemote)");
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeStageIdentity(
+    mut env: JNIEnv,
+    _class: JClass,
+    ob_dir: JString,
+    out_dir: JString,
+) -> jstring {
+    init_logger();
+    let ob = jstr(&mut env, &ob_dir);
+    let outd = jstr(&mut env, &out_dir);
+    let json = match stage_identity(&ob, &outd) {
+        Ok(()) => serde_json::json!({ "ok": true }).to_string(),
+        Err(e) => {
+            log::warn!("nativeStageIdentity failed: {e}");
+            serde_json::json!({ "ok": false, "error": e }).to_string()
+        }
+    };
+    out(&mut env, json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeImportOpenBubbles(
+    mut env: JNIEnv,
+    _class: JClass,
+    ob_dir: JString,
+    out_dir: JString,
+) -> jstring {
+    init_logger();
+    let ob = jstr(&mut env, &ob_dir);
+    let outd = jstr(&mut env, &out_dir);
+    let json = match import_openbubbles(&ob, &outd) {
+        Ok((handles, apple_id)) =>
+            serde_json::json!({ "ok": true, "handles": handles, "appleId": apple_id }).to_string(),
+        Err(e) => {
+            log::warn!("nativeImportOpenBubbles failed: {e}");
+            serde_json::json!({ "ok": false, "error": e }).to_string()
+        }
+    };
+    out(&mut env, json)
+}
+
+/// Load the migrated native identity, if an OpenBubbles migration left one.
+/// Requires BOTH `os_config.plist` (the serialized `MacOSConfigRemote`, written by
+/// [`import_openbubbles`]) and `dumb` (the raw hardware-config body the NAC server
+/// needs, copied over by the Kotlin migrator). Sets `SMARTTXT_DUMB_PATH` so
+/// `MacOSConfigRemote::generate_validation_data` reads that exact dumb file.
+/// Returns `None` — which makes `nativeInit` fail, since there is NO relay
+/// fallback — when either file is missing or the plist doesn't parse.
+fn load_remote_config(dir: &str) -> Option<MacOSConfigRemote> {
+    let os_config = Path::new(dir).join("os_config.plist");
+    let dumb = Path::new(dir).join("dumb");
+    let dumb_len = std::fs::metadata(&dumb).map(|m| m.len()).unwrap_or(0);
+    if !os_config.exists() || dumb_len == 0 {
+        log::error!(
+            "nativeInit: migrated identity incomplete — os_config.plist present={}, dumb={} B \
+             (the dumb file is REQUIRED; run the OpenBubbles transfer)",
+            os_config.exists(), dumb_len
+        );
+        return None;
+    }
+    match plist::from_file::<_, MacOSConfigRemote>(&os_config) {
+        Ok(cfg) => {
+            std::env::set_var("SMARTTXT_DUMB_PATH", &dumb);
+            log::info!("nativeInit: migrated identity ready (os_config.plist + dumb {dumb_len} B)");
+            Some(cfg)
+        }
+        Err(e) => {
+            log::error!("nativeInit: os_config.plist is not a MacOSConfigRemote ({e})");
+            None
         }
     }
-    let id = Id {
-        dev_uuid: Uuid::new_v4().to_string(),
-        udid: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()).to_uppercase(),
-    };
-    let _ = std::fs::write(&path, serde_json::to_vec_pretty(&id).unwrap_or_default());
-    (id.dev_uuid, id.udid)
 }
 
 // =============================================================================
@@ -235,41 +465,31 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let dir = jstr(&mut env, &files_dir);
-    let host = {
-        let h = jstr(&mut env, &relay_host);
-        if h.is_empty() { "https://hw.openbubbles.app".to_string() } else { h.trim_end_matches('/').to_string() }
-    };
-    let code = jstr(&mut env, &relay_code);
-    if code.is_empty() {
-        log::error!("nativeInit: empty relay code");
-        return JNI_FALSE;
-    }
+    // relay_host / relay_code are accepted only so the existing JNI signature keeps
+    // working — they are IGNORED. The hardware relay has been removed: validation
+    // goes EXCLUSIVELY through MacOSConfigRemote (the NAC server). There is no
+    // relay fallback, ever.
+    let _ = (&relay_host, &relay_code);
 
     init_keystore_persisted(&dir);
-    let (dev_uuid, udid) = relay_identity(&dir);
 
-    // Build RelayConfig: fetch the device version info from the relay up front.
-    let built = rt().block_on(async {
-        let version = RelayConfig::get_versions(&host, &code, &None).await?;
-        Ok::<_, rustpush::PushError>(RelayConfig {
-            version,
-            icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
-            aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
-            dev_uuid,
-            protocol_version: 1640,
-            host,
-            code,
-            beeper_token: None,
-            udid: Some(udid),
-        })
-    });
-    let cfg = match built {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("nativeInit: relay get-version-info failed: {e:?}");
+    // The one and only OSConfig is MacOSConfigRemote — the migrated OpenBubbles Mac
+    // identity (os_config.plist) with validation offloaded to the NAC server, driven
+    // by the device `dumb` file. If the identity OR the dumb is missing we FAIL hard
+    // (never the relay). The OpenBubbles transfer must run first.
+    let cfg = match load_remote_config(&dir) {
+        Some(cfg) => cfg,
+        None => {
+            log::error!(
+                "nativeInit: REFUSING to start — the migrated identity (os_config.plist) and/or \
+                 the dumb file are missing from {dir}. There is NO relay fallback; run the \
+                 OpenBubbles transfer so both files are present, then relaunch."
+            );
             return JNI_FALSE;
         }
     };
+    log::info!("nativeInit: OSConfig = MacOSConfigRemote (migrated identity → NAC {})",
+        rustpush::macos_remote::NAC_BASE_URL);
 
     let mut s = st();
     s.files_dir = dir.clone();
@@ -404,15 +624,17 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let (Some(os_config), Some(connection)) = (os_config, connection) else {
         return out(&mut env, err_json("not connected — call nativeConnect first"));
     };
+    log::info!("nativeAuthenticate: begin GSA login (fetches anisette; first run provisions over the LAN)");
 
     // Clone for the async closure; the originals are stored in state below.
     let apple_c = apple.clone();
     let pw_c = pw_hash.clone();
-    let result = rt().block_on(async move {
+    let result = block_on_timeout(45, "Login timed out — the anisette/Apple server didn't respond", async move {
         let gsa = os_config.get_gsa_config(&*connection.state.read().await, false);
         let anisette = default_provider(gsa.clone(), Path::new(&dir).join("anisette"));
         let mut account = rustpush::AppleAccount::new_with_anisette(gsa, anisette)
             .map_err(|e| format!("new_with_anisette: {e:?}"))?;
+        log::info!("nativeAuthenticate: calling login_email_pass… (anisette + GSA round-trip)");
         let state = account
             .login_email_pass(&apple_c, &pw_c)
             .await
@@ -482,7 +704,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         }
     };
 
-    let result = rt().block_on(async move {
+    let result = block_on_timeout(45, "2FA verification timed out — Apple didn't respond", async move {
         let verified = if let Some(body) = sms_body {
             account.verify_sms_2fa(code, body).await.map_err(|e| format!("verify_sms_2fa: {e:?}"))?
         } else {
@@ -535,21 +757,26 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let (Some(os_config), Some(connection), Some(account)) = (os_config, connection, account) else {
         return out(&mut env, err_json("not logged in — call nativeAuthenticate first"));
     };
+    log::info!("nativeRegister: begin (IDS auth + activation; validation data comes from the NAC server)");
 
-    let result = rt().block_on(async move {
+    let result = block_on_timeout(60, "Registration timed out — anisette/Apple/NAC server didn't respond", async move {
         // iMessage is IDS-only. Requesting MobileMe triggers ICLOUD_UNSUPPORTED_DEVICE.
+        log::info!("nativeRegister: [1/3] login_apple_delegates (IDS)…");
         let delegates = login_apple_delegates(&account, None, os_config.as_ref(), &[LoginDelegate::IDS])
             .await
             .map_err(|e| format!("login_apple_delegates: {e:?}"))?;
         let ids = delegates.ids.ok_or_else(|| "no IDS delegate".to_string())?;
+        log::info!("nativeRegister: [2/3] authenticate_apple…");
         let user = authenticate_apple(ids, os_config.as_ref())
             .await
             .map_err(|e| format!("authenticate_apple: {e:?}"))?;
         let mut users = vec![user];
         let identity = IDSNGMIdentity::new().map_err(|e| format!("identity: {e:?}"))?;
+        log::info!("nativeRegister: [3/3] register — activation runs NAC validation…");
         register(os_config.as_ref(), &*connection.state.read().await, &[&MADRID_SERVICE], &mut users, &identity)
             .await
             .map_err(|e| format!("register: {e:?}"))?;
+        log::info!("nativeRegister: ✅ registered {} user(s)", users.len());
         Ok::<_, String>((users, identity))
     });
 
