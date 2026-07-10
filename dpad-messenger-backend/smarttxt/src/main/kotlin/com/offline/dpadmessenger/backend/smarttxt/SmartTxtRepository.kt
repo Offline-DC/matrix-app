@@ -311,6 +311,11 @@ object SmartTxtRepository {
         transport = null
         bridge = null
         if (wipe) {
+            // Clear the NATIVE login state too (config.plist, keystore.plist, creds,
+            // id_cache, anisette) — not just the Kotlin store — so the next sign-in is
+            // fresh with no OpenBubbles/migrated resume. Device identity (dumb +
+            // os_config.plist) is kept so a fresh registration still validates via NAC.
+            RustPushNative.runCatchingNativeLogout()
             SmartTxtAccountStore(context.applicationContext).clear()
             _status.value = SmartTxtStatus.UNREGISTERED
         }

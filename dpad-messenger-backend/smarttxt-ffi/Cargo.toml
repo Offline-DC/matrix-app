@@ -32,6 +32,10 @@ android_logger = "0.13"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 plist = "1"
+# Rebuilding OpenBubbles' anisette adi_pb blob (convert_anisette): its client_secret/
+# mid/metadata are raw <data> that get re-base64'd into the adi_pb JSON. Matches the
+# rustpush tree's base64 (0.21) so cargo doesn't compile a second copy.
+base64 = "0.21"
 # For installing the process-global rustls crypto provider (ring) before any TLS,
 # same as the imessage-register harness. Match rustpush's rustls (0.23).
 rustls = { version = "0.23", features = ["ring"] }

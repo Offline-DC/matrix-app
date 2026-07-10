@@ -128,15 +128,42 @@ fn block_on_timeout<T>(
     msg: &str,
     fut: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
-    rt().block_on(async move {
-        match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
-            Ok(r) => r,
-            Err(_) => {
-                log::error!("{msg} (timed out after {secs}s)");
-                Err(format!("{msg} (timed out after {secs}s)"))
+    // catch_unwind so a PANIC inside the future (e.g. a keystore/plist `.expect`, like the
+    // `Failed to decrypt!` at keystore/software.rs get_key) becomes a returned Err the JNI
+    // caller can surface — instead of unwinding across the extern "system" boundary, which
+    // is UB and in practice hangs the UI forever with the call never returning. The panic
+    // hook (init_logger) has already logged "RUST PANIC …" with the real location.
+    let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt().block_on(async move {
+            match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+                Ok(r) => r,
+                Err(_) => {
+                    log::error!("{msg} (timed out after {secs}s)");
+                    Err(format!("{msg} (timed out after {secs}s)"))
+                }
             }
+        })
+    }));
+    match driven {
+        Ok(r) => r,
+        Err(_) => {
+            log::error!("{msg}: panicked (see the RUST PANIC line above for the cause)");
+            Err(format!("{msg}: internal error — please try again"))
         }
-    })
+    }
+}
+
+/// Run [`build_client_and_receive`] on the runtime, turning BOTH an `Err` and a PANIC
+/// (e.g. a keystore `get_key` on an unreadable entry) into an `Err(String)`. Both
+/// `nativeConnect` (resume) and `nativeRegister` build the client OUTSIDE
+/// `block_on_timeout`, so without this a panic there unwinds across JNI and hangs the UI.
+fn build_client_guarded(users: Vec<IDSUser>, identity: IDSNGMIdentity) -> Result<(), String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt().block_on(build_client_and_receive(users, identity))
+    })) {
+        Ok(r) => r,
+        Err(_) => Err("client build panicked (internal error — see the RUST PANIC line in logs). Please try signing in again.".to_string()),
+    }
 }
 fn st() -> MutexGuard<'static, AppState> {
     STATE.get_or_init(|| Mutex::new(AppState::default())).lock().unwrap()
@@ -156,9 +183,17 @@ fn init_logger() {
     PANIC_HOOK.call_once(|| {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let backtrace = std::backtrace::Backtrace::force_capture();
-            // `info` Display includes "panicked at <file>:<line>:<col>:\n<message>".
-            log::error!("RUST PANIC: {info}\n{backtrace}");
+            // Log the message + location FIRST (info's Display is
+            // "panicked at <file>:<line>:<col>:\n<message>") so the essential line always
+            // reaches logcat even if the backtrace step is slow. THEN force_capture a
+            // backtrace for the call path INTO the panic (the `.so` is built panic=unwind,
+            // so unwind info exists; strip=true just drops symbol NAMES, leaving addresses).
+            // Message-first ordering means we never lose the location — unlike computing the
+            // backtrace first. NB: a hook can't fully undo a panic that fires while a lock is
+            // held (that stalls other threads), so panics on hot paths — e.g. the keystore
+            // decrypt — are ALSO converted to errors at the source rather than relying on this.
+            log::error!("RUST PANIC: {info}");
+            log::error!("backtrace:\n{}", std::backtrace::Backtrace::force_capture());
             default_hook(info);
         }));
     });
@@ -279,6 +314,73 @@ fn ob_de_field<T: serde::de::DeserializeOwned>(d: &plist::Dictionary, key: &str)
     })
 }
 
+/// Recover OpenBubbles' `identity`. OB persists it via `IDSNGMIdentity::save(tag)` — an
+/// AES-GCM-encrypted binary plist keyed by `ids:identity-storage-key:{tag}` in the
+/// keystore (the caller must load that keystore BEFORE calling this). We recover `tag`
+/// from the keystore file's key names and `restore()` (decrypt) it. Falls back to a
+/// plain deserialize if OB ever stored it inline in our own dict format.
+fn ob_restore_identity(hwd: &plist::Dictionary, keystore_plist: &Path) -> Result<IDSNGMIdentity, String> {
+    let v = hwd.get("identity").ok_or_else(|| "hw_info.plist missing 'identity'".to_string())?;
+    let blob = match v {
+        plist::Value::Data(blob) => blob,
+        // Already inline in our own dict format — deserialize directly.
+        _ => return ob_de_field(hwd, "identity"),
+    };
+    // OB's identity blob is IDSNGMIdentity::save() output, decryptable with the keystore
+    // key `ids:identity-storage-key:{tag}`. That only works if OB stored that key
+    // UNENCRYPTED (our NoEncryptor format: a `bplist00` binary plist). OpenBubbles encrypts
+    // its keystore, so the key isn't readable — and per the migration design we do NOT need
+    // OB's keystore: only the login data (users/registration + push) transfers. So when the
+    // key is unreadable, generate a FRESH device identity and let the transferred
+    // registration + auth re-register against it (via hw.openbubbles.app).
+    let tag = ob_identity_tag(keystore_plist);
+    let key_is_plaintext = tag.as_deref()
+        .and_then(|t| ob_keystore_key_format(keystore_plist, t))
+        .map(|(_, _, is_plist)| is_plist)
+        .unwrap_or(false);
+    if let (Some(tag), true) = (tag.as_deref(), key_is_plaintext) {
+        log::info!("import: decrypting OpenBubbles identity ({} B) with tag '{tag}'", blob.len());
+        return IDSNGMIdentity::restore(blob, tag)
+            .map_err(|e| format!("identity restore (decrypt, tag '{tag}') failed: {e:?}"));
+    }
+    log::warn!(
+        "import: OpenBubbles identity is locked (encrypted keystore) — generating a FRESH device \
+         identity; the transferred login (users + auth) re-registers against it."
+    );
+    IDSNGMIdentity::new().map_err(|e| format!("fresh identity generation failed: {e:?}"))
+}
+
+/// Report `(len, head_hex, starts_with_bplist00)` for the `ids:identity-storage-key:{tag}`
+/// entry in OpenBubbles' keystore plist — used to tell an unencrypted key (our
+/// NoEncryptor format, a `bplist00` binary plist) from an encrypted one.
+fn ob_keystore_key_format(keystore_plist: &Path, tag: &str) -> Option<(usize, String, bool)> {
+    let alias = format!("ids:identity-storage-key:{tag}");
+    let v = plist::Value::from_file(keystore_plist).ok()?;
+    let d = v.as_dictionary()?;
+    ["keys", "secrets"].iter().find_map(|section| {
+        match d.get(*section)?.as_dictionary()?.get(alias.as_str())? {
+            plist::Value::Data(b) => {
+                let head: String = b.iter().take(12).map(|x| format!("{x:02x}")).collect();
+                Some((b.len(), head, b.starts_with(b"bplist00")))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// The `{tag}` embedded in a `ids:identity-storage-key:{tag}` alias, scanned straight
+/// from OpenBubbles' keystore plist (checking both key and secret sections, so it works
+/// regardless of which section the AES key lives in).
+fn ob_identity_tag(keystore_plist: &Path) -> Option<String> {
+    const PREFIX: &str = "ids:identity-storage-key:";
+    let v = plist::Value::from_file(keystore_plist).ok()?;
+    let d = v.as_dictionary()?;
+    ["keys", "secrets"].iter().find_map(|section| {
+        d.get(*section)?.as_dictionary()?.keys()
+            .find_map(|k| k.strip_prefix(PREFIX).map(str::to_string))
+    })
+}
+
 /// Walk any plist value and collect iMessage handles (tel:/mailto:) — robust to
 /// the exact IDSUser/registration nesting.
 fn collect_handles(v: &plist::Value, acc: &mut Vec<String>) {
@@ -304,10 +406,40 @@ fn import_openbubbles(ob: &str, out: &str) -> Result<(Vec<String>, String), Stri
     let obp = Path::new(ob);
     let outp = Path::new(out);
     log::info!("import: reading OpenBubbles state from {ob}");
-    // 1. hw_info.plist → push (APSState) + identity (IDSNGMIdentity). Parse as a generic
-    //    value first (proven to work in stage_identity), log the keys + shapes, then
-    //    deserialize push/identity INDIVIDUALLY (tolerant of inline-dict vs data-blob),
-    //    so a rustpush serialization skew between OpenBubbles and us names the exact field.
+    // 0. Start from a CLEAN, EMPTY keystore and init the singleton FIRST (rustpush needs a
+    //    keystore before any identity use). We deliberately DO NOT copy OpenBubbles'
+    //    keystore_s.plist: its entries are AES-GCM ENCRYPTED with OB's device-bound key, so
+    //    reading them back through our NoEncryptor hands ciphertext to plist parsing and
+    //    PANICS (keystore/software.rs get_key, line 238). Per the migration design only the
+    //    LOGIN DATA (users/registration + push) transfers; the device identity is
+    //    regenerated fresh (below) and re-registers against hw.openbubbles.app, which
+    //    repopulates THIS keystore with fresh plaintext keys. An empty keystore also makes a
+    //    missing alias a graceful KeyNotFound error instead of a ciphertext panic. init is
+    //    idempotent (OnceLock — a later nativeInit re-init is a harmless no-op).
+    let ks_dst = outp.join("keystore.plist");
+    // If the migrator staged a DECRYPTED keystore (plaintext NoEncryptor XML, produced
+    // on-device by running OpenBubbles' OWN AndroidKeyStore key AS OpenBubbles' uid), adopt
+    // it. Then `ob_restore_identity` finds `ids:identity-storage-key:{tag}` as plaintext and
+    // decrypts OB's REAL device identity, the push keypair's `activation:{serial}` private key
+    // resolves at connect, and the imported users keep their registration — so we RESTORE the
+    // login exactly like OpenBubbles does, with NO re-registration. Absent a staged keystore we
+    // fall back to the old behaviour (empty keystore → fresh identity → re-register on connect).
+    let staged_ks = obp.join("keystore.plist");
+    let adopted_keystore = staged_ks.exists();
+    if adopted_keystore {
+        std::fs::copy(&staged_ks, &ks_dst)
+            .map_err(|e| format!("copy staged decrypted keystore.plist: {e}"))?;
+        let sz = std::fs::metadata(&ks_dst).map(|m| m.len()).unwrap_or(0);
+        log::info!("import: adopted staged DECRYPTED keystore ({sz} B) — restoring OB identity (no re-register)");
+    } else {
+        let _ = std::fs::remove_file(&ks_dst); // drop any stale / half-migrated keystore
+        log::warn!("import: no decrypted keystore staged — starting empty (fresh identity, re-registers on connect)");
+    }
+    init_keystore_persisted(out);
+
+    // 1. hw_info.plist → push (inline dict) + identity (encrypted blob → decrypt via
+    //    IDSNGMIdentity::restore). Parse generically first (proven in stage_identity)
+    //    and log the field shapes so any skew is visible.
     let hwv = plist::Value::from_file(obp.join("hw_info.plist"))
         .map_err(|e| format!("hw_info.plist parse: {e}"))?;
     let hwd = hwv.as_dictionary()
@@ -318,23 +450,20 @@ fn import_openbubbles(ob: &str, out: &str) -> Result<(Vec<String>, String), Stri
         hwd.get("identity").map(ob_shape).unwrap_or_else(|| "MISSING".to_string()),
         hwd.get("os_config").map(ob_shape).unwrap_or_else(|| "MISSING".to_string()));
     let push: APSState = ob_de_field(hwd, "push")?;
-    let identity: IDSNGMIdentity = ob_de_field(hwd, "identity")?;
-    log::info!("import: hw_info.plist ok (push + identity parsed)");
+    let identity: IDSNGMIdentity = ob_restore_identity(hwd, &ks_dst)?;
+    log::info!("import: hw_info.plist ok (push parsed + identity decrypted)");
     // 2. id.plist → Vec<IDSUser> (exact rustpush shape confirmed on device)
     let users: Vec<IDSUser> = plist::from_file(obp.join("id.plist"))
         .map_err(|e| format!("id.plist: {e}"))?;
     log::info!("import: id.plist → {} user(s)", users.len());
-    // 3. write our config.plist (SavedState) via rustpush's own serializer
+    // 3. write our config.plist (SavedState) — identity is re-serialized in OUR format
+    //    (an inline dict, not re-encrypted), matching how nativeRegister persists it.
     let state = SavedState { push, users, identity };
     if !state.is_registered() {
         return Err("imported registration is empty (no users/registration)".into());
     }
     save_saved(out, &state);
     log::info!("import: wrote config.plist (registered={})", state.is_registered());
-    // 4. keystore_s.plist → keystore.plist (both are rustpush SoftwareKeystoreState)
-    let ks_bytes = std::fs::copy(obp.join("keystore_s.plist"), outp.join("keystore.plist"))
-        .map_err(|e| format!("keystore copy: {e}"))?;
-    log::info!("import: wrote keystore.plist ({ks_bytes} B)");
     // NB: os_config.plist (the MacOSConfigRemote device identity) is written SEPARATELY
     // and BEFORE this by `stage_identity`/nativeStageIdentity, so that a failure of the
     // login repackage here can fall back to a manual sign-in that still validates
@@ -349,9 +478,14 @@ fn import_openbubbles(ob: &str, out: &str) -> Result<(Vec<String>, String), Stri
             .map(|h| h.trim_start_matches("mailto:").to_string())
     }).unwrap_or_default();
     log::info!(
-        "import_openbubbles DONE: {} handle(s), apple_id={} — config.plist + keystore.plist written",
+        "import_openbubbles DONE: {} handle(s), apple_id={} — config.plist written ({})",
         handles.len(),
         if apple_id.is_empty() { "(none)" } else { apple_id.as_str() },
+        if adopted_keystore {
+            "RESTORED OB identity + keys from decrypted keystore — connects WITHOUT re-registration"
+        } else {
+            "fresh identity + empty keystore — re-registers on connect"
+        },
     );
     Ok((handles, apple_id))
 }
@@ -395,6 +529,122 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     out(&mut env, json)
 }
 
+/// Convert OpenBubbles' anisette machine-identity `state.plist` into the format
+/// omnisette's `RemoteAnisetteProviderV3` reads, so the migrated login keeps the
+/// already-provisioned ADI and never re-provisions anisette.
+///
+/// OpenBubbles stores the provisioned ADI SPLIT into a `provisioned` sub-dict:
+///   { keychain_identifier:<data>,
+///     provisioned:{ client_secret:<data>, mid:<data>, metadata:<data>,
+///                   rinfo:<string>, flavor:<string "Mac"> } }
+/// omnisette wants the SINGLE opaque blob the anisette server issued (base64-decoded
+/// into `adi_pb`), which the server re-parses on every headers call:
+///   { keychain_identifier:<data>,
+///     adi_pb:<data = {"version":1,"flavor":1,"client_secret":"…","mid":"…",
+///                     "metadata":"…","rinfo":"…"} > }
+/// The sensitive values (client_secret/mid/metadata) are carried VERBATIM — their raw
+/// bytes re-base64'd into the JSON strings — so only the JSON wrapper is rebuilt; the
+/// `keychain_identifier` the ADI is bound to is preserved. A file already in the new
+/// format (it has `adi_pb`) is re-emitted unchanged.
+fn convert_anisette(ob_state: &str, out_state: &str) -> Result<usize, String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let val = plist::Value::from_file(ob_state)
+        .map_err(|e| format!("read anisette state.plist ({ob_state}): {e}"))?;
+    let dict = val.as_dictionary()
+        .ok_or_else(|| "anisette state.plist is not a dictionary".to_string())?;
+
+    // The 16-byte machine id the adi_pb is bound to — must be carried as-is.
+    let keychain = dict.get("keychain_identifier").and_then(|v| v.as_data())
+        .ok_or_else(|| "anisette state.plist has no keychain_identifier".to_string())?
+        .to_vec();
+    if keychain.len() != 16 {
+        return Err(format!("keychain_identifier is {} bytes, expected 16", keychain.len()));
+    }
+
+    // Already new-format (a single adi_pb blob)? Re-emit unchanged.
+    if let Some(adi) = dict.get("adi_pb").and_then(|v| v.as_data()) {
+        write_anisette(out_state, &keychain, adi)?;
+        return Ok(adi.len());
+    }
+
+    // Old OpenBubbles split format: rebuild the adi_pb JSON from the sub-dict.
+    let prov = dict.get("provisioned").and_then(|v| v.as_dictionary())
+        .ok_or_else(|| "anisette state has neither adi_pb nor a 'provisioned' dict — \
+                        OpenBubbles never finished provisioning".to_string())?;
+    // A <data> field → base64 string for the JSON (tolerate an already-encoded string).
+    let field_b64 = |k: &str| -> Result<String, String> {
+        match prov.get(k) {
+            Some(plist::Value::Data(d)) => Ok(b64.encode(d)),
+            Some(plist::Value::String(s)) => Ok(s.clone()),
+            _ => Err(format!("provisioned.{k} is missing or not <data>")),
+        }
+    };
+    let client_secret = field_b64("client_secret")?;
+    let mid = field_b64("mid")?;
+    let metadata = field_b64("metadata")?;
+    let rinfo = prov.get("rinfo")
+        .and_then(|v| v.as_string().map(|s| s.to_string())
+            .or_else(|| v.as_signed_integer().map(|i| i.to_string())))
+        .ok_or_else(|| "provisioned.rinfo is missing".to_string())?;
+    let flavor = match prov.get("flavor").and_then(|v| v.as_string()) {
+        Some("Mac") | None => 1u32,
+        Some(other) => { log::warn!("convert_anisette: unmapped flavor '{other}', using 1 (Mac)"); 1 }
+    };
+
+    // Struct (not a map) so serde_json emits the fields in the server's issued order.
+    #[derive(serde::Serialize)]
+    struct AdiPb {
+        version: u32,
+        flavor: u32,
+        client_secret: String,
+        mid: String,
+        metadata: String,
+        rinfo: String,
+    }
+    let adi = serde_json::to_vec(&AdiPb {
+        version: 1, flavor, client_secret, mid, metadata, rinfo,
+    }).map_err(|e| format!("serialize adi_pb json: {e}"))?;
+    write_anisette(out_state, &keychain, &adi)?;
+    Ok(adi.len())
+}
+
+/// Write an omnisette-format anisette `state.plist` (keychain_identifier + adi_pb),
+/// creating the parent `anisette/` dir if needed.
+fn write_anisette(out_state: &str, keychain: &[u8], adi_pb: &[u8]) -> Result<(), String> {
+    if let Some(parent) = Path::new(out_state).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
+    }
+    let mut d = plist::Dictionary::new();
+    d.insert("keychain_identifier".into(), plist::Value::Data(keychain.to_vec()));
+    d.insert("adi_pb".into(), plist::Value::Data(adi_pb.to_vec()));
+    plist::Value::Dictionary(d).to_file_xml(out_state)
+        .map_err(|e| format!("write anisette state.plist ({out_state}): {e}"))?;
+    log::info!("convert_anisette: wrote {out_state} (adi_pb {} bytes)", adi_pb.len());
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeConvertAnisette(
+    mut env: JNIEnv,
+    _class: JClass,
+    ob_state: JString,
+    out_state: JString,
+) -> jstring {
+    init_logger();
+    let obs = jstr(&mut env, &ob_state);
+    let outs = jstr(&mut env, &out_state);
+    let json = match convert_anisette(&obs, &outs) {
+        Ok(n) => serde_json::json!({ "ok": true, "adi_pb_len": n }).to_string(),
+        Err(e) => {
+            log::warn!("nativeConvertAnisette failed: {e}");
+            serde_json::json!({ "ok": false, "error": e }).to_string()
+        }
+    };
+    out(&mut env, json)
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeImportOpenBubbles(
     mut env: JNIEnv,
@@ -405,12 +655,29 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     init_logger();
     let ob = jstr(&mut env, &ob_dir);
     let outd = jstr(&mut env, &out_dir);
-    let json = match import_openbubbles(&ob, &outd) {
-        Ok((handles, apple_id)) =>
+    // Run the import on a worker thread bounded to 30s, catching panics. A keystore
+    // decrypt mismatch `expect(...)`s (panics), and a panic's backtrace capture can
+    // stall on Android — so without this the whole migration could freeze. On a
+    // timeout OR panic we return an error and the migrator falls back to manual sign-in.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| import_openbubbles(&ob, &outd)));
+        let _ = tx.send(r);
+    });
+    let json = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(Ok(Ok((handles, apple_id)))) =>
             serde_json::json!({ "ok": true, "handles": handles, "appleId": apple_id }).to_string(),
-        Err(e) => {
+        Ok(Ok(Err(e))) => {
             log::warn!("nativeImportOpenBubbles failed: {e}");
             serde_json::json!({ "ok": false, "error": e }).to_string()
+        }
+        Ok(Err(_panic)) => {
+            log::error!("nativeImportOpenBubbles PANICKED (see 'RUST PANIC' above for the cause)");
+            serde_json::json!({ "ok": false, "error": "import crashed (panic) — see logcat (RUST PANIC)" }).to_string()
+        }
+        Err(_timeout) => {
+            log::error!("nativeImportOpenBubbles timed out after 30s (import stalled)");
+            serde_json::json!({ "ok": false, "error": "import timed out after 30s" }).to_string()
         }
     };
     out(&mut env, json)
@@ -424,33 +691,197 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 /// Returns `None` — which makes `nativeInit` fail, since there is NO relay
 /// fallback — when either file is missing or the plist doesn't parse.
 fn load_remote_config(dir: &str) -> Option<MacOSConfigRemote> {
+    use base64::Engine;
     let os_config = Path::new(dir).join("os_config.plist");
     let dumb = Path::new(dir).join("dumb");
-    let dumb_len = std::fs::metadata(&dumb).map(|m| m.len()).unwrap_or(0);
-    if !os_config.exists() || dumb_len == 0 {
-        log::error!(
-            "nativeInit: migrated identity incomplete — os_config.plist present={}, dumb={} B \
-             (the dumb file is REQUIRED; run the OpenBubbles transfer)",
-            os_config.exists(), dumb_len
-        );
-        return None;
-    }
-    match plist::from_file::<_, MacOSConfigRemote>(&os_config) {
+    // The dumb is now the ONLY required file: the whole identity (hardware + software) is
+    // rebuilt from it, so os_config.plist is optional — kept only for a verification compare.
+    let raw = match std::fs::read(&dumb) {
+        Ok(r) if !r.is_empty() => r,
+        _ => {
+            log::error!(
+                "nativeInit: the dumb file is REQUIRED and missing/empty at {} — run the OpenBubbles transfer",
+                dumb.display()
+            );
+            return None;
+        }
+    };
+    // OpenBubbles stores the dumb base64-encoded; decode (fall back to raw if not base64).
+    let body = match base64::engine::general_purpose::STANDARD.decode(String::from_utf8_lossy(&raw).trim()) {
+        Ok(d) if !d.is_empty() => d,
+        _ => raw.clone(),
+    };
+    match rustpush::macos_remote::MacOSConfigRemote::from_dumb_body(&body) {
         Ok(cfg) => {
             std::env::set_var("SMARTTXT_DUMB_PATH", &dumb);
-            log::info!("nativeInit: migrated identity ready (os_config.plist + dumb {dumb_len} B)");
+            // If os_config.plist is also present (older migration), verify the dumb-derived
+            // config against it field-by-field. This does NOT change what we use — the
+            // dumb-derived config is authoritative and self-consistent with the NAC
+            // validation data (both come from the one dumb).
+            if os_config.exists() {
+                match plist::from_file::<_, MacOSConfigRemote>(&os_config) {
+                    Ok(old) => compare_configs(&cfg, &old),
+                    Err(e) => log::warn!("config-verify: os_config.plist present but unreadable ({e}) — skipping compare"),
+                }
+            }
+            log::info!("nativeInit: identity built FROM THE DUMB ({} B) — os_config.plist not required", body.len());
             Some(cfg)
         }
         Err(e) => {
-            log::error!("nativeInit: os_config.plist is not a MacOSConfigRemote ({e})");
-            None
+            log::error!("nativeInit: couldn't build config from the dumb ({e})");
+            // Fall back to os_config.plist so an existing install still starts if the dumb
+            // parse ever regresses.
+            match plist::from_file::<_, MacOSConfigRemote>(&os_config) {
+                Ok(cfg) => {
+                    std::env::set_var("SMARTTXT_DUMB_PATH", &dumb);
+                    log::warn!("nativeInit: FELL BACK to os_config.plist (dumb parse failed)");
+                    Some(cfg)
+                }
+                Err(e2) => {
+                    log::error!("nativeInit: no usable identity — dumb parse failed AND os_config.plist unreadable ({e2})");
+                    None
+                }
+            }
         }
     }
+}
+
+/// Log a field-by-field comparison of the dumb-derived config vs os_config.plist, so the
+/// dumb parse can be confirmed correct before os_config.plist is dropped for good.
+fn compare_configs(from_dumb: &MacOSConfigRemote, from_plist: &MacOSConfigRemote) {
+    let cmp = |name: &str, a: String, b: String| {
+        if a == b {
+            log::info!("config-verify: {name} MATCH ({a})");
+        } else {
+            log::warn!("config-verify: {name} MISMATCH — dumb={a:?} os_config={b:?}");
+        }
+    };
+    let rd: Vec<u8> = from_dumb.inner.rom.clone().into();
+    let rp: Vec<u8> = from_plist.inner.rom.clone().into();
+    cmp("product_name", from_dumb.inner.product_name.clone(), from_plist.inner.product_name.clone());
+    cmp("serial", from_dumb.inner.platform_serial_number.clone(), from_plist.inner.platform_serial_number.clone());
+    cmp("build", from_dumb.inner.os_build_num.clone(), from_plist.inner.os_build_num.clone());
+    cmp("mlb", from_dumb.inner.mlb.clone(), from_plist.inner.mlb.clone());
+    cmp("rom", dbg_hex(&rd), dbg_hex(&rp));
+    cmp("version", from_dumb.version.clone(), from_plist.version.clone());
+    cmp("protocol_version", from_dumb.protocol_version.to_string(), from_plist.protocol_version.to_string());
+    cmp("device_id", from_dumb.device_id.clone(), from_plist.device_id.clone());
+    cmp("icloud_ua", from_dumb.icloud_ua.clone(), from_plist.icloud_ua.clone());
+    cmp("aoskit_version", from_dumb.aoskit_version.clone(), from_plist.aoskit_version.clone());
+    cmp("udid", from_dumb.udid.clone().unwrap_or_default(), from_plist.udid.clone().unwrap_or_default());
 }
 
 // =============================================================================
 // JNI: lifecycle
 // =============================================================================
+
+/// Lowercase hex of some bytes (diagnostic only).
+fn dbg_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Walk a protobuf wire-format buffer and log each top-level field: number, wire type,
+/// and a value preview (UTF-8 string when printable, else hex). DIAGNOSTIC ONLY — used
+/// to reveal the dumb file's `HwInfo` schema (there's no `.proto` for it in-tree) so its
+/// hardware fields (serial / model / build / mlb / rom) can later be mapped to
+/// `HardwareConfig` with confidence instead of guessing field numbers.
+fn dbg_log_protobuf(tag: &str, mut buf: &[u8]) {
+    fn read_varint(buf: &mut &[u8]) -> Option<u64> {
+        let (mut result, mut shift) = (0u64, 0u32);
+        loop {
+            let (&byte, rest) = buf.split_first()?;
+            *buf = rest;
+            result |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(result);
+            }
+            shift += 7;
+            if shift >= 64 {
+                return None;
+            }
+        }
+    }
+    let mut count = 0u32;
+    while !buf.is_empty() {
+        let Some(key) = read_varint(&mut buf) else { break };
+        let (field, wire) = (key >> 3, key & 7);
+        match wire {
+            0 => match read_varint(&mut buf) {
+                Some(v) => log::info!("{tag}: #{field} varint = {v}"),
+                None => break,
+            },
+            1 => {
+                if buf.len() < 8 {
+                    break;
+                }
+                let (b, rest) = buf.split_at(8);
+                buf = rest;
+                log::info!("{tag}: #{field} i64 = 0x{}", dbg_hex(b));
+            }
+            2 => {
+                let Some(len) = read_varint(&mut buf) else { break };
+                let len = len as usize;
+                if buf.len() < len {
+                    break;
+                }
+                let (val, rest) = buf.split_at(len);
+                buf = rest;
+                match std::str::from_utf8(val) {
+                    Ok(s) if !s.is_empty() && s.chars().all(|c| !c.is_control()) => {
+                        log::info!("{tag}: #{field} str[{len}] = {s:?}")
+                    }
+                    _ => log::info!("{tag}: #{field} bytes[{len}] = {}", dbg_hex(val)),
+                }
+            }
+            5 => {
+                if buf.len() < 4 {
+                    break;
+                }
+                let (b, rest) = buf.split_at(4);
+                buf = rest;
+                log::info!("{tag}: #{field} i32 = 0x{}", dbg_hex(b));
+            }
+            _ => {
+                log::warn!("{tag}: #{field} unknown wire type {wire} — stopping");
+                break;
+            }
+        }
+        count += 1;
+        if count > 200 {
+            log::warn!("{tag}: >200 fields — stopping");
+            break;
+        }
+    }
+    log::info!("{tag}: decoded {count} top-level field(s)");
+}
+
+/// Diagnostic: read `<dir>/dumb`, base64-decode it (OpenBubbles stores it base64), skip
+/// the 5-byte OABS header, and log every protobuf field of the `HwInfo` body. Purely
+/// observational — nothing depends on the result yet; it exists so the dumb's fields can
+/// be identified before deriving `HardwareConfig` from it (and dropping os_config.plist).
+fn dbg_log_dumb(dir: &str) {
+    use base64::Engine;
+    let path = Path::new(dir).join("dumb");
+    let raw = match std::fs::read(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("dumb-decode: can't read {}: {e}", path.display());
+            return;
+        }
+    };
+    let txt = String::from_utf8_lossy(&raw);
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(txt.trim()) {
+        Ok(d) if !d.is_empty() => d,
+        _ => raw.clone(),
+    };
+    log::info!("dumb-decode: {} raw byte(s) → {} decoded byte(s)", raw.len(), decoded.len());
+    if decoded.len() <= 5 {
+        log::warn!("dumb-decode: only {} decoded byte(s) — too short for a 5-byte header + HwInfo", decoded.len());
+        return;
+    }
+    log::info!("dumb-decode: 5-byte header = 0x{}", dbg_hex(&decoded[..5]));
+    dbg_log_protobuf("dumb-hwinfo", &decoded[5..]);
+}
 
 #[no_mangle]
 pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeInit(
@@ -470,6 +901,11 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     // goes EXCLUSIVELY through MacOSConfigRemote (the NAC server). There is no
     // relay fallback, ever.
     let _ = (&relay_host, &relay_code);
+
+    // Diagnostic: dump the dumb file's HwInfo protobuf fields to logcat, so its hardware
+    // identity (serial/model/build/mlb/rom) can be mapped and os_config.plist eventually
+    // dropped. Observational only — nothing here consumes the result yet.
+    dbg_log_dumb(&dir);
 
     init_keystore_persisted(&dir);
 
@@ -536,13 +972,38 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         return JNI_FALSE;
     };
     let saved_push = load_saved(&dir).map(|s| s.push);
+    // Resume diagnostics. A MIGRATED session carries OpenBubbles' push keypair + user auth
+    // keys as keystore-ALIAS references whose private halves lived in OB's un-transferable
+    // keystore. If push.keypair shows present here but the keystore is empty, do_connect
+    // SKIPS activate() and then fails signing with KeyNotFound — check the paired
+    // "keystore get_key: alias '…' NOT FOUND — keystore holds 0 key(s)" line for the alias.
+    log::info!(
+        "nativeConnect: resume state — {} user(s), identity={}, push.keypair={}, push.token={}",
+        resume_users.len(),
+        resume_identity.is_some(),
+        saved_push.as_ref().map(|p| p.keypair.is_some()).unwrap_or(false),
+        saved_push.as_ref().map(|p| p.token.is_some()).unwrap_or(false),
+    );
 
+    // Retry the APNs connect a few times: a transient "connection refused" to Apple's
+    // push bag (init-p01st.push.apple.com) is common right after the migration disables
+    // OpenBubbles (which briefly churns the network/push state).
     let conn = rt().block_on(async move {
-        let (connection, err) = APSConnectionResource::new(os_config, saved_push).await;
-        match err {
-            Some(e) => Err(e),
-            None => Ok(connection),
+        let mut last_err = None;
+        for attempt in 1..=4u32 {
+            let (connection, err) = APSConnectionResource::new(os_config.clone(), saved_push.clone()).await;
+            match err {
+                None => return Ok(connection),
+                Some(e) => {
+                    log::warn!("nativeConnect: APNs attempt {attempt}/4 failed: {e:?}");
+                    last_err = Some(e);
+                    if attempt < 4 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
         }
+        Err(last_err.expect("loop ran at least once"))
     });
     let connection = match conn {
         Ok(c) => c,
@@ -556,10 +1017,12 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         s.connection = Some(connection);
         s.connected = true;
     }
-    // If we resumed a registration, build the client + receive loop now.
+    // If we resumed a registration, build the client + receive loop now. Panic-guarded:
+    // a keystore/identity panic here must not unwind across JNI (hang) — we stay connected
+    // and just log it; the UI can re-drive registration.
     if !resume_users.is_empty() {
         if let Some(identity) = resume_identity {
-            if let Err(e) = rt().block_on(build_client_and_receive(resume_users, identity)) {
+            if let Err(e) = build_client_guarded(resume_users, identity) {
                 log::error!("nativeConnect: client build (resume) failed: {e}");
             }
         }
@@ -599,6 +1062,47 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     s.connection = None;
     s.client = None;
     s.receive_started = false;
+}
+
+/// Full LOGOUT: wipe every trace of the current login so the NEXT sign-in is fresh —
+/// no OpenBubbles/migrated resume. Resets the in-memory [`AppState`] to default
+/// (keeping ONLY the device identity `os_config` + `files_dir`) and deletes the
+/// persisted login files (config.plist, keystore.plist, creds.json, id_cache.plist,
+/// anisette/). The device identity (`dumb` + `os_config.plist`) is intentionally KEPT
+/// so a fresh registration still validates through the NAC server (no relay). Called on
+/// explicit logout AND at the start of a fresh sign-in, so a stale/dangling session
+/// (e.g. OpenBubbles' push keypair whose private half lived in its un-transferable
+/// keystore) can never block `nativeConnect` with KeyNotFound.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeLogout(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    init_logger();
+    let dir = {
+        let mut s = st();
+        let files_dir = s.files_dir.clone();
+        let os_config = s.os_config.clone();
+        *s = AppState::default(); // drop connection/client/users/identity/account/creds/handles/…
+        s.files_dir = files_dir.clone();
+        s.os_config = os_config; // keep the device identity in memory
+        files_dir
+    };
+    // Delete only LOGIN-level files. Do NOT touch anisette/: the anisette machine identity
+    // (adi_pb + keychain_identifier) is DEVICE-level, not tied to the Apple ID login. Wiping
+    // it forces a brand-new provisioning round-trip on every sign-in — which both wastes the
+    // provisioning server (hw.openbubbles.app started returning HTTP 400 after the repeated
+    // re-provisions) and makes login fail whenever provisioning has any hiccup. Keeping it
+    // means a re-login reuses the already-provisioned identity and SKIPS provisioning
+    // entirely (RemoteAnisetteProviderV3 only provisions when !is_provisioned()).
+    for f in ["config.plist", "keystore.plist", "creds.json", "id_cache.plist"] {
+        match std::fs::remove_file(Path::new(&dir).join(f)) {
+            Ok(()) => log::info!("nativeLogout: deleted {f}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("nativeLogout: couldn't delete {f}: {e}"),
+        }
+    }
+    log::info!("nativeLogout: login state cleared (device identity dumb + os_config + anisette KEPT for fresh sign-in)");
 }
 
 // =============================================================================
@@ -795,7 +1299,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         });
         save_saved(&dir, &SavedState { push, users: users.clone(), identity: identity.clone() });
     }
-    if let Err(e) = rt().block_on(build_client_and_receive(users, identity)) {
+    if let Err(e) = build_client_guarded(users, identity) {
         log::error!("nativeRegister: client build failed: {e}");
         return out(&mut env, err_json(e));
     }
@@ -914,12 +1418,19 @@ fn spawn_recover_if_closed(err_dbg: &str) {
         return; // a recover is already in flight
     }
     rt().spawn(async {
+        // Reset the in-flight flag on ANY exit — normal, Err, or panic-unwind — so a
+        // panic inside recover() (contained here by tokio, not a UI hang) can't wedge
+        // auto-recovery permanently. A Drop guard fires even while unwinding.
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) { RECOVERING.store(false, Ordering::SeqCst); }
+        }
+        let _reset = ResetGuard;
         log::warn!("identity closed (6005) — recovering: fresh login + re-register");
         match recover().await {
             Ok(()) => log::info!("recover ok — receiving again"),
             Err(e) => log::error!("recover failed: {e}"),
         }
-        RECOVERING.store(false, Ordering::SeqCst);
     });
 }
 
@@ -1206,13 +1717,13 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let reply_to = jstr(&mut env, &reply_to);
     let client = st().client.clone();
     let Some(client) = client else {
-        return out(&mut env, String::new());
+        return out(&mut env, "ERR:Not connected — the iMessage engine isn't running yet. Reopen the app and try again.".to_string());
     };
 
     let guid = rt().block_on(async move {
         let handles = client.identity.get_handles().await;
         let Some(handle) = pick_send_handle(&handles) else {
-            return String::new();
+            return "ERR:No sending number or email is set up for this account (no registered handles).".to_string();
         };
         // A group ("iMessage;+;a,b,c") always goes over iMessage to every member;
         // only a 1:1 gets per-number SMS-forwarding routing.
@@ -1271,7 +1782,10 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             }
             Err(e) => {
                 log::error!("nativeSendText: send failed: {e:?}");
-                String::new()
+                // Surface the real reason to the UI (via the ERR: channel) instead of a
+                // generic "couldn't send". Display is the human-readable thiserror message;
+                // the full Debug is in logcat above.
+                format!("ERR:Send failed: {e}")
             }
         }
     });
@@ -1303,7 +1817,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let client = st().client.clone();
     let connection = st().connection.clone();
     let (Some(client), Some(connection)) = (client, connection) else {
-        return out(&mut env, String::new());
+        return out(&mut env, "ERR:Not connected — the iMessage engine isn't running yet. Reopen the app and try again.".to_string());
     };
     let voice = mime_s.starts_with("audio/");
     let uti = uti_for_mime(&mime_s);
@@ -1311,7 +1825,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let guid = rt().block_on(async move {
         let handles = client.identity.get_handles().await;
         let Some(handle) = pick_send_handle(&handles) else {
-            return String::new();
+            return "ERR:No sending number or email is set up for this account (no registered handles).".to_string();
         };
         // Group attachments go over iMessage to every member; only a 1:1 gets
         // per-number SMS-forwarding routing.
@@ -1338,7 +1852,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             Ok(p) => p,
             Err(e) => {
                 log::error!("nativeSendAttachment: prepare_put: {e:?}");
-                return String::new();
+                return format!("ERR:Couldn't prepare the attachment upload: {e}");
             }
         };
         let attachment = match Attachment::new_mmcs(
@@ -1355,7 +1869,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             Ok(a) => a,
             Err(e) => {
                 log::error!("nativeSendAttachment: mmcs upload: {e:?}");
-                return String::new();
+                return format!("ERR:Attachment upload failed: {e}");
             }
         };
 
@@ -1392,7 +1906,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             }
             Err(e) => {
                 log::error!("nativeSendAttachment: send failed: {e:?}");
-                String::new()
+                format!("ERR:Send failed: {e}")
             }
         }
     });

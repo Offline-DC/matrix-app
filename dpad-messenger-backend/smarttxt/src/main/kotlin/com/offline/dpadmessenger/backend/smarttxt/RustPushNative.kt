@@ -62,10 +62,26 @@ object RustPushNative {
      *  Returns JSON `{"ok":true}` or `{"ok":false,"error":"…"}`. */
     external fun nativeStageIdentity(obFilesDir: String, outDir: String): String
 
+    /** Rebuild OpenBubbles' anisette machine identity into omnisette's format.
+     *  OpenBubbles stores the provisioned ADI split across a `provisioned` sub-dict
+     *  ([obStatePlist], its files/anisette_test/state.plist); omnisette wants the
+     *  single `adi_pb`=base64(JSON) blob. Reads [obStatePlist], writes the converted
+     *  state.plist to [outStatePlist] (filesDir/anisette/state.plist) so the migrated
+     *  login reuses the provisioning instead of re-provisioning. Returns JSON
+     *  `{"ok":true,"adi_pb_len":N}` or `{"ok":false,"error":"…"}`. */
+    external fun nativeConvertAnisette(obStatePlist: String, outStatePlist: String): String
+
     /** Open the APNs courier socket (rustpush `APNSConnection`). */
     external fun nativeConnect(): Boolean
     external fun nativeIsConnected(): Boolean
     external fun nativeDisconnect()
+
+    /** Full LOGOUT: wipe the in-memory session + delete the persisted LOGIN files
+     *  (config.plist, keystore.plist, creds.json, id_cache.plist, anisette/) so the
+     *  next sign-in is FRESH with no OpenBubbles/migrated resume. KEEPS the device
+     *  identity (dumb + os_config.plist) so a fresh registration still validates via
+     *  the NAC server. Safe to call before every fresh sign-in. */
+    external fun nativeLogout()
 
     // ---- Apple ID authentication (GrandSlam + 2FA) --------------------------
     // rustpush needs an authenticated Apple ID (GSA token -> IDS auth cert)
@@ -146,6 +162,12 @@ object RustPushNative {
         if (loaded) runCatching { nativeSetSendHandle(handle) }
     }
 
+    /** Null-safe logout: no-op when the `.so` isn't loaded. Clears native login state
+     *  so the next sign-in is fresh (device identity kept). */
+    fun runCatchingNativeLogout() {
+        if (loaded) runCatching { nativeLogout() }
+    }
+
     /** Null-safe iMessage check: defaults to true (iMessage/blue) when the `.so`
      *  isn't loaded or the lookup fails, so we never wrongly show a green composer. */
     fun runCatchingNativeIsImessage(handle: String): Boolean =
@@ -162,6 +184,14 @@ object RustPushNative {
      *  loaded or the native call throws, so the migrator treats it as a hard fail. */
     fun runCatchingNativeStageIdentity(obFilesDir: String, outDir: String): String =
         if (loaded) runCatching { nativeStageIdentity(obFilesDir, outDir) }
+            .getOrElse { """{"ok":false,"error":"${it.message?.replace('"', '\'')}"}""" }
+        else """{"ok":false,"error":"native library not loaded"}"""
+
+    /** Null-safe anisette conversion: returns an error JSON when the `.so` isn't
+     *  loaded or the native call throws, so the migrator treats a failure as
+     *  "anisette not carried" (soft — it just re-provisions on first sign-in). */
+    fun runCatchingNativeConvertAnisette(obStatePlist: String, outStatePlist: String): String =
+        if (loaded) runCatching { nativeConvertAnisette(obStatePlist, outStatePlist) }
             .getOrElse { """{"ok":false,"error":"${it.message?.replace('"', '\'')}"}""" }
         else """{"ok":false,"error":"native library not loaded"}"""
 

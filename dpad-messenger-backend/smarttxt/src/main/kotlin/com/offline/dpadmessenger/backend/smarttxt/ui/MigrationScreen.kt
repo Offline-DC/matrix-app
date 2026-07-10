@@ -29,9 +29,10 @@ import com.offline.dpadmessenger.backend.smarttxt.OpenBubblesMigrator
 import com.offline.dpadmessenger.backend.smarttxt.R
 
 /**
- * "Transferring to new Smart Txt" screen — shown on first launch when the user
- * isn't signed in yet but a logged-in OpenBubbles is present to migrate from
- * (see [OpenBubblesMigrator.available]).
+ * "Setting up…" screen — shown on first launch when the user isn't signed in yet
+ * but a logged-in OpenBubbles is present to migrate from (see
+ * [OpenBubblesMigrator.available]). The copy is intentionally neutral because this
+ * screen can fall back to a manual sign-in when the OpenBubbles login can't be reused.
  *
  * The transfer runs in two phases and has three outcomes:
  *  - **Device identity fails** (couldn't copy/stage the `dumb` + os_config, which
@@ -50,13 +51,13 @@ fun MigrationScreen(
     onFallbackToSetup: () -> Unit,
 ) {
     val context = LocalContext.current
-    var step by remember { mutableStateOf("Setting things up…") }
+    var step by remember { mutableStateOf("This will only take a moment…") }
     var failure by remember { mutableStateOf<String?>(null) }
     var attempt by remember { mutableStateOf(0) }
 
     LaunchedEffect(attempt) {
         failure = null
-        step = "Setting things up…"
+        step = "This will only take a moment…"
         Log.i("ObMigrator", "MigrationScreen shown → starting transfer (attempt ${attempt + 1})")
         val result = OpenBubblesMigrator.migrate(context) { step = it }
         when {
@@ -98,7 +99,11 @@ fun MigrationScreen(
                 val err = failure
                 if (err == null) {
                     Text(
-                        text = "Transferring to new Smart Txt",
+                        // Deliberately NEUTRAL: this screen may fall back to a manual
+                        // sign-in if the OpenBubbles login can't be reused, so we never
+                        // promise "your login is carrying over" — that would confuse the
+                        // user about why they're being asked to sign in.
+                        text = "Setting up…",
                         style = MaterialTheme.typography.titleMedium,
                         textAlign = TextAlign.Center,
                     )

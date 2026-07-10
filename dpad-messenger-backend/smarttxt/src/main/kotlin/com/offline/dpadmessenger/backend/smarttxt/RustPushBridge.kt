@@ -87,7 +87,8 @@ class RustPushBridge(
         return try {
             parseRegisterResult(appleId, RustPushNative.nativeRegister(appleId))
         } catch (e: Throwable) {
-            RegistrationResult.Failure("Native registration failed: ${e.message}", e)
+            Log.w(TAG, "native registration threw", e)
+            RegistrationResult.Failure(humanizeLoginError(e.message), e)
         }
     }
 
@@ -104,8 +105,17 @@ class RustPushBridge(
     ): RegistrationResult {
         if (!NATIVE_AVAILABLE) return RegistrationResult.Failure("native library not loaded")
         return try {
+            // Fresh sign-in: wipe any stale/migrated login state FIRST so nativeConnect
+            // activates a brand-new push key instead of resuming OpenBubbles' dangling
+            // keystore refs (which fail APNs connect with KeyNotFound). Device identity is
+            // kept. Skip only if we're already connected on a live (non-stale) session.
+            if (!RustPushNative.nativeIsConnected()) {
+                RustPushNative.runCatchingNativeLogout()
+            }
             if (!RustPushNative.nativeIsConnected() && !RustPushNative.nativeConnect()) {
-                return RegistrationResult.Failure("APNs connect failed")
+                Log.w(TAG, "sign-in: nativeConnect failed (APNs)")
+                return RegistrationResult.Failure(
+                    "Couldn't connect to Apple's servers. Check your internet connection and try again.")
             }
             // Login. The remote anisette server (v3) can transiently fail
             // provisioning (e.g. EndProvisioningError → ErrorGettingAnisette). Retry
@@ -118,23 +128,78 @@ class RustPushBridge(
                 auth = json.parseToJsonElement(RustPushNative.nativeAuthenticate(appleId, password)).jsonObject
                 authErr = auth["error"]?.jsonPrimitive?.content
             }
-            if (authErr != null) return RegistrationResult.Failure("Login failed: $authErr")
+            if (authErr != null) {
+                Log.w(TAG, "sign-in: authenticate failed: $authErr")
+                return RegistrationResult.Failure(humanizeLoginError(authErr))
+            }
             if (auth["status"]?.jsonPrimitive?.content == "needs_2fa") {
                 val code = twoFactorProvider?.invoke()
-                    ?: return RegistrationResult.Failure("Two-factor code required")
+                    ?: return RegistrationResult.Failure("A verification code is required to sign in.")
                 val verify = json.parseToJsonElement(RustPushNative.nativeSubmit2fa(code)).jsonObject
-                verify["error"]?.jsonPrimitive?.content?.let { return RegistrationResult.Failure("2FA failed: $it") }
+                verify["error"]?.jsonPrimitive?.content?.let {
+                    Log.w(TAG, "sign-in: 2FA verify failed: $it")
+                    return RegistrationResult.Failure(
+                        "That verification code didn't work. Request a new code and try again.")
+                }
             }
             parseRegisterResult(appleId, RustPushNative.nativeRegister(appleId))
         } catch (e: Throwable) {
-            RegistrationResult.Failure("Native sign-in failed: ${e.message}", e)
+            Log.w(TAG, "sign-in threw", e)
+            RegistrationResult.Failure(humanizeLoginError(e.message), e)
+        }
+    }
+
+    /**
+     * Convert a raw native error — often deeply-nested Rust Debug output like
+     * `ErrorGettingAnisette(WsError(Http(Response { status: 400, … })))` — into a short,
+     * human-readable message that still names the failing stage and any HTTP status, so
+     * it stays useful for debugging without dumping raw Rust at the user. Callers log the
+     * raw string separately, so nothing is lost for deep debugging.
+     */
+    private fun humanizeLoginError(raw: String?): String {
+        val r = raw?.trim().orEmpty()
+        if (r.isEmpty()) return "Sign-in failed. Please try again."
+        val lower = r.lowercase()
+        val status = Regex("""status:\s*(\d{3})""").find(r)?.groupValues?.getOrNull(1)
+        val httpHint = if (status != null) " (server returned HTTP $status)" else ""
+        return when {
+            lower.contains("anisette") || lower.contains("provision") ->
+                "Couldn't reach the activation server$httpHint. This is usually a temporary " +
+                    "server-side problem — wait a moment and try again."
+            lower.contains("bad credentials") || lower.contains("needslogin") ||
+                lower.contains("-20101") || lower.contains("authentication failed") ->
+                "Your Apple ID or password is incorrect. Check them and try again."
+            lower.contains("2fa") || lower.contains("two-factor") || lower.contains("two factor") ||
+                lower.contains("verification code") ->
+                "That verification code didn't work. Request a new code and try again."
+            lower.contains("timed out") || lower.contains("timeout") ->
+                "The server took too long to respond$httpHint. Check your connection and try again."
+            lower.contains("apns") || lower.contains("connect failed") ||
+                lower.contains("connection refused") || lower.contains("os error 111") ->
+                "Couldn't connect to Apple's servers. Check your internet connection and try again."
+            lower.contains("nac") || lower.contains("validation") ->
+                "Couldn't verify this device with Apple$httpHint. Try again in a moment."
+            lower.contains("dumb") || lower.contains("os_config") || lower.contains("device identity") ->
+                "This device isn't fully set up for iMessage yet. Reopen the app to finish device " +
+                    "setup, then try again."
+            lower.contains("locked") ->
+                "This Apple ID appears to be locked. Unlock it at appleid.apple.com, then try again."
+            status != null ->
+                "The server returned an error (HTTP $status). This is usually server-side — try again shortly."
+            else -> {
+                val tail = r.take(120).replace(Regex("""\s+"""), " ")
+                "Sign-in failed. (Technical detail: $tail)"
+            }
         }
     }
 
     /** Parse the `{"handles":[…]}` / `{"error":…}` JSON from `nativeRegister`. */
     private fun parseRegisterResult(appleId: String, resultJson: String): RegistrationResult {
         val obj = json.parseToJsonElement(resultJson).jsonObject
-        obj["error"]?.jsonPrimitive?.content?.let { return RegistrationResult.Failure("rustpush: $it") }
+        obj["error"]?.jsonPrimitive?.content?.let {
+            Log.w(TAG, "register failed: $it")
+            return RegistrationResult.Failure(humanizeLoginError(it))
+        }
         val handles = obj["handles"]?.jsonArray?.map { it.jsonPrimitive.content } ?: listOf("mailto:$appleId")
         return RegistrationResult.Success(
             SmartTxtAccount(

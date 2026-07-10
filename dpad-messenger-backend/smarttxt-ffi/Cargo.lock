@@ -1656,6 +1656,7 @@ name = "keystore"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "log",
  "openssl",
  "plist",
  "rand 0.8.6",
@@ -2981,6 +2982,7 @@ name = "smarttxt-ffi"
 version = "0.1.0"
 dependencies = [
  "android_logger",
+ "base64 0.21.7",
  "jni",
  "keystore",
  "log",
