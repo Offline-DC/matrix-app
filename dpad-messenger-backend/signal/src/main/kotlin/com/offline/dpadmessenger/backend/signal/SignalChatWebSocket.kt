@@ -5,6 +5,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
@@ -25,6 +26,7 @@ import org.signal.libsignal.protocol.message.SignalMessage
 import org.whispersystems.signalservice.internal.push.SignalServiceProtos
 import org.whispersystems.signalservice.internal.websocket.WebSocketProtos
 import java.util.UUID
+import java.util.concurrent.Executors
 
 /**
  * Authenticated chat WebSocket connection.
@@ -83,7 +85,29 @@ class SignalChatWebSocket(
     var onSocketConnected: (() -> Unit)? = null
 
     private var socket: WebSocket? = null
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Dedicated, bounded pool for decrypted-payload processing (repository
+     * writes, group-state fetches, contact-sync downloads). Each inbound
+     * payload used to be `launch`ed onto Dispatchers.IO's 64-thread pool, so a
+     * backlog drain fanned dozens of concurrent network/DB coroutines at once —
+     * the burst that pinned the heap and caused a >1.5s blocking GC on 1GB
+     * devices in the startup logs. Capping to [MAX_CONCURRENT_ENVELOPES] daemon
+     * threads bounds *active* concurrency; a coroutine that suspends (e.g.
+     * parked on a per-group fetch lock) frees its thread, so throughput holds.
+     */
+    private val processingDispatcher =
+        Executors.newFixedThreadPool(MAX_CONCURRENT_ENVELOPES) { r ->
+            Thread(r, "SignalMsgProc").apply { isDaemon = true }
+        }.asCoroutineDispatcher()
+    private val scope = CoroutineScope(SupervisorJob() + processingDispatcher)
+
+    /**
+     * Unbounded scope for connection lifecycle only (keepalive loop, reconnect
+     * backoff, on-connect callback). Kept off [scope] so these never queue
+     * behind a payload drain.
+     */
+    private val connScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** Set by [disconnect] and by a terminal auth failure so a pending
      *  reconnect doesn't fire. */
@@ -130,7 +154,7 @@ class SignalChatWebSocket(
             authFailures = 0
             // Notify outside the listener thread so anything heavy (network,
             // crypto) doesn't block frame intake.
-            scope.launch { runCatching { onSocketConnected?.invoke() } }
+            connScope.launch { runCatching { onSocketConnected?.invoke() } }
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -160,7 +184,7 @@ class SignalChatWebSocket(
                     return
                 }
                 Log.w(TAG, "chat socket auth rejected (HTTP $code) — retry $authFailures/$AUTH_FAILURE_LIMIT")
-                scope.launch {
+                connScope.launch {
                     delay(5_000)
                     if (!stopped) connect()
                 }
@@ -173,7 +197,7 @@ class SignalChatWebSocket(
             val attempt = reconnectAttempts++
             val backoffMs = (5_000L * (1L shl attempt.coerceAtMost(5))).coerceAtMost(MAX_BACKOFF_MS)
             Log.w(TAG, "chat socket dropped (code=$code ${t.message}); reconnecting in ${backoffMs}ms")
-            scope.launch {
+            connScope.launch {
                 delay(backoffMs)
                 if (!stopped) connect()
             }
@@ -235,7 +259,7 @@ class SignalChatWebSocket(
         }
 
         val sourceServiceId = env.sourceServiceIdString()
-        Log.d(TAG, "ENVELOPE type=${env.type} from=$sourceServiceId deviceId=${env.sourceDeviceId}")
+        if (VERBOSE) Log.d(TAG, "ENVELOPE type=${env.type} from=$sourceServiceId deviceId=${env.sourceDeviceId}")
 
         val store = protocolStore ?: run {
             Log.w(TAG, "no protocol store wired — cannot decrypt; dropping")
@@ -365,7 +389,7 @@ class SignalChatWebSocket(
 
         // Diagnostic: what is this decrypted message, and does a DataMessage
         // carry a profileKey (the only thing we can resolve a name from)?
-        run {
+        if (VERBOSE) {
             val hasData = content.hasDataMessage()
             Log.d(
                 TAG,
@@ -778,7 +802,7 @@ class SignalChatWebSocket(
      * mautrix-signal sends one every 30s. We match.
      */
     private fun startKeepalive() {
-        scope.launch {
+        connScope.launch {
             var keepaliveId = 1L
             while (true) {
                 delay(30_000)
@@ -833,15 +857,17 @@ class SignalChatWebSocket(
         // single-recipient; if we see multi-recipient, the server is
         // delivering an unextracted share which we need to flatten with
         // multiRecipientMessageForSingleRecipient first.
-        val first = if (cipherBody.isNotEmpty()) cipherBody[0].toInt() and 0xFF else -1
-        val version = (first shr 4) and 0x0F
-        val variant = first and 0x0F
-        val hexPreview = cipherBody.take(32).joinToString(" ") { "%02x".format(it.toInt() and 0xFF) }
-        Log.d(
-            TAG,
-            "sealed sender cipherBody: ${cipherBody.size}b firstByte=0x${"%02x".format(first)} " +
-                "(version=$version variant=$variant) head=[$hexPreview]",
-        )
+        if (VERBOSE) {
+            val first = if (cipherBody.isNotEmpty()) cipherBody[0].toInt() and 0xFF else -1
+            val version = (first shr 4) and 0x0F
+            val variant = first and 0x0F
+            val hexPreview = cipherBody.take(32).joinToString(" ") { "%02x".format(it.toInt() and 0xFF) }
+            Log.d(
+                TAG,
+                "sealed sender cipherBody: ${cipherBody.size}b firstByte=0x${"%02x".format(first)} " +
+                    "(version=$version variant=$variant) head=[$hexPreview]",
+            )
+        }
 
         // libsignal accepts exactly one trust root per validator instance —
         // walk the rotation list until one accepts the sender cert.
@@ -849,7 +875,7 @@ class SignalChatWebSocket(
             try {
                 val result = cipher.decrypt(validator, cipherBody, timestamp)
                 val plaintext = stripPadding(result.paddedMessage)
-                Log.d(
+                if (VERBOSE) Log.d(
                     TAG,
                     "sealed sender decrypt OK from ${result.senderUuid}.${result.deviceId} " +
                         "(msgType=${result.ciphertextMessageType}, plain=${plaintext.size}b)",
@@ -905,6 +931,19 @@ class SignalChatWebSocket(
 
     companion object {
         private const val TAG = "SignalChatWS"
+        /**
+         * Max decrypted payloads processed at once during a backlog drain.
+         * Small on purpose: keeps peak heap + concurrent network low on 1GB
+         * devices. Raise cautiously if throughput ever matters more than RAM.
+         */
+        private const val MAX_CONCURRENT_ENVELOPES = 4
+        /**
+         * Gate for per-envelope diagnostic logs (envelope type, decrypted
+         * content summary, sealed-sender cipher preview) — hundreds of lines
+         * during a backlog drain. Off by default; R8 strips Log.d in release
+         * regardless. Flip to true to trace message flow in a debug build.
+         */
+        private const val VERBOSE = false
         /** Cap on reconnect backoff so a long outage settles at a slow poll. */
         private const val MAX_BACKOFF_MS = 60_000L
         /** Consecutive 401/403s before we conclude the device is unlinked. */

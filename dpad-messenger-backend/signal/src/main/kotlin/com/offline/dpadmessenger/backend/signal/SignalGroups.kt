@@ -21,6 +21,7 @@ import org.signal.libsignal.zkgroup.groupsend.GroupSendEndorsement
 import org.signal.libsignal.zkgroup.groupsend.GroupSendEndorsementsResponse
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * GroupsV2 subsystem: turns a group's 32-byte `masterKey` (carried in every
@@ -116,20 +117,40 @@ class SignalGroups(
     }
 
     /**
+     * Per-group fetch locks. The short-lived [cache] alone does NOT prevent a
+     * stampede: when the message backlog drains on startup, many queued
+     * envelopes for the SAME group all call [getOrFetch] within a few ms, all
+     * miss the still-empty cache together, and all run [fetchGroupState] in
+     * parallel — the "thundering herd" in the logs (one 134-member group
+     * fetched ~9× concurrently, each an auth-cred + group-state round trip).
+     * Serializing per gid collapses that burst into a single fetch; the losers
+     * wake up and read the entry the winner just cached.
+     */
+    private val fetchLocks = ConcurrentHashMap<String, Mutex>()
+
+    /** Cache read under [cacheMutex]; returns the info only if still fresh. */
+    private suspend fun cachedFresh(gid: String): GroupInfo? = cacheMutex.withLock {
+        cache[gid]?.takeIf { System.currentTimeMillis() - it.fetchedAt < CACHE_TTL_MS }?.info
+    }
+
+    /**
      * Fetch + decrypt group state, served from a short-lived cache. Returns
      * null if the server params constant is unset or the fetch/decrypt fails
      * (callers fall back to a placeholder name + the senders they've seen).
      */
     suspend fun getOrFetch(masterKey: ByteArray): GroupInfo? {
         val gid = groupIdForMasterKey(masterKey) ?: return null
-        cacheMutex.withLock {
-            cache[gid]?.let {
-                if (System.currentTimeMillis() - it.fetchedAt < CACHE_TTL_MS) return it.info
-            }
+        // Fast path: a fresh cache entry needs no fetch lock.
+        cachedFresh(gid)?.let { return it }
+        // Slow path: one fetch per gid at a time. computeIfAbsent is atomic, so
+        // every concurrent caller parks on the *same* Mutex instance.
+        fetchLocks.computeIfAbsent(gid) { Mutex() }.withLock {
+            // Re-check under the lock: the winner may have just populated it.
+            cachedFresh(gid)?.let { return it }
+            val fresh = fetchGroupState(masterKey, gid) ?: return null
+            cacheMutex.withLock { cache[gid] = CachedGroup(fresh, System.currentTimeMillis()) }
+            return fresh
         }
-        val fresh = fetchGroupState(masterKey, gid) ?: return null
-        cacheMutex.withLock { cache[gid] = CachedGroup(fresh, System.currentTimeMillis()) }
-        return fresh
     }
 
     /**

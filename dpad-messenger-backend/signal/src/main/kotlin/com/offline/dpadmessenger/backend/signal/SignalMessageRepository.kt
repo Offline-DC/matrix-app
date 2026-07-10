@@ -1455,7 +1455,7 @@ class SignalMessageRepository(
             messagesByRoom.value.containsKey(pniRoom) ||
             numberToServiceId.values.any { it == pni }
         if (hasPniThread) mergeRecipient(fromServiceId = pni, toServiceId = aci)
-        if (prior != aci) Log.d(TAG, "identity link: $pni -> $aci")
+        if (VERBOSE && prior != aci) Log.d(TAG, "identity link: $pni -> $aci")
     }
 
     /** Diagnostic: log how every DM thread is currently keyed (service-id),
@@ -1734,6 +1734,11 @@ class SignalMessageRepository(
         /** Max chars of the parent body echoed into an outbound reply quote. */
         const val QUOTE_PREVIEW_MAX = 120
         private const val TAG = "SigRepo"
+        /** Gate for the highest-cardinality debug logs (e.g. the per-identity
+         *  PNI→ACI link — a full storage sync teaches hundreds on startup).
+         *  Off by default; R8 also strips Log.d in release. Flip to true when
+         *  chasing a PNI/ACI thread-split bug. */
+        private const val VERBOSE = false
         /** Display name of the DM thread keyed by our own account. */
         const val NOTE_TO_SELF = "Note to Self"
     }
