@@ -6,6 +6,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
@@ -108,6 +109,32 @@ class SignalChatWebSocket(
      * behind a payload drain.
      */
     private val connScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Inbound contact-sync coalescing. The primary re-pushes its whole address
+     * book as `SyncMessage.Contacts` fairly often, and a backlog drain can
+     * deliver several at once (5–6 in the startup logs) — each a ~705 KB
+     * download + decrypt + full re-apply of ~280 contacts. A CONFLATED channel
+     * keeps only the LATEST pending sync; a single consumer drains it serially,
+     * so a burst collapses to one download + one apply. Safe because each sync
+     * is a full address-book snapshot — the newest supersedes any it replaces.
+     */
+    private val contactsSyncChannel =
+        Channel<SignalServiceProtos.SyncMessage.Contacts>(Channel.CONFLATED)
+
+    init {
+        val handler = contactSyncHandler
+        if (handler != null) {
+            // Single serial consumer on the bounded payload [scope]; parks
+            // (no thread held) between syncs, occupies one slot while applying.
+            scope.launch {
+                for (contacts in contactsSyncChannel) {
+                    runCatching { handler.handle(contacts) }
+                        .onFailure { Log.w(TAG, "contact sync handler threw", it) }
+                }
+            }
+        }
+    }
 
     /** Set by [disconnect] and by a terminal auth failure so a pending
      *  reconnect doesn't fire. */
@@ -580,15 +607,13 @@ class SignalChatWebSocket(
     private fun handleSyncMessage(sync: SignalServiceProtos.SyncMessage) {
         when {
             sync.hasContacts() -> {
-                val handler = contactSyncHandler
-                if (handler == null) {
+                if (contactSyncHandler == null) {
                     Log.w(TAG, "contact sync inbound but no handler wired")
                     return
                 }
-                scope.launch {
-                    runCatching { handler.handle(sync.contacts) }
-                        .onFailure { Log.w(TAG, "contact sync handler threw", it) }
-                }
+                // Coalesce a burst of queued syncs into a single download +
+                // apply of the latest snapshot (see [contactsSyncChannel]).
+                contactsSyncChannel.trySend(sync.contacts)
             }
             sync.hasSent() -> dispatchSentTranscript(sync.sent)
             // `read` is a `repeated Read` field — protobuf-javalite generates
