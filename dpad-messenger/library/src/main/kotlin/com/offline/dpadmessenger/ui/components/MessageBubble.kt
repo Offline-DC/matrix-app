@@ -51,6 +51,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.platform.LocalDensity
 import kotlinx.coroutines.launch
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -149,6 +150,11 @@ fun MessageBubble(
     var bubbleTopY by remember { mutableStateOf(0f) }
     var bubbleHeightPx by remember { mutableStateOf(0) }
     var bubbleWidthPx by remember { mutableStateOf(0) }
+    // Measured widths of the name header and the bubble, used to decide whether a
+    // tapback badge (top-right corner) would actually reach the name header — only
+    // then do we drop the name onto its own line. See badgeWouldCoverName below.
+    var nameWidthPx by remember { mutableStateOf(0) }
+    var bubbleBoxWidthPx by remember { mutableStateOf(0) }
     // Outgoing bubbles use a vertical gradient (top → bottom). When top == bottom
     // (the Signal/default palette) it renders flat; the SmartTxt skin sets a
     // lighter top for the classic blue gradient. Incoming bubbles are a flat fill.
@@ -176,11 +182,31 @@ fun MessageBubble(
         bottomStart = if (isOutgoing) 16.dp else 4.dp,
         bottomEnd = if (isOutgoing) 4.dp else 16.dp,
     )
+    // iMessage-style SmartTxt: the sender name renders as a small grey header ABOVE
+    // the bubble (not bold inside it). That header also gives the tapback badge room
+    // to sit over the bubble's top corner without overlapping the message above.
+    val hasNameHeader = colors.smarttxt && showSenderName && senderName != null && !isOutgoing
+    // A SmartTxt tapback badge straddles the bubble's top corner and needs vertical
+    // room so the previous message doesn't clip it. The name header supplies that
+    // room when present; otherwise reserve it with extra top padding.
+    val hasTapback = colors.smarttxt && message.reactions.isNotEmpty() && !message.isDeleted
+    // The badge sits at the bubble's top-RIGHT. It only collides with the name header
+    // (top-left) when the name is wide enough to reach the bubble's right side — e.g.
+    // a long phone number over a short bubble. Only then do we push the name onto its
+    // own line; a name that clears the badge stays tight to the bubble. (Measured, so
+    // it adapts to the actual name/bubble widths rather than guessing.)
+    val badgeWouldCoverName = nameWidthPx > 0 && bubbleBoxWidthPx > 0 &&
+        nameWidthPx > bubbleBoxWidthPx - with(LocalDensity.current) { 24.dp.toPx() }
 
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 8.dp, vertical = 2.dp)
+            .padding(
+                start = 8.dp,
+                end = 8.dp,
+                top = if (hasTapback && !hasNameHeader) 18.dp else 2.dp,
+                bottom = 2.dp,
+            )
             .bringIntoViewRequester(bringIntoView)
             .onGloballyPositioned { coords ->
                 bubbleTopY = coords.positionInWindow().y
@@ -200,6 +226,25 @@ fun MessageBubble(
             // Avoids a fixed max-width that would overflow tiny screens.
             modifier = Modifier.fillMaxWidth(0.82f),
         ) {
+            // iMessage-style sender label ABOVE the bubble (SmartTxt only): small,
+            // grey, indented to line up with the bubble's text. Non-SmartTxt skins
+            // keep the bold in-bubble name (below).
+            if (hasNameHeader) {
+                Text(
+                    text = senderName.orEmpty(),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = colors.mutedText,
+                    // Only leave the extra gap when the badge would actually reach the
+                    // name (badgeWouldCoverName); otherwise keep the name tight to the
+                    // bubble. onGloballyPositioned measures the name's width for that test.
+                    modifier = Modifier
+                        .padding(
+                            start = 12.dp,
+                            bottom = if (hasTapback && badgeWouldCoverName) 18.dp else 3.dp,
+                        )
+                        .onGloballyPositioned { nameWidthPx = it.size.width },
+                )
+            }
             // Wrapper so the SmartTxt tapback badge can overlap the bubble's top
             // corner (it's drawn outside the bubble's own clip).
             Box {
@@ -209,6 +254,9 @@ fun MessageBubble(
                     // halo (border + tint) isn't overpainted.
                     .clip(bubbleShape)
                     .background(bubbleBrush)
+                    // Bubble width feeds badgeWouldCoverName (is the name wide enough
+                    // to reach the top-right tapback badge?).
+                    .onGloballyPositioned { bubbleBoxWidthPx = it.size.width }
                     .then(extraFocusRequesters.fold(Modifier as Modifier) { acc, fr -> acc.focusRequester(fr) })
                     .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
                     // On the blue SmartTxt outgoing bubble the default primary
@@ -353,7 +401,10 @@ fun MessageBubble(
                     .padding(horizontal = 12.dp, vertical = 8.dp),
             ) {
                 Column {
-                    if (showSenderName && senderName != null && !isOutgoing) {
+                    // Non-SmartTxt skins show the sender name bold INSIDE the bubble.
+                    // SmartTxt renders it as a grey header above the bubble (see
+                    // hasNameHeader) for the iMessage look.
+                    if (!colors.smarttxt && showSenderName && senderName != null && !isOutgoing) {
                         Text(
                             text = senderName,
                             style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
@@ -593,12 +644,14 @@ private fun TapbackOverlay(
 ) {
     val colors = LocalDpadMessengerColors.current
     Row(
-        // Nudge the badge up and outward so it straddles the bubble's corner.
+        // Nudge the badge up and outward so it straddles the bubble's corner. The
+        // upward nudge lands it in the name-header band (or the reserved top padding),
+        // so it reads clearly without being clipped by the message above.
         modifier = modifier.offset(
             x = if (isOutgoing) (-10).dp else 10.dp,
-            y = (-10).dp,
+            y = (-14).dp,
         ),
-        horizontalArrangement = Arrangement.spacedBy((-8).dp),
+        horizontalArrangement = Arrangement.spacedBy((-10).dp),
     ) {
         // One badge per distinct emoji (SmartTxt stacks tapbacks by type). The
         // grey fill + surface-colored outline reads on both the blue outgoing
@@ -606,13 +659,13 @@ private fun TapbackOverlay(
         reactions.keys.take(3).forEach { emoji ->
             Box(
                 modifier = Modifier
-                    .size(22.dp)
+                    .size(28.dp)
                     .clip(CircleShape)
                     .background(colors.incomingBubble)
-                    .border(1.5.dp, MaterialTheme.colorScheme.surface, CircleShape),
+                    .border(2.dp, MaterialTheme.colorScheme.surface, CircleShape),
                 contentAlignment = Alignment.Center,
             ) {
-                Text(emoji, style = MaterialTheme.typography.labelSmall)
+                Text(emoji, style = MaterialTheme.typography.bodyLarge)
             }
         }
     }

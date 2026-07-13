@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -508,12 +509,22 @@ private fun Timeline(
                 listViewport = top to (top + coords.size.height)
             },
     ) {
-        items(items = reversed, key = { it.key }) { item ->
+        itemsIndexed(items = reversed, key = { _, it -> it.key }) { index, item ->
             when (item) {
                 is TimelineItem.LoadingOlder -> LoadingOlderRow()
                 is TimelineItem.DateDivider -> DateDivider(label = item.label)
                 is TimelineItem.MessageItem -> {
                     val msg = item.message
+                    // Group consecutive messages from the same sender: show the name
+                    // header only on the FIRST of a run (iMessage style). The bubble
+                    // visually above (older) is the NEXT entry in this reverse-laid-out
+                    // list; if that's a message from the same incoming sender, this one
+                    // is a continuation and repeats no name. A date divider or a
+                    // different sender above → this starts a new run → show the name.
+                    val above = (reversed.getOrNull(index + 1) as? TimelineItem.MessageItem)?.message
+                    val firstOfRun = above == null ||
+                        above.isOutgoing != msg.isOutgoing ||
+                        above.senderId != msg.senderId
                     val parent by produceState<ReplyParentSnippet?>(
                         initialValue = null,
                         key1 = msg.replyToId,
@@ -523,7 +534,7 @@ private fun Timeline(
                     MessageBubble(
                         message = msg,
                         senderName = if (msg.isOutgoing) null else senderNameFor(msg.senderId),
-                        showSenderName = isGroup && !msg.isOutgoing,
+                        showSenderName = isGroup && !msg.isOutgoing && firstOfRun,
                         showReceipt = msg.id == lastOutgoingId,
                         parentSnippet = parent,
                         onClick = { onBubbleClick(msg) },
