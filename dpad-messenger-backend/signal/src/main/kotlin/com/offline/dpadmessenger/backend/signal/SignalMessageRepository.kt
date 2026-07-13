@@ -490,10 +490,9 @@ class SignalMessageRepository(
     }
 
     override suspend fun markRoomRead(roomId: String) {
-        // Clear the unread badge locally only. By product decision we do NOT
-        // send Signal read receipts, so the other side is never told we've
-        // read their messages. (Inbound delivery/read receipts that peers
-        // choose to send US are still reflected on our own sent bubbles.)
+        // Clear the unread badge locally. We do NOT send a peer read receipt (no
+        // ReceiptMessage(READ)), so the OTHER side is never told we read their
+        // messages — but we DO sync the read to our own other devices below.
         rooms.value = rooms.value.map {
             if (it.room.id == roomId && it.unreadCount != 0) it.copy(unreadCount = 0) else it
         }
@@ -502,6 +501,31 @@ class SignalMessageRepository(
         // doesn't linger in the system shade.
         activeRoomId = roomId
         notifier?.clearConversation(roomId, reason = "mark-read")
+        // Sync the read to our OWN other linked devices so they clear this chat's
+        // notification too — a SyncMessage.Read to our own ACI, never a receipt to
+        // the peer. DMs only (a Read entry is keyed by its sender; group reads
+        // aren't routed, matching the receive side).
+        if (roomId.startsWith("sig:dm:")) {
+            val peer = roomId.removePrefix("sig:dm:")
+            val lastIncomingTs = messagesByRoom.value[roomId].orEmpty()
+                .filter { !it.isOutgoing }
+                .maxOfOrNull { it.timestampMs }
+            if (lastIncomingTs != null && lastIncomingTs > 0L) {
+                persistScope.launch { runCatching { sender?.sendReadSync(listOf(peer to lastIncomingTs)) } }
+            }
+        }
+    }
+
+    /** A conversation was read on ANOTHER linked device (an inbound
+     *  `SyncMessage.Read`). Clear its unread badge + notification here so this
+     *  device matches — the read didn't happen here, so [markRoomRead] never ran.
+     *  Unlike [markRoomRead] it does NOT make the room active (it isn't open) and
+     *  sends no receipt. */
+    fun markReadElsewhere(roomId: String) {
+        rooms.value = rooms.value.map {
+            if (it.room.id == roomId && it.unreadCount != 0) it.copy(unreadCount = 0) else it
+        }
+        notifier?.clearConversation(roomId, reason = "read-elsewhere")
     }
 
     override suspend fun simulateIncoming(roomId: String, senderId: String, body: String) {

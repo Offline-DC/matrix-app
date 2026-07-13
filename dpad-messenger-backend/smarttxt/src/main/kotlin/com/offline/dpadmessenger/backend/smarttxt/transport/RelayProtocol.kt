@@ -41,6 +41,8 @@ object RelayProtocol {
     const val P_NEW_MESSAGE = "new_message"
     const val P_MESSAGE_STATUS = "message_status"
     const val P_TAPBACK = "tapback"
+    /** A chat was read on another of my devices → clear its unread + notification. */
+    const val P_CHAT_READ = "chat_read"
     const val P_TYPING = "typing"
     const val P_CHAT_UPDATED = "chat_updated"
     const val P_AUTH_EXPIRED = "auth_expired"

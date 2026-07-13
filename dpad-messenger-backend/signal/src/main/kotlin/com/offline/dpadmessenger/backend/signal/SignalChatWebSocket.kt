@@ -618,7 +618,7 @@ class SignalChatWebSocket(
             sync.hasSent() -> dispatchSentTranscript(sync.sent)
             // `read` is a `repeated Read` field — protobuf-javalite generates
             // getReadCount()/getReadList() but no hasRead(). Check the count.
-            sync.readCount > 0 -> Log.d(TAG, "sync read receipts (${sync.readCount}) — not yet applied")
+            sync.readCount > 0 -> applyReadSync(sync.readList)
             sync.hasRequest() -> Log.d(TAG, "sync request type=${sync.request.type} from sibling")
             else -> Log.d(TAG, "sync message with no recognized payload")
         }
@@ -636,6 +636,32 @@ class SignalChatWebSocket(
      * rewrites it; a plain message/attachment is rendered as our outgoing
      * bubble.
      */
+    /**
+     * A `SyncMessage.Read` batch — conversations I read on ANOTHER linked device
+     * (typically the primary phone). Each entry names the sender whose message I
+     * read, so clear that DM's unread + notification here to keep the Flip in sync.
+     * (Group reads aren't routed: a Read entry carries only sender + timestamp, no
+     * group id — the DM case is what produces lingering notifications anyway.)
+     */
+    private fun applyReadSync(reads: List<SignalServiceProtos.SyncMessage.Read>) {
+        val roomIds = reads.mapNotNull { readSenderServiceId(it) }
+            .distinct()
+            .map { "sig:dm:$it" }
+        if (roomIds.isEmpty()) return
+        Log.d(TAG, "sync read: clearing ${roomIds.size} conversation(s) read on another device")
+        scope.launch {
+            roomIds.forEach { runCatching { repository.markReadElsewhere(it) } }
+        }
+    }
+
+    /** ACI of a Read entry: the string field when present, else the 16-byte binary.
+     *  Mirrors [sourceServiceIdString] so the id matches our `sig:dm:<aci>` rooms. */
+    private fun readSenderServiceId(read: SignalServiceProtos.SyncMessage.Read): String? {
+        if (read.hasSenderAci() && read.senderAci.isNotEmpty()) return read.senderAci
+        val bin = read.senderAciBinary?.toByteArray() ?: return null
+        return if (bin.size == 16) bytesToUuid(bin) else null
+    }
+
     private fun dispatchSentTranscript(sent: SignalServiceProtos.SyncMessage.Sent) {
         // Edits arrive as Sent.editMessage (no Sent.message).
         if (sent.hasEditMessage()) {

@@ -141,6 +141,11 @@ object RustPushNative {
     /** Send a tapback using a BlueBubbles associatedMessageType code. */
     external fun nativeSendTapback(chatGuid: String, targetGuid: String, associatedMessageType: Int): Boolean
 
+    /** Sync "read on device" for [chatGuid] to my OWN other Apple devices (clears
+     *  their notification), WITHOUT sending a read receipt to the sender. Returns
+     *  true if the sync was sent. */
+    external fun nativeMarkRead(chatGuid: String): Boolean
+
     /** Drain queued inbound events as a JSON array of objects shaped like the
      *  relay wire (type + fields), e.g.
      *  `[{"type":"new_message","message":{…}}, {"type":"message_status",…}]`.

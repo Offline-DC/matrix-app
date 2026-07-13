@@ -1398,6 +1398,56 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     }
 }
 
+/// Sync "read on device" to MY OTHER Apple devices for `chat_guid`, so they clear
+/// this conversation's notification + unread. This is the read-receipts-OFF path:
+/// it sends `Message::MessageReadOnDevice` — a self-device sync — and NEVER
+/// `Message::Read` (the actual read receipt), so the OTHER party is never told we
+/// read their message. Best-effort: returns false if not connected or no handle.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeMarkRead<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    chat_guid: JString<'l>,
+) -> jboolean {
+    let chat = jstr(&mut env, &chat_guid);
+    let client = st().client.clone();
+    let Some(client) = client else {
+        return JNI_FALSE;
+    };
+    let ok = rt().block_on(async move {
+        let handles = client.identity.get_handles().await;
+        // Send from the handle this thread is on (falls back to the default).
+        let Some(handle) = thread_send_handle(&chat, &handles).or_else(|| pick_send_handle(&handles))
+        else {
+            return false;
+        };
+        // participants = the chat's OTHER party, so my other devices can map this to
+        // the right conversation; prepare_send adds MY handle, which is how the sync
+        // reaches my own devices. MessageReadOnDevice carries no payload and is a
+        // self-read notification — not a read receipt shown to the sender.
+        let mut inst = MessageInst::new(
+            ConversationData {
+                participants: participants_from_chat_guid(&chat),
+                cv_name: None,
+                sender_guid: Some(Uuid::new_v4().to_string()),
+                after_guid: None,
+            },
+            &handle,
+            Message::MessageReadOnDevice,
+        );
+        match client.send(&mut inst).await {
+            Ok(_) => true,
+            Err(e) => {
+                log::warn!("nativeMarkRead: send failed: {e:?}");
+                false
+            }
+        }
+    });
+    if ok { JNI_TRUE } else { JNI_FALSE }
+}
+
 /// Build the IMClient from registered users + identity and spawn the APNs receive
 /// loop that drains inbound messages onto `AppState.inbound` as relay-wire JSON.
 async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity) -> Result<(), String> {
@@ -1608,6 +1658,56 @@ fn push_relay_event(msg: MessageInst) {
         let dir = st().files_dir.clone();
         save_sms_active(&dir, *enabled);
         st().inbound.push_back(serde_json::json!({ "type": "sms_activation", "enabled": *enabled }));
+        return;
+    }
+    // Cross-device read sync: Apple tells THIS device that I read a chat on another
+    // of my devices, so we can clear its unread + notification here.
+    //  - MessageReadOnDevice (type 147): the canonical "read on another of my devices".
+    //  - A Read receipt whose sender is one of MY OWN handles: same meaning (I read it
+    //    elsewhere). A Read receipt from the OTHER party is a "they read my message"
+    //    delivery receipt — NOT this — so it's excluded by the self-handle check.
+    let read_elsewhere = match &msg.message {
+        Message::MessageReadOnDevice => true,
+        Message::Read => {
+            let sender = msg.sender.clone().unwrap_or_default();
+            !sender.is_empty() && st().self_handles.iter().any(|h| canon(h) == canon(&sender))
+        }
+        _ => false,
+    };
+    if read_elsewhere {
+        let sender = msg.sender.clone().unwrap_or_default();
+        let my: Vec<String> = st().self_handles.iter().map(|h| canon(h)).collect();
+        let participants: Vec<String> = msg
+            .conversation
+            .as_ref()
+            .map(|c| c.participants.clone())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| vec![sender.clone()]);
+        let cv_name = msg
+            .conversation
+            .as_ref()
+            .and_then(|c| c.cv_name.clone())
+            .filter(|s| !s.is_empty());
+        let mut counterparts: Vec<String> = participants
+            .iter()
+            .map(|h| canon(h))
+            .filter(|c| !c.is_empty() && !my.contains(c))
+            .collect();
+        counterparts.sort();
+        counterparts.dedup();
+        // Match the chat_guid the text path computes (incl. cv_name grouping) so the
+        // notification id (roomId.hashCode()) lines up on the Kotlin side.
+        let is_group = counterparts.len() > 1 || cv_name.is_some();
+        let chat_guid = if is_group {
+            format!("iMessage;+;{}", counterparts.join(","))
+        } else {
+            match counterparts.first() {
+                Some(other) => format!("iMessage;-;{other}"),
+                None => return, // can't tell which chat — nothing to clear
+            }
+        };
+        log::info!("recv read-on-device → clear unread/notif for chat={chat_guid}");
+        st().inbound.push_back(serde_json::json!({ "type": "chat_read", "chatGuid": chat_guid }));
         return;
     }
     // Sync window: drop messages/reactions older than SYNC_WINDOW_MS so a big

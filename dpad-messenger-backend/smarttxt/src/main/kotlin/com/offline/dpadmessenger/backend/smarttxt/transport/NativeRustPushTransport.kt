@@ -4,6 +4,7 @@ import android.util.Log
 import com.offline.dpadmessenger.backend.smarttxt.MacOSConfig
 import com.offline.dpadmessenger.backend.smarttxt.RegistrationResult
 import com.offline.dpadmessenger.backend.smarttxt.RustPushBridge
+import com.offline.dpadmessenger.backend.smarttxt.RustPushNative
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -95,7 +96,10 @@ class NativeRustPushTransport(
 
     override suspend fun editMessage(chatGuid: String, targetGuid: String, newText: String): Boolean = false
     override suspend fun unsendMessage(chatGuid: String, targetGuid: String): Boolean = false
-    override suspend fun markRead(chatGuid: String): Boolean = false
+    // Syncs "read on device" to my OWN other Apple devices (clears their
+    // notification) without telling the sender — see nativeMarkRead.
+    override suspend fun markRead(chatGuid: String): Boolean =
+        RustPushBridge.NATIVE_AVAILABLE && runCatching { RustPushNative.nativeMarkRead(chatGuid) }.getOrDefault(false)
     override suspend fun setTyping(chatGuid: String, typing: Boolean) {}
     override suspend fun listContacts(): List<RelayContact> = emptyList()
     override suspend fun createChat(addresses: List<String>, title: String?): RelayChat? {
@@ -162,6 +166,7 @@ class NativeRustPushTransport(
         val messages = ArrayList<RelayMessage>()
         val statuses = ArrayList<TransportEvent.MessageStatusChanged>()
         val tapbacks = ArrayList<TransportEvent.TapbackUpdated>()
+        val chatReads = ArrayList<String>()
         for (el in arr) {
             val obj = el.jsonObject
             when (obj["type"]?.jsonPrimitive?.content) {
@@ -188,12 +193,18 @@ class NativeRustPushTransport(
                         timestampMs = obj["timestampMs"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
                     ),
                 )
+                RelayProtocol.P_CHAT_READ -> obj["chatGuid"]?.jsonPrimitive?.content?.let {
+                    if (it.isNotBlank()) chatReads.add(it)
+                }
             }
         }
         // Messages first (statuses/tapbacks may reference a message in this batch).
         if (messages.isNotEmpty()) _events.emit(TransportEvent.MessagesUpdated(messages))
         if (statuses.isNotEmpty()) _events.emit(TransportEvent.MessageStatusBatch(statuses))
         if (tapbacks.isNotEmpty()) _events.emit(TransportEvent.TapbackBatch(tapbacks))
+        // Read-elsewhere last, so a chat that got a new message AND a read in the same
+        // batch ends cleared (read wins) rather than re-notified.
+        for (chatGuid in chatReads) _events.emit(TransportEvent.ChatRead(chatGuid))
     }
 
     private companion object {

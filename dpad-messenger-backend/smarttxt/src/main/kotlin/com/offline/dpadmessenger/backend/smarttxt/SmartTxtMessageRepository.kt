@@ -215,6 +215,7 @@ internal class SmartTxtMessageRepository(
             is TransportEvent.TapbackUpdated -> onTapbacks(listOf(e))
             is TransportEvent.TapbackBatch -> onTapbacks(e.items)
             is TransportEvent.TypingChanged -> { /* no UI slot yet; ignore */ }
+            is TransportEvent.ChatRead -> onChatReadElsewhere(e.chatGuid)
             TransportEvent.Connected -> { Log.i(TAG, "session connected"); _authExpired.value = false }
             TransportEvent.Disconnected -> Log.i(TAG, "session disconnected")
             TransportEvent.AuthExpired -> { Log.w(TAG, "auth expired"); _authExpired.value = true }
@@ -691,7 +692,22 @@ internal class SmartTxtMessageRepository(
         activeRoomId = roomId
         notifier.clearConversation(roomId)
         writeLock.withLock { unreadByRoom.value = unreadByRoom.value + (roomId to 0); requestSave() }
-        if (sendReadReceipts) scope.launch { runCatching { session.markRead(roomId) } }
+        // Always sync "read on device" so my OTHER Apple devices clear this chat's
+        // notification. This is NOT a read receipt — session.markRead sends the
+        // self-only MessageReadOnDevice, never Message::Read — so the sender is never
+        // told. (sendReadReceipts, when true, would additionally send a peer-facing
+        // receipt; that path isn't wired, by product decision.)
+        scope.launch { runCatching { session.markRead(roomId) } }
+    }
+
+    /** A chat was read on ANOTHER of my devices (iMessage synced it here). Clear its
+     *  notification + unread so this device matches — the read didn't happen here, so
+     *  [markRoomRead] never ran. Does NOT set [activeRoomId] (the room isn't open) and
+     *  doesn't send a read receipt (the reading device already did). */
+    private suspend fun onChatReadElsewhere(roomId: String) {
+        Log.i(TAG, "read elsewhere → clearing notif/unread for $roomId")
+        notifier.clearConversation(roomId, reason = "read-elsewhere")
+        writeLock.withLock { unreadByRoom.value = unreadByRoom.value + (roomId to 0); requestSave() }
     }
 
     override suspend fun simulateIncoming(roomId: String, senderId: String, body: String) {}

@@ -152,6 +152,10 @@ sealed class TransportEvent {
     /** Typing indicator toggled in a chat. */
     data class TypingChanged(val chatGuid: String, val typing: Boolean) : TransportEvent()
 
+    /** A chat was read on another of my devices — clear its unread + notification
+     *  here (the read didn't happen on THIS device, so nothing else clears it). */
+    data class ChatRead(val chatGuid: String) : TransportEvent()
+
     /** Credentials died and could not be refreshed — re-register needed. */
     data object AuthExpired : TransportEvent()
 }

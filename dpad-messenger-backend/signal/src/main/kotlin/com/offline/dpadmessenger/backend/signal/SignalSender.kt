@@ -859,6 +859,72 @@ class SignalSender(
     }
 
     /**
+     * Sync "I read these conversations" to our OWN other devices only — a
+     * `SyncMessage.Read` posted to our own ACI. The server fans it out to sibling
+     * devices (excluding this one), so the primary phone etc. clear the chat's
+     * notification + unread. This is NOT a peer read receipt: we never send a
+     * `ReceiptMessage(READ)`, so the sender is never told we read their message.
+     *
+     * @param reads (senderServiceId, messageTimestamp) pairs — one per conversation
+     *   read; a sibling matches each to a chat exactly as it matches inbound messages.
+     */
+    suspend fun sendReadSync(reads: List<Pair<String, Long>>) {
+        if (reads.isEmpty()) return
+        val cert = getOrRefreshSenderCertificate()
+        val ourBundle = getOwnBundleCached()
+        val ourIdentityKey = IdentityKey(Base64.decode(ourBundle.identityKey, Base64.NO_WRAP), 0)
+        val otherDevices = ourBundle.devices.filter { it.deviceId != account.deviceId }
+        if (otherDevices.isEmpty()) {
+            Log.d(TAG, "read-sync: no other linked devices — skipping")
+            return
+        }
+        otherDevices.forEach { bootstrapSessionIfNeeded(account.aci, it, ourIdentityKey) }
+
+        val syncBuilder = SignalServiceProtos.SyncMessage.newBuilder()
+        for ((serviceId, ts) in reads) {
+            syncBuilder.addRead(
+                SignalServiceProtos.SyncMessage.Read.newBuilder()
+                    .setSenderAci(serviceId)
+                    .setSenderAciBinary(serviceIdBinary(serviceId))
+                    .setTimestamp(ts),
+            )
+        }
+        val syncContent = SignalServiceProtos.Content.newBuilder()
+            .setSyncMessage(syncBuilder.build())
+            .build()
+        val padded = padPlaintext(syncContent.toByteArray())
+        val timestamp = System.currentTimeMillis()
+
+        val cipher = SealedSessionCipher(
+            protocolStore,
+            UUID.fromString(account.aci),
+            account.phoneNumber,
+            account.deviceId,
+        )
+        val outgoing = otherDevices.map { dev ->
+            val addr = SignalProtocolAddress(account.aci, dev.deviceId)
+            val encrypted = cipher.encrypt(addr, cert, padded)
+            OutgoingMessage(
+                type = ENVELOPE_TYPE_UNIDENTIFIED_SENDER,
+                destinationDeviceId = dev.deviceId,
+                destinationRegistrationId = dev.registrationId,
+                content = Base64.encodeToString(encrypted, Base64.NO_WRAP),
+            )
+        }
+        val result = api.sendMessage(
+            login = login,
+            password = password,
+            recipientServiceId = account.aci,
+            body = SendMessageRequest(messages = outgoing, timestamp = timestamp),
+        )
+        if (!result.isSuccess) {
+            Log.w(TAG, "read-sync HTTP ${result.httpStatus}: ${result.rawBody}")
+            return
+        }
+        Log.d(TAG, "read-sync delivered to ${outgoing.size} sibling device(s) for ${reads.size} convo(s)")
+    }
+
+    /**
      * Ask our primary device to push us a fresh contact-sync attachment.
      * Sent as a `SyncMessage.Request{type: CONTACTS}` to our own ACI; the
      * primary phone responds asynchronously with a `SyncMessage.Contacts`
