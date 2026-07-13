@@ -267,6 +267,31 @@ object SmartTxtRepository {
         }
     }
 
+    /** Manually force a re-registration NOW — the Settings "Re-register now" test
+     *  hook for the periodic renewal. Unlike [renew] (which re-runs the register
+     *  transport path), this asks the LIVE native client to re-register with the
+     *  current identity — no login, no 2FA — so the running session picks it up.
+     *  Requires being signed in AND connected; the native side errors otherwise. */
+    suspend fun reregisterNow(context: Context): RegistrationResult {
+        val store = SmartTxtAccountStore(context.applicationContext)
+        val account = store.loadAccount() ?: return RegistrationResult.Failure("You're not signed in yet.")
+        return when (val r = bridge().reregister()) {
+            is RustPushBridge.ReregisterResult.Success -> {
+                val updated = account.copy(
+                    lastRegisteredMs = System.currentTimeMillis(),
+                    handles = r.handles.ifEmpty { account.handles },
+                )
+                store.saveAccount(updated); store.markRegistered(updated.lastRegisteredMs)
+                Log.i(TAG, "manual re-register ok (${updated.handles.size} handles)")
+                RegistrationResult.Success(updated)
+            }
+            is RustPushBridge.ReregisterResult.Failure -> {
+                Log.w(TAG, "manual re-register failed: ${r.message}")
+                RegistrationResult.Failure(r.message)
+            }
+        }
+    }
+
     /** Mark the identity REGISTERED after an out-of-band sign-in (the OpenBubbles
      *  migration): the account store + native files are already written, so just
      *  flip [status], schedule renewal, and start the push service — the same tail

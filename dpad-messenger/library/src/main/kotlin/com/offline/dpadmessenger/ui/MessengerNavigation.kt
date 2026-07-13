@@ -88,6 +88,9 @@ fun DpadMessengerApp(
     sendHandles: List<String> = emptyList(),
     defaultSendHandle: String = "",
     onDefaultSendHandleChange: ((String) -> Unit)? = null,
+    /** Force an IDS re-registration now (periodic renewal, on demand). Adds a
+     *  "Re-register now" row to Settings when set; null hides it. */
+    onReregister: (() -> Unit)? = null,
     /** Deep link: open this conversation on top of the room list (set when
      *  the user tapped a message notification). [initialRoomKey] must change
      *  per tap so a fresh notification re-navigates. */
@@ -226,6 +229,7 @@ fun DpadMessengerApp(
                     sendHandles = sendHandles,
                     defaultSendHandle = defaultSendHandle,
                     onDefaultSendHandleChange = onDefaultSendHandleChange,
+                    onReregister = onReregister,
                 )
             }
         }

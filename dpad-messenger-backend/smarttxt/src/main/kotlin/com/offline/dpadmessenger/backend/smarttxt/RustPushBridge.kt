@@ -287,12 +287,41 @@ class RustPushBridge(
         return localId
     }
 
+    /** Force an IDS re-registration now, reusing the current identity — the
+     *  periodic-renewal path, on demand (Settings "Re-register now"). No login/2FA.
+     *  Needs a live/connected client; the native side returns an error otherwise. */
+    suspend fun reregister(): ReregisterResult {
+        // No withContext wrapper — like registerWithLogin/sendText, this runs on the
+        // caller's dispatcher (SmartTxtRepository.reregisterNow is invoked on IO). The
+        // native call blocks until rustpush finishes (bounded ~30s) or errors.
+        if (!NATIVE_AVAILABLE) return ReregisterResult.Failure("Native backend isn't loaded.")
+        return try {
+            val obj = json.parseToJsonElement(RustPushNative.nativeReregister()).jsonObject
+            obj["error"]?.jsonPrimitive?.content?.let {
+                Log.w(TAG, "reregister failed: $it")
+                return ReregisterResult.Failure(humanizeLoginError(it))
+            }
+            val handles = obj["handles"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+            Log.i(TAG, "reregister ok (${handles.size} handles)")
+            ReregisterResult.Success(handles)
+        } catch (e: Throwable) {
+            Log.w(TAG, "reregister threw", e)
+            ReregisterResult.Failure(humanizeLoginError(e.message))
+        }
+    }
+
     /** Drain queued native inbound events as raw JSON (relay-wire shaped). The
      *  [NativeRustPushTransport] poll loop calls this and parses to events. */
     fun pollNativeEvents(): String = if (NATIVE_AVAILABLE) RustPushNative.nativePollEvents() else "[]"
 
     suspend fun emitStubInbound(roomId: String, senderHandle: String, body: String) {
         _inbound.emit(BridgeEvent.IncomingMessage(roomId, senderHandle, body))
+    }
+
+    /** Outcome of a manual [reregister] trigger. */
+    sealed class ReregisterResult {
+        data class Success(val handles: List<String>) : ReregisterResult()
+        data class Failure(val message: String) : ReregisterResult()
     }
 
     companion object {

@@ -9,8 +9,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import android.widget.Toast
 import androidx.compose.ui.platform.LocalContext
 import com.offline.dpadmessenger.backend.smarttxt.OpenBubblesMigrator
+import com.offline.dpadmessenger.backend.smarttxt.RegistrationResult
 import com.offline.dpadmessenger.backend.smarttxt.RustPushNative
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtAccountStore
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtRepository
@@ -185,6 +187,20 @@ private fun SmartTxtChat(
             }
             Unit
         } else null,
+        // Test hook: force the periodic IDS re-registration on demand (no sign-in).
+        // Toasts the outcome; the humanized failure text comes from the bridge.
+        onReregister = {
+            Toast.makeText(context, "Re-registering…", Toast.LENGTH_SHORT).show()
+            scope.launch {
+                val r = withContext(Dispatchers.IO) { SmartTxtRepository.reregisterNow(context) }
+                val msg = when (r) {
+                    is RegistrationResult.Success -> "iMessage re-registered."
+                    is RegistrationResult.Failure -> r.message
+                }
+                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+            }
+            Unit
+        },
         initialRoomId = initialRoomId,
         initialRoomKey = initialRoomKey,
     )

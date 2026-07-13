@@ -1357,6 +1357,47 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     out(&mut env, serde_json::json!({ "handles": handles }).to_string())
 }
 
+/// Force an IDS re-registration NOW, reusing the already-registered identity — no
+/// login, no 2FA. This is the SAME operation rustpush runs on its own every couple
+/// of months (schedule_rereg → IdentityResource::generate → `register(...)`); the
+/// Settings "Re-register now" button drives it on demand so that path can be tested
+/// without waiting for the cert to near expiry.
+///
+/// Goes through the live client's IdentityManager (`refresh_now`) so the running
+/// client picks up the fresh registration, rather than re-registering a detached
+/// copy underneath it. rustpush debounces this to once per 15s (MAX_RESOURCE_REGEN)
+/// and bounds the wait to 30s (MAX_RESOURCE_WAIT); a call inside the debounce window
+/// returns Ok without hitting Apple. Requires a live client — i.e. the user is
+/// signed in and connected.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeReregister<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jstring {
+    let client = st().client.clone();
+    let Some(client) = client else {
+        return out(&mut env, err_json("Not connected — the iMessage engine isn't running yet. Reopen the app and try again."));
+    };
+    log::info!("nativeReregister: forcing IDS re-registration (reusing identity — no login)…");
+    let result = rt().block_on(async move {
+        // Display, not Debug, so an IDS 6004/6005/rate-limit surfaces its human text.
+        client.identity.refresh_now().await.map_err(|e| format!("{e}"))?;
+        Ok::<Vec<String>, String>(client.identity.get_handles().await)
+    });
+    match result {
+        Ok(handles) => {
+            log::info!("nativeReregister: ✅ re-registered handles={handles:?}");
+            out(&mut env, serde_json::json!({ "ok": true, "handles": handles }).to_string())
+        }
+        Err(e) => {
+            log::error!("nativeReregister: {e}");
+            out(&mut env, err_json(e))
+        }
+    }
+}
+
 /// Build the IMClient from registered users + identity and spawn the APNs receive
 /// loop that drains inbound messages onto `AppState.inbound` as relay-wire JSON.
 async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity) -> Result<(), String> {

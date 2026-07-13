@@ -80,6 +80,9 @@ fun SettingsScreen(
     sendHandles: List<String> = emptyList(),
     defaultSendHandle: String = "",
     onDefaultSendHandleChange: ((String) -> Unit)? = null,
+    /** Force an IDS re-registration now (the periodic renewal, on demand). Shows a
+     *  "Re-register now" row when set; null hides it. Host handles the result feedback. */
+    onReregister: (() -> Unit)? = null,
 ) {
     // Land focus on the back button on entry, so the screen has a visible
     // highlight and DPAD navigation works immediately (every other screen sets
@@ -179,6 +182,13 @@ fun SettingsScreen(
             }
             if (linkAgeDays != null) {
                 StaticRow(title = "Days since last link", subtitle = linkAgeDays.toString())
+            }
+            if (onReregister != null) {
+                ActionRow(
+                    title = "Re-register now",
+                    subtitle = "Refresh this device's iMessage registration (no sign-in needed)",
+                    onClick = onReregister,
+                )
             }
             ActionRow(
                 title = "Log out",

@@ -113,6 +113,11 @@ object RustPushNative {
      */
     external fun nativeRegister(appleId: String): String
 
+    /** Force an IDS re-registration NOW, reusing the current identity — no login,
+     *  no 2FA (the periodic renewal path, on demand). Requires a live/connected
+     *  client. Returns `{"ok":true,"handles":[…]}` or `{"error":"…"}`. */
+    external fun nativeReregister(): String
+
     // ---- messaging ----------------------------------------------------------
 
     /** Send a text. Returns the server message guid, or "" on failure. */
