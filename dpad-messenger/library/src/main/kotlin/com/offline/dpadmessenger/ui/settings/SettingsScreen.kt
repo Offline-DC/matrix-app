@@ -75,7 +75,8 @@ fun SettingsScreen(
     onUse24HourTimeChange: ((Boolean) -> Unit)? = null,
     /** The handles the user can send FROM (raw form, e.g. "tel:+1…"/"mailto:…").
      *  When non-empty and [onDefaultSendHandleChange] is set, Settings shows a
-     *  "Send from" picker (the iMessage default number/email). */
+     *  "Start new messages from" picker — the default handle for NEW conversations
+     *  (existing threads keep their own handle, decided natively per-thread). */
     sendHandles: List<String> = emptyList(),
     defaultSendHandle: String = "",
     onDefaultSendHandleChange: ((String) -> Unit)? = null,
@@ -260,8 +261,10 @@ private fun ActionRow(
     }
 }
 
-/** "Send from" default-handle chooser: a focusable row showing the current
- *  number/email, opening a dropdown of the other registered handles on OK. */
+/** "Start new messages from" default-handle chooser: a focusable row showing the
+ *  current number/email, opening a dropdown of the other registered handles on OK.
+ *  This default only applies to NEW conversations — an existing thread continues
+ *  from whatever handle it was started with (handled natively per-thread). */
 @Composable
 private fun HandlePickerRow(
     handles: List<String>,
@@ -278,14 +281,14 @@ private fun HandlePickerRow(
                 .padding(horizontal = 12.dp, vertical = 10.dp),
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("Send from", style = MaterialTheme.typography.bodyLarge)
+                Text("Start new messages from", style = MaterialTheme.typography.bodyLarge)
                 Text(
                     prettyHandle(selected),
                     style = MaterialTheme.typography.bodySmall,
                     color = LocalDpadMessengerColors.current.mutedText,
                 )
             }
-            Icon(Icons.Filled.ArrowDropDown, contentDescription = "Change send number or email")
+            Icon(Icons.Filled.ArrowDropDown, contentDescription = "Change the handle new conversations start from")
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             handles.forEach { h ->

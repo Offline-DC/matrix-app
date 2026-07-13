@@ -25,6 +25,17 @@ RUSTPUSH_DIR="$(cd "$CRATE_DIR/../../../rustpush" 2>/dev/null && pwd || true)"
 
 : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to your NDK path}"
 
+# rustpush's cloudkit-proto compiles .proto files via prost-build, which needs the
+# `protoc` binary on the HOST. Fail early with an actionable hint rather than the
+# raw "Could not find `protoc`" that prost-build emits deep in the build.
+command -v protoc >/dev/null 2>&1 || {
+  echo "error: 'protoc' (protobuf compiler) not found — rustpush's cloudkit-proto needs it to build." >&2
+  echo "       macOS:  brew install protobuf" >&2
+  echo "       Debian: sudo apt-get install -y protobuf-compiler" >&2
+  echo "       (or set PROTOC to a protoc binary; see https://docs.rs/prost-build)" >&2
+  exit 1
+}
+
 # --- Fairplay activation certs ------------------------------------------------
 # rustpush's src/activation.rs does `include_bytes!("../certs/fairplay/<name>.crt"
 # + .pem)` for a fixed list of cert IDs, so those 20 files must exist at COMPILE

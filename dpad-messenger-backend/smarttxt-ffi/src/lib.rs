@@ -97,10 +97,20 @@ struct AppState {
     /// exclude myself when deciding a thread's other participant(s).
     self_handles: Vec<String>,
 
-    /// The handle the user chose to send FROM (raw rustpush form, e.g. "tel:+1…"
+    /// The DEFAULT handle for NEW conversations (raw rustpush form, e.g. "tel:+1…"
     /// or "mailto:…"). Empty = fall back to the first registered handle. Set from
-    /// Kotlin via `nativeSetSendHandle` (handle-picker + Settings default).
+    /// Kotlin via `nativeSetSendHandle` (handle-picker + the Settings "Start new
+    /// messages from" default). Existing threads override this via `thread_handles`.
     send_handle: String,
+
+    /// Per-conversation self-handle: chat_guid → the registered handle this thread
+    /// transmits from. Learned from synced messages I sent (Apple tells us which
+    /// handle a thread uses) and pinned on first send, so a REPLY to an existing
+    /// thread goes out from the thread's own handle rather than `send_handle`.
+    /// Replying under a different self-handle than a thread was started with is what
+    /// Apple renders as an added participant — the "group chat with yourself" bug.
+    /// Persisted to thread_handles.json so this survives a warm start.
+    thread_handles: std::collections::HashMap<String, String>,
 
     connected: bool,
     receive_started: bool,
@@ -253,6 +263,28 @@ fn load_creds(dir: &str) -> Option<(String, Vec<u8>)> {
         .filter_map(|i| hex.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
         .collect();
     Some((apple_id, pw_hash))
+}
+
+/// Per-conversation self-handle map (chat_guid → registered send-from handle).
+/// Persisted so replies to existing threads keep their handle across a warm start.
+fn thread_handles_path(dir: &str) -> PathBuf {
+    Path::new(dir).join("thread_handles.json")
+}
+fn load_thread_handles(dir: &str) -> std::collections::HashMap<String, String> {
+    std::fs::read(thread_handles_path(dir))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+fn save_thread_handles(dir: &str, map: &std::collections::HashMap<String, String>) {
+    match serde_json::to_vec(map) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(thread_handles_path(dir), json) {
+                log::warn!("persist thread_handles failed: {e}");
+            }
+        }
+        Err(e) => log::warn!("serialize thread_handles failed: {e}"),
+    }
 }
 
 /// Install the process-global software keystore, backed by `<dir>/keystore.plist`.
@@ -929,6 +961,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 
     let mut s = st();
     s.files_dir = dir.clone();
+    s.thread_handles = load_thread_handles(&dir);
     s.os_config = Some(Arc::new(cfg));
     // Restore a prior registration so a warm start skips login/2FA.
     if let Some(saved) = load_saved(&dir) {
@@ -1137,12 +1170,16 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         let gsa = os_config.get_gsa_config(&*connection.state.read().await, false);
         let anisette = default_provider(gsa.clone(), Path::new(&dir).join("anisette"));
         let mut account = rustpush::AppleAccount::new_with_anisette(gsa, anisette)
-            .map_err(|e| format!("new_with_anisette: {e:?}"))?;
+            .map_err(|e| format!("new_with_anisette: {e}"))?;
         log::info!("nativeAuthenticate: calling login_email_pass… (anisette + GSA round-trip)");
         let state = account
             .login_email_pass(&apple_c, &pw_c)
             .await
-            .map_err(|e| format!("login_email_pass: {e:?}"))?;
+            // Display, not Debug: icloud_auth::Error::AuthSrpWithMessage is
+            // `#[error("{1} ({0})")]`, so `{e}` yields Apple's own message + code
+            // (e.g. "Your Apple ID or password was entered incorrectly. (-20101)").
+            // `{e:?}` would collapse that to `AuthSrpWithMessage(-20101, "…")`.
+            .map_err(|e| format!("login_email_pass: {e}"))?;
         log::info!("login_email_pass → {state:?}");
 
         // Returns (status_json, sms_body). status = "logged_in" | "needs_2fa".
@@ -1150,11 +1187,11 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             LoginState::LoggedIn => ("logged_in", None),
             LoginState::Needs2FAVerification => ("needs_2fa", None),
             LoginState::NeedsDevice2FA => {
-                account.send_2fa_to_devices().await.map_err(|e| format!("send_2fa_to_devices: {e:?}"))?;
+                account.send_2fa_to_devices().await.map_err(|e| format!("send_2fa_to_devices: {e}"))?;
                 ("needs_2fa", None)
             }
             LoginState::NeedsSMS2FA => {
-                match account.send_sms_2fa_to_devices(1).await.map_err(|e| format!("send_sms_2fa: {e:?}"))? {
+                match account.send_sms_2fa_to_devices(1).await.map_err(|e| format!("send_sms_2fa: {e}"))? {
                     LoginState::NeedsSMS2FAVerification(body) => ("needs_2fa", Some(body)),
                     other => {
                         log::warn!("send_sms_2fa unexpected: {other:?}");
@@ -1210,9 +1247,9 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 
     let result = block_on_timeout(45, "2FA verification timed out — Apple didn't respond", async move {
         let verified = if let Some(body) = sms_body {
-            account.verify_sms_2fa(code, body).await.map_err(|e| format!("verify_sms_2fa: {e:?}"))?
+            account.verify_sms_2fa(code, body).await.map_err(|e| format!("verify_sms_2fa: {e}"))?
         } else {
-            account.verify_2fa(code).await.map_err(|e| format!("verify_2fa: {e:?}"))?
+            account.verify_2fa(code).await.map_err(|e| format!("verify_2fa: {e}"))?
         };
         log::info!("2FA verify → {verified:?}");
         match verified {
@@ -1220,7 +1257,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             LoginState::NeedsLogin => {
                 // Trusted-device path accepts the code (ec=0) but issues no PET;
                 // re-run SRP to collect it (the harness' PET trick).
-                account.login_email_pass(&apple, &pw_hash).await.map_err(|e| format!("post-2fa re-login: {e:?}"))?;
+                account.login_email_pass(&apple, &pw_hash).await.map_err(|e| format!("post-2fa re-login: {e}"))?;
             }
             other => return Err(format!("unexpected 2FA result: {other:?}")),
         }
@@ -1268,18 +1305,23 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         log::info!("nativeRegister: [1/3] login_apple_delegates (IDS)…");
         let delegates = login_apple_delegates(&account, None, os_config.as_ref(), &[LoginDelegate::IDS])
             .await
-            .map_err(|e| format!("login_apple_delegates: {e:?}"))?;
+            .map_err(|e| format!("login_apple_delegates: {e}"))?;
         let ids = delegates.ids.ok_or_else(|| "no IDS delegate".to_string())?;
         log::info!("nativeRegister: [2/3] authenticate_apple…");
         let user = authenticate_apple(ids, os_config.as_ref())
             .await
-            .map_err(|e| format!("authenticate_apple: {e:?}"))?;
+            .map_err(|e| format!("authenticate_apple: {e}"))?;
         let mut users = vec![user];
-        let identity = IDSNGMIdentity::new().map_err(|e| format!("identity: {e:?}"))?;
+        let identity = IDSNGMIdentity::new().map_err(|e| format!("identity: {e}"))?;
         log::info!("nativeRegister: [3/3] register — activation runs NAC validation…");
+        // Display, not Debug: PushError::RegisterFailed(IDSError) is
+        // `#[error("Registration Error {0}")]` and IDSError's Display carries the
+        // human 6001/6004/6005/6009 text; RateLimit / CustomerMessage likewise put
+        // their message in Display. `{e:?}` would reduce all of that to
+        // `RegisterFailed(IDSError(6005))`.
         register(os_config.as_ref(), &*connection.state.read().await, &[&MADRID_SERVICE], &mut users, &identity)
             .await
-            .map_err(|e| format!("register: {e:?}"))?;
+            .map_err(|e| format!("register: {e}"))?;
         log::info!("nativeRegister: ✅ registered {} user(s)", users.len());
         Ok::<_, String>((users, identity))
     });
@@ -1671,6 +1713,29 @@ fn push_relay_event(msg: MessageInst) {
         // Green (SMS, forwarded by the iPhone) vs blue (iMessage).
         let service = if matches!(normal.service, MessageType::SMS { .. }) { "SMS" } else { "iMessage" };
 
+        // Learn which of MY handles this 1:1 iMessage thread transmits from, so a
+        // reply goes out from the SAME handle instead of the global default. A
+        // message I sent (synced from any device) is ground truth: its sender IS the
+        // thread's handle. A received message is a weaker signal — the handle they
+        // addressed — used only when we don't already know. (Groups route over
+        // iMessage to everyone regardless, so they don't need a pinned self-handle.)
+        if service == "iMessage" && !is_group {
+            let my_registered = st().my_handles.clone();
+            if is_from_me {
+                if my_registered.iter().any(|h| h == &sender) {
+                    remember_thread_handle(&chat_guid, &sender);
+                }
+            } else if !st().thread_handles.contains_key(&chat_guid) {
+                let mine = participants.iter().find_map(|p| {
+                    let pc = canon(p.as_str());
+                    my_registered.iter().find(|h| canon(h.as_str()) == pc).cloned()
+                });
+                if let Some(mine) = mine {
+                    remember_thread_handle(&chat_guid, &mine);
+                }
+            }
+        }
+
         let event = serde_json::json!({
             "type": "new_message",
             "message": {
@@ -1722,7 +1787,10 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 
     let guid = rt().block_on(async move {
         let handles = client.identity.get_handles().await;
-        let Some(handle) = pick_send_handle(&handles) else {
+        // Existing thread → the handle it's already on; new thread → the global
+        // "start new messages from" default. Keeps a reply on the thread's own
+        // self-handle so Apple doesn't see a new participant (group-chat-with-self).
+        let Some(handle) = thread_send_handle(&chat, &handles).or_else(|| pick_send_handle(&handles)) else {
             return "ERR:No sending number or email is set up for this account (no registered handles).".to_string();
         };
         // A group ("iMessage;+;a,b,c") always goes over iMessage to every member;
@@ -1768,6 +1836,10 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         );
         match client.send(&mut inst).await {
             Ok(_) => {
+                // Pin this thread to the handle we just sent from, so every later
+                // reply/attachment/tapback stays on it — and a brand-new thread's
+                // first message fixes its self-handle here.
+                remember_thread_handle(&chat, &handle);
                 let guid = inst.id.clone(); // VERIFY: server guid field name on MessageInst
                 // Optimistic "delivered" so the bubble shows a receipt. Apple's real
                 // delivery receipt arrives later over APNs (via the receive loop).
@@ -1824,7 +1896,8 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 
     let guid = rt().block_on(async move {
         let handles = client.identity.get_handles().await;
-        let Some(handle) = pick_send_handle(&handles) else {
+        // Existing thread → its own handle; new thread → the global default.
+        let Some(handle) = thread_send_handle(&chat, &handles).or_else(|| pick_send_handle(&handles)) else {
             return "ERR:No sending number or email is set up for this account (no registered handles).".to_string();
         };
         // Group attachments go over iMessage to every member; only a 1:1 gets
@@ -1894,6 +1967,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         );
         match client.send(&mut inst).await {
             Ok(_) => {
+                remember_thread_handle(&chat, &handle);
                 let guid = inst.id.clone();
                 st().inbound.push_back(serde_json::json!({
                     "type": "message_status",
@@ -1979,6 +2053,32 @@ fn pick_send_handle(handles: &[String]) -> Option<String> {
     handles.first().cloned()
 }
 
+/// Record that conversation `chat_guid` transmits from `handle`. No-op if unchanged;
+/// persists to disk on a change. Called from the receive loop (learning from synced
+/// sent-messages) and after a successful send (pinning a thread to its handle).
+fn remember_thread_handle(chat_guid: &str, handle: &str) {
+    if chat_guid.is_empty() || handle.is_empty() {
+        return;
+    }
+    let (dir, snapshot) = {
+        let mut s = st();
+        if s.thread_handles.get(chat_guid).map(String::as_str) == Some(handle) {
+            return; // unchanged — skip the disk write
+        }
+        s.thread_handles.insert(chat_guid.to_string(), handle.to_string());
+        (s.files_dir.clone(), s.thread_handles.clone())
+    };
+    save_thread_handles(&dir, &snapshot);
+}
+
+/// The handle an EXISTING conversation already transmits from, if we know it AND it
+/// is still a currently-registered handle. `None` → the caller falls back to the
+/// global "start new messages from" default (i.e. this is a brand-new thread).
+fn thread_send_handle(chat_guid: &str, handles: &[String]) -> Option<String> {
+    let h = st().thread_handles.get(chat_guid).cloned()?;
+    handles.iter().any(|x| x == &h).then_some(h)
+}
+
 fn sms_active_path(dir: &str) -> std::path::PathBuf {
     Path::new(dir).join("sms_active")
 }
@@ -2023,7 +2123,7 @@ async fn decide_route(client: &IMClient, handle: &str, recipient: &str) -> Route
     }
     if !SMS_ACTIVE.load(Ordering::SeqCst) {
         return Route::Block(
-            "SMS forwarding isn't on. On your iPhone (same Apple ID): Settings ▸ Messages ▸ Text Message Forwarding ▸ turn on this device."
+            "SMS forwarding isn't on. On your iPhone (same Apple ID): Settings ▸ Messages ▸ Text Message Forwarding ▸ turn on all devices ▸ restart iPhone."
                 .to_string(),
         );
     }
@@ -2185,7 +2285,9 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 
     let ok = rt().block_on(async move {
         let handles = client.identity.get_handles().await;
-        let Some(handle) = pick_send_handle(&handles) else {
+        // React from the handle this thread is on (a tapback under a different
+        // self-handle would fork the conversation just like a reply would).
+        let Some(handle) = thread_send_handle(&chat, &handles).or_else(|| pick_send_handle(&handles)) else {
             return false;
         };
         let react = ReactMessage {

@@ -9,6 +9,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -91,8 +93,14 @@ fun MessageContextSheet(
         sheetState = sheetState,
     ) {
         Column(
+            // Scrollable: on a short screen (e.g. the 240x320 TCL Flip 2) a failed
+            // send with a long reason — e.g. the multi-line SMS-forwarding hint —
+            // pushes the notice below the fold, where it was clipped. verticalScroll
+            // lets the user reach the full text, and DPAD focus auto-scrolls to
+            // whichever action row is focused.
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .padding(start = 12.dp, end = 12.dp, bottom = 16.dp),
         ) {
             ReactionPickerRow(

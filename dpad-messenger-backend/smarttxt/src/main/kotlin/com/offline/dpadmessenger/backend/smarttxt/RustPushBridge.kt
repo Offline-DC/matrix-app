@@ -138,8 +138,11 @@ class RustPushBridge(
                 val verify = json.parseToJsonElement(RustPushNative.nativeSubmit2fa(code)).jsonObject
                 verify["error"]?.jsonPrimitive?.content?.let {
                     Log.w(TAG, "sign-in: 2FA verify failed: $it")
-                    return RegistrationResult.Failure(
-                        "That verification code didn't work. Request a new code and try again.")
+                    // Classify rather than assume a wrong code: a genuine bad code
+                    // ("Bad 2fa code.") maps to the retry message, but a 2FA-time
+                    // timeout or network drop should say so instead of misblaming
+                    // the digits the user typed.
+                    return RegistrationResult.Failure(humanizeLoginError(it))
                 }
             }
             parseRegisterResult(appleId, RustPushNative.nativeRegister(appleId))
@@ -162,21 +165,45 @@ class RustPushBridge(
         val lower = r.lowercase()
         val status = Regex("""status:\s*(\d{3})""").find(r)?.groupValues?.getOrNull(1)
         val httpHint = if (status != null) " (server returned HTTP $status)" else ""
+        // Order matters: most specific first. In particular the timeout and
+        // network checks sit ABOVE the generic "2fa" check, because a 2FA-time
+        // timeout ("2FA verification timed out …") also contains "2fa" and would
+        // otherwise be mislabeled as a wrong code. The IDS-code checks below rely
+        // on the FFI now formatting rustpush errors with Display (not Debug), so
+        // the "(6001)"/"(6004)"/"(6005)"/"(6009)" suffixes are actually present.
         return when {
+            // A genuinely wrong 2FA code — distinct from a 2FA-time timeout/network
+            // drop, which fall through to the timeout/connection branches below.
+            lower.contains("bad 2fa code") ->
+                "That verification code didn't work. Request a new code and try again."
             lower.contains("anisette") || lower.contains("provision") ->
                 "Couldn't reach the activation server$httpHint. This is usually a temporary " +
                     "server-side problem — wait a moment and try again."
+            lower.contains("timed out") || lower.contains("timeout") ->
+                "The server took too long to respond$httpHint. Check your connection and try again."
+            lower.contains("apns") || lower.contains("connect failed") ||
+                lower.contains("connection refused") || lower.contains("os error 111") ->
+                "Couldn't connect to Apple's servers. Check your internet connection and try again."
+            // IDS registration errors. rustpush embeds the numeric code in its
+            // Display text, e.g. "Registration Error … (6005)".
+            lower.contains("rate-limit") || lower.contains("rate limit") ||
+                lower.contains("temporarily disabled") || lower.contains("(6009)") ->
+                "Apple has temporarily limited iMessage for this account. This usually clears on " +
+                    "its own — wait a while (it can take hours) and try again."
+            lower.contains("(6001)") ->
+                "iMessage can't register while Advanced Data Protection or Contact Key Verification " +
+                    "is on. Turn both off in your Apple Account settings, then try again."
+            lower.contains("(6005)") ->
+                "Apple couldn't verify your account (6005). Wait a moment and sign in again; if it " +
+                    "keeps happening, re-run device setup."
+            lower.contains("(6004)") ->
+                "Apple asked us to try again (6004). Wait a moment and sign in again."
             lower.contains("bad credentials") || lower.contains("needslogin") ||
                 lower.contains("-20101") || lower.contains("authentication failed") ->
                 "Your Apple ID or password is incorrect. Check them and try again."
             lower.contains("2fa") || lower.contains("two-factor") || lower.contains("two factor") ||
                 lower.contains("verification code") ->
                 "That verification code didn't work. Request a new code and try again."
-            lower.contains("timed out") || lower.contains("timeout") ->
-                "The server took too long to respond$httpHint. Check your connection and try again."
-            lower.contains("apns") || lower.contains("connect failed") ||
-                lower.contains("connection refused") || lower.contains("os error 111") ->
-                "Couldn't connect to Apple's servers. Check your internet connection and try again."
             lower.contains("nac") || lower.contains("validation") ->
                 "Couldn't verify this device with Apple$httpHint. Try again in a moment."
             lower.contains("dumb") || lower.contains("os_config") || lower.contains("device identity") ->

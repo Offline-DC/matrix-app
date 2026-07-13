@@ -450,9 +450,13 @@ fun MessageBubble(
             }
             // SmartTxt: the delivery receipt sits BELOW the bubble, right-aligned
             // and gray (like real SmartTxt), so it never widens the bubble.
-            if (colors.smarttxt && isOutgoing && showReceipt && message.status != MessageStatus.SENT &&
-                !message.isDeleted
-            ) {
+            // Shown for EVERY outgoing status (SENDING/SENT/DELIVERED/READ/FAILED),
+            // not skipping SENT: the send ladder is SENDING → SENT → DELIVERED, and
+            // hiding the row during the brief SENT step made it collapse to zero
+            // height — the whole thread jumped down then back up as "Delivered"
+            // landed. Keeping the row always present (SENT reads "Sending…", see
+            // statusGlyph) means the text just swaps in place, no reflow.
+            if (colors.smarttxt && isOutgoing && showReceipt && !message.isDeleted) {
                 Text(
                     text = statusGlyph(message.status, true),
                     style = MaterialTheme.typography.labelSmall,
@@ -618,7 +622,12 @@ private fun statusGlyph(status: MessageStatus, smarttxt: Boolean): String =
     if (smarttxt) when (status) {
         // SmartTxt shows the delivery state as words under the last sent bubble.
         MessageStatus.SENDING -> "Sending…"
-        MessageStatus.SENT -> "Sent"
+        // SENT is a transient hop on the way to DELIVERED (the FFI pushes an
+        // optimistic "delivered" right after a successful send). Label it
+        // "Sending…" too so the receipt reads continuously "Sending…" → "Delivered"
+        // with no blank frame in between (which used to collapse the row and make
+        // the thread jump). Real SmartTxt likewise never rests on a bare "Sent".
+        MessageStatus.SENT -> "Sending…"
         MessageStatus.DELIVERED -> "Delivered"
         MessageStatus.READ -> "Read"
         MessageStatus.FAILED -> "Not Delivered"
