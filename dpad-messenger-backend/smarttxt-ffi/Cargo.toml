@@ -38,7 +38,16 @@ plist = "1"
 base64 = "0.21"
 # For installing the process-global rustls crypto provider (ring) before any TLS,
 # same as the imessage-register harness. Match rustpush's rustls (0.23).
-rustls = { version = "0.23", features = ["ring"] }
+#
+# `default-features = false` is load-bearing, not cosmetic. rustls 0.23's DEFAULT
+# feature set includes the aws-lc-rs provider, and cargo features are ADDITIVE
+# across the graph — so leaving defaults on here would pull `aws-lc-sys` back in
+# even though rustpush now pins rustls to ring. aws-lc-sys is a big cmake-built
+# C/asm blob: megabytes in the .so and a cross-compile hazard on armv7-android.
+# We install ring explicitly in lib.rs (`rustls::crypto::ring::default_provider()
+# .install_default()`), so the aws-lc provider is dead weight either way.
+# Keep this in sync with rustpush's Cargo.toml.
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 
 # --- OpenBubbles rustpush (ENABLED) ----------------------------------------
 # The phone runs rustpush for activation/APNs/auth/register/send. We use its

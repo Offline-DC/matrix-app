@@ -20,13 +20,85 @@ JNILIBS="$(cd "$(dirname "$0")/.." && pwd)/smarttxt/src/main/jniLibs"
 LIB_NAME="libsmarttxt_ffi.so"
 MIN_SDK="${MIN_SDK:-24}"
 
+# rustpush lives here per smarttxt-ffi/Cargo.toml (`path = "../../../rustpush"`).
+RUSTPUSH_DIR="$(cd "$CRATE_DIR/../../../rustpush" 2>/dev/null && pwd || true)"
+
 : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to your NDK path}"
 
-HOST_TAG="linux-x86_64"
-case "$(uname -s)" in
-  Darwin) HOST_TAG="darwin-x86_64" ;;
-esac
-TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$HOST_TAG/bin"
+# --- Fairplay activation certs ------------------------------------------------
+# rustpush's src/activation.rs does `include_bytes!("../certs/fairplay/<name>.crt"
+# + .pem)` for a fixed list of cert IDs, so those 20 files must exist at COMPILE
+# time or the build dies with "couldn't read .../certs/fairplay/...: No such file".
+# They're gitignored (never committed) because the real ones are Apple Fairplay
+# secrets — but our validation is offloaded to the NAC server, so activation-time
+# Fairplay signing is never actually exercised on this path. rustpush's OWN CI
+# stubs them by copying the committed `certs/legacy-fairplay/fairplay.{crt,pem}`
+# placeholder into each expected name; we do exactly the same so local and CI
+# builds match. The cert names are grepped straight out of activation.rs rather
+# than hardcoded, so if upstream changes the FAIRPLAY_KEYS list this follows.
+setup_fairplay_stubs() {
+  local src_pem="$RUSTPUSH_DIR/certs/legacy-fairplay/fairplay.pem"
+  local src_crt="$RUSTPUSH_DIR/certs/legacy-fairplay/fairplay.crt"
+  local dst="$RUSTPUSH_DIR/certs/fairplay"
+
+  if [ ! -f "$src_pem" ] || [ ! -f "$src_crt" ]; then
+    echo "error: legacy-fairplay placeholder not found under $RUSTPUSH_DIR/certs/legacy-fairplay" >&2
+    echo "       (is RUSTPUSH_DIR right? got: $RUSTPUSH_DIR)" >&2
+    exit 1
+  fi
+
+  local names
+  names="$(grep -oE 'include_cert!\("[0-9]+"\)' "$RUSTPUSH_DIR/src/activation.rs" \
+             | grep -oE '[0-9]+')"
+  if [ -z "$names" ]; then
+    echo "error: no include_cert! names found in $RUSTPUSH_DIR/src/activation.rs" >&2
+    exit 1
+  fi
+
+  mkdir -p "$dst"
+  local n count=0
+  for n in $names; do
+    cp "$src_pem" "$dst/$n.pem"
+    cp "$src_crt" "$dst/$n.crt"
+    count=$((count + 1))
+  done
+  echo "==> stubbed $count Fairplay cert(s) in $dst"
+}
+setup_fairplay_stubs
+
+# Don't guess the host tag — ask the NDK. Google has shipped `darwin-x86_64`
+# (x86_64 binaries, Rosetta on Apple Silicon) for years, but that's a naming
+# convention, not a contract, and hardcoding it means a future NDK that ships
+# `darwin-arm64` breaks this script for a reason nobody will enjoy debugging.
+# There is exactly one prebuilt dir per NDK, so globbing for it is both simpler
+# and more correct than a uname case.
+PREBUILT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt"
+TOOLCHAIN=""
+for d in "$PREBUILT"/*/; do
+  if [ -d "${d}bin" ]; then
+    TOOLCHAIN="${d}bin"
+    break
+  fi
+done
+
+if [ -z "$TOOLCHAIN" ]; then
+  echo "error: no NDK toolchain found under $PREBUILT" >&2
+  echo "       (ANDROID_NDK_HOME=$ANDROID_NDK_HOME — is that the right NDK dir?)" >&2
+  echo "       Installed NDKs:" >&2
+  ls "$(dirname "$ANDROID_NDK_HOME")" 2>/dev/null | sed 's/^/         /' >&2 || true
+  exit 1
+fi
+echo "==> NDK toolchain: $TOOLCHAIN"
+
+# rustpush depends on `openssl` with the `vendored` feature, so openssl-src
+# compiles OpenSSL from source as part of this build. It doesn't go through
+# cargo's CC_<triple>/linker env vars — it shells out to OpenSSL's own Configure
+# script, which reads ANDROID_NDK_ROOT and expects the NDK's clang on PATH.
+# Without these two lines the build dies inside openssl-sys's build script with a
+# message that looks like a Rust error but isn't. Set here (rather than asking
+# every caller to) so local runs and CI behave identically.
+export ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+export PATH="$TOOLCHAIN:$PATH"
 
 # Rust target triple  ->  (NDK clang prefix, jniLibs ABI dir)
 build_one() {
@@ -36,12 +108,27 @@ build_one() {
 
   local cc="$TOOLCHAIN/${clang_prefix}${MIN_SDK}-clang"
   local ar="$TOOLCHAIN/llvm-ar"
-  # Per-target linker/cc via env (cargo reads CARGO_TARGET_<TRIPLE>_LINKER).
-  local upper
-  upper="$(echo "$rust_target" | tr 'a-z-' 'A-Z_')"
+
+  if [ ! -x "$cc" ]; then
+    echo "error: no compiler at $cc" >&2
+    echo "       (MIN_SDK=$MIN_SDK — does this NDK support that API level?)" >&2
+    exit 1
+  fi
+
+  # Cargo reads CARGO_TARGET_<TRIPLE>_LINKER; the cc crate (which builds the C
+  # deps, incl. vendored OpenSSL) reads CC_<triple> / AR_<triple>.
+  #
+  # Both want the triple with '-' → '_'. That's not cosmetic: a shell variable
+  # name cannot contain a hyphen, so `export CC_armv7-linux-androideabi=...`
+  # is a syntax error ("not a valid identifier"), which is what this used to do.
+  # cc-rs looks up both the hyphenated and underscored spellings, so the
+  # underscored one is the only form that's simultaneously legal and understood.
+  local under upper
+  under="$(echo "$rust_target" | tr '-' '_')"
+  upper="$(echo "$under" | tr 'a-z' 'A-Z')"
   export "CARGO_TARGET_${upper}_LINKER=$cc"
-  export "CC_${rust_target}=$cc"
-  export "AR_${rust_target}=$ar"
+  export "CC_${under}=$cc"
+  export "AR_${under}=$ar"
 
   ( cd "$CRATE_DIR" && cargo build --release --target "$rust_target" )
 
