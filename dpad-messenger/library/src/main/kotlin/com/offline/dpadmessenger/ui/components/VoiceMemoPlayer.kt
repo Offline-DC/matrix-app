@@ -69,6 +69,10 @@ fun VoiceMemoPlayer(
     var positionMs by remember { mutableStateOf(0) }
     var durationMs by remember { mutableStateOf(0) }
     var playFocused by remember { mutableStateOf(false) }
+    // True when the file downloaded but the device's MediaPlayer couldn't decode it
+    // (e.g. Apple's CAF container, which Android doesn't support natively). Surfaced
+    // so a tap shows an honest "can't play" state instead of doing nothing.
+    var failed by remember(localPath) { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
         onDispose { runCatching { player?.release() } }
@@ -88,8 +92,11 @@ fun VoiceMemoPlayer(
             mp.start()
             player = mp
             isPlaying = true
+            failed = false
         }.onFailure {
+            android.util.Log.w("VoiceMemoPlayer", "playback failed for $p (unsupported codec/container?)", it)
             isPlaying = false
+            failed = true
         }
     }
 
@@ -160,7 +167,11 @@ fun VoiceMemoPlayer(
             modifier = Modifier.width(120.dp),
         )
         Spacer(Modifier.width(10.dp))
-        Text(formatClock(shownMs), style = MaterialTheme.typography.labelMedium)
+        Text(
+            text = if (failed) "Can't play" else formatClock(shownMs),
+            style = MaterialTheme.typography.labelMedium,
+            color = if (failed) MaterialTheme.colorScheme.error else Color.Unspecified,
+        )
     }
 }
 

@@ -1829,9 +1829,19 @@ fn push_relay_event(msg: MessageInst) {
         for (idx, part) in normal.parts.0.iter().enumerate() {
             if let MessagePart::Attachment(att) = &part.part {
                 let guid = format!("{}:{}", msg.id, idx);
-                let kind = if att.mime.starts_with("image/") { "image" }
+                // A voice memo (the message's `voice` flag) is an audio attachment
+                // whose mime often ISN'T "audio/*" — iMessage sends CAF as
+                // application/octet-stream — so it would otherwise fall to "other" and
+                // get routed to the photo viewer ("Can't preview this photo"). The
+                // voice flag is the reliable signal, so honor it FIRST; also treat CAF
+                // by uti/mime as audio for good measure.
+                let is_audio_uti = att.uti_type.contains("coreaudio")
+                    || att.uti_type.contains("m4a")
+                    || att.mime.contains("caf")
+                    || att.name.to_lowercase().ends_with(".caf");
+                let kind = if normal.voice || is_audio_uti || att.mime.starts_with("audio/") { "audio" }
+                    else if att.mime.starts_with("image/") { "image" }
                     else if att.mime.starts_with("video/") { "video" }
-                    else if att.mime.starts_with("audio/") { "audio" }
                     else { "other" };
                 att_json.push(serde_json::json!({
                     "guid": guid, "mimeType": att.mime, "name": att.name, "kind": kind,

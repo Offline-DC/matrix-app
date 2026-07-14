@@ -803,14 +803,24 @@ internal class SmartTxtMessageRepository(
             return null
         }
         Log.i(TAG, "downloadMedia: got ${bytes.size} bytes for msg=$messageId")
-        val ext = when (att.kind) {
-            AttachmentKind.IMAGE -> att.mimeType.substringAfter('/', "jpg").ifBlank { "jpg" }
-            AttachmentKind.VIDEO -> att.mimeType.substringAfter('/', "mp4").ifBlank { "mp4" }
-            AttachmentKind.AUDIO -> "m4a"
+        // iMessage voice memos arrive as Apple CAF, which Android's MediaPlayer can't
+        // open. Repackage CAF → a playable container (Opus→.opus, AAC→.aac) — a
+        // container swap, no re-encode. Non-CAF audio (already .m4a) and other kinds
+        // save unchanged.
+        val converted = if (att.kind == AttachmentKind.AUDIO) CafAudio.convert(bytes) else null
+        if (att.kind == AttachmentKind.AUDIO) {
+            Log.i(TAG, "downloadMedia: audio ${bytes.size}B — ${if (converted != null) "CAF→${converted.ext} ${converted.bytes.size}B" else "kept as-is (not CAF or unsupported codec)"}")
+        }
+        val saveBytes = converted?.bytes ?: bytes
+        val ext = when {
+            converted != null -> converted.ext
+            att.kind == AttachmentKind.IMAGE -> att.mimeType.substringAfter('/', "jpg").ifBlank { "jpg" }
+            att.kind == AttachmentKind.VIDEO -> att.mimeType.substringAfter('/', "mp4").ifBlank { "mp4" }
+            att.kind == AttachmentKind.AUDIO -> "m4a"
             else -> "bin"
         }
         val file = java.io.File(mediaDir, "${messageId.filter { it.isLetterOrDigit() }}.$ext")
-        runCatching { file.writeBytes(bytes) }.getOrElse { Log.e(TAG, "downloadMedia: media write failed", it); return null }
+        runCatching { file.writeBytes(saveBytes) }.getOrElse { Log.e(TAG, "downloadMedia: media write failed", it); return null }
         val path = file.absolutePath
         writeLock.withLock {
             updateMessage(roomId, messageId) { m -> m.copy(attachment = m.attachment?.copy(localPath = path)) }
