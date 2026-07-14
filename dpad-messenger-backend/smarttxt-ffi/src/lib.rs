@@ -1457,7 +1457,11 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         match client.send(&mut inst).await {
             Ok(_) => true,
             Err(e) => {
-                log::warn!("nativeMarkRead: send failed: {e:?}");
+                // Expected on a green/SMS thread: read-on-device is an iMessage-only
+                // self-sync, and an SMS contact has no iMessage targets, so this
+                // always returns NoValidTargets. Not a real failure — debug, not warn,
+                // so it doesn't look like the cause when diagnosing send problems.
+                log::debug!("nativeMarkRead: skipped ({e:?}) — no iMessage targets (SMS thread?)");
                 false
             }
         }
@@ -1898,6 +1902,20 @@ fn push_relay_event(msg: MessageInst) {
         // Green (SMS, forwarded by the iPhone) vs blue (iMessage).
         let service = if matches!(normal.service, MessageType::SMS { .. }) { "SMS" } else { "iMessage" };
 
+        // Self-heal SMS forwarding state: RECEIVING a forwarded green text is proof
+        // the paired iPhone's Text Message Forwarding is live right now. Trust that
+        // for SENDING too, even if we never caught the EnableSmsActivation announce
+        // (forwarding turned on before this app existed, the persisted flag was lost,
+        // etc.). Without this, "I can receive green but can't reply green" happens
+        // because the SMS send is blocked on a stale SMS_ACTIVE=false. The iPhone
+        // still turns it back OFF explicitly via EnableSmsActivation(false).
+        if service == "SMS" && !SMS_ACTIVE.load(Ordering::SeqCst) {
+            log::info!("inbound SMS observed — enabling SMS forwarding for outgoing sends");
+            SMS_ACTIVE.store(true, Ordering::SeqCst);
+            let dir = st().files_dir.clone();
+            save_sms_active(&dir, true);
+        }
+
         // Learn which of MY handles this 1:1 iMessage thread transmits from, so a
         // reply goes out from the SAME handle instead of the global default. A
         // message I sent (synced from any device) is ground truth: its sender IS the
@@ -1996,6 +2014,14 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             }
         };
         let is_sms = matches!(service, MessageType::SMS { .. });
+        // One line that says exactly how this send was routed — the missing piece
+        // when a green reply fails: was it built as SMS (green) or iMessage (blue),
+        // and from which of my handles. Pair it with the decide_route log above.
+        log::info!(
+            "nativeSendText: chat={chat} is_group={is_group} is_sms={is_sms} \
+             from_handle={handle} has_reply={}",
+            !reply_to.is_empty()
+        );
         let mut msg = NormalMessage::new(body, service);
         // Thread as a reply to a specific message so it shows quoted on all devices.
         if !reply_to.is_empty() {
@@ -2283,11 +2309,21 @@ enum Route {
     Block(String),
 }
 
+/// Build the green-SMS route from my own account's phone handle, or a user-facing
+/// reason we can't. Shared by `decide_route`'s "confirmed not on iMessage" and
+/// "couldn't check" paths.
+fn sms_route() -> Route {
+    // Forward from my own phone number (the tel: handle on my account).
+    match st().my_handles.iter().find(|h| h.starts_with("tel:")).cloned() {
+        Some(number) => Route::Sms { using_number: number },
+        None => Route::Block("Your iCloud account has no phone number to text from.".to_string()),
+    }
+}
+
 async fn decide_route(client: &IMClient, handle: &str, recipient: &str) -> Route {
+    let is_phone = recipient.starts_with("tel:");
+    let sms_active = SMS_ACTIVE.load(Ordering::SeqCst);
     let targets = vec![recipient.to_string()];
-    // On a lookup FAILURE default to iMessage — don't silently misroute a real
-    // iMessage contact to SMS just because a network check hiccupped. Only an
-    // explicit empty result means "definitely not on iMessage".
     let valid = match client
         .identity
         .validate_targets(&targets, "com.apple.madrid", handle)
@@ -2295,28 +2331,39 @@ async fn decide_route(client: &IMClient, handle: &str, recipient: &str) -> Route
     {
         Ok(v) => v,
         Err(e) => {
-            log::warn!("validate_targets failed ({e:?}); defaulting to iMessage");
+            // Couldn't check iMessage availability (network/IDS hiccup). For a phone
+            // number whose SMS forwarding we KNOW is live, a green send WILL land —
+            // so try SMS rather than a doomed iMessage encrypt that fails
+            // NoValidTargets and surfaces as "Not Delivered". For an email, or with
+            // forwarding off, keep the old "assume iMessage" default so a transient
+            // blip doesn't misroute a real iMessage contact to a text.
+            if is_phone && sms_active {
+                log::warn!("decide_route[{recipient}]: validate failed ({e:?}) — forwarding on, routing SMS");
+                return sms_route();
+            }
+            log::warn!("decide_route[{recipient}]: validate failed ({e:?}); defaulting to iMessage");
             return Route::IMessage;
         }
     };
-    if valid.iter().any(|t| t == recipient) {
+    let on_imessage = valid.iter().any(|t| t == recipient);
+    log::info!(
+        "decide_route[{recipient}]: on_imessage={on_imessage} is_phone={is_phone} \
+         sms_active={sms_active} valid={valid:?}"
+    );
+    if on_imessage {
         return Route::IMessage;
     }
     // Not on iMessage. Only phone numbers can fall back to SMS.
-    if !recipient.starts_with("tel:") {
+    if !is_phone {
         return Route::Block("This address isn't on iMessage, and only phone numbers can receive a text.".to_string());
     }
-    if !SMS_ACTIVE.load(Ordering::SeqCst) {
+    if !sms_active {
         return Route::Block(
             "SMS forwarding isn't on. On your iPhone (same Apple ID): Settings ▸ Messages ▸ Text Message Forwarding ▸ turn on all devices ▸ restart iPhone."
                 .to_string(),
         );
     }
-    // Forward from my own phone number (the tel: handle on my account).
-    match st().my_handles.iter().find(|h| h.starts_with("tel:")).cloned() {
-        Some(number) => Route::Sms { using_number: number },
-        None => Route::Block("Your iCloud account has no phone number to text from.".to_string()),
-    }
+    sms_route()
 }
 
 /// Set the handle outgoing messages are sent FROM (the Settings "default send"
