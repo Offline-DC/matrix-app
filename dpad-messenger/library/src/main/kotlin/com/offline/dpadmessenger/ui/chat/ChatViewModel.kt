@@ -149,6 +149,7 @@ class ChatViewModel(
                 else -> parent.body
             },
             imagePath = if (parent.isDeleted) null else imagePath,
+            isOutgoing = parent.isOutgoing,
         )
     }
 

@@ -1,6 +1,7 @@
 package com.offline.dpadmessenger.ui.components
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
@@ -37,40 +38,108 @@ fun CompactTopBar(
     title: String,
     modifier: Modifier = Modifier,
     navigationIcon: @Composable (() -> Unit)? = null,
+    /**
+     * Center the title in the bar rather than left-aligning it after the
+     * navigation slot. The room list uses this for the iOS/OpenBubbles
+     * "Messages" header, where the title is optically centered in the bar and
+     * the profile button floats at the trailing edge.
+     *
+     * Implemented with a Box rather than a weighted Row so the title is centered
+     * on the BAR, not on the space left over between the two icon slots — with
+     * only a trailing action (and no leading one) a weighted Row would push the
+     * title off-center by half the button's width.
+     */
+    centerTitle: Boolean = false,
+    /**
+     * Replaces the [title] text with arbitrary content in the title slot. The
+     * chat screen uses this for the OpenBubbles conversation header: a circular
+     * avatar stacked over the contact / group name. [title] is still used for
+     * accessibility, so callers should pass it either way.
+     */
+    titleContent: (@Composable () -> Unit)? = null,
+    /**
+     * Drop the bar's own surface tint and its hairline bottom rule, so it sits on
+     * the same background as the content below and reads as one continuous
+     * sheet — the way the OpenBubbles "Messages" header flows straight into the
+     * conversation list. The default (false) keeps the tinted, ruled bar that
+     * separates itself from the content.
+     */
+    seamless: Boolean = false,
     actions: @Composable RowScope.() -> Unit = {},
 ) {
     Surface(
         modifier = modifier.fillMaxWidth(),
-        color = MaterialTheme.colorScheme.surface,
+        color = if (seamless) MaterialTheme.colorScheme.background
+            else MaterialTheme.colorScheme.surface,
     ) {
         Column {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 36.dp)
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
-            ) {
-                if (navigationIcon != null) {
-                    navigationIcon()
-                } else {
-                    Spacer(Modifier.size(8.dp))
+            if (centerTitle) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 36.dp)
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (navigationIcon != null) {
+                        Box(Modifier.align(Alignment.CenterStart)) { navigationIcon() }
+                    }
+                    // Keep the title clear of the icon slots on a 240px-wide
+                    // screen — it ellipsizes rather than sliding under them.
+                    if (titleContent != null) {
+                        Box(modifier = Modifier.padding(horizontal = 40.dp)) { titleContent() }
+                    } else {
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 40.dp),
+                        )
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                        modifier = Modifier.align(Alignment.CenterEnd),
+                        content = actions,
+                    )
                 }
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(horizontal = 4.dp).weight(1f),
-                )
-                actions()
+            } else {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 36.dp)
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
+                ) {
+                    if (navigationIcon != null) {
+                        navigationIcon()
+                    } else {
+                        Spacer(Modifier.size(8.dp))
+                    }
+                    if (titleContent != null) {
+                        Box(Modifier.padding(horizontal = 4.dp).weight(1f)) { titleContent() }
+                    } else {
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 4.dp).weight(1f),
+                        )
+                    }
+                    actions()
+                }
             }
-            HorizontalDivider(
-                thickness = Dp.Hairline,
-                color = LocalDpadMessengerColors.current.divider,
-            )
+            if (!seamless) {
+                HorizontalDivider(
+                    thickness = Dp.Hairline,
+                    color = LocalDpadMessengerColors.current.divider,
+                )
+            }
         }
     }
 }

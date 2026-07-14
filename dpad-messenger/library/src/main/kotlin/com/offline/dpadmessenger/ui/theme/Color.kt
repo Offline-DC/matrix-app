@@ -25,6 +25,12 @@ internal val ComposerButtonHighlight = Color(0xFF1B74E4)
 // surface; the focus ring still marks DPAD selection.
 internal val ComposerButtonNeutral = Color(0xFFC7C7CC)
 
+// Resting fill of the "+" attach button in the SmartTxt skin. OpenBubbles keeps
+// the "+" as a permanently-visible light grey disc (iOS systemGray5) with a dark
+// glyph, rather than a circle that only appears on focus.
+internal val ComposerAttachBg = Color(0xFFE9E9EB)
+internal val ComposerAttachGlyph = Color(0xFF3C3C43)
+
 internal val LightBg = Color(0xFFFFFFFF)
 internal val LightSurface = Color(0xFFF6F6F8)
 internal val LightOnSurface = Color(0xFF161616)
@@ -43,11 +49,14 @@ internal val IncomingBubbleLight = Color(0xFFF1F3F4)
 internal val IncomingBubbleDark = Color(0xFF2C2C2E)
 
 // ── SmartTxt / BlueBubbles palette (the classic blue SmartTxt look) ──────────
-// Sent bubbles are a blue vertical gradient (top → bottom); received bubbles are
-// the iOS gray; the accent is the iOS system blue. White text on sent bubbles.
-internal val SmartTxtSentTopLight = Color(0xFF3AA9FF)
-internal val SmartTxtSentLight = Color(0xFF0A7BFF)
-internal val SmartTxtSentTopDark = Color(0xFF37ABFF)
+// Matched to OpenBubbles, which uses Apple's system colors verbatim: the sent
+// bubble is a FLAT systemBlue (#007AFF) — the old iOS 7-era top-to-bottom blue
+// gradient is gone in current iMessage, so `SentTop == Sent` here and the
+// gradient plumbing in MessageBubble renders flat. Received bubbles are the iOS
+// received-gray (#E9E9EB). White text on sent, black-ish on received.
+internal val SmartTxtSentTopLight = Color(0xFF007AFF)
+internal val SmartTxtSentLight = Color(0xFF007AFF)
+internal val SmartTxtSentTopDark = Color(0xFF0A84FF)
 internal val SmartTxtSentDark = Color(0xFF0A84FF)
 internal val SmartTxtReceivedLight = Color(0xFFE9E9EB)
 internal val SmartTxtReceivedDark = Color(0xFF26262B)
@@ -57,6 +66,11 @@ internal val SmartTxtAccentDark = Color(0xFF0A84FF)
 // SmartTxt renders every initials-avatar as the same neutral gray circle (it
 // doesn't color-code contacts), so the skin overrides the per-contact avatar
 // color with this single iOS system gray.
+//
+// OpenBubbles draws that circle as a soft vertical gradient (light gray at the
+// top falling to a mid gray at the bottom) rather than a flat fill, which is
+// what gives its avatars their subtle dimension. Top → bottom:
+internal val SmartTxtAvatarGrayTop = Color(0xFFC7C7CC)
 internal val SmartTxtAvatarGray = Color(0xFF8E8E93)
 
 // DPAD focus outline for the blue SmartTxt SENT bubble. A white ring looked

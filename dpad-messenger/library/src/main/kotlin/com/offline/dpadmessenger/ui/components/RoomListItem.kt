@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -25,6 +26,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.offline.dpadmessenger.data.Attachment
@@ -58,6 +60,10 @@ fun RoomListItem(
     onLongClick: (() -> Unit)? = null,
     /** Show a small muted indicator when the conversation is muted. */
     isMuted: Boolean = false,
+    /** Draw the iMessage-style hairline separator beneath this row. The caller
+     *  passes false for the last row, where a rule would just hang under the
+     *  list. Only rendered in the SmartTxt skin. */
+    showDivider: Boolean = true,
 ) {
     val colors = LocalDpadMessengerColors.current
     // Layer additional FocusRequesters on top — each .focusRequester() points
@@ -65,9 +71,13 @@ fun RoomListItem(
     val extras = extraFocusRequesters.fold(Modifier as Modifier) { acc, fr ->
         acc.focusRequester(fr)
     }
+    // The separator lives OUTSIDE the row (hence the Column) so it isn't swept
+    // up in the row's focus highlight — the halo should bound the row, not a
+    // rule that belongs to the gap between two rows.
+    Column(modifier = modifier.fillMaxWidth()) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = modifier
+        modifier = Modifier
             .fillMaxWidth()
             .then(extras)
             .dpadRow(
@@ -76,14 +86,49 @@ fun RoomListItem(
                 shape = RoundedCornerShape(14.dp),
                 onLongClick = onLongClick,
             )
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .padding(
+                // SmartTxt pulls the row's leading edge in so the unread dot sits
+                // out near the margin (OpenBubbles) instead of being tucked into
+                // the row's own padding.
+                start = if (colors.smarttxt) ROW_START_SMARTTXT else 12.dp,
+                end = 12.dp,
+                top = 10.dp,
+                bottom = 10.dp,
+            ),
     ) {
+        // SmartTxt marks unread with a blue dot in the LEFT margin (OpenBubbles /
+        // iMessage) rather than a count badge on the right. The slot is always
+        // laid out, empty or not, so avatars stay on one vertical line whether or
+        // not a conversation is unread. Start-aligned, so the dot hugs the margin
+        // and the leftover width becomes the (small) gap before the avatar.
+        if (colors.smarttxt) {
+            Box(
+                modifier = Modifier.size(UNREAD_DOT_SLOT),
+                contentAlignment = Alignment.CenterStart,
+            ) {
+                if (summary.unreadCount > 0) {
+                    Box(
+                        modifier = Modifier
+                            .size(UNREAD_DOT_SIZE)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primary),
+                    )
+                }
+            }
+        }
         InitialsAvatar(name = summary.room.name, colorHex = summary.room.avatarColor)
-        Spacer(Modifier.width(12.dp))
+        Spacer(Modifier.width(AVATAR_GAP))
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = summary.room.name,
-                style = MaterialTheme.typography.titleMedium,
+                // SmartTxt sets the name at the SAME size as the preview beneath
+                // it and separates the two by weight and color alone, rather than
+                // by a step up in size.
+                style = if (colors.smarttxt) {
+                    MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
+                } else {
+                    MaterialTheme.typography.titleMedium
+                },
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -96,7 +141,16 @@ fun RoomListItem(
                 text = preview,
                 style = MaterialTheme.typography.bodyMedium,
                 color = colors.mutedText,
-                maxLines = 1,
+                // Two lines in SmartTxt. Ellipsis only lands on the SECOND line:
+                // Compose fills line 1 in full and only truncates once the text
+                // outruns the last permitted line.
+                //
+                // min == max, so the preview ALWAYS reserves two lines' height —
+                // a short one-line preview leaves the second line blank instead of
+                // shrinking its row. Otherwise row height tracks the preview and
+                // the list reads as a ragged column of different-sized rows.
+                minLines = if (colors.smarttxt) 2 else 1,
+                maxLines = if (colors.smarttxt) 2 else 1,
                 overflow = TextOverflow.Ellipsis,
             )
         }
@@ -107,19 +161,67 @@ fun RoomListItem(
             Text(text = "🔕", style = MaterialTheme.typography.labelSmall, color = colors.mutedText)
         }
         Spacer(Modifier.width(8.dp))
-        Column(horizontalAlignment = Alignment.End) {
+        Column(
+            horizontalAlignment = Alignment.End,
+            // Top-aligned, not centered: OpenBubbles hangs the timestamp off the
+            // TOP-right of the row so it sits on the same line as the contact
+            // name, with the unread badge dropping beneath it. Centering it (the
+            // old behavior) floated it opposite the gap between the name and the
+            // message preview, which read as a stray label belonging to neither.
+            // The 2dp nudge lines the small timestamp's cap-height up with the
+            // larger name's, since Top aligns their boxes, not their baselines.
+            modifier = Modifier
+                .align(Alignment.Top)
+                .padding(top = 2.dp),
+        ) {
             Text(
                 text = summary.lastMessage?.let { formatRelativeShort(it.timestampMs) } ?: "",
                 style = MaterialTheme.typography.labelSmall,
                 color = colors.mutedText,
             )
-            Spacer(Modifier.size(4.dp))
-            if (summary.unreadCount > 0) {
+            // Non-SmartTxt skins keep the trailing count badge; SmartTxt has
+            // already shown unread as the blue dot in the left margin.
+            if (!colors.smarttxt && summary.unreadCount > 0) {
+                Spacer(Modifier.size(4.dp))
                 UnreadBadge(count = summary.unreadCount)
             }
         }
     }
+        // iMessage rule: starts after the avatar and runs to the right edge, so
+        // the avatars read as one uninterrupted column down the left.
+        if (colors.smarttxt && showDivider) {
+            HorizontalDivider(
+                thickness = Dp.Hairline,
+                color = colors.divider,
+                modifier = Modifier.padding(start = DIVIDER_INSET),
+            )
+        }
+    }
 }
+
+/** Leading padding of a SmartTxt row — tighter than the default so the unread
+ *  dot reads as sitting in the margin rather than inside the row. */
+private val ROW_START_SMARTTXT = 4.dp
+
+/** The unread dot itself, and the slot it's start-aligned in. The slack between
+ *  the two (slot − dot) is the gap between the dot and the avatar. */
+private val UNREAD_DOT_SIZE = 10.dp
+private val UNREAD_DOT_SLOT = 13.dp
+
+/** Gap between the avatar and the name/preview column. */
+private val AVATAR_GAP = 12.dp
+
+/** Diameter of the row avatar — [InitialsAvatar]'s default. Named here only so
+ *  [DIVIDER_INSET] can be summed from it. */
+private val AVATAR_SIZE = 44.dp
+
+/** Left inset of the row separator: it should begin where the row's TEXT begins,
+ *  clearing the avatar entirely. Summed from the insets that precede the text —
+ *  dpadRow's 2dp focus padding, the row's leading padding, the unread-dot slot,
+ *  the avatar, and the gap after it. Keep this in step with those values; if the
+ *  avatar or paddings change and this doesn't, the rule drifts off the text. */
+private val DIVIDER_INSET =
+    2.dp + ROW_START_SMARTTXT + UNREAD_DOT_SLOT + AVATAR_SIZE + AVATAR_GAP
 
 /** Optical x-correction for the unread digit's right-leaning side bearing. */
 private val OPTICAL_NUDGE = (-0.5).dp

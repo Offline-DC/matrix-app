@@ -152,6 +152,17 @@ object RustPushNative {
      *  Empty array (`"[]"`) when nothing is pending. */
     external fun nativePollEvents(): String
 
+    /** Tell the native side which message guids we ALREADY hold on disk, as a JSON
+     *  array of strings. Apple replays its stored backlog on every APS connect, so
+     *  without this the last few days of history are re-delivered on every launch.
+     *  Call BEFORE [nativeConnect]; anything not seeded is treated as new. */
+    external fun nativeSeedSeen(guidsJson: String)
+
+    /** Null-safe seed: no-op when the `.so` isn't loaded. */
+    fun runCatchingNativeSeedSeen(guidsJson: String) {
+        if (loaded) runCatching { nativeSeedSeen(guidsJson) }
+    }
+
     /** Null-safe tapback send: no-op (false) when the `.so` isn't loaded, so
      *  callers never risk an UnsatisfiedLinkError. */
     fun runCatchingNativeTapback(chatGuid: String, targetGuid: String, associatedMessageType: Int): Boolean =

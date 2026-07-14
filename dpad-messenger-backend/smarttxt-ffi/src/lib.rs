@@ -120,6 +120,23 @@ struct AppState {
     /// `nativeDownloadAttachment` looks the rustpush `Attachment` back up here and
     /// streams it from MMCS (or returns the inline bytes) on demand.
     attachments: std::collections::HashMap<String, Attachment>,
+
+    /// Guids of messages/reactions the app ALREADY has, so an Apple replay is
+    /// dropped instead of re-delivered (see `push_relay_event`).
+    ///
+    /// Apple re-sends its stored backlog on every APS connect — rustpush's
+    /// `IMClient::setup_conn` explicitly asks it to (madrid command 160, "flush
+    /// cache"), which is how messages that arrived while the app was closed get
+    /// through. The cost is that a few days of history is re-delivered on EVERY
+    /// launch, and without this set the whole pipeline re-runs for messages the
+    /// app already stored.
+    ///
+    /// Seeded from Kotlin's on-disk cache at startup (`nativeSeedSeen`, called
+    /// before connect) and grown as we deliver. Deliberately NOT persisted here:
+    /// the Kotlin cache is the single source of truth, so we can only ever
+    /// suppress a message Kotlin has proven it holds. If that cache is ever lost,
+    /// nothing is seeded, nothing is suppressed, and the replay repopulates it.
+    seen_guids: std::collections::HashSet<String>,
 }
 
 fn rt() -> &'static Runtime {
@@ -1722,6 +1739,23 @@ fn push_relay_event(msg: MessageInst) {
     {
         return;
     }
+    // Replay guard: Apple re-sends its stored backlog on every APS connect (see
+    // `AppState.seen_guids`), so on a relaunch the last few days of messages come
+    // down the socket AGAIN — already-stored history, re-decrypted, re-marshalled,
+    // re-folded into the room list. Drop anything the app already has.
+    //
+    // `insert` returns false when the guid was already present, so this both tests
+    // and records in one lock. A tapback's add and its later removal are separate
+    // messages with separate guids, so reactions dedupe correctly too.
+    if matches!(&msg.message, Message::Message(_) | Message::React(_)) && !msg.id.is_empty() {
+        // Bind first so the AppState guard is released before the block runs — the
+        // rest of this function re-locks `st()` freely.
+        let already_stored = !st().seen_guids.insert(msg.id.clone());
+        if already_stored {
+            log::debug!("skip replay: guid={} already stored", msg.id);
+            return;
+        }
+    }
     // A reaction (tapback) from someone — emit a tapback event the repo folds into
     // the target message's reactions.
     if let Message::React(react) = &msg.message {
@@ -2480,6 +2514,30 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 ) -> jstring {
     let drained: Vec<serde_json::Value> = st().inbound.drain(..).collect();
     out(&mut env, serde_json::to_string(&drained).unwrap_or_else(|_| "[]".into()))
+}
+
+/// Tell the native side which message guids the app ALREADY has on disk, so the
+/// backlog Apple replays on every APS connect is dropped instead of re-delivered
+/// (see `AppState.seen_guids`). `guids_json` is a JSON array of strings.
+///
+/// Kotlin calls this from its cache restore, BEFORE connecting — anything not in
+/// the seed is treated as new, so a missing/corrupt cache simply means nothing is
+/// suppressed and the replay rebuilds the history.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeSeedSeen(
+    mut env: JNIEnv,
+    _class: JClass,
+    guids_json: JString,
+) {
+    let raw = jstr(&mut env, &guids_json);
+    let guids: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+    let mut s = st();
+    for g in guids {
+        if !g.is_empty() {
+            s.seen_guids.insert(g);
+        }
+    }
+    log::info!("nativeSeedSeen: {} guid(s) already stored by the app", s.seen_guids.len());
 }
 
 /// `iMessage;-;<addr>` (or a bare/scheme'd address) → a rustpush handle.

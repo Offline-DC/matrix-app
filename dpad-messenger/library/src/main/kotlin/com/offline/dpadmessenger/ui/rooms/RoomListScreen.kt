@@ -19,8 +19,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Create
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -62,6 +62,8 @@ import com.offline.dpadmessenger.ui.components.RoomListItem
 import com.offline.dpadmessenger.ui.settings.RELINK_WARN_DAYS
 import com.offline.dpadmessenger.ui.theme.ComposerButtonHighlight
 import com.offline.dpadmessenger.ui.theme.ComposerButtonResting
+import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
+import com.offline.dpadmessenger.ui.theme.SmartTxtAvatarGray
 
 /**
  * Top-level room list. DPAD Up/Down moves between rooms; OK opens the chat.
@@ -80,7 +82,7 @@ fun RoomListScreen(
     onRoomClick: (roomId: String) -> Unit,
     onSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
-    topBarTitle: String = "Chats",
+    topBarTitle: String = "Messages",
     /** Open the new-conversation flow. When null, the compose button is hidden
      *  (repository can't start conversations — e.g. the mock). */
     onNewMessage: (() -> Unit)? = null,
@@ -122,6 +124,11 @@ fun RoomListScreen(
         topBar = {
             CompactTopBar(
                 title = topBarTitle,
+                // iOS/OpenBubbles header: "Messages" centered, profile button
+                // floated at the trailing edge, on the same white as the list
+                // below it with no rule between the two.
+                centerTitle = true,
+                seamless = LocalDpadMessengerColors.current.smarttxt,
                 actions = {
                     CompactBarButton(
                         onClick = onSettingsClick,
@@ -165,10 +172,18 @@ fun RoomListScreen(
                             } else false
                         },
                     ) {
+                        // OpenBubbles puts a small profile avatar here, not a
+                        // settings cog — it still opens Settings (hence the
+                        // content description), but reads as "you". The filled
+                        // AccountCircle is a person cut OUT of a disc, so tinting
+                        // it with the avatar gray gives exactly that: a gray
+                        // circle with a white silhouette, matching the initials
+                        // avatars in the list below.
                         Icon(
-                            Icons.Filled.Settings,
-                            contentDescription = "Settings",
-                            modifier = Modifier.size(20.dp),
+                            Icons.Filled.AccountCircle,
+                            contentDescription = "Profile and settings",
+                            tint = SmartTxtAvatarGray,
+                            modifier = Modifier.size(26.dp),
                         )
                     }
                 },
@@ -333,7 +348,12 @@ private fun RoomList(
     }
     LazyColumn(
         state = listState,
-        contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp, start = 8.dp, end = 8.dp),
+        // Tight side gutters. The row's DPAD focus border is drawn ON the row's
+        // own bounds, so this gutter is the ONLY thing between that border and
+        // the screen edge — at 8dp it wasted ~16dp of a 240px-wide screen and
+        // pushed the border well inboard. 2dp keeps the halo from bleeding off
+        // the display while handing the width back to the row.
+        contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp, start = 2.dp, end = 2.dp),
         // Scaffold insets as REAL padding (not contentPadding) so the list
         // viewport ends below the top bar. With contentPadding the rows could
         // scroll underneath the bar, and the focus-driven bringIntoView only
@@ -374,6 +394,9 @@ private fun RoomList(
                 extraFocusRequesters = if (isFirst) listOf(firstRowFocus) else emptyList(),
                 onLongClick = onRoomLongClick?.let { handler -> { handler(summary) } },
                 isMuted = summary.room.id in mutedRooms,
+                // No rule under the final row — it would hang below the list
+                // rather than separate two conversations.
+                showDivider = summary.room.id != rooms.lastOrNull()?.room?.id,
             )
         }
     }

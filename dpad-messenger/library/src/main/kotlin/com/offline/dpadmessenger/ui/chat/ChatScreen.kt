@@ -14,8 +14,11 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -40,7 +43,9 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 import kotlinx.coroutines.delay
 import com.offline.dpadmessenger.focus.DpadFireGate
 import com.offline.dpadmessenger.focus.OkKeys
@@ -51,6 +56,7 @@ import com.offline.dpadmessenger.ui.components.CompactBarButton
 import com.offline.dpadmessenger.ui.components.CompactTopBar
 import com.offline.dpadmessenger.ui.components.DateDivider
 import com.offline.dpadmessenger.ui.components.DpadComposer
+import com.offline.dpadmessenger.ui.components.InitialsAvatar
 import com.offline.dpadmessenger.ui.components.LoadingOlderRow
 import com.offline.dpadmessenger.ui.components.MessageBubble
 import com.offline.dpadmessenger.ui.components.MessageContextSheet
@@ -196,16 +202,48 @@ fun ChatScreen(
     // to reach Compose.
     BackHandler { onBack() }
 
+    // OpenBubbles conversation header: a blue chevron back, and the contact /
+    // group identity stacked in the center — circular avatar with the name
+    // beneath it. Other skins keep the plain "← Name" bar, which suits a
+    // 36dp-tall Signal-style bar better than a two-line header.
+    val smarttxt = LocalDpadMessengerColors.current.smarttxt
+
     Scaffold(
         topBar = {
             CompactTopBar(
                 title = room?.name ?: "",
+                centerTitle = smarttxt,
+                seamless = smarttxt,
+                titleContent = if (!smarttxt) null else {
+                    {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            InitialsAvatar(
+                                name = room?.name.orEmpty(),
+                                colorHex = room?.avatarColor ?: "#8E8E93",
+                                size = 34.dp,
+                            )
+                            Text(
+                                text = room?.name.orEmpty(),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(top = 2.dp),
+                            )
+                        }
+                    }
+                },
                 navigationIcon = {
                     CompactBarButton(onClick = onBack, focusRequester = backBtnFr) {
                         Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            // iOS/OpenBubbles marks Back with a bare blue chevron,
+                            // not a filled arrow.
+                            imageVector = if (smarttxt) Icons.Filled.ChevronLeft
+                                else Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",
-                            modifier = Modifier.size(20.dp),
+                            tint = if (smarttxt) MaterialTheme.colorScheme.primary
+                                else LocalContentColor.current,
+                            modifier = Modifier.size(if (smarttxt) 28.dp else 20.dp),
                         )
                     }
                 },
@@ -531,10 +569,17 @@ private fun Timeline(
                     ) {
                         value = resolveParent(msg.replyToId)
                     }
+                    // Consecutive replies to the SAME message quote it once — on
+                    // the first (oldest) of the run, which is the one rendered
+                    // visually at the top. `above` is that older neighbour, so a
+                    // match means this reply is a continuation and repeats no quote.
+                    val repeatsParent = msg.replyToId != null &&
+                        above?.replyToId == msg.replyToId
                     MessageBubble(
                         message = msg,
                         senderName = if (msg.isOutgoing) null else senderNameFor(msg.senderId),
                         showSenderName = isGroup && !msg.isOutgoing && firstOfRun,
+                        showQuotedParent = !repeatsParent,
                         showReceipt = msg.id == lastOutgoingId,
                         parentSnippet = parent,
                         onClick = { onBubbleClick(msg) },
