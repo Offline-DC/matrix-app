@@ -747,10 +747,32 @@ fn load_remote_config(dir: &str) -> Option<MacOSConfigRemote> {
     // rebuilt from it, so os_config.plist is optional — kept only for a verification compare.
     let raw = match std::fs::read(&dumb) {
         Ok(r) if !r.is_empty() => r,
-        _ => {
+        Ok(_) => {
             log::error!(
-                "nativeInit: the dumb file is REQUIRED and missing/empty at {} — run the OpenBubbles transfer",
+                "nativeInit: the dumb at {} is EMPTY (0 B) — re-run the OpenBubbles transfer",
                 dumb.display()
+            );
+            return None;
+        }
+        Err(e) => {
+            // Say WHICH failure. The old message claimed "missing/empty" for every error,
+            // including EACCES — so a dumb that was dropped in with `su cp` (root-owned,
+            // wrong SELinux label) shows up fine in `ls`/`cat` as root but is unreadable by
+            // the app's uid, and the log sent people hunting for a file sitting right there.
+            // Report the file's owner: uid 0 is the tell.
+            use std::os::unix::fs::MetadataExt;
+            let (exists, size, uid, gid, mode) = match std::fs::metadata(&dumb) {
+                Ok(m) => (true, m.len(), m.uid(), m.gid(), m.mode() & 0o777),
+                Err(_) => (false, 0, 0, 0, 0),
+            };
+            log::error!(
+                "nativeInit: CANNOT READ the dumb at {} — {e} (kind={:?}). \
+                 exists={exists} size={size}B owner={uid}:{gid} mode={mode:o}. \
+                 If it exists but won't read, it was placed there by ROOT (uid 0) rather than \
+                 by the app: chown it to the app's uid and restorecon it, or just re-run the \
+                 OpenBubbles transfer, which copies it AS the app.",
+                dumb.display(),
+                e.kind(),
             );
             return None;
         }

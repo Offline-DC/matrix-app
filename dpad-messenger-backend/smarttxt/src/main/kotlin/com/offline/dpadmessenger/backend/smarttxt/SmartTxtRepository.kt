@@ -141,7 +141,10 @@ object SmartTxtRepository {
             }
             if (!ensureNativeInit(appContext)) {
                 _nativeError.value = IDENTITY_MISSING_MESSAGE
-                Log.e(TAG, "create: nativeInit failed (no migrated identity/dumb)")
+                // The native lib is confirmed loaded above, so this IS the identity: the
+                // dumb is missing, empty, or unreadable. smarttxt_ffi logs which (and the
+                // file's owner — uid 0 means root put it there and the app can't read it).
+                Log.e(TAG, "create: nativeInit failed — dumb missing/empty/unreadable (see smarttxt_ffi log)")
                 return null
             }
         } else {
@@ -182,8 +185,10 @@ object SmartTxtRepository {
     suspend fun register(context: Context, config: MacOSConfig, appleId: String): RegistrationResult {
         val appContext = context.applicationContext
         if (!ensureNativeInit(appContext)) {
-            Log.e(TAG, "register: nativeInit failed — no migrated identity/dumb")
-            return RegistrationResult.Failure(IDENTITY_MISSING_MESSAGE)
+            Log.e(TAG, "register: nativeInit failed — " +
+                if (!RustPushBridge.NATIVE_AVAILABLE) "native library not loaded"
+                else "the dumb is missing/empty/unreadable (see smarttxt_ffi log for which)")
+            return RegistrationResult.Failure(initFailureMessage())
         }
         val store = SmartTxtAccountStore(appContext)
         store.saveConfig(config)
@@ -206,8 +211,10 @@ object SmartTxtRepository {
     ): RegistrationResult {
         val appContext = context.applicationContext
         if (!ensureNativeInit(appContext)) {
-            Log.e(TAG, "register: nativeInit failed — no migrated identity/dumb")
-            return RegistrationResult.Failure(IDENTITY_MISSING_MESSAGE)
+            Log.e(TAG, "register: nativeInit failed — " +
+                if (!RustPushBridge.NATIVE_AVAILABLE) "native library not loaded"
+                else "the dumb is missing/empty/unreadable (see smarttxt_ffi log for which)")
+            return RegistrationResult.Failure(initFailureMessage())
         }
         val store = SmartTxtAccountStore(appContext)
         store.saveConfig(config)
@@ -360,13 +367,24 @@ object SmartTxtRepository {
 
     private const val TAG = "IMsgRepoHolder"
 
-    /** Shown whenever nativeInit fails. With the relay removed, that happens for
-     *  exactly one reason: the migrated device identity (os_config.plist) and/or the
-     *  `dumb` file aren't on disk, so NAC validation can't run. Naming the dumb file
-     *  makes the real cause obvious instead of a downstream "APNs connect failed". */
+    /** Shown when nativeInit fails because the identity isn't usable. The `dumb` is the
+     *  ONLY file required — rustpush rebuilds the whole device identity from it, so
+     *  os_config.plist / config.plist / keystore.plist being absent is FINE (that's just
+     *  a device that hasn't signed in yet). This message means the dumb is missing, empty,
+     *  or unreadable; `smarttxt_ffi` logs which, including the file's owner — a root-owned
+     *  dumb (uid 0, e.g. dropped in with `su cp`) exists but the app can't read it. */
     const val IDENTITY_MISSING_MESSAGE =
-        "Can't start iMessage — the device identity (the OpenBubbles “dumb” file) wasn't transferred. " +
+        "Can't start iMessage — the device identity (the “dumb” file) is missing or unreadable. " +
         "Reopen the app to run the OpenBubbles transfer (OpenBubbles must be installed and signed in), then try again."
+
+    /** nativeInit is only reached when the .so actually loaded. Blaming the identity for a
+     *  missing native library sent us chasing a dumb file that was sitting right there. */
+    const val NATIVE_MISSING_MESSAGE =
+        "iMessage engine isn't available on this device (the native library failed to load)."
+
+    /** Why did [ensureNativeInit] fail? Distinguishes the two very different causes. */
+    private fun initFailureMessage(): String =
+        if (!RustPushBridge.NATIVE_AVAILABLE) NATIVE_MISSING_MESSAGE else IDENTITY_MISSING_MESSAGE
 }
 
 /** Where the SmartTxt identity is in its lifecycle. The UI gates on this. */

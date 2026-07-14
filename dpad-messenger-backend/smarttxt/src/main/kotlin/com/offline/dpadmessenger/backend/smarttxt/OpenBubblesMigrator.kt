@@ -121,11 +121,12 @@ object OpenBubblesMigrator {
         val dumb = "dumb" in have
         val id = "id.plist" in have
         val ks = "keystore_s.plist" in have
-        // Offer the transfer whenever a rooted OpenBubbles is present (hw_info). The
-        // dumb is REQUIRED but enforced inside migrate() (a missing/failed dumb shows
-        // the failure screen); id/keystore_s only matter for reusing the login, and
-        // migrate() falls back to manual sign-in without them.
-        val available = root && hw
+        // Offer the transfer whenever a rooted OpenBubbles has EITHER source of a device
+        // identity. The dumb alone is sufficient (rustpush rebuilds the full identity from
+        // it), so an OB install with a dumb but no hw_info still gets the transfer — it
+        // just can't reuse the login and lands on manual sign-in. The dumb requirement is
+        // enforced inside migrate(); id/keystore_s only matter for reusing the login.
+        val available = root && (hw || dumb)
         Log.i(TAG, "available? → $available  [alreadyRegistered=$registered nativeLib=$native root=$root " +
             "hw_info=$hw dumb=$dumb id=$id keystore_s=$ks]  have=${have.sorted()}")
         return available
@@ -143,21 +144,16 @@ object OpenBubblesMigrator {
         Log.i(TAG, "Smart Txt filesDir BEFORE migration:\n${listDir(app.filesDir)}")
         val stage = File(app.cacheDir, "ob_stage").apply { deleteRecursively(); mkdirs() }
         try {
-            // ══ PHASE 1 — NAC device identity (dumb + os_config). HARD requirement:
-            //    there is no relay fallback, so if this fails the transfer fails.
+            // ══ PHASE 1 — NAC device identity. The `dumb` is the ONE hard requirement.
+            //    rustpush's from_dumb_body rebuilds the WHOLE identity from it — hardware
+            //    (product/serial/board/rom/mlb) AND software (version/protocol/device UUID/
+            //    iCloud UA/AOSKit) — so os_config.plist is now only a verification compare,
+            //    and hw_info.plist only matters for REUSING the OpenBubbles login. A device
+            //    that has nothing but a dumb is a perfectly valid device: it just signs in
+            //    manually instead of inheriting the session. Neither is worth failing on.
             onStep("This will only take a moment…")
 
-            // 1a. root-copy the LOGIN source (hw_info.plist: push + identity + users) into
-            //     an app-owned staging dir. The dumb is handled separately in 1b.
-            run {
-                val ok = suCopy("$OB_FILES/hw_info.plist", File(stage, "hw_info.plist"))
-                val size = File(stage, "hw_info.plist").length()
-                Log.i(TAG, "  copy identity hw_info.plist → ${size}B ${if (ok && size > 0) "✓" else "✗"}")
-                if (size == 0L) return@withContext fail("couldn't read OpenBubbles hw_info.plist (root or copy failed)", t0)
-            }
-
-            // 1b. Ensure the device dumb (the NAC validation identity) is in the app's OWN
-            //     storage. PREFER Smart Txt's own dumb — the launcher may already have
+            // 1a. The dumb (HARD). PREFER Smart Txt's own — the launcher may already have
             //     provisioned it (filesDir/dumb) even when OpenBubbles was never installed —
             //     and only fall back to copying OpenBubbles' dumb when Smart Txt has none.
             val dumbDst = File(app.filesDir, "dumb")
@@ -170,16 +166,32 @@ object OpenBubblesMigrator {
             if (dumbDst.length() == 0L)
                 return@withContext fail("no device dumb — neither Smart Txt nor OpenBubbles has one yet (provisioning may still be running). NAC validation can't run without it.", t0)
 
-            // 1c. write os_config.plist (the device identity) via the FFI.
-            val stageRaw = RustPushNative.runCatchingNativeStageIdentity(stage.absolutePath, app.filesDir.absolutePath)
-            Log.i(TAG, "  nativeStageIdentity → $stageRaw")
-            val stageRes = JSONObject(stageRaw)
-            if (!stageRes.optBoolean("ok", false))
-                return@withContext fail("device identity staging failed: ${stageRes.optString("error", "unknown")}", t0)
-            val osCfg = File(app.filesDir, "os_config.plist")
-            if (!osCfg.exists() || osCfg.length() == 0L)
-                return@withContext fail("os_config.plist wasn't written — device identity incomplete", t0)
-            Log.i(TAG, "  ✅ NAC identity staged (dumb ${dumbDst.length()}B + os_config.plist ${osCfg.length()}B)")
+            // 1b. hw_info.plist (SOFT). Only the login reuse (push + identity + users) and
+            //     the os_config compare consume it. Without it we still have a complete
+            //     identity from the dumb — we just can't inherit OpenBubbles' session.
+            val haveHwInfo = run {
+                val ok = suCopy("$OB_FILES/hw_info.plist", File(stage, "hw_info.plist"))
+                val size = File(stage, "hw_info.plist").length()
+                Log.i(TAG, "  copy hw_info.plist → ${size}B " +
+                    if (ok && size > 0) "✓" else "✗ (no login reuse — will route to manual sign-in)")
+                size > 0L
+            }
+
+            // 1c. os_config.plist (SOFT). The dumb-derived config is authoritative and
+            //     self-consistent with the NAC validation data; this file is kept only so
+            //     load_remote_config can diff the two. Failing here used to abort a transfer
+            //     that already had everything it needed.
+            if (haveHwInfo) {
+                val stageRaw = RustPushNative.runCatchingNativeStageIdentity(stage.absolutePath, app.filesDir.absolutePath)
+                Log.i(TAG, "  nativeStageIdentity → $stageRaw")
+                val osCfg = File(app.filesDir, "os_config.plist")
+                if (osCfg.length() > 0L)
+                    Log.i(TAG, "  ✅ NAC identity (dumb ${dumbDst.length()}B + os_config.plist ${osCfg.length()}B)")
+                else
+                    Log.w(TAG, "  os_config.plist not written — continuing on the dumb alone (it is authoritative)")
+            } else {
+                Log.i(TAG, "  ✅ NAC identity from the dumb alone (${dumbDst.length()}B) — no os_config.plist, which is fine")
+            }
             // We've committed to the OpenBubbles transfer — never auto-migrate again, so a
             // later logout goes to fresh manual sign-in instead of re-importing OpenBubbles.
             markMigrationDone(app)
@@ -218,7 +230,10 @@ object OpenBubblesMigrator {
             //    migrated). SOFT: if it fails we KEEP the staged identity and send the user
             //    to the normal sign-in screen, which still validates through the NAC server.
             onStep("This will only take a moment…")
-            val login = try {
+            val login = if (!haveHwInfo) {
+                Log.w(TAG, "  no hw_info.plist — nothing to import a login FROM; manual sign-in")
+                null
+            } else try {
                 importLogin(app, stage)
             } catch (e: Exception) {
                 Log.w(TAG, "  login import crashed: ${e.message}")
