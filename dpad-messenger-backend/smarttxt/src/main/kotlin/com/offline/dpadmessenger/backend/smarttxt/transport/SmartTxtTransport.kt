@@ -102,6 +102,12 @@ interface SmartTxtTransport {
 
     fun isConnected(): Boolean
 
+    /** Tell the transport which message guids we already hold locally, so a server
+     *  replay of history we've already stored is dropped instead of re-delivered.
+     *  Call BEFORE [connect]. Only the native transport replays; the relay
+     *  transports no-op. */
+    fun seedSeen(guids: Collection<String>) {}
+
     /** Tear down the connection and any background work. */
     fun shutdown()
 }

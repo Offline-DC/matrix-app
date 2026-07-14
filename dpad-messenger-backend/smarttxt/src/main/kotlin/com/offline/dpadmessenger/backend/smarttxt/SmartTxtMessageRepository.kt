@@ -131,7 +131,6 @@ internal class SmartTxtMessageRepository(
 
     init {
         notifier.ensureChannel()
-        scope.launch { restoreFromCache() }
         scope.launch { session.events.collect { handleEvent(it) } }
         scope.launch { for (r in saveRequests) { delay(1500); persistToCache() } }
         // Drain the voice-memo prefetch queue one at a time (see [maybePrefetchAudio]).
@@ -143,7 +142,20 @@ internal class SmartTxtMessageRepository(
         }
         scope.launch { delay(8000); _initialSyncComplete.value = true } // never spin forever
         scope.launch { while (true) { pruneOldMessages(); delay(60 * 60_000L) } }
-        session.connect()
+        // Restore the stored history, hand its guids to the transport, THEN open the
+        // socket. The ordering carries real weight:
+        //  - Apple replays its stored backlog on every connect (that's how messages
+        //    received while the app was closed arrive), so the transport needs the
+        //    "already have these" seed in hand BEFORE it connects or it re-delivers
+        //    days of history the app already has — the "why is it reloading all my
+        //    messages on launch" bug.
+        //  - The cache load is a Keystore-backed decrypt + JSON parse. Connecting in
+        //    parallel with it raced the restore against the first inbound message.
+        scope.launch {
+            restoreFromCache()
+            session.seedSeen(messagesByRoom.value.values.flatten().map { it.id })
+            session.connect()
+        }
     }
 
     // ---- RetentionSettings --------------------------------------------------
@@ -197,22 +209,48 @@ internal class SmartTxtMessageRepository(
     // ---- persistence --------------------------------------------------------
 
     private suspend fun restoreFromCache() {
-        val snap = withContext(Dispatchers.IO) { cache.load() } ?: return
+        val snap = withContext(Dispatchers.IO) { cache.load() }
+        if (snap == null) {
+            Log.i(TAG, "cache restore: nothing stored (first run, or cleared)")
+            return
+        }
         writeLock.withLock {
-            if (rooms.value.isNotEmpty() || messagesByRoom.value.isNotEmpty()) return@withLock
             val cutoff = if (_autoDelete.value) System.currentTimeMillis() - AUTO_DELETE_AGE_MS else 0L
-            // Sanitize any legacy cache written before display names were
-            // scheme-stripped, so a persisted "tel:+…"/"mailto:…" never resurfaces.
-            usersById.value = snap.usersById.mapValues { (_, u) -> u.copy(displayName = stripScheme(u.displayName)) } + (ME to currentUser)
-            rooms.value = snap.rooms.map { it.copy(name = stripScheme(it.name)) }
-            messagesByRoom.value = snap.messagesByRoom.mapValues { (_, l) ->
+            // Merge the cache UNDER whatever is already live instead of bailing when
+            // the map is non-empty. The old guard ("if non-empty, return") threw the
+            // ENTIRE stored history away if a single message landed before this slow
+            // (Keystore decrypt + JSON parse) load finished — silently swapping the
+            // user's real history for whatever the server happened to replay. Live
+            // always wins per-guid, so a merge is strictly safer and can't lose data.
+            val live = messagesByRoom.value
+            val restored = snap.messagesByRoom.mapValues { (_, l) ->
                 val kept = l.filter { it.timestampMs >= cutoff }
                 if (kept.size > MAX_MESSAGES_PER_ROOM) kept.takeLast(MAX_MESSAGES_PER_ROOM) else kept
             }
-            unreadByRoom.value = snap.unreadByRoom
-            mutedRooms.value = snap.mutedRooms
+            messagesByRoom.value = (restored.keys + live.keys).associateWith { room ->
+                val byId = LinkedHashMap<String, Message>()
+                restored[room].orEmpty().forEach { byId[it.id] = it }
+                live[room].orEmpty().forEach { byId[it.id] = it }   // a live copy wins
+                byId.values.sortedBy { it.timestampMs }
+            }
+            // Sanitize any legacy cache written before display names were
+            // scheme-stripped, so a persisted "tel:+…"/"mailto:…" never resurfaces.
+            usersById.value = snap.usersById.mapValues { (_, u) -> u.copy(displayName = stripScheme(u.displayName)) } +
+                usersById.value + (ME to currentUser)
+            val liveRoomIds = rooms.value.map { it.id }.toSet()
+            rooms.value = snap.rooms.map { it.copy(name = stripScheme(it.name)) }
+                .filterNot { it.id in liveRoomIds } + rooms.value
+            unreadByRoom.value = snap.unreadByRoom + unreadByRoom.value
+            mutedRooms.value = snap.mutedRooms + mutedRooms.value
             rooms.value.forEach { roomNameById[it.id] = it.name }
-            if (snap.rooms.isNotEmpty()) _initialSyncComplete.value = true
+            // rooms.value, not snap.rooms: the restore above MERGES cache with whatever
+            // already arrived live, so the merged set is what decides "synced".
+            if (rooms.value.isNotEmpty()) _initialSyncComplete.value = true
+            Log.i(
+                TAG,
+                "cache restore: ${rooms.value.size} room(s), " +
+                    "${messagesByRoom.value.values.sumOf { it.size }} message(s)",
+            )
             // Memos already in history (received before auto-download existed, or whose
             // file got pruned) still show "tap to play" with no length — queue those too.
             messagesByRoom.value.values.forEach { list -> list.forEach { maybePrefetchAudio(it) } }

@@ -1,5 +1,6 @@
 package com.offline.dpadmessenger.ui.components
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -55,11 +56,16 @@ import androidx.compose.ui.platform.LocalDensity
 import kotlinx.coroutines.launch
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.offline.dpadmessenger.data.Message
 import com.offline.dpadmessenger.data.MessageStatus
 import com.offline.dpadmessenger.focus.DpadFireGate
@@ -90,6 +96,10 @@ fun MessageBubble(
     senderName: String?,
     showSenderName: Boolean,
     parentSnippet: ReplyParentSnippet?,
+    /** False when the message directly above is a reply to the SAME parent. A run
+     *  of replies to one message quotes it once, at the top of the run; the rest
+     *  show only the thread connector. */
+    showQuotedParent: Boolean = true,
     /** Only the newest outgoing message shows the delivery receipt (iMessage
      *  style), so "Delivered"/"Read" doesn't repeat under every prior sent one. */
     showReceipt: Boolean = true,
@@ -183,12 +193,35 @@ fun MessageBubble(
         colors.mutedText
     }
     val alignment = if (isOutgoing) Arrangement.End else Arrangement.Start
-    val bubbleShape = RoundedCornerShape(
-        topStart = 16.dp,
-        topEnd = 16.dp,
-        bottomStart = if (isOutgoing) 16.dp else 4.dp,
-        bottomEnd = if (isOutgoing) 4.dp else 16.dp,
-    )
+    // SmartTxt: a true iMessage/OpenBubbles bubble — fully rounded, with a tail
+    // curling out of the bottom corner on the sender's side (right when sent,
+    // left when received). Other skins keep the old tail-less bubble, which fakes
+    // the "point" with a tightened 4dp corner.
+    val bubbleShape: Shape = if (colors.smarttxt) {
+        TailedBubbleShape(isOutgoing = isOutgoing)
+    } else {
+        RoundedCornerShape(
+            topStart = 16.dp,
+            topEnd = 16.dp,
+            bottomStart = if (isOutgoing) 16.dp else 4.dp,
+            bottomEnd = if (isOutgoing) 4.dp else 16.dp,
+        )
+    }
+    // The tail hangs in a strip reserved at the bubble's trailing edge (see
+    // TailedBubbleShape), so the CONTENT has to be padded clear of it — otherwise
+    // the last character of a line sits on top of the tail.
+    val tailInset = if (colors.smarttxt) BubbleTailWidth else 0.dp
+    // SmartTxt sets its bubble copy a step below the shared bodyLarge and gives it
+    // more room to breathe inside the bubble. Smaller type plus a roomier inset is
+    // what makes an iMessage bubble read as a rounded label around the words rather
+    // than a box the text is jammed into.
+    val bubblePadH = if (colors.smarttxt) 14.dp else 12.dp
+    val bubblePadV = if (colors.smarttxt) 10.dp else 8.dp
+    val bubbleTextStyle = if (colors.smarttxt) {
+        MaterialTheme.typography.bodyLarge.copy(fontSize = 14.sp, lineHeight = 18.sp)
+    } else {
+        MaterialTheme.typography.bodyLarge
+    }
     // iMessage-style SmartTxt: the sender name renders as a small grey header ABOVE
     // the bubble (not bold inside it). That header also gives the tapback badge room
     // to sit over the bubble's top corner without overlapping the message above.
@@ -209,8 +242,12 @@ fun MessageBubble(
         modifier = modifier
             .fillMaxWidth()
             .padding(
-                start = 8.dp,
-                end = 8.dp,
+                // Same reasoning as the room list's gutters: the bubble's focus
+                // border sits on the bubble's own edge, so this margin is all
+                // that separates it from the screen edge. Keep it slim so long
+                // messages get the width instead.
+                start = 4.dp,
+                end = 4.dp,
                 top = if (hasTapback && !hasNameHeader) 18.dp else 2.dp,
                 bottom = 2.dp,
             )
@@ -250,6 +287,17 @@ fun MessageBubble(
                             bottom = if (hasTapback && badgeWouldCoverName) 18.dp else 3.dp,
                         )
                         .onGloballyPositioned { nameWidthPx = it.size.width },
+                )
+            }
+            // SmartTxt renders a reply as a THREAD: the quoted parent appears as
+            // an outlined ghost bubble above, with a curved connector hooking
+            // down into this bubble. Other skins keep the quote inline inside the
+            // bubble (see ReplyQuote below).
+            if (colors.smarttxt && parentSnippet != null) {
+                ReplyThreadHeader(
+                    snippet = parentSnippet,
+                    replyIsOutgoing = isOutgoing,
+                    showGhost = showQuotedParent,
                 )
             }
             // Wrapper so the SmartTxt tapback badge can overlap the bubble's top
@@ -405,7 +453,15 @@ fun MessageBubble(
                             Modifier.onDpadAction { onClick(); true }
                         },
                     )
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .padding(
+                        // The tail is carved out of the bubble's leading edge, so the
+                        // text has to be pushed clear of it by that much extra on that
+                        // side (see BubbleTailWidth) or it would sit on the tail.
+                        start = bubblePadH + if (isOutgoing) 0.dp else tailInset,
+                        end = bubblePadH + if (isOutgoing) tailInset else 0.dp,
+                        top = bubblePadV,
+                        bottom = bubblePadV,
+                    ),
             ) {
                 Column {
                     // Non-SmartTxt skins show the sender name bold INSIDE the bubble.
@@ -419,7 +475,9 @@ fun MessageBubble(
                         )
                         Spacer(Modifier.padding(top = 2.dp))
                     }
-                    if (parentSnippet != null) {
+                    // SmartTxt already showed the parent as a ghost bubble above
+                    // (ReplyThreadHeader) — don't repeat it inside the bubble.
+                    if (parentSnippet != null && !colors.smarttxt) {
                         ReplyQuote(
                             parentSnippet = parentSnippet,
                             // On a colored (blue/green) sent bubble a blue accent +
@@ -452,7 +510,7 @@ fun MessageBubble(
                     } else if (message.body.isNotBlank()) {
                         Text(
                             text = message.body,
-                            style = MaterialTheme.typography.bodyLarge,
+                            style = bubbleTextStyle,
                             color = onBubbleText,
                         )
                     }
@@ -536,6 +594,129 @@ fun MessageBubble(
                 )
             }
         }
+    }
+}
+
+/**
+ * SmartTxt/iMessage reply thread header, rendered ABOVE the reply bubble.
+ *
+ * Two parts:
+ *  - the quoted parent as an OUTLINED "ghost" bubble — same tailed shape as a
+ *    real bubble but stroked instead of filled, hung on the PARENT's side and in
+ *    the parent's color (blue if you sent it, grey if they did). That's what
+ *    makes it read as "this message, quoted" rather than a new message.
+ *  - a curved connector on the REPLY's leading side, hooking down into the reply
+ *    bubble below.
+ *
+ * The connector is deliberately a short decorative elbow anchored to the reply,
+ * NOT a line drawn between the two bubbles' actual corners: the ghost and the
+ * reply frequently sit on OPPOSITE sides (you reply to their message, or they to
+ * yours), and a true corner-to-corner line would need both bubbles' measured
+ * bounds and would sweep across the whole thread. iMessage itself just brackets
+ * the reply, which is what this reproduces.
+ */
+@Composable
+private fun ReplyThreadHeader(
+    snippet: ReplyParentSnippet,
+    replyIsOutgoing: Boolean,
+    /** False when the message ABOVE already quoted this same parent — a run of
+     *  replies to one message shows the quoted parent once, at the top, and the
+     *  rest just carry the connector. Repeating the ghost on every reply reads as
+     *  several separate threads rather than one. */
+    showGhost: Boolean,
+) {
+    val colors = LocalDpadMessengerColors.current
+    // The ghost takes the PARENT's color, not the reply's.
+    val ink = if (snippet.isOutgoing) MaterialTheme.colorScheme.primary else colors.mutedText
+    val ghostShape = TailedBubbleShape(isOutgoing = snippet.isOutgoing)
+    Column(
+        // Puts the connector elbow on the reply's leading side. The ghost row
+        // below fills the width and aligns itself independently.
+        horizontalAlignment = if (replyIsOutgoing) Alignment.End else Alignment.Start,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        if (showGhost) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement =
+                    if (snippet.isOutgoing) Arrangement.End else Arrangement.Start,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .border(1.dp, ink, ghostShape)
+                        // Clear the tail strip, exactly as a filled bubble does.
+                        .padding(
+                            start = 10.dp + if (snippet.isOutgoing) 0.dp else BubbleTailWidth,
+                            end = 10.dp + if (snippet.isOutgoing) BubbleTailWidth else 0.dp,
+                            top = 5.dp,
+                            bottom = 5.dp,
+                        ),
+                ) {
+                    Text(
+                        text = snippet.bodyPreview,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = ink,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+        // Lighter than the ghost's outline/text: the elbow is a hint at the link
+        // between the two bubbles, not something to read, so it should recede.
+        ReplyConnector(
+            color = colors.mutedText.copy(alpha = 0.45f),
+            replyIsOutgoing = replyIsOutgoing,
+        )
+    }
+}
+
+/** Width/height of the curved elbow that brackets a threaded reply. */
+private val CONNECTOR_WIDTH = 18.dp
+private val CONNECTOR_HEIGHT = 14.dp
+
+/**
+ * How far the elbow sits IN from the reply bubble's outer edge.
+ *
+ * It has to clear two things to look like it lands on the bubble rather than
+ * floating off its corner: the tail strip reserved at the bubble's leading edge
+ * ([BubbleTailWidth]), and the bubble's rounded corner, which leaves the very
+ * corner empty. Anchoring at the outer edge (inset 0) is what left the elbow
+ * hanging out to the left of the bubble.
+ */
+private val CONNECTOR_INSET = BubbleTailWidth + 10.dp
+
+@Composable
+private fun ReplyConnector(
+    color: Color,
+    replyIsOutgoing: Boolean,
+) {
+    Canvas(
+        modifier = Modifier
+            .padding(
+                start = if (replyIsOutgoing) 0.dp else CONNECTOR_INSET,
+                end = if (replyIsOutgoing) CONNECTOR_INSET else 0.dp,
+            )
+            .size(width = CONNECTOR_WIDTH, height = CONNECTOR_HEIGHT),
+    ) {
+        val w = size.width
+        val h = size.height
+        val path = Path().apply {
+            if (replyIsOutgoing) {
+                // Reply hangs on the right: hook enters top-left, curves down to
+                // the bubble's trailing edge.
+                moveTo(0f, 0f)
+                cubicTo(w * 0.65f, 0f, w, h * 0.35f, w, h)
+            } else {
+                moveTo(w, 0f)
+                cubicTo(w * 0.35f, 0f, 0f, h * 0.35f, 0f, h)
+            }
+        }
+        drawPath(
+            path = path,
+            color = color,
+            style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round),
+        )
     }
 }
 
@@ -922,6 +1103,11 @@ data class ReplyParentSnippet(
     /** Local file path of the quoted image, when it's already downloaded —
      *  the quote then shows a small thumbnail (like Signal's). */
     val imagePath: String? = null,
+    /** Was the QUOTED message sent by us? The SmartTxt thread header outlines the
+     *  ghost bubble in the parent's own color (blue when quoting one of yours,
+     *  grey when quoting theirs) and hangs it on the parent's own side — so it
+     *  needs the parent's direction, not the reply's. */
+    val isOutgoing: Boolean = false,
 )
 
 /** Short typed label for quoting a media-only message ("Photo", "Video", …).

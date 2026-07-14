@@ -10,10 +10,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 
 /**
  * Lightweight circular avatar showing initials over a deterministic color.
@@ -31,11 +34,22 @@ fun InitialsAvatar(
 ) {
     // SmartTxt doesn't color-code contacts — every avatar is the same neutral
     // gray circle. In that skin, ignore the per-contact color; otherwise use it.
-    val bg = if (com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors.current.smarttxt) {
-        com.offline.dpadmessenger.ui.theme.SmartTxtAvatarGray
-    } else {
-        parseHexColor(colorHex)
-    }
+    //
+    // OpenBubbles shades that circle as a soft vertical gradient (light gray →
+    // mid gray) rather than a flat disc, which is what gives its avatars their
+    // subtle roundness. Other skins keep their flat per-contact color, so this
+    // is a SolidColor there — same Brush type either way.
+    val bg: Brush =
+        if (com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors.current.smarttxt) {
+            Brush.verticalGradient(
+                listOf(
+                    com.offline.dpadmessenger.ui.theme.SmartTxtAvatarGrayTop,
+                    com.offline.dpadmessenger.ui.theme.SmartTxtAvatarGray,
+                ),
+            )
+        } else {
+            SolidColor(parseHexColor(colorHex))
+        }
     Box(
         modifier = modifier
             .size(size)
@@ -46,7 +60,15 @@ fun InitialsAvatar(
         Text(
             text = initialsOf(name),
             color = Color.White,
-            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+            // Initials scale WITH the circle rather than sitting at a fixed
+            // titleMedium: the chat header renders a small (26dp) avatar, and a
+            // fixed 16sp monogram would overflow it. 0.36 × diameter reproduces
+            // the previous size at the default 44dp.
+            style = MaterialTheme.typography.titleMedium.copy(
+                fontWeight = FontWeight.Bold,
+                fontSize = (size.value * 0.36f).sp,
+                lineHeight = (size.value * 0.42f).sp,
+            ),
         )
     }
 }

@@ -59,6 +59,18 @@ class RustPushBridge(
     fun isApnsConnected(): Boolean =
         if (NATIVE_AVAILABLE) RustPushNative.nativeIsConnected() else apnsConnected
 
+    /** Hand rustpush the guids we already have stored, so the backlog Apple replays
+     *  on connect is dropped instead of re-delivered. Must run BEFORE [connectApns].
+     *  No-op on the stub path (nothing replays there). */
+    fun seedSeenGuids(guids: Collection<String>) {
+        if (!NATIVE_AVAILABLE || guids.isEmpty()) return
+        val payload = kotlinx.serialization.json.JsonArray(
+            guids.map { kotlinx.serialization.json.JsonPrimitive(it) },
+        ).toString()
+        RustPushNative.runCatchingNativeSeedSeen(payload)
+        Log.i(TAG, "seeded ${guids.size} already-stored guid(s) — replay will be dropped")
+    }
+
     // ---- registration (§2.2) -----------------------------------------------
 
     suspend fun register(config: MacOSConfig, appleId: String): RegistrationResult {

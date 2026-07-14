@@ -58,6 +58,11 @@ class SmartTxtSession(
 
     fun isConnected(): Boolean = transport.isConnected()
 
+    /** Tell the transport which message guids we already hold on disk, so the
+     *  backlog Apple replays on connect is dropped rather than re-delivered.
+     *  Must run BEFORE [connect]. */
+    fun seedSeen(guids: Collection<String>) = transport.seedSeen(guids)
+
     /** Open the connection. Initial sync is driven off the [TransportEvent
      *  .Connected] event (see [init]), so it runs on first connect AND on every
      *  reconnect. */

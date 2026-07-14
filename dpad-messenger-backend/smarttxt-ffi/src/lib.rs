@@ -120,6 +120,23 @@ struct AppState {
     /// `nativeDownloadAttachment` looks the rustpush `Attachment` back up here and
     /// streams it from MMCS (or returns the inline bytes) on demand.
     attachments: std::collections::HashMap<String, Attachment>,
+
+    /// Guids of messages/reactions the app ALREADY has, so an Apple replay is
+    /// dropped instead of re-delivered (see `push_relay_event`).
+    ///
+    /// Apple re-sends its stored backlog on every APS connect — rustpush's
+    /// `IMClient::setup_conn` explicitly asks it to (madrid command 160, "flush
+    /// cache"), which is how messages that arrived while the app was closed get
+    /// through. The cost is that a few days of history is re-delivered on EVERY
+    /// launch, and without this set the whole pipeline re-runs for messages the
+    /// app already stored.
+    ///
+    /// Seeded from Kotlin's on-disk cache at startup (`nativeSeedSeen`, called
+    /// before connect) and grown as we deliver. Deliberately NOT persisted here:
+    /// the Kotlin cache is the single source of truth, so we can only ever
+    /// suppress a message Kotlin has proven it holds. If that cache is ever lost,
+    /// nothing is seeded, nothing is suppressed, and the replay repopulates it.
+    seen_guids: std::collections::HashSet<String>,
 }
 
 fn rt() -> &'static Runtime {
@@ -1440,7 +1457,11 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         match client.send(&mut inst).await {
             Ok(_) => true,
             Err(e) => {
-                log::warn!("nativeMarkRead: send failed: {e:?}");
+                // Expected on a green/SMS thread: read-on-device is an iMessage-only
+                // self-sync, and an SMS contact has no iMessage targets, so this
+                // always returns NoValidTargets. Not a real failure — debug, not warn,
+                // so it doesn't look like the cause when diagnosing send problems.
+                log::debug!("nativeMarkRead: skipped ({e:?}) — no iMessage targets (SMS thread?)");
                 false
             }
         }
@@ -1722,6 +1743,23 @@ fn push_relay_event(msg: MessageInst) {
     {
         return;
     }
+    // Replay guard: Apple re-sends its stored backlog on every APS connect (see
+    // `AppState.seen_guids`), so on a relaunch the last few days of messages come
+    // down the socket AGAIN — already-stored history, re-decrypted, re-marshalled,
+    // re-folded into the room list. Drop anything the app already has.
+    //
+    // `insert` returns false when the guid was already present, so this both tests
+    // and records in one lock. A tapback's add and its later removal are separate
+    // messages with separate guids, so reactions dedupe correctly too.
+    if matches!(&msg.message, Message::Message(_) | Message::React(_)) && !msg.id.is_empty() {
+        // Bind first so the AppState guard is released before the block runs — the
+        // rest of this function re-locks `st()` freely.
+        let already_stored = !st().seen_guids.insert(msg.id.clone());
+        if already_stored {
+            log::debug!("skip replay: guid={} already stored", msg.id);
+            return;
+        }
+    }
     // A reaction (tapback) from someone — emit a tapback event the repo folds into
     // the target message's reactions.
     if let Message::React(react) = &msg.message {
@@ -1864,6 +1902,20 @@ fn push_relay_event(msg: MessageInst) {
         // Green (SMS, forwarded by the iPhone) vs blue (iMessage).
         let service = if matches!(normal.service, MessageType::SMS { .. }) { "SMS" } else { "iMessage" };
 
+        // Self-heal SMS forwarding state: RECEIVING a forwarded green text is proof
+        // the paired iPhone's Text Message Forwarding is live right now. Trust that
+        // for SENDING too, even if we never caught the EnableSmsActivation announce
+        // (forwarding turned on before this app existed, the persisted flag was lost,
+        // etc.). Without this, "I can receive green but can't reply green" happens
+        // because the SMS send is blocked on a stale SMS_ACTIVE=false. The iPhone
+        // still turns it back OFF explicitly via EnableSmsActivation(false).
+        if service == "SMS" && !SMS_ACTIVE.load(Ordering::SeqCst) {
+            log::info!("inbound SMS observed — enabling SMS forwarding for outgoing sends");
+            SMS_ACTIVE.store(true, Ordering::SeqCst);
+            let dir = st().files_dir.clone();
+            save_sms_active(&dir, true);
+        }
+
         // Learn which of MY handles this 1:1 iMessage thread transmits from, so a
         // reply goes out from the SAME handle instead of the global default. A
         // message I sent (synced from any device) is ground truth: its sender IS the
@@ -1962,6 +2014,14 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             }
         };
         let is_sms = matches!(service, MessageType::SMS { .. });
+        // One line that says exactly how this send was routed — the missing piece
+        // when a green reply fails: was it built as SMS (green) or iMessage (blue),
+        // and from which of my handles. Pair it with the decide_route log above.
+        log::info!(
+            "nativeSendText: chat={chat} is_group={is_group} is_sms={is_sms} \
+             from_handle={handle} has_reply={}",
+            !reply_to.is_empty()
+        );
         let mut msg = NormalMessage::new(body, service);
         // Thread as a reply to a specific message so it shows quoted on all devices.
         if !reply_to.is_empty() {
@@ -2249,11 +2309,21 @@ enum Route {
     Block(String),
 }
 
+/// Build the green-SMS route from my own account's phone handle, or a user-facing
+/// reason we can't. Shared by `decide_route`'s "confirmed not on iMessage" and
+/// "couldn't check" paths.
+fn sms_route() -> Route {
+    // Forward from my own phone number (the tel: handle on my account).
+    match st().my_handles.iter().find(|h| h.starts_with("tel:")).cloned() {
+        Some(number) => Route::Sms { using_number: number },
+        None => Route::Block("Your iCloud account has no phone number to text from.".to_string()),
+    }
+}
+
 async fn decide_route(client: &IMClient, handle: &str, recipient: &str) -> Route {
+    let is_phone = recipient.starts_with("tel:");
+    let sms_active = SMS_ACTIVE.load(Ordering::SeqCst);
     let targets = vec![recipient.to_string()];
-    // On a lookup FAILURE default to iMessage — don't silently misroute a real
-    // iMessage contact to SMS just because a network check hiccupped. Only an
-    // explicit empty result means "definitely not on iMessage".
     let valid = match client
         .identity
         .validate_targets(&targets, "com.apple.madrid", handle)
@@ -2261,28 +2331,39 @@ async fn decide_route(client: &IMClient, handle: &str, recipient: &str) -> Route
     {
         Ok(v) => v,
         Err(e) => {
-            log::warn!("validate_targets failed ({e:?}); defaulting to iMessage");
+            // Couldn't check iMessage availability (network/IDS hiccup). For a phone
+            // number whose SMS forwarding we KNOW is live, a green send WILL land —
+            // so try SMS rather than a doomed iMessage encrypt that fails
+            // NoValidTargets and surfaces as "Not Delivered". For an email, or with
+            // forwarding off, keep the old "assume iMessage" default so a transient
+            // blip doesn't misroute a real iMessage contact to a text.
+            if is_phone && sms_active {
+                log::warn!("decide_route[{recipient}]: validate failed ({e:?}) — forwarding on, routing SMS");
+                return sms_route();
+            }
+            log::warn!("decide_route[{recipient}]: validate failed ({e:?}); defaulting to iMessage");
             return Route::IMessage;
         }
     };
-    if valid.iter().any(|t| t == recipient) {
+    let on_imessage = valid.iter().any(|t| t == recipient);
+    log::info!(
+        "decide_route[{recipient}]: on_imessage={on_imessage} is_phone={is_phone} \
+         sms_active={sms_active} valid={valid:?}"
+    );
+    if on_imessage {
         return Route::IMessage;
     }
     // Not on iMessage. Only phone numbers can fall back to SMS.
-    if !recipient.starts_with("tel:") {
+    if !is_phone {
         return Route::Block("This address isn't on iMessage, and only phone numbers can receive a text.".to_string());
     }
-    if !SMS_ACTIVE.load(Ordering::SeqCst) {
+    if !sms_active {
         return Route::Block(
             "SMS forwarding isn't on. On your iPhone (same Apple ID): Settings ▸ Messages ▸ Text Message Forwarding ▸ turn on all devices ▸ restart iPhone."
                 .to_string(),
         );
     }
-    // Forward from my own phone number (the tel: handle on my account).
-    match st().my_handles.iter().find(|h| h.starts_with("tel:")).cloned() {
-        Some(number) => Route::Sms { using_number: number },
-        None => Route::Block("Your iCloud account has no phone number to text from.".to_string()),
-    }
+    sms_route()
 }
 
 /// Set the handle outgoing messages are sent FROM (the Settings "default send"
@@ -2480,6 +2561,30 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 ) -> jstring {
     let drained: Vec<serde_json::Value> = st().inbound.drain(..).collect();
     out(&mut env, serde_json::to_string(&drained).unwrap_or_else(|_| "[]".into()))
+}
+
+/// Tell the native side which message guids the app ALREADY has on disk, so the
+/// backlog Apple replays on every APS connect is dropped instead of re-delivered
+/// (see `AppState.seen_guids`). `guids_json` is a JSON array of strings.
+///
+/// Kotlin calls this from its cache restore, BEFORE connecting — anything not in
+/// the seed is treated as new, so a missing/corrupt cache simply means nothing is
+/// suppressed and the replay rebuilds the history.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeSeedSeen(
+    mut env: JNIEnv,
+    _class: JClass,
+    guids_json: JString,
+) {
+    let raw = jstr(&mut env, &guids_json);
+    let guids: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+    let mut s = st();
+    for g in guids {
+        if !g.is_empty() {
+            s.seen_guids.insert(g);
+        }
+    }
+    log::info!("nativeSeedSeen: {} guid(s) already stored by the app", s.seen_guids.len());
 }
 
 /// `iMessage;-;<addr>` (or a bare/scheme'd address) → a rustpush handle.

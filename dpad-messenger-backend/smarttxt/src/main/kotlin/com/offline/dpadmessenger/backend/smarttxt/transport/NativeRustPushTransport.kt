@@ -139,6 +139,8 @@ class NativeRustPushTransport(
 
     override fun isConnected(): Boolean = bridge.isApnsConnected()
 
+    override fun seedSeen(guids: Collection<String>) = bridge.seedSeenGuids(guids)
+
     override fun shutdown() {
         pollJob?.cancel()
         bridge.disconnectApns()

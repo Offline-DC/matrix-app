@@ -27,6 +27,7 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.isUnspecified
 import androidx.compose.ui.input.key.Key
@@ -50,7 +51,9 @@ import androidx.compose.ui.unit.dp
  * Draws a thick rounded border + tint when focused. Use on any element the
  * DPAD can land on: list rows, message bubbles, buttons, the text field.
  *
- * @param shape the clip/border shape. Defaults to 12dp rounded.
+ * @param shape the clip/border shape. Defaults to 12dp rounded. Any [Shape] —
+ *              not just a [RoundedCornerShape] — so a message bubble can pass
+ *              its tailed outline and have the focus border trace the tail too.
  * @param borderWidth focused-state border width.
  * @param focusedTint background tint applied when focused. Pass
  *                    [Color.Unspecified] to skip the tint.
@@ -60,7 +63,7 @@ import androidx.compose.ui.unit.dp
  *                    send button) so the halo doesn't disappear into the bg.
  */
 fun Modifier.dpadFocusHighlight(
-    shape: RoundedCornerShape = RoundedCornerShape(12.dp),
+    shape: Shape = RoundedCornerShape(12.dp),
     borderWidth: Dp = 3.dp,
     focusedTint: Color = Color.Unspecified,
     borderColor: Color = Color.Unspecified,
