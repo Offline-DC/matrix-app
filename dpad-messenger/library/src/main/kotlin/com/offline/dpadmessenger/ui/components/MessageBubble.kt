@@ -117,12 +117,19 @@ fun MessageBubble(
     getListViewport: (() -> Pair<Float, Float>?)? = null,
 ) {
     val hasMedia = message.attachment != null
+    // A voice memo we failed to SEND still has a playable local copy, but a tap on it
+    // must reach the context sheet (Retry send) — same as a failed photo, which gets
+    // there via onMediaActivate. Without this, play/pause would swallow the tap and
+    // the only way to retry a memo would be an undiscoverable long-press.
+    val failedOutgoing = message.isOutgoing && message.status == MessageStatus.FAILED
     // A downloaded voice memo: tapping/OK on the bubble should toggle play/pause
     // (driven via audioToggle → VoiceMemoPlayer) rather than the load/view path.
-    val loadedAudio = message.attachment?.let { a ->
-        a.kind == com.offline.dpadmessenger.data.AttachmentKind.AUDIO &&
-            a.localPath?.let { java.io.File(it).exists() } == true
-    } ?: false
+    val loadedAudio = !failedOutgoing && (
+        message.attachment?.let { a ->
+            a.kind == com.offline.dpadmessenger.data.AttachmentKind.AUDIO &&
+                a.localPath?.let { java.io.File(it).exists() } == true
+        } ?: false
+        )
     var audioToggle by remember { mutableStateOf(0) }
     val colors = LocalDpadMessengerColors.current
     val isOutgoing = message.isOutgoing

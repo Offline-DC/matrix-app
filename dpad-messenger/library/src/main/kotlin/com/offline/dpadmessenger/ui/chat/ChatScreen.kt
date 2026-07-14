@@ -317,6 +317,10 @@ fun ChatScreen(
             onEdit = { viewModel.startEdit(sel) },
             onDelete = { viewModel.delete(sel.id) },
             onRetry = { viewModel.resend(sel.id) },
+            // Only SmartTxt keeps the outgoing bytes around to re-upload; Signal /
+            // Google Messages bail on attachment resend, so they get no Retry row
+            // on a failed photo / video / voice memo.
+            canRetryAttachment = viewModel.canResendAttachments,
             onRelink = onRelink,
             onDismiss = viewModel::closeMessageSheet,
             senderNameFor = viewModel::senderName,

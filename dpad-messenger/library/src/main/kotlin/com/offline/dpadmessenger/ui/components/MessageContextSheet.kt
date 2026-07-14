@@ -68,6 +68,11 @@ fun MessageContextSheet(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onRetry: () -> Unit = {},
+    /** True if the backing repo can re-upload a failed ATTACHMENT (see
+     *  [com.offline.dpadmessenger.data.AttachmentResendCapable]). When false, a
+     *  failed photo / video / voice memo shows no Retry row — resending it would
+     *  drop the media and send an empty body. Text retry is always offered. */
+    canRetryAttachment: Boolean = false,
     /** Re-link the phone (re-pair, keeping history). When set, a failed message
      *  offers a "Re-link phone" action so the user can recover without logging
      *  out. Null hides it. */
@@ -130,8 +135,13 @@ fun MessageContextSheet(
                     .background(MaterialTheme.colorScheme.surfaceVariant)
                     .padding(vertical = 0.5.dp),
             )
-            // Retry is the primary action for a failed send — list it first.
-            if (message.status == MessageStatus.FAILED && message.isOutgoing && message.attachment == null) {
+            // Retry is the primary action for a failed send — list it first. An
+            // attachment only gets the row when the repo can actually re-upload it
+            // (SmartTxt); otherwise retrying would resend an empty body and drop the
+            // media, so it's better to offer nothing than a button that eats the file.
+            if (message.status == MessageStatus.FAILED && message.isOutgoing &&
+                (message.attachment == null || canRetryAttachment)
+            ) {
                 ActionRow(
                     icon = Icons.Filled.Refresh,
                     label = "Retry send",
