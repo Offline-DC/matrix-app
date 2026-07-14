@@ -428,10 +428,16 @@ internal class SmartTxtMessageRepository(
             val list = byRoom[e.chatGuid].orEmpty().toMutableList()
             val ti = list.indexOfFirst { it.id == e.targetGuid }
             var targetBody = ""
+            // NEW reaction (this reactor+emoji wasn't already on the target)? APNs
+            // redelivers messages/reactions on every reconnect, and a re-received
+            // reaction folds into the SAME reactor set (no change) — so gating notify
+            // on this flag stops the "reaction from yesterday re-notifies forever" bug.
+            var newlyAdded = false
             if (ti >= 0) {
                 val m = list[ti]
                 targetBody = m.body
                 val reactors = m.reactions[e.emoji].orEmpty()
+                newlyAdded = !e.remove && reactorId !in reactors
                 val next = if (e.remove) reactors - reactorId else (reactors + reactorId).distinct()
                 val map = m.reactions.toMutableMap()
                 if (next.isEmpty()) map.remove(e.emoji) else map[e.emoji] = next
@@ -439,7 +445,7 @@ internal class SmartTxtMessageRepository(
                 byRoom[e.chatGuid] = list
                 msgsChanged = true
             }
-            if (!e.remove && !e.isFromMe) {
+            if (newlyAdded && !e.isFromMe) {
                 // Bump the chat by the reaction's REAL send time only — NO "now"
                 // fallback. An unknown (0) or old timestamp must never shove a chat
                 // up: that's the catch-up reorder bug (a backlog of old reactions
