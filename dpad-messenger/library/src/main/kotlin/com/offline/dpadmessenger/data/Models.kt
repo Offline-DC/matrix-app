@@ -121,10 +121,16 @@ sealed class TimelineItem {
 }
 
 /**
- * Emoji set available in the reaction picker. Kept short and DPAD-friendly —
- * a hardware-DPAD grid scrolling sucks past a dozen options. Pick the ones
- * that actually get used.
+ * Emoji set available in the reaction picker: the six classic iMessage-style
+ * tapbacks, in tapback order —
+ *   loved ❤️, liked 👍, disliked 👎, cry-laughing 😂, emphasized ‼️, questioned ❓
+ *
+ * The SmartTxt/iMessage backend maps these exact emoji to native BlueBubbles
+ * tapback codes (see `Tapback` in BlueBubblesModel.kt), so keep the strings
+ * byte-for-byte identical to that enum or `codeForEmoji()` will miss and fall
+ * back to a sticker reaction. Signal and Google Messages send them through as
+ * ordinary emoji reactions.
  */
 object DefaultReactions {
-    val emojis: List<String> = listOf("👍", "❤️", "😂", "😮", "😢", "🎉", "🙏")
+    val emojis: List<String> = listOf("❤️", "👍", "👎", "😂", "‼️", "❓")
 }

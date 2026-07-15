@@ -227,7 +227,7 @@ private fun ReactionPickerRow(
     firstChipFocus: FocusRequester,
 ) {
     // LazyRow + DPAD-left/right keeps the picker usable on 240dp-wide
-    // screens (TCL Flip 2 et al.) where a fixed Row of 7 chips overflows.
+    // screens (TCL Flip 2 et al.) where a fixed Row of tapback chips overflows.
     val state = rememberLazyListState()
     LazyRow(
         state = state,
