@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -55,6 +56,7 @@ import com.offline.dpadmessenger.ui.components.BannerKind
 import com.offline.dpadmessenger.ui.components.CompactBarButton
 import com.offline.dpadmessenger.ui.components.CompactTopBar
 import com.offline.dpadmessenger.ui.components.DateDivider
+import com.offline.dpadmessenger.ui.components.TimestampSeparator
 import com.offline.dpadmessenger.ui.components.DpadComposer
 import com.offline.dpadmessenger.ui.components.InitialsAvatar
 import com.offline.dpadmessenger.ui.components.LoadingOlderRow
@@ -479,6 +481,10 @@ private fun Timeline(
     val listState = rememberLazyListState()
     val reversed = remember(timeline) { timeline.asReversed() }
 
+    // SmartTxt/iMessage skin swaps the plain day pill for centered "<Day> <time>"
+    // separators on time gaps (see the MessageItem branch below). Read once here.
+    val smarttxt = LocalDpadMessengerColors.current.smarttxt
+
     // The list's viewport bounds in window pixels (top, bottom). A focused
     // bubble taller than this needs the list scrolled to read it fully; the
     // bubble compares its own window bounds against these to decide whether a
@@ -554,7 +560,10 @@ private fun Timeline(
         itemsIndexed(items = reversed, key = { _, it -> it.key }) { index, item ->
             when (item) {
                 is TimelineItem.LoadingOlder -> LoadingOlderRow()
-                is TimelineItem.DateDivider -> DateDivider(label = item.label)
+                // The SmartTxt skin folds the day into the gap-based TimestampSeparator
+                // below (BlueBubbles' iOS behaviour has no separate day pill), so skip
+                // the plain divider there. Other skins keep the day pill.
+                is TimelineItem.DateDivider -> if (!smarttxt) DateDivider(label = item.label)
                 is TimelineItem.MessageItem -> {
                     val msg = item.message
                     // Group consecutive messages from the same sender: show the name
@@ -567,6 +576,25 @@ private fun Timeline(
                     val firstOfRun = above == null ||
                         above.isOutgoing != msg.isOutgoing ||
                         above.senderId != msg.senderId
+
+                    // iMessage-style centered timestamp (SmartTxt only). BlueBubbles'
+                    // rule verbatim: show "<Day> <time>" above this message when more
+                    // than 30 minutes elapsed since the PREVIOUS message
+                    // (TimestampSeparator: `dateCreated.difference(...).inMinutes.abs() > 30`).
+                    // The older neighbour may be separated by a (now-hidden) day divider,
+                    // so scan past non-message items to find the real previous message.
+                    val olderMsg: Message? = if (!smarttxt) null else {
+                        var j = index + 1
+                        var found: Message? = null
+                        while (j <= reversed.lastIndex) {
+                            val prev = reversed[j]
+                            if (prev is TimelineItem.MessageItem) { found = prev.message; break }
+                            j++
+                        }
+                        found
+                    }
+                    val showStamp = olderMsg != null &&
+                        kotlin.math.abs(msg.timestampMs - olderMsg.timestampMs) > 30 * 60_000L
                     val parent by produceState<ReplyParentSnippet?>(
                         initialValue = null,
                         key1 = msg.replyToId,
@@ -579,25 +607,33 @@ private fun Timeline(
                     // match means this reply is a continuation and repeats no quote.
                     val repeatsParent = msg.replyToId != null &&
                         above?.replyToId == msg.replyToId
-                    MessageBubble(
-                        message = msg,
-                        senderName = if (msg.isOutgoing) null else senderNameFor(msg.senderId),
-                        showSenderName = isGroup && !msg.isOutgoing && firstOfRun,
-                        showQuotedParent = !repeatsParent,
-                        showReceipt = msg.id == lastOutgoingId,
-                        parentSnippet = parent,
-                        onClick = { onBubbleClick(msg) },
-                        // Last bubble gets the composer's DPAD-Up requester; the
-                        // bubble whose media was just viewed additionally gets
-                        // the viewer's return-focus requester (both can be the
-                        // same bubble, hence a separate handle).
-                        focusRequester = if (msg.id == lastMessageId) lastBubbleFocusRequester else null,
-                        extraFocusRequesters = if (msg.id == returnFocusId) listOf(returnFocusRequester) else emptyList(),
-                        isDownloadingMedia = msg.id in downloadingMedia,
-                        mediaFailed = msg.id in failedMedia,
-                        onMediaActivate = { onMediaActivate(msg) },
-                        getListViewport = { listViewport },
-                    )
+                    // Stack the (optional) timestamp above the bubble in one item so it
+                    // sits directly over the message it belongs to. reverseLayout only
+                    // reverses ITEM order, not within-item column order, so the stamp
+                    // still renders visually above (older than) the bubble. The Column
+                    // fills width so the bubble keeps its own left/right alignment.
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        if (showStamp) TimestampSeparator(epochMs = msg.timestampMs)
+                        MessageBubble(
+                            message = msg,
+                            senderName = if (msg.isOutgoing) null else senderNameFor(msg.senderId),
+                            showSenderName = isGroup && !msg.isOutgoing && firstOfRun,
+                            showQuotedParent = !repeatsParent,
+                            showReceipt = msg.id == lastOutgoingId,
+                            parentSnippet = parent,
+                            onClick = { onBubbleClick(msg) },
+                            // Last bubble gets the composer's DPAD-Up requester; the
+                            // bubble whose media was just viewed additionally gets
+                            // the viewer's return-focus requester (both can be the
+                            // same bubble, hence a separate handle).
+                            focusRequester = if (msg.id == lastMessageId) lastBubbleFocusRequester else null,
+                            extraFocusRequesters = if (msg.id == returnFocusId) listOf(returnFocusRequester) else emptyList(),
+                            isDownloadingMedia = msg.id in downloadingMedia,
+                            mediaFailed = msg.id in failedMedia,
+                            onMediaActivate = { onMediaActivate(msg) },
+                            getListViewport = { listViewport },
+                        )
+                    }
                 }
             }
         }

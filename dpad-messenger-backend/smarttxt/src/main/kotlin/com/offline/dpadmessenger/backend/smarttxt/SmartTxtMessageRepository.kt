@@ -38,7 +38,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -649,7 +648,7 @@ internal class SmartTxtMessageRepository(
                 } else last
                 RoomSummary(room = room, lastMessage = preview, unreadCount = unread[room.id] ?: 0)
             }.sortedByDescending { it.lastMessage?.timestampMs ?: 0L }
-        }.onStart { activeRoomId = null }
+        }
 
     override fun observeMessages(roomId: String): Flow<List<Message>> =
         messagesByRoom.map { it[roomId].orEmpty() }
@@ -842,8 +841,42 @@ internal class SmartTxtMessageRepository(
         return older.size >= limit
     }
 
-    override suspend fun markRoomRead(roomId: String) {
+    /** UI lifecycle: the chat screen for [roomId] became the resumed, on-screen UI
+     *  (ChatViewModel.markActive, via the screen's RESUME). Mark it active so its
+     *  incoming messages don't notify (the user is looking at them) and clear
+     *  anything already posted. Runs on EVERY resume, so reopening a thread from its
+     *  notification clears it even when the ViewModel (and its one-shot markRoomRead)
+     *  is reused rather than recreated. */
+    override fun onRoomOpened(roomId: String) {
         activeRoomId = roomId
+        notifier.clearConversation(roomId, reason = "room-open")
+        if ((unreadByRoom.value[roomId] ?: 0) != 0) {
+            unreadByRoom.value = unreadByRoom.value + (roomId to 0)
+            scope.launch { writeLock.withLock { requestSave() } }
+        }
+        Log.i(TAG, "room-open active=$roomId (notification + unread cleared, suppressed)")
+    }
+
+    /** UI lifecycle: the chat screen for [roomId] was paused or left (back, a hotkey,
+     *  the app backgrounded, the screen turning off). Resume this thread's
+     *  notifications. Owning active-room state HERE — the chat screen's RESUME/PAUSE
+     *  lifecycle — instead of via markRoomRead + observeRoomSummaries.onStart is what
+     *  fixes "left the chat but its new messages never notify": exiting the app
+     *  straight from a chat now clears activeRoomId, where the old list-only onStart
+     *  never fired, leaving the chat "active" so maybeNotify swallowed its own alerts
+     *  while the screen was on. Mirrors Signal + Google Messages. */
+    override fun onRoomClosed(roomId: String) {
+        if (activeRoomId == roomId) {
+            activeRoomId = null
+            Log.i(TAG, "room-close active cleared (was $roomId — notifications resume)")
+        }
+    }
+
+    override suspend fun markRoomRead(roomId: String) {
+        // activeRoomId is owned by onRoomOpened/onRoomClosed (RESUME/PAUSE), NOT here.
+        // Setting it here was the ONLY place it was set, and only the room LIST's
+        // observeRoomSummaries.onStart cleared it — so leaving the app straight from a
+        // chat left it "active" forever and suppressed that chat's notifications.
         notifier.clearConversation(roomId)
         writeLock.withLock { unreadByRoom.value = unreadByRoom.value + (roomId to 0); requestSave() }
         // Always sync "read on device" so my OTHER Apple devices clear this chat's

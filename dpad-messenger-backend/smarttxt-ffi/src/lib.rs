@@ -513,6 +513,23 @@ fn import_openbubbles(ob: &str, out: &str) -> Result<(Vec<String>, String), Stri
     }
     save_saved(out, &state);
     log::info!("import: wrote config.plist (registered={})", state.is_registered());
+
+    // SMS forwarding survives the migration — seed it ON. We only reach here with a
+    // REGISTERED OpenBubbles identity, and that device had Text Message Forwarding
+    // enabled at Apple's side (that's how it sent/received green texts). We inherit the
+    // SAME identity + registration, so forwarding is still on for us. But
+    // `EnableSmsActivation` is a one-time APNs push the iPhone sends only when you TOGGLE
+    // the setting — it already fired during OpenBubbles' lifetime and Apple will NOT
+    // re-announce it to the migrated app. Without this seed, every migrated user starts
+    // with sms_active=false and green sends are BLOCKED (decide_route) until they happen
+    // to RECEIVE a green text (the inbound self-heal at from_raw) or manually toggle
+    // forwarding off/on on the iPhone. That's the "green messages stopped sending after
+    // migrating" regression. Seed true so sending works from the first launch; the iPhone
+    // still turns it back OFF explicitly via EnableSmsActivation(false) if forwarding is
+    // later disabled, and the inbound self-heal re-confirms it either way.
+    SMS_ACTIVE.store(true, Ordering::SeqCst);
+    save_sms_active(out, true);
+    log::info!("import: seeded sms_active=true (migrated OpenBubbles identity had SMS forwarding)");
     // NB: os_config.plist (the MacOSConfigRemote device identity) is written SEPARATELY
     // and BEFORE this by `stage_identity`/nativeStageIdentity, so that a failure of the
     // login repackage here can fall back to a manual sign-in that still validates
