@@ -36,8 +36,10 @@ import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.focus.dpadFocusRing
 import com.offline.dpadmessenger.focus.onDpadAction
 import com.offline.dpadmessenger.ui.theme.ComposerButtonHighlight
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Play/pause control for a voice memo: a round play button, a progress bar, and
@@ -117,6 +119,18 @@ fun VoiceMemoPlayer(
         }
     }
 
+    // Show the memo's LENGTH before playback instead of 0:00. MediaPlayer only knows
+    // the duration once it's prepared, which didn't happen until the first play — so
+    // the label sat at 0:00 on every sent memo and every downloaded one. Probe the
+    // file as soon as we have a path (off the main thread — this is real file I/O).
+    LaunchedEffect(path) {
+        val p = path ?: return@LaunchedEffect
+        if (durationMs > 0) return@LaunchedEffect
+        val probed = withContext(Dispatchers.IO) { probeDurationMs(p) }
+        // Don't clobber a duration that startPlaying already set authoritatively.
+        if (probed > 0 && durationMs == 0) durationMs = probed
+    }
+
     // Tick the position while playing.
     LaunchedEffect(isPlaying) {
         while (isPlaying) {
@@ -173,6 +187,43 @@ fun VoiceMemoPlayer(
             color = if (failed) MaterialTheme.colorScheme.error else Color.Unspecified,
         )
     }
+}
+
+/**
+ * Total length of an audio file in ms, or 0 if it can't be determined.
+ *
+ * MediaMetadataRetriever is the cheap path — it parses container metadata without
+ * spinning up a decoder. It reports nothing for some containers, so fall back to
+ * preparing a MediaPlayer: still much cheaper than playing, and it's the same code
+ * path the first play would take anyway, so if this can't prepare the file, playback
+ * was going to fail regardless (the bubble then shows "Can't play" on tap).
+ *
+ * MUST be called off the main thread — both paths do file I/O.
+ */
+private fun probeDurationMs(path: String): Int {
+    val viaMetadata = runCatching {
+        val r = android.media.MediaMetadataRetriever()
+        try {
+            r.setDataSource(path)
+            r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toIntOrNull() ?: 0
+        } finally {
+            // MediaMetadataRetriever only became AutoCloseable in API 29; minSdk is 24.
+            runCatching { r.release() }
+        }
+    }.getOrDefault(0)
+    if (viaMetadata > 0) return viaMetadata
+
+    return runCatching {
+        val mp = android.media.MediaPlayer()
+        try {
+            mp.setDataSource(path)
+            mp.prepare()
+            mp.duration.coerceAtLeast(0)
+        } finally {
+            runCatching { mp.release() }
+        }
+    }.getOrDefault(0)
 }
 
 /** mm:ss for a millisecond duration. */

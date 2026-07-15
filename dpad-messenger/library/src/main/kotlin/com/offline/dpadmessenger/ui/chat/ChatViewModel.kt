@@ -252,6 +252,12 @@ class ChatViewModel(
     val canDeleteForEveryone: Boolean =
         repository is com.offline.dpadmessenger.data.RemoteDeleteCapable
 
+    /** True if this repo can RE-UPLOAD a failed attachment, not just resend text
+     *  (drives whether the context sheet offers "Retry send" on a failed photo /
+     *  video / voice memo). */
+    val canResendAttachments: Boolean =
+        repository is com.offline.dpadmessenger.data.AttachmentResendCapable
+
     /** Send a picked photo/video (content:// uri) to this room. */
     fun sendAttachment(contentUri: String) {
         val sender = repository as? com.offline.dpadmessenger.data.AttachmentSender ?: return

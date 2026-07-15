@@ -513,6 +513,23 @@ fn import_openbubbles(ob: &str, out: &str) -> Result<(Vec<String>, String), Stri
     }
     save_saved(out, &state);
     log::info!("import: wrote config.plist (registered={})", state.is_registered());
+
+    // SMS forwarding survives the migration — seed it ON. We only reach here with a
+    // REGISTERED OpenBubbles identity, and that device had Text Message Forwarding
+    // enabled at Apple's side (that's how it sent/received green texts). We inherit the
+    // SAME identity + registration, so forwarding is still on for us. But
+    // `EnableSmsActivation` is a one-time APNs push the iPhone sends only when you TOGGLE
+    // the setting — it already fired during OpenBubbles' lifetime and Apple will NOT
+    // re-announce it to the migrated app. Without this seed, every migrated user starts
+    // with sms_active=false and green sends are BLOCKED (decide_route) until they happen
+    // to RECEIVE a green text (the inbound self-heal at from_raw) or manually toggle
+    // forwarding off/on on the iPhone. That's the "green messages stopped sending after
+    // migrating" regression. Seed true so sending works from the first launch; the iPhone
+    // still turns it back OFF explicitly via EnableSmsActivation(false) if forwarding is
+    // later disabled, and the inbound self-heal re-confirms it either way.
+    SMS_ACTIVE.store(true, Ordering::SeqCst);
+    save_sms_active(out, true);
+    log::info!("import: seeded sms_active=true (migrated OpenBubbles identity had SMS forwarding)");
     // NB: os_config.plist (the MacOSConfigRemote device identity) is written SEPARATELY
     // and BEFORE this by `stage_identity`/nativeStageIdentity, so that a failure of the
     // login repackage here can fall back to a manual sign-in that still validates
@@ -747,10 +764,32 @@ fn load_remote_config(dir: &str) -> Option<MacOSConfigRemote> {
     // rebuilt from it, so os_config.plist is optional — kept only for a verification compare.
     let raw = match std::fs::read(&dumb) {
         Ok(r) if !r.is_empty() => r,
-        _ => {
+        Ok(_) => {
             log::error!(
-                "nativeInit: the dumb file is REQUIRED and missing/empty at {} — run the OpenBubbles transfer",
+                "nativeInit: the dumb at {} is EMPTY (0 B) — re-run the OpenBubbles transfer",
                 dumb.display()
+            );
+            return None;
+        }
+        Err(e) => {
+            // Say WHICH failure. The old message claimed "missing/empty" for every error,
+            // including EACCES — so a dumb that was dropped in with `su cp` (root-owned,
+            // wrong SELinux label) shows up fine in `ls`/`cat` as root but is unreadable by
+            // the app's uid, and the log sent people hunting for a file sitting right there.
+            // Report the file's owner: uid 0 is the tell.
+            use std::os::unix::fs::MetadataExt;
+            let (exists, size, uid, gid, mode) = match std::fs::metadata(&dumb) {
+                Ok(m) => (true, m.len(), m.uid(), m.gid(), m.mode() & 0o777),
+                Err(_) => (false, 0, 0, 0, 0),
+            };
+            log::error!(
+                "nativeInit: CANNOT READ the dumb at {} — {e} (kind={:?}). \
+                 exists={exists} size={size}B owner={uid}:{gid} mode={mode:o}. \
+                 If it exists but won't read, it was placed there by ROOT (uid 0) rather than \
+                 by the app: chown it to the app's uid and restorecon it, or just re-run the \
+                 OpenBubbles transfer, which copies it AS the app.",
+                dumb.display(),
+                e.kind(),
             );
             return None;
         }

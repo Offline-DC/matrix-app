@@ -10,6 +10,7 @@ import com.offline.dpadmessenger.backend.smarttxt.transport.Tapback
 import com.offline.dpadmessenger.backend.smarttxt.transport.TransportEvent
 import com.offline.dpadmessenger.data.Attachment
 import com.offline.dpadmessenger.data.AttachmentKind
+import com.offline.dpadmessenger.data.AttachmentResendCapable
 import com.offline.dpadmessenger.data.AttachmentSender
 import com.offline.dpadmessenger.data.ContactEntry
 import com.offline.dpadmessenger.data.ContactsSource
@@ -37,7 +38,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -61,7 +61,8 @@ internal class SmartTxtMessageRepository(
     private val session: SmartTxtSession,
     context: Context,
 ) : MessageRepository, InitialSyncAware, ConversationStarter, GroupConversationStarter,
-    ContactsSource, MediaDownloader, AttachmentSender, RetentionSettings, ThreadActions, SmsThreadInfo {
+    ContactsSource, MediaDownloader, AttachmentSender, RetentionSettings, ThreadActions, SmsThreadInfo,
+    AttachmentResendCapable {
 
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -107,10 +108,37 @@ internal class SmartTxtMessageRepository(
     private val saveRequests = Channel<Unit>(Channel.CONFLATED)
     private fun requestSave() { saveRequests.trySend(Unit) }
 
+    // Voice memos auto-download as soon as they arrive, the way iMessage does. Two
+    // reasons: they're tiny (tens of KB — a photo this eager would be rude), and the
+    // bubble physically cannot show the memo's LENGTH until the file is on disk, so
+    // without this every received memo sits at "tap to play" with no duration.
+    // Serialized through a channel (one download at a time) so a sync backlog can't
+    // fire fifty concurrent MMCS fetches; `attempted` makes it once-per-session, so
+    // an APNs redelivery of the same memo doesn't re-download it.
+    private val audioPrefetchQueue = Channel<Pair<String, String>>(Channel.UNLIMITED)
+    private val audioPrefetchAttempted = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** Queue a voice memo for background download if we don't already have its bytes. */
+    private fun maybePrefetchAudio(m: Message) {
+        val att = m.attachment ?: return
+        if (att.kind != AttachmentKind.AUDIO) return
+        if (att.downloadToken.isBlank()) return
+        if (att.localPath?.let { java.io.File(it).exists() } == true) return
+        if (!audioPrefetchAttempted.add(m.id)) return
+        audioPrefetchQueue.trySend(m.roomId to m.id)
+    }
+
     init {
         notifier.ensureChannel()
         scope.launch { session.events.collect { handleEvent(it) } }
         scope.launch { for (r in saveRequests) { delay(1500); persistToCache() } }
+        // Drain the voice-memo prefetch queue one at a time (see [maybePrefetchAudio]).
+        scope.launch {
+            for ((room, id) in audioPrefetchQueue) {
+                runCatching { downloadMedia(room, id) }
+                    .onFailure { Log.w(TAG, "audio prefetch failed for $id", it) }
+            }
+        }
         scope.launch { delay(8000); _initialSyncComplete.value = true } // never spin forever
         scope.launch { while (true) { pruneOldMessages(); delay(60 * 60_000L) } }
         // Restore the stored history, hand its guids to the transport, THEN open the
@@ -214,12 +242,17 @@ internal class SmartTxtMessageRepository(
             unreadByRoom.value = snap.unreadByRoom + unreadByRoom.value
             mutedRooms.value = snap.mutedRooms + mutedRooms.value
             rooms.value.forEach { roomNameById[it.id] = it.name }
+            // rooms.value, not snap.rooms: the restore above MERGES cache with whatever
+            // already arrived live, so the merged set is what decides "synced".
             if (rooms.value.isNotEmpty()) _initialSyncComplete.value = true
             Log.i(
                 TAG,
                 "cache restore: ${rooms.value.size} room(s), " +
                     "${messagesByRoom.value.values.sumOf { it.size }} message(s)",
             )
+            // Memos already in history (received before auto-download existed, or whose
+            // file got pruned) still show "tap to play" with no length — queue those too.
+            messagesByRoom.value.values.forEach { list -> list.forEach { maybePrefetchAudio(it) } }
         }
     }
 
@@ -348,6 +381,9 @@ internal class SmartTxtMessageRepository(
             } else mapped
             if (idx >= 0) list[idx] = preserved else list.add(preserved)
             byRoom[rm.chatGuid] = list
+            // Pull voice-memo bytes down now so the bubble can show its length
+            // without waiting for a tap. Queued, not awaited — the lock is held here.
+            maybePrefetchAudio(preserved)
             touched.add(rm.chatGuid)   // sorted + capped once after the loop
             if (!rm.isFromMe && rm.chatGuid != activeRoomId) {
                 unread[rm.chatGuid] = (unread[rm.chatGuid] ?: 0) + (if (isNew) 1 else 0)
@@ -456,9 +492,11 @@ internal class SmartTxtMessageRepository(
         if (items.isEmpty()) return@withLock
         val byRoom = messagesByRoom.value.toMutableMap()
         val activity = roomActivity.value.toMutableMap()
+        val unread = unreadByRoom.value.toMutableMap()
         val toNotify = ArrayList<Pair<TransportEvent.TapbackUpdated, String>>()
         var msgsChanged = false
         var activityChanged = false
+        var unreadChanged = false
         for (e in items) {
             val reactorId = if (e.isFromMe) ME else handleToUserId(e.senderAddress)
             val list = byRoom[e.chatGuid].orEmpty().toMutableList()
@@ -495,12 +533,22 @@ internal class SmartTxtMessageRepository(
                     )
                     activityChanged = true
                 }
+                // Light the unread dot on the chat list, exactly like an incoming
+                // message does (see onMessages) — a reaction is unread activity too.
+                // Skip only the actively-open room; redelivery dedup is already
+                // handled by `newlyAdded`, so a reaction seen once won't re-light the
+                // dot on every APNs reconnect.
+                if (e.chatGuid != activeRoomId) {
+                    unread[e.chatGuid] = (unread[e.chatGuid] ?: 0) + 1
+                    unreadChanged = true
+                }
                 toNotify.add(e to targetBody)
             }
         }
         if (msgsChanged) messagesByRoom.value = byRoom
         if (activityChanged) roomActivity.value = activity
-        if (msgsChanged || activityChanged) requestSave()
+        if (unreadChanged) unreadByRoom.value = unread
+        if (msgsChanged || activityChanged || unreadChanged) requestSave()
         for ((e, body) in toNotify) notifyTapback(e, body)
     }
 
@@ -600,7 +648,7 @@ internal class SmartTxtMessageRepository(
                 } else last
                 RoomSummary(room = room, lastMessage = preview, unreadCount = unread[room.id] ?: 0)
             }.sortedByDescending { it.lastMessage?.timestampMs ?: 0L }
-        }.onStart { activeRoomId = null }
+        }
 
     override fun observeMessages(roomId: String): Flow<List<Message>> =
         messagesByRoom.map { it[roomId].orEmpty() }
@@ -666,12 +714,75 @@ internal class SmartTxtMessageRepository(
     override suspend fun resendMessage(roomId: String, messageId: String) {
         val failed = messagesByRoom.value[roomId]?.firstOrNull { it.id == messageId } ?: return
         if (failed.status != MessageStatus.FAILED || !failed.isOutgoing) return
+
+        // An attachment (photo / video / voice memo) can't go back through
+        // sendMessage: its body is EMPTY (the bytes are the payload), so the text
+        // path would resend a blank message and silently drop the media. Re-upload
+        // the bytes we kept at send time instead — see [resendAttachment].
+        if (failed.attachment != null) {
+            resendAttachment(roomId, failed)
+            return
+        }
+
         writeLock.withLock {
             messagesByRoom.value = messagesByRoom.value +
                 (roomId to messagesByRoom.value[roomId].orEmpty().filterNot { it.id == messageId })
             requestSave()
         }
         sendMessage(roomId, failed.body, failed.replyToId)
+    }
+
+    /**
+     * Re-upload a failed attachment IN PLACE (same bubble, same id) rather than
+     * removing + re-adding it like the text path does. Two reasons: the bytes are
+     * already sitting in our media cache (written by [sendAttachment] so the sender
+     * can see their own photo / play their own memo), so there's nothing to re-copy;
+     * and keeping the id means the in-flight correlation id the FFI echoes back is
+     * still the one on screen.
+     *
+     * The failed send never got a server guid (ack.guid is null on failure), so
+     * [Message.id] is still the original `tmp_…` — safe to reuse as the send id.
+     */
+    private suspend fun resendAttachment(roomId: String, failed: Message) = withContext(Dispatchers.IO) {
+        val att = failed.attachment ?: return@withContext
+        // No local copy = the bytes are gone (the write at send time failed, or the
+        // cache was pruned). Nothing to re-upload; leave it FAILED with a reason the
+        // bubble can show rather than pretending to retry.
+        val bytes = att.localPath
+            ?.let { p -> runCatching { java.io.File(p).readBytes() }.getOrNull()?.takeIf { it.isNotEmpty() } }
+        if (bytes == null) {
+            Log.w(TAG, "resend: attachment bytes missing (localPath=${att.localPath}) for ${failed.id}")
+            writeLock.withLock {
+                updateMessage(roomId, failed.id) {
+                    it.copy(errorReason = "Attachment is no longer available — send it again.")
+                }
+                requestSave()
+            }
+            return@withContext
+        }
+
+        writeLock.withLock {
+            updateMessage(roomId, failed.id) {
+                it.copy(status = MessageStatus.SENDING, errorReason = null)
+            }
+            requestSave()
+        }
+        Log.i(TAG, "resend: re-uploading ${bytes.size}B ${att.mimeType} for ${failed.id}")
+        val ack = runCatching { session.sendAttachment(roomId, failed.id, bytes, att.mimeType, att.name) }
+            .getOrElse {
+                Log.e(TAG, "resend: attachment upload failed", it)
+                com.offline.dpadmessenger.backend.smarttxt.transport.SendAck(false)
+            }
+        writeLock.withLock {
+            updateMessage(roomId, failed.id) {
+                it.copy(
+                    id = ack.guid ?: it.id,
+                    status = if (ack.ok) MessageStatus.SENT else MessageStatus.FAILED,
+                    errorReason = if (ack.ok) null else ack.error,
+                )
+            }
+            requestSave()
+        }
     }
 
     /** SmartTxt edit (15-min window). Optimistic; relay echo is source of truth. */
@@ -730,8 +841,42 @@ internal class SmartTxtMessageRepository(
         return older.size >= limit
     }
 
-    override suspend fun markRoomRead(roomId: String) {
+    /** UI lifecycle: the chat screen for [roomId] became the resumed, on-screen UI
+     *  (ChatViewModel.markActive, via the screen's RESUME). Mark it active so its
+     *  incoming messages don't notify (the user is looking at them) and clear
+     *  anything already posted. Runs on EVERY resume, so reopening a thread from its
+     *  notification clears it even when the ViewModel (and its one-shot markRoomRead)
+     *  is reused rather than recreated. */
+    override fun onRoomOpened(roomId: String) {
         activeRoomId = roomId
+        notifier.clearConversation(roomId, reason = "room-open")
+        if ((unreadByRoom.value[roomId] ?: 0) != 0) {
+            unreadByRoom.value = unreadByRoom.value + (roomId to 0)
+            scope.launch { writeLock.withLock { requestSave() } }
+        }
+        Log.i(TAG, "room-open active=$roomId (notification + unread cleared, suppressed)")
+    }
+
+    /** UI lifecycle: the chat screen for [roomId] was paused or left (back, a hotkey,
+     *  the app backgrounded, the screen turning off). Resume this thread's
+     *  notifications. Owning active-room state HERE — the chat screen's RESUME/PAUSE
+     *  lifecycle — instead of via markRoomRead + observeRoomSummaries.onStart is what
+     *  fixes "left the chat but its new messages never notify": exiting the app
+     *  straight from a chat now clears activeRoomId, where the old list-only onStart
+     *  never fired, leaving the chat "active" so maybeNotify swallowed its own alerts
+     *  while the screen was on. Mirrors Signal + Google Messages. */
+    override fun onRoomClosed(roomId: String) {
+        if (activeRoomId == roomId) {
+            activeRoomId = null
+            Log.i(TAG, "room-close active cleared (was $roomId — notifications resume)")
+        }
+    }
+
+    override suspend fun markRoomRead(roomId: String) {
+        // activeRoomId is owned by onRoomOpened/onRoomClosed (RESUME/PAUSE), NOT here.
+        // Setting it here was the ONLY place it was set, and only the room LIST's
+        // observeRoomSummaries.onStart cleared it — so leaving the app straight from a
+        // chat left it "active" forever and suppressed that chat's notifications.
         notifier.clearConversation(roomId)
         writeLock.withLock { unreadByRoom.value = unreadByRoom.value + (roomId to 0); requestSave() }
         // Always sync "read on device" so my OTHER Apple devices clear this chat's
