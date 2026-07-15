@@ -253,7 +253,7 @@ object OpenBubblesMigrator {
             // History is intentionally NOT transferred — new messages arrive as they
             // come, and the chat list shows a welcome empty-state until then.
             SmartTxtRepository.markRegisteredExternally(app)
-            Log.i(TAG, "  status → REGISTERED, push service started")
+            Log.i(TAG, "  status → REGISTERED, background connection started")
             retireOpenBubbles()
 
             Log.i(TAG, "════ ✅ MIGRATION OK (${SystemClock.elapsedRealtime() - t0}ms) handles=${handles.size} ════")

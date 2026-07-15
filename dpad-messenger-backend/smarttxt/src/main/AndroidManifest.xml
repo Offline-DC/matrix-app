@@ -1,24 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- SmartTxt runs over Apple's APNs + IDS, all of which need the network.
-         The native rustpush path keeps a persistent APNs socket alive in
-         APNsForegroundService. -->
+    <!-- Smart Txt runs over Apple's APNs + IDS, which need the network. The
+         persistent APNs socket now lives in the launcher process itself
+         (SmartTxtRepository.connectInBackground): the launcher is the
+         android:persistent HOME app, so it stays connected WITHOUT a foreground
+         service — and therefore without that service's mandatory, un-hideable
+         status-bar notification (the old "smart txt connection" phantom icon).
+         Mirrors the gmessages/signal backends, which also run in-process. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-    <!-- Foreground service that hosts the (eventual) rustpush tokio runtime +
-         APNs connection, so SmartTxts keep arriving with the UI closed. The
-         data-sync type matches a persistent message-sync socket. -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Posts incoming-message notifications; WAKE_LOCK briefly wakes the
+         (cover) display when a text arrives. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- Briefly wakes the (cover) display when an incoming text arrives. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <application>
-        <service
-            android:name=".APNsForegroundService"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
-    </application>
+    <!-- This module no longer runs a foreground service of its own. These are
+         retained because the merged app still has data-sync foreground services
+         (e.g. the launcher's diagnostics / reboot-logging services), which
+         require these permissions at targetSdk 34+. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 </manifest>

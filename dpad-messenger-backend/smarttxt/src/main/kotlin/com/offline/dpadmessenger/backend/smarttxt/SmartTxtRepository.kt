@@ -176,8 +176,8 @@ object SmartTxtRepository {
      * Register this identity with Apple via the active transport (the relay
      * obtains validation data + runs IDS registration; the native path runs the
      * §2.2 four-call sequence on-device). Persists the dumb file + account,
-     * stamps it registered, schedules renewal, starts the push service, and
-     * flips [status] to REGISTERED.
+     * stamps it registered, schedules renewal, brings up the background
+     * connection, and flips [status] to REGISTERED.
      */
     suspend fun register(context: Context, config: MacOSConfig, appleId: String): RegistrationResult {
         val appContext = context.applicationContext
@@ -222,8 +222,8 @@ object SmartTxtRepository {
     }
 
     /** Shared post-register persistence for both [register] overloads: on
-     *  success save the account, stamp it registered, schedule renewal, start
-     *  the push service, and flip [status]; on failure roll [status] back. */
+     *  success save the account, stamp it registered, schedule renewal, bring up
+     *  the background connection, and flip [status]; on failure roll [status] back. */
     private fun finishRegister(
         appContext: Context,
         store: SmartTxtAccountStore,
@@ -241,7 +241,7 @@ object SmartTxtRepository {
             store.saveAccount(account)
             store.markRegistered(account.lastRegisteredMs)
             SmartTxtRenewalWorker.schedule(appContext)
-            APNsForegroundService.start(appContext)
+            connectInBackground(appContext)
             _status.value = SmartTxtStatus.REGISTERED
             RegistrationResult.Success(account)
         }
@@ -294,35 +294,57 @@ object SmartTxtRepository {
 
     /** Mark the identity REGISTERED after an out-of-band sign-in (the OpenBubbles
      *  migration): the account store + native files are already written, so just
-     *  flip [status], schedule renewal, and start the push service — the same tail
+     *  flip [status], schedule renewal, and bring up the connection — the same tail
      *  as [finishRegister] minus the live register call. */
     fun markRegisteredExternally(context: Context) {
         val appContext = context.applicationContext
         SmartTxtRenewalWorker.schedule(appContext)
-        APNsForegroundService.start(appContext)
+        connectInBackground(appContext)
         _status.value = SmartTxtStatus.REGISTERED
         Log.i(TAG, "markRegisteredExternally → REGISTERED")
     }
 
-    /** Connect the live session (called by the foreground service / on create). */
+    /** Connect the live session (called on launcher start / after registration). */
     fun connect(context: Context) {
         create(context) // building the repository connects the session
+    }
+
+    /**
+     * Bring the process-scoped session up OFF the main thread — [connect] →
+     * [create] runs the one-time native init (keystore + file I/O + tokio
+     * runtime), which must never run on the caller's main thread.
+     *
+     * This IS the "keep Smart Txt connected in the background" mechanism. Like
+     * the sibling [com.offline.dpadmessenger.backend.gmessages.GoogleMessagesRepository]
+     * and Signal backends, it runs entirely in-process with NO foreground
+     * service: the launcher is the persistent (`android:persistent`) HOME app,
+     * so its process stays alive and holds the APNs socket open on its own. A
+     * foreground service would only add Android's mandatory — and, on API 30,
+     * un-hideable — status-bar notification for no reliability gain (the OS
+     * floors any FGS notification channel to IMPORTANCE_LOW, so the icon can't
+     * be suppressed; that was the phantom "smart txt connection" icon).
+     */
+    private fun connectInBackground(appContext: Context) {
+        Thread {
+            runCatching { connect(appContext) }
+                .onFailure { Log.w(TAG, "session connect failed: ${it.message}") }
+        }.start()
     }
 
     /** Bring the background push connection up on launcher start if the user is
      *  already signed in, so messages sync whenever the launcher process and the
      *  phone are on — not only while the Smart Txt screen is open. Safe to call on
-     *  every launch: the foreground service (START_STICKY) and connect are
-     *  idempotent. Missed messages from while the phone was OFF aren't backfilled,
+     *  every launch: [connect] is idempotent (the session is a process-scoped
+     *  singleton). Missed messages from while the phone was OFF aren't backfilled,
      *  but anything APNs queued while briefly disconnected replays on reconnect. */
     fun startBackgroundSyncIfRegistered(context: Context) {
         val appContext = context.applicationContext
-        // Off the main thread so reading EncryptedSharedPreferences + starting the
-        // service never blocks the launcher's Application.onCreate (ANR risk).
+        // Off the main thread so reading EncryptedSharedPreferences + the native
+        // connect never block the launcher's Application.onCreate (ANR risk).
         Thread {
             if (!SmartTxtAccountStore(appContext).isRegistered()) return@Thread
             restoreStatus(appContext)
-            runCatching { APNsForegroundService.start(appContext) }
+            runCatching { connect(appContext) }
                 .onFailure { Log.w(TAG, "background sync start on boot failed: ${it.message}") }
         }.start()
     }
