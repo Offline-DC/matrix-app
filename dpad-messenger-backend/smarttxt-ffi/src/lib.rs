@@ -474,7 +474,12 @@ fn import_openbubbles(ob: &str, out: &str) -> Result<(Vec<String>, String), Stri
     // login exactly like OpenBubbles does, with NO re-registration. Absent a staged keystore we
     // fall back to the old behaviour (empty keystore → fresh identity → re-register on connect).
     let staged_ks = obp.join("keystore.plist");
-    let adopted_keystore = staged_ks.exists();
+    // Adopt ONLY a NON-EMPTY staged keystore. A 0-byte file means the on-device decrypt ran
+    // but produced nothing (missing keystore_s.plist / no readable AndroidKeyStore alias for
+    // OB's uid). Treating that as "adopted" made us copy an empty keystore, log a bogus
+    // "restored OB identity", and skip the clean fresh-identity fallback. Size-gate it so
+    // empty == not staged and we fall through to the fresh-identity/re-register path.
+    let adopted_keystore = std::fs::metadata(&staged_ks).map(|m| m.len() > 0).unwrap_or(false);
     if adopted_keystore {
         std::fs::copy(&staged_ks, &ks_dst)
             .map_err(|e| format!("copy staged decrypted keystore.plist: {e}"))?;
@@ -498,9 +503,20 @@ fn import_openbubbles(ob: &str, out: &str) -> Result<(Vec<String>, String), Stri
         hwd.get("push").map(ob_shape).unwrap_or_else(|| "MISSING".to_string()),
         hwd.get("identity").map(ob_shape).unwrap_or_else(|| "MISSING".to_string()),
         hwd.get("os_config").map(ob_shape).unwrap_or_else(|| "MISSING".to_string()));
-    let push: APSState = ob_de_field(hwd, "push")?;
+    // A hard `?` here is what dropped migrations to manual sign-in: when the OpenBubbles build
+    // on the device bundled a rustpush that serialized the push state in a skewed format — e.g.
+    // the keypair's private key as <data> where our rustpush wants a <string> — this returned
+    // Serde("invalid value: byte array, expected a string") and aborted the ENTIRE login import.
+    // The APNs token + keypair are re-established on connect regardless, so degrade to a FRESH
+    // push state instead of failing. The migrated users + identity then re-register on connect
+    // (the same fallback path taken when the keystore is missing), rather than forcing the user
+    // back to a manual sign-in.
+    let push: APSState = ob_de_field::<APSState>(hwd, "push").unwrap_or_else(|e| {
+        log::warn!("import: push state from hw_info.plist is incompatible ({e}); starting FRESH push — migrated users/identity re-register on connect");
+        APSState::default()
+    });
     let identity: IDSNGMIdentity = ob_restore_identity(hwd, &ks_dst)?;
-    log::info!("import: hw_info.plist ok (push parsed + identity decrypted)");
+    log::info!("import: hw_info.plist processed (push ready, identity ready)");
     // 2. id.plist → Vec<IDSUser> (exact rustpush shape confirmed on device)
     let users: Vec<IDSUser> = plist::from_file(obp.join("id.plist"))
         .map_err(|e| format!("id.plist: {e}"))?;
