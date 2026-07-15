@@ -264,6 +264,8 @@ internal class GoogleMessagesSessionClient(
         bytes: ByteArray,
         mime: String,
         fileName: String,
+        /** Optional caption text carried on the SAME message as the media. */
+        caption: String = "",
     ): Boolean = withContext(Dispatchers.IO) {
         runCatching {
             Log.i(TAG, "sendMedia: mime=$mime size=${bytes.size} name=$fileName conv=${conversationId.take(12)}…")
@@ -281,6 +283,7 @@ internal class GoogleMessagesSessionClient(
                 size = bytes.size.toLong(),
                 decryptionKey = key,
                 mime = mime,
+                caption = caption,
             )
             val resp = sendDataRequest(GMSessionProto.ACTION_SEND_MESSAGE, payload, awaitResponse = true)
             val plain = resp?.encryptedData?.let(::decrypt)

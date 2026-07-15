@@ -726,14 +726,24 @@ internal object GMSessionProto {
         size: Long,
         decryptionKey: ByteArray,
         mime: String,
+        /** Optional caption; sent as a second MessageInfo (text) on the SAME
+         *  message so it renders as one bubble alongside the media. */
+        caption: String = "",
     ): ByteArray {
         val media = mediaContent(mediaId, mediaFormatForMime(mime), mediaName, size, decryptionKey, mime)
-        val messageInfo = ProtoWriter().message(3, media) // MessageInfo.mediaContent
+        val mediaInfo = ProtoWriter().message(3, media) // MessageInfo.mediaContent
         val payload = ProtoWriter()
             .string(1, tmpId)
             .string(7, conversationId)
             .string(9, participantId)
-            .message(10, messageInfo)
+            .message(10, mediaInfo)
+        // A caption is a second repeated MessageInfo carrying messageContent (text);
+        // the parser already reads both text + media parts off field 10.
+        if (caption.isNotEmpty()) {
+            val textInfo = ProtoWriter().message(2, ProtoWriter().string(1, caption))
+            payload.message(10, textInfo)
+        }
+        payload
             .string(12, tmpId)
         return ProtoWriter()
             .string(2, conversationId)

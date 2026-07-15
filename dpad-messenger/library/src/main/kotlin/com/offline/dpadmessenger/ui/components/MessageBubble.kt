@@ -490,13 +490,45 @@ fun MessageBubble(
                     }
                     val attachment = message.attachment
                     if (attachment != null && !message.isDeleted) {
-                        MediaBlock(
-                            attachment = attachment,
-                            isDownloading = isDownloadingMedia,
-                            failed = mediaFailed,
-                            messageTimestampMs = message.timestampMs,
-                            audioToggleKey = audioToggle,
-                        )
+                        Box {
+                            MediaBlock(
+                                attachment = attachment,
+                                isDownloading = isDownloadingMedia,
+                                failed = mediaFailed,
+                                messageTimestampMs = message.timestampMs,
+                                audioToggleKey = audioToggle,
+                            )
+                            // While an outgoing photo/video is uploading, dim it and
+                            // show a spinner + "Sending…" ON the media, so it's clear
+                            // the bubble is in flight (not already sent). Audio has its
+                            // own inline control, so skip the scrim there.
+                            if (message.status == MessageStatus.SENDING &&
+                                message.isOutgoing &&
+                                attachment.kind != com.offline.dpadmessenger.data.AttachmentKind.AUDIO
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .matchParentSize()
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(Color.Black.copy(alpha = 0.28f)),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        androidx.compose.material3.CircularProgressIndicator(
+                                            modifier = Modifier.size(18.dp),
+                                            strokeWidth = 2.dp,
+                                            color = Color.White,
+                                        )
+                                        Spacer(Modifier.padding(start = 8.dp))
+                                        Text(
+                                            text = "Sending…",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = Color.White,
+                                        )
+                                    }
+                                }
+                            }
+                        }
                         if (message.body.isNotBlank()) Spacer(Modifier.padding(top = 6.dp))
                     }
                     if (message.isDeleted) {

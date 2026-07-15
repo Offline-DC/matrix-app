@@ -501,6 +501,11 @@ private fun LoadingState(padding: PaddingValues) {
 
 @Composable
 private fun EmptyState(padding: PaddingValues) {
+    // This screen is shared by all three apps (Signal, Google Messages, SmartTxt),
+    // so a hardcoded "Smart Txt" title leaked into the other two. Brand it only for
+    // the SmartTxt skin; the others get a neutral welcome. (smarttxt is the only
+    // per-app signal the shared library carries — see DpadMessengerColors.)
+    val smarttxt = LocalDpadMessengerColors.current.smarttxt
     Box(
         modifier = Modifier.fillMaxSize().padding(padding),
         contentAlignment = Alignment.Center,
@@ -510,7 +515,7 @@ private fun EmptyState(padding: PaddingValues) {
             modifier = Modifier.padding(horizontal = 32.dp),
         ) {
             Text(
-                "Welcome to Smart Txt 2.0!",
+                if (smarttxt) "Welcome to Smart Txt 2.0!" else "No conversations yet",
                 style = MaterialTheme.typography.titleMedium,
                 textAlign = TextAlign.Center,
             )

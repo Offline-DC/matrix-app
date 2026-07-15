@@ -20,8 +20,9 @@ interface MediaDownloader {
 interface AttachmentSender {
     /**
      * Send the media at [contentUri] (a content:// from the photo picker) to
-     * [roomId]. The repository reads + uploads the bytes. @return true if the
-     * send was accepted.
+     * [roomId]. The repository reads + uploads the bytes. [caption] is optional
+     * text that rides the SAME message as the media (one bubble, like iMessage);
+     * null/blank sends the media alone. @return true if the send was accepted.
      */
-    suspend fun sendAttachment(roomId: String, contentUri: String): Boolean
+    suspend fun sendAttachment(roomId: String, contentUri: String, caption: String? = null): Boolean
 }

@@ -769,7 +769,7 @@ internal class GoogleMessagesMessageRepository(
 
     // ---- AttachmentSender ---------------------------------------------------
 
-    override suspend fun sendAttachment(roomId: String, contentUri: String): Boolean {
+    override suspend fun sendAttachment(roomId: String, contentUri: String, caption: String?): Boolean {
         val uri = runCatching { android.net.Uri.parse(contentUri) }.getOrNull() ?: return false
         val resolver = appContext.contentResolver
         // getType() is null for file:// (e.g. a recorded voice memo) — fall back
@@ -784,18 +784,24 @@ internal class GoogleMessagesMessageRepository(
         val isVideo = mime.startsWith("video/")
         val tmpId = "tmp_" + System.nanoTime()
 
-        // Optimistic local bubble (already downloaded — points at the source uri
-        // path isn't reliable, so just show a generic placeholder until the echo
-        // replaces it). Keep it simple: show a SENDING text-less media bubble.
+        // Optimistic local bubble. The real media (with a downloadable id) arrives
+        // via the phone's echo; until then show a generic placeholder — unless the
+        // user typed a caption, which rides the same message and shows right away.
+        val cap = caption?.trim().orEmpty()
+        val placeholder = when {
+            isAudio -> "[voice message]"
+            isVideo -> "[video]"
+            else -> "[photo]"
+        }
         val optimistic = Message(
             id = tmpId,
             roomId = roomId,
             senderId = currentUser.id,
-            body = if (isVideo) "[video]" else "[photo]",
+            body = cap.ifEmpty { placeholder },
             timestampMs = System.currentTimeMillis(),
             status = MessageStatus.SENDING,
             isOutgoing = true,
-        ).let { if (isAudio) it.copy(body = "[voice message]") else it }
+        )
         writeLock.withLock {
             messagesByRoom.value = messagesByRoom.value +
                 (roomId to (messagesByRoom.value[roomId].orEmpty() + optimistic))
@@ -804,7 +810,7 @@ internal class GoogleMessagesMessageRepository(
 
         val participantId = outgoingIdByRoom[roomId].orEmpty()
         val ok = runCatching {
-            session.sendMedia(roomId, participantId, tmpId, bytes, mime, name)
+            session.sendMedia(roomId, participantId, tmpId, bytes, mime, name, cap)
         }.getOrElse { Log.e(TAG, "sendAttachment failed", it); false }
         writeLock.withLock {
             updateMessage(roomId, tmpId) {

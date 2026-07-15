@@ -145,8 +145,12 @@ fun ChatScreen(
 
     // In-app, DPAD-navigable photo/video picker for the composer "+" button.
     // Replaces the system Photos picker (not DPAD-friendly on flip phones).
-    // When true, the picker overlay is shown; picking sends via the repository.
+    // When true, the picker overlay is shown.
     var showMediaPicker by remember { mutableStateOf(false) }
+    // A photo/video the user picked but hasn't sent yet. Picking STAGES it here
+    // (shown as a preview in the composer) instead of firing it off immediately,
+    // so they can add a caption or remove it first.
+    var pendingAttachmentUri by remember { mutableStateOf<String?>(null) }
 
     // Tap/OK on a media bubble: first load it, then (once cached) view it.
     val onMediaActivate: (Message) -> Unit = activate@{ msg ->
@@ -329,6 +333,13 @@ fun ChatScreen(
                 onAttach = if (viewModel.canSendAttachments) {
                     { showMediaPicker = true }
                 } else null,
+                // Staged photo: preview + caption + remove before it actually sends.
+                pendingAttachmentUri = pendingAttachmentUri,
+                onRemoveAttachment = { pendingAttachmentUri = null },
+                onSendAttachment = { uri, caption ->
+                    viewModel.sendAttachment(uri, caption)
+                    pendingAttachmentUri = null
+                },
                 // Empty field shows a record (mic) button → record → preview →
                 // send a voice memo. Only when the repo can send attachments.
                 onSendVoiceMemo = if (viewModel.canSendAttachments) {
@@ -371,7 +382,9 @@ fun ChatScreen(
     if (showMediaPicker) {
         MediaPickerScreen(
             onPick = { uri ->
-                viewModel.sendAttachment(uri)
+                // STAGE the pick — don't send. The composer shows it as a preview
+                // the user can caption or remove; Send ships it.
+                pendingAttachmentUri = uri
                 showMediaPicker = false
                 scope.launch {
                     withFrameNanos {}

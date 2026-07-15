@@ -119,7 +119,8 @@ class SmartTxtSession(
 
     suspend fun sendAttachment(
         chatGuid: String, tempGuid: String, bytes: ByteArray, mimeType: String, name: String,
-    ): SendAck = transport.sendAttachment(chatGuid, tempGuid, bytes, mimeType, name)
+        caption: String = "",
+    ): SendAck = transport.sendAttachment(chatGuid, tempGuid, bytes, mimeType, name, caption)
 
     suspend fun downloadAttachment(attachmentGuid: String): ByteArray? =
         transport.downloadAttachment(attachmentGuid)

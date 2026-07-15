@@ -258,10 +258,11 @@ class ChatViewModel(
     val canResendAttachments: Boolean =
         repository is com.offline.dpadmessenger.data.AttachmentResendCapable
 
-    /** Send a picked photo/video (content:// uri) to this room. */
-    fun sendAttachment(contentUri: String) {
+    /** Send a picked photo/video (content:// uri) to this room, with an optional
+     *  caption that rides the same message as the media. */
+    fun sendAttachment(contentUri: String, caption: String? = null) {
         val sender = repository as? com.offline.dpadmessenger.data.AttachmentSender ?: return
-        viewModelScope.launch { runCatching { sender.sendAttachment(roomId, contentUri) } }
+        viewModelScope.launch { runCatching { sender.sendAttachment(roomId, contentUri, caption?.trim()?.ifBlank { null }) } }
     }
 
     /** Send a recorded voice memo (local .m4a file path) as an audio attachment. */

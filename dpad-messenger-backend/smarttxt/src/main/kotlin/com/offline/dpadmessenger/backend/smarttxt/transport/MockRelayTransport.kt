@@ -147,13 +147,13 @@ class MockRelayTransport : SmartTxtTransport {
     }
 
     override suspend fun sendAttachment(
-        chatGuid: String, tempGuid: String, bytes: ByteArray, mimeType: String, name: String,
+        chatGuid: String, tempGuid: String, bytes: ByteArray, mimeType: String, name: String, caption: String,
     ): SendAck {
         val guid = "msg_${guidSeq.incrementAndGet()}"
         val kind = if (mimeType.startsWith("video/")) "video" else if (mimeType.startsWith("image/")) "image" else "other"
         val msg = RelayMessage(
             guid = guid, chatGuid = chatGuid, tempGuid = tempGuid, senderAddress = ME, isFromMe = true,
-            text = "", timestampMs = System.currentTimeMillis(), service = "iMessage", status = "sent",
+            text = caption, timestampMs = System.currentTimeMillis(), service = "iMessage", status = "sent",
             attachments = listOf(RelayAttachment(guid = "att_$guid", mimeType = mimeType, name = name, kind = kind)),
         )
         lock.withLock { messages.getOrPut(chatGuid) { mutableListOf() }.add(msg) }

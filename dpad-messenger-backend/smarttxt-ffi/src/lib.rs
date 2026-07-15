@@ -2128,10 +2128,12 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     data: JByteArray<'l>,
     mime: JString<'l>,
     name: JString<'l>,
+    caption: JString<'l>,
 ) -> jstring {
     let chat = jstr(&mut env, &chat_guid);
     let mime_s = jstr(&mut env, &mime);
     let name_s = jstr(&mut env, &name);
+    let caption_s = jstr(&mut env, &caption);
     let bytes = match env.convert_byte_array(&data) {
         Ok(b) => b,
         Err(_) => return out(&mut env, String::new()),
@@ -2196,13 +2198,28 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             }
         };
 
-        // 2) A message whose single part is that attachment.
-        let mut normal = NormalMessage::new(String::new(), service);
-        normal.parts = MessageParts(vec![IndexedMessagePart {
-            part: MessagePart::Attachment(attachment),
-            idx: None,
-            ext: None,
-        }]);
+        // 2) The message. Its parts are the attachment, plus — when a caption was
+        // typed — the caption text so it renders as ONE bubble (image + caption),
+        // matching iMessage. NormalMessage::new builds the text part(s) from the
+        // caption; we then append the attachment part. With no caption we send the
+        // attachment alone (an empty text part would show as a blank line).
+        let mut normal = if caption_s.is_empty() {
+            let mut n = NormalMessage::new(String::new(), service);
+            n.parts = MessageParts(vec![IndexedMessagePart {
+                part: MessagePart::Attachment(attachment),
+                idx: None,
+                ext: None,
+            }]);
+            n
+        } else {
+            let mut n = NormalMessage::new(caption_s.clone(), service);
+            n.parts.0.push(IndexedMessagePart {
+                part: MessagePart::Attachment(attachment),
+                idx: None,
+                ext: None,
+            });
+            n
+        };
         normal.voice = voice;
         let mut inst = MessageInst::new(
             ConversationData {

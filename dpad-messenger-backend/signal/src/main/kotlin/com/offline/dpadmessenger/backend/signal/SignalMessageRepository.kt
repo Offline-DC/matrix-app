@@ -577,8 +577,9 @@ class SignalMessageRepository(
         return path
     }
 
-    override suspend fun sendAttachment(roomId: String, contentUri: String): Boolean {
+    override suspend fun sendAttachment(roomId: String, contentUri: String, caption: String?): Boolean {
         if (sender == null || attachments == null) return false
+        val cap = caption?.trim().orEmpty()
         val isGroup = isGroupRoom(roomId)
         val recipient = roomId.removePrefix("sig:dm:")
         if (!isGroup && recipient == roomId) return false
@@ -607,7 +608,8 @@ class SignalMessageRepository(
             id = tentativeId,
             roomId = roomId,
             senderId = currentUser.id,
-            body = "",
+            // Caption rides the same message as the media (one bubble).
+            body = cap,
             timestampMs = now,
             status = MessageStatus.SENDING,
             isOutgoing = true,
@@ -617,12 +619,13 @@ class SignalMessageRepository(
         bumpSummary(roomId, tentative)
 
         return try {
+            val bodyOrNull = cap.ifEmpty { null }
             val serverTs = if (isGroup) {
                 val target = groupTargetFor(roomId)
                     ?: throw IllegalStateException("group $roomId not resolved")
-                sender.sendGroupAttachment(target, uploaded, body = null)
+                sender.sendGroupAttachment(target, uploaded, body = bodyOrNull)
             } else {
-                sender.sendAttachment(recipient, uploaded, body = null)
+                sender.sendAttachment(recipient, uploaded, body = bodyOrNull)
             }
             updateStatus(roomId, tentativeId, MessageStatus.SENT, newTimestamp = serverTs)
             true

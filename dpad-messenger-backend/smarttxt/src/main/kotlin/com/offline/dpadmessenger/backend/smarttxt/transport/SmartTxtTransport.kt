@@ -83,13 +83,15 @@ interface SmartTxtTransport {
     /** Create/resolve a chat for the given handles. */
     suspend fun createChat(addresses: List<String>, title: String?): RelayChat?
 
-    /** Send a media attachment; bytes are uploaded to MMCS by the relay. */
+    /** Send a media attachment; bytes are uploaded to MMCS by the relay. [caption]
+     *  rides the same message as the media (one bubble); "" sends media alone. */
     suspend fun sendAttachment(
         chatGuid: String,
         tempGuid: String,
         bytes: ByteArray,
         mimeType: String,
         name: String,
+        caption: String = "",
     ): SendAck
 
     /** Download attachment bytes by guid (the relay handles MMCS download +

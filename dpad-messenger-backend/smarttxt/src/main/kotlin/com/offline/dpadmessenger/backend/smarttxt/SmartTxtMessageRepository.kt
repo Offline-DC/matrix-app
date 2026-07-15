@@ -768,7 +768,8 @@ internal class SmartTxtMessageRepository(
             requestSave()
         }
         Log.i(TAG, "resend: re-uploading ${bytes.size}B ${att.mimeType} for ${failed.id}")
-        val ack = runCatching { session.sendAttachment(roomId, failed.id, bytes, att.mimeType, att.name) }
+        // Re-send with the same caption (the failed message's body) on the bubble.
+        val ack = runCatching { session.sendAttachment(roomId, failed.id, bytes, att.mimeType, att.name, failed.body) }
             .getOrElse {
                 Log.e(TAG, "resend: attachment upload failed", it)
                 com.offline.dpadmessenger.backend.smarttxt.transport.SendAck(false)
@@ -1020,7 +1021,7 @@ internal class SmartTxtMessageRepository(
     // Whole body runs OFF the main thread: the content-resolver queries and —
     // critically — session.sendAttachment (the MMCS network upload, which blocks
     // on a tokio runtime) would ANR the UI if run on the caller's Main dispatcher.
-    override suspend fun sendAttachment(roomId: String, contentUri: String): Boolean =
+    override suspend fun sendAttachment(roomId: String, contentUri: String, caption: String?): Boolean =
         withContext(Dispatchers.IO) {
             val uri = runCatching { android.net.Uri.parse(contentUri) }.getOrNull()
                 ?: return@withContext false
@@ -1044,9 +1045,15 @@ internal class SmartTxtMessageRepository(
             val ext = mime.substringAfterLast('/', "bin").substringBefore(';').ifBlank { "bin" }
             val localCopy = java.io.File(mediaDir, "${tmpId.filter { it.isLetterOrDigit() }}.$ext")
             val localPath = runCatching { localCopy.writeBytes(bytes); localCopy.absolutePath }.getOrNull()
+            // The caption rides the SAME message as the media (one bubble). It's
+            // the body when present; otherwise a placeholder only when we couldn't
+            // keep a local copy to render.
+            val cap = caption?.trim().orEmpty()
             val optimistic = Message(
                 id = tmpId, roomId = roomId, senderId = ME,
-                body = if (localPath != null) "" else when {
+                body = when {
+                    cap.isNotEmpty() -> cap
+                    localPath != null -> ""
                     mime.startsWith("video/") -> "[video]"
                     mime.startsWith("audio/") -> "[voice message]"
                     else -> "[photo]"
@@ -1058,7 +1065,7 @@ internal class SmartTxtMessageRepository(
                 messagesByRoom.value = messagesByRoom.value + (roomId to (messagesByRoom.value[roomId].orEmpty() + optimistic))
                 requestSave()
             }
-            val ack = runCatching { session.sendAttachment(roomId, tmpId, bytes, mime, name) }
+            val ack = runCatching { session.sendAttachment(roomId, tmpId, bytes, mime, name, cap) }
                 .getOrElse { com.offline.dpadmessenger.backend.smarttxt.transport.SendAck(false) }
             writeLock.withLock {
                 updateMessage(roomId, tmpId) { it.copy(id = ack.guid ?: it.id, status = if (ack.ok) MessageStatus.SENT else MessageStatus.FAILED, errorReason = if (ack.ok) null else ack.error) }

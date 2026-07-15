@@ -22,7 +22,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -37,7 +39,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import com.offline.dpadmessenger.media.VoiceRecorder
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -113,6 +120,16 @@ fun DpadComposer(
      *  this on activate. DPAD-Left from the field focuses it; Left again exits
      *  via [onLeftFromField]. */
     onAttach: (() -> Unit)? = null,
+    /** A photo/video the user has picked but NOT yet sent — staged in the composer
+     *  so they can caption or remove it first. Non-null shows a preview strip above
+     *  the input with a Remove control; the text field becomes the caption; Send
+     *  ships media+caption as one message. Null = nothing staged. */
+    pendingAttachmentUri: String? = null,
+    /** Drop the staged attachment without sending (the preview's Remove control). */
+    onRemoveAttachment: () -> Unit = {},
+    /** Send the staged [pendingAttachmentUri] with the field text as its caption.
+     *  Required whenever [pendingAttachmentUri] can be non-null. */
+    onSendAttachment: ((uri: String, caption: String) -> Unit)? = null,
     /** When non-null, an empty text field shows a record (mic) button instead of
      *  Send; recording → stop → a preview modal → this fires with the recorded
      *  .m4a file path to send as a voice memo. */
@@ -134,6 +151,8 @@ fun DpadComposer(
     val fieldFr = textFieldFocusRequester ?: remember { FocusRequester() }
     val attachFr = remember { FocusRequester() }
     val sendFr = sendButtonFocusRequester ?: remember { FocusRequester() }
+    // The staged-attachment "Remove" control, when a photo is pending.
+    val removeFr = remember { FocusRequester() }
 
     // Tracks whether the inner field has been placed in the layout (and
     // therefore is in the focus tree). The parent-side LaunchedEffect that
@@ -166,8 +185,15 @@ fun DpadComposer(
 
     fun submit() {
         val payload = fieldValue.text.trim()
-        if (payload.isEmpty()) return
-        onSend(payload)
+        // A staged photo sends media + (optional) caption as one message, even
+        // when the field is empty. Plain text still requires non-empty text.
+        val staged = pendingAttachmentUri
+        if (staged != null) {
+            onSendAttachment?.invoke(staged, payload)
+        } else {
+            if (payload.isEmpty()) return
+            onSend(payload)
+        }
         fieldValue = TextFieldValue("")
         keyboard?.hide()
         // Keep focus on the inner field after send. The IME stays hidden
@@ -266,6 +292,21 @@ fun DpadComposer(
             .padding(bottom = extraImeBottom),
     ) {
         if (header != null) header()
+        // A picked-but-unsent photo/video sits here as a preview until the user
+        // hits Send (or removes it). This is what stops a tap on a thumbnail from
+        // firing the message off immediately.
+        if (pendingAttachmentUri != null) {
+            StagedAttachmentPreview(
+                uri = pendingAttachmentUri,
+                removeFocusRequester = removeFr,
+                onRemove = {
+                    onRemoveAttachment()
+                    runCatching { fieldFr.requestFocus() }
+                },
+                onUp = onUpFromField,
+                onDownToField = { runCatching { fieldFr.requestFocus() } },
+            )
+        }
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -366,7 +407,17 @@ fun DpadComposer(
                                     val onFirstLine = textLayout
                                         ?.let { it.getLineForOffset(fieldValue.selection.start) == 0 }
                                         ?: true
-                                    if (onFirstLine) { onUpFromField(); true } else false
+                                    if (onFirstLine) {
+                                        // A staged photo's Remove control sits just
+                                        // above the field — land there first so it's
+                                        // DPAD-reachable; Up again exits to the timeline.
+                                        if (pendingAttachmentUri != null) {
+                                            runCatching { removeFr.requestFocus() }
+                                        } else {
+                                            onUpFromField()
+                                        }
+                                        true
+                                    } else false
                                 }
                                 Key.DirectionLeft -> {
                                     // Only leave the field (→ "+" attach, else the
@@ -395,7 +446,8 @@ fun DpadComposer(
                     decorationBox = { inner ->
                         if (fieldValue.text.isEmpty()) {
                             Text(
-                                text = hint,
+                                // With a photo staged, the field is the caption box.
+                                text = if (pendingAttachmentUri != null) "Add a caption…" else hint,
                                 color = colors.mutedText,
                                 style = MaterialTheme.typography.bodyLarge,
                             )
@@ -416,15 +468,17 @@ fun DpadComposer(
                     focusRequester = sendFr,
                     onLeftToField = {},
                 )
-                // Empty field + voice enabled → a record (waveform) button.
-                voiceEnabled && fieldValue.text.isBlank() -> RecordStopButton(
+                // Empty field + voice enabled → a record (waveform) button. But a
+                // staged photo always shows Send (the field is now its caption), so
+                // the user can send the photo with no caption.
+                pendingAttachmentUri == null && voiceEnabled && fieldValue.text.isBlank() -> RecordStopButton(
                     recording = false,
                     onClick = { onRecordPressed() },
                     focusRequester = sendFr,
                     onLeftToField = { runCatching { fieldFr.requestFocus() } },
                 )
                 else -> SendButton(
-                    enabled = fieldValue.text.isNotBlank(),
+                    enabled = fieldValue.text.isNotBlank() || pendingAttachmentUri != null,
                     onClick = { submit() },
                     focusRequester = sendFr,
                     onLeftToField = { runCatching { fieldFr.requestFocus() } },
@@ -654,6 +708,112 @@ private fun SendButton(
             modifier = Modifier.size(InnerActionIcon),
         )
     }
+}
+
+/** Preview strip for a photo/video staged in the composer: a thumbnail, a label,
+ *  and a DPAD-focusable Remove (✕) control. Sits above the input row; the text
+ *  field below acts as the caption until the user hits Send. */
+@Composable
+private fun StagedAttachmentPreview(
+    uri: String,
+    removeFocusRequester: FocusRequester,
+    onRemove: () -> Unit,
+    onUp: () -> Unit,
+    onDownToField: () -> Unit,
+) {
+    val colors = LocalDpadMessengerColors.current
+    val thumb = rememberContentThumbnail(uri)
+    var removeFocused by remember { mutableStateOf(false) }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(colors.divider),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (thumb != null) {
+                androidx.compose.foundation.Image(
+                    bitmap = thumb,
+                    contentDescription = "Attachment preview",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.size(44.dp),
+                )
+            } else {
+                // Video, or an image we couldn't decode — a generic media glyph.
+                Icon(
+                    imageVector = Icons.Filled.Image,
+                    contentDescription = null,
+                    tint = colors.mutedText,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+        }
+        Text(
+            text = "Photo ready — add a caption or send",
+            style = MaterialTheme.typography.bodyMedium,
+            color = colors.mutedText,
+            maxLines = 2,
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 10.dp),
+        )
+        // Remove (✕) — the DPAD focus target for the strip. Down returns to the
+        // caption field; Up exits to the timeline.
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(30.dp)
+                .focusRequester(removeFocusRequester)
+                .dpadFocusRing(removeFocused, ComposerButtonHighlight, ringWidth = 2.dp, gap = 1.dp)
+                .clip(CircleShape)
+                .background(if (removeFocused) ComposerButtonNeutral else ComposerAttachBg)
+                .onFocusChanged { removeFocused = it.isFocused }
+                .focusable()
+                .onDpadAction { onRemove(); true }
+                .onPreviewKeyEvent { event ->
+                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    when (event.key) {
+                        Key.DirectionDown -> { onDownToField(); true }
+                        Key.DirectionUp -> { onUp(); true }
+                        else -> false
+                    }
+                },
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Close,
+                contentDescription = "Remove attachment",
+                tint = ComposerAttachGlyph,
+                modifier = Modifier.size(18.dp),
+            )
+        }
+    }
+}
+
+/** Decode a small thumbnail from a `content://`/`file://` URI for the staged
+ *  preview. Heavily downsampled — this is a 44dp chip. Null for video or an
+ *  undecodable source (the caller shows a generic glyph). */
+@Composable
+private fun rememberContentThumbnail(uri: String): ImageBitmap? {
+    val context = LocalContext.current
+    var bmp by remember(uri) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(uri) {
+        bmp = withContext(Dispatchers.IO) {
+            runCatching {
+                val u = android.net.Uri.parse(uri)
+                val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = 8 }
+                context.contentResolver.openInputStream(u)?.use {
+                    android.graphics.BitmapFactory.decodeStream(it, null, opts)
+                }?.asImageBitmap()
+            }.getOrNull()
+        }
+    }
+    return bmp
 }
 
 /** Saver so `rememberSaveable` can round-trip a [TextFieldValue]. */

@@ -124,8 +124,9 @@ object RustPushNative {
     external fun nativeSendText(chatGuid: String, text: String, tempGuid: String, replyToGuid: String): String
 
     /** Upload [data] to MMCS and send it as an attachment. An audio [mimeType]
-     *  is sent as a voice message. Returns the server guid, or "" on failure. */
-    external fun nativeSendAttachment(chatGuid: String, tempGuid: String, data: ByteArray, mimeType: String, name: String): String
+     *  is sent as a voice message. [caption] rides the same message as the media
+     *  (one bubble); "" sends media alone. Returns the server guid, or "" on failure. */
+    external fun nativeSendAttachment(chatGuid: String, tempGuid: String, data: ByteArray, mimeType: String, name: String, caption: String): String
 
     /** Download a received attachment by the guid from [nativePollEvents]; null on failure. */
     external fun nativeDownloadAttachment(guid: String): ByteArray?
@@ -170,8 +171,8 @@ object RustPushNative {
         else false
 
     /** Null-safe attachment send: "" when the `.so` isn't loaded or the send fails. */
-    fun runCatchingNativeSendAttachment(chatGuid: String, tempGuid: String, data: ByteArray, mimeType: String, name: String): String =
-        if (loaded) runCatching { nativeSendAttachment(chatGuid, tempGuid, data, mimeType, name) }.getOrDefault("")
+    fun runCatchingNativeSendAttachment(chatGuid: String, tempGuid: String, data: ByteArray, mimeType: String, name: String, caption: String): String =
+        if (loaded) runCatching { nativeSendAttachment(chatGuid, tempGuid, data, mimeType, name, caption) }.getOrDefault("")
         else ""
 
     /** Null-safe attachment download: null when the `.so` isn't loaded or the fetch fails. */

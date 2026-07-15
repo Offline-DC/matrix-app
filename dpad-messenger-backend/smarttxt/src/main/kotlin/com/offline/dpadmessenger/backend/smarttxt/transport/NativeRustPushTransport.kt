@@ -123,10 +123,10 @@ class NativeRustPushTransport(
         }
     }
     override suspend fun sendAttachment(
-        chatGuid: String, tempGuid: String, bytes: ByteArray, mimeType: String, name: String,
+        chatGuid: String, tempGuid: String, bytes: ByteArray, mimeType: String, name: String, caption: String,
     ): SendAck = withContext(Dispatchers.IO) {
         val guid = com.offline.dpadmessenger.backend.smarttxt.RustPushNative
-            .runCatchingNativeSendAttachment(chatGuid, tempGuid, bytes, mimeType, name)
+            .runCatchingNativeSendAttachment(chatGuid, tempGuid, bytes, mimeType, name, caption)
         ackFromNative(guid, "Couldn't send the attachment — try again.")
     }
 
