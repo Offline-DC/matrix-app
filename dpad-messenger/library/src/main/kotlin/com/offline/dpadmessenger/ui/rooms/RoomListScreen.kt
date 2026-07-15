@@ -58,6 +58,7 @@ import com.offline.dpadmessenger.focus.dpadRow
 import com.offline.dpadmessenger.focus.onDpadAction
 import com.offline.dpadmessenger.ui.components.CompactBarButton
 import com.offline.dpadmessenger.ui.components.CompactTopBar
+import com.offline.dpadmessenger.ui.components.MessengerSoftKeys
 import com.offline.dpadmessenger.ui.components.RoomListItem
 import com.offline.dpadmessenger.ui.settings.RELINK_WARN_DAYS
 import com.offline.dpadmessenger.ui.theme.ComposerButtonHighlight
@@ -189,7 +190,23 @@ fun RoomListScreen(
                 },
             )
         },
-        modifier = modifier.fillMaxSize(),
+        // Native soft-key bar: "new" (compose) on the left, "settings" on the right.
+        bottomBar = {
+            MessengerSoftKeys(leftLabel = "new", rightLabel = "settings")
+        },
+        modifier = modifier
+            .fillMaxSize()
+            .onPreviewKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown) {
+                    when (event.key) {
+                        // soft-left (some devices send MENU) → new conversation
+                        Key.SoftLeft, Key.Menu -> onNewMessage?.let { it(); true } ?: false
+                        // soft-right → open settings
+                        Key.SoftRight -> { onSettingsClick(); true }
+                        else -> false
+                    }
+                } else false
+            },
     ) { innerPadding ->
         // When the session is near its ~2-week end, pin a red re-link banner
         // above the list (tapping it opens Settings). The top inset is applied
@@ -222,7 +239,7 @@ fun RoomListScreen(
                             entryRowFocus = entryRowFocus,
                             firstRowFocus = firstRowFocus,
                             // DPAD-Right anywhere in the list jumps to the compose button.
-                            composeButtonFocus = composeButtonFocus.takeIf { onNewMessage != null },
+                            composeButtonFocus = null, // pencil removed; "new" lives on the soft-key bar
                             savedScroll = viewModel.savedScroll,
                             onScrollChanged = viewModel::saveScroll,
                             listState = listState,
@@ -236,45 +253,8 @@ fun RoomListScreen(
                 }
             }
 
-            if (onNewMessage != null) {
-                ComposeButton(
-                    onClick = onNewMessage,
-                    focusRequester = composeButtonFocus,
-                    // Leaving the compose button: back to the list normally, but
-                    // back up to the settings cog when there are no rows.
-                    onLeft = {
-                        runCatching {
-                            if (rooms.isEmpty()) settingsFocus.requestFocus()
-                            else entryRowFocus.requestFocus()
-                        }
-                    },
-                    // DPAD-Up: return to the chat you were last on (the
-                    // last-opened row) so you can back out of the compose button
-                    // to where you came from without opening "new message".
-                    // Falls back to the top row, or the settings cog when the
-                    // list is empty. Retried across a few frames because the
-                    // target row may not be attached the instant we ask.
-                    onUp = {
-                        scope.launch {
-                            if (rooms.isEmpty()) {
-                                runCatching { settingsFocus.requestFocus() }
-                                return@launch
-                            }
-                            repeat(8) {
-                                withFrameNanos {}
-                                if (runCatching { entryRowFocus.requestFocus() }.isSuccess) return@launch
-                            }
-                            runCatching { firstRowFocus.requestFocus() }
-                        }
-                    },
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(
-                            end = 16.dp,
-                            bottom = innerPadding.calculateBottomPadding() + 16.dp,
-                        ),
-                )
-            }
+            // Pencil compose button removed — "new" is now on the native soft-key bar
+            // (soft-left). See the Scaffold's onPreviewKeyEvent + bottomBar above.
 
             // Press-and-hold context sheet for the selected conversation.
             contextRoom?.let { cr ->

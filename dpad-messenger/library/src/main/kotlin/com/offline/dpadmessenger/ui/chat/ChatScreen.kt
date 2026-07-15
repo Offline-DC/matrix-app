@@ -38,6 +38,7 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
@@ -55,6 +56,7 @@ import com.offline.dpadmessenger.data.TimelineItem
 import com.offline.dpadmessenger.ui.components.BannerKind
 import com.offline.dpadmessenger.ui.components.CompactBarButton
 import com.offline.dpadmessenger.ui.components.CompactTopBar
+import com.offline.dpadmessenger.ui.components.MessengerSoftKeys
 import com.offline.dpadmessenger.ui.components.DateDivider
 import com.offline.dpadmessenger.ui.components.TimestampSeparator
 import com.offline.dpadmessenger.ui.components.DpadComposer
@@ -255,6 +257,10 @@ fun ChatScreen(
                 },
             )
         },
+        // Native soft-key bar: "back" on the right.
+        bottomBar = {
+            MessengerSoftKeys(rightLabel = "back")
+        },
         modifier = modifier
             .fillMaxSize()
             .imePadding()
@@ -265,6 +271,10 @@ fun ChatScreen(
             .onPreviewKeyEvent { event ->
                 if (event.type == KeyEventType.KeyUp && event.key in OkKeys) {
                     DpadFireGate.release(event.key)
+                }
+                // soft-right → back to the conversation list
+                if (event.type == KeyEventType.KeyDown && event.key == Key.SoftRight) {
+                    onBack(); return@onPreviewKeyEvent true
                 }
                 false
             },

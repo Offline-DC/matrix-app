@@ -84,6 +84,11 @@ fun SettingsScreen(
      *  "Re-register now" row when set; null hides it. Host handles the result feedback. */
     onReregister: (() -> Unit)? = null,
 ) {
+    // Settings has no soft-key actions of its own. Publish BLANK labels so the
+    // native soft-key bar stays VISIBLE (matching every other screen) instead of
+    // hiding it — setVisible(false) left an empty black strip at the bottom.
+    com.offline.dpadmessenger.ui.components.MessengerSoftKeys()
+
     // Land focus on the back button on entry, so the screen has a visible
     // highlight and DPAD navigation works immediately (every other screen sets
     // initial focus; this one used to start with nothing focused).

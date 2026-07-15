@@ -343,11 +343,7 @@ internal class SmartTxtMessageRepository(
                 val ti = list.indexOfFirst { it.id == rm.associatedMessageGuid }
                 if (ti >= 0) {
                     val m = list[ti]
-                    val reactors = m.reactions[emoji].orEmpty()
-                    val next = if (isRemoval) reactors - reactorId else (reactors + reactorId).distinct()
-                    val map = m.reactions.toMutableMap()
-                    if (next.isEmpty()) map.remove(emoji) else map[emoji] = next
-                    list[ti] = m.copy(reactions = map)
+                    list[ti] = m.copy(reactions = applyTapback(m.reactions, reactorId, emoji, remove = isRemoval))
                     byRoom[rm.chatGuid] = list
                     touched.add(rm.chatGuid)
                 }
@@ -510,12 +506,8 @@ internal class SmartTxtMessageRepository(
             if (ti >= 0) {
                 val m = list[ti]
                 targetBody = m.body
-                val reactors = m.reactions[e.emoji].orEmpty()
-                newlyAdded = !e.remove && reactorId !in reactors
-                val next = if (e.remove) reactors - reactorId else (reactors + reactorId).distinct()
-                val map = m.reactions.toMutableMap()
-                if (next.isEmpty()) map.remove(e.emoji) else map[e.emoji] = next
-                list[ti] = m.copy(reactions = map)
+                newlyAdded = !e.remove && reactorId !in m.reactions[e.emoji].orEmpty()
+                list[ti] = m.copy(reactions = applyTapback(m.reactions, reactorId, e.emoji, remove = e.remove))
                 byRoom[e.chatGuid] = list
                 msgsChanged = true
             }
@@ -820,12 +812,8 @@ internal class SmartTxtMessageRepository(
         var adding = false
         writeLock.withLock {
             updateMessage(roomId, messageId) { m ->
-                val reactors = m.reactions[emoji].orEmpty()
-                adding = ME !in reactors
-                val next = if (adding) reactors + ME else reactors - ME
-                val map = m.reactions.toMutableMap()
-                if (next.isEmpty()) map.remove(emoji) else map[emoji] = next
-                m.copy(reactions = map)
+                adding = ME !in m.reactions[emoji].orEmpty()
+                m.copy(reactions = applyTapback(m.reactions, ME, emoji, remove = !adding))
             }
             requestSave()
         }
@@ -833,6 +821,28 @@ internal class SmartTxtMessageRepository(
             val ok = runCatching { session.sendTapback(roomId, messageId, emoji, remove = !adding) }.getOrDefault(false)
             if (!ok) Log.w(TAG, "tapback rejected")
         }
+    }
+
+    /** Apply one tapback with iMessage semantics: a person holds at most ONE
+     *  reaction per message. An ADD clears [reactorId] from every other emoji
+     *  first, so switching (e.g. ❓ → ‼️) REPLACES instead of stacking two
+     *  reactions from the same person. A REMOVE only clears them from THIS
+     *  emoji, so a late/stale remove of an old tapback can't wipe a reaction
+     *  they've since switched to. Empty buckets are dropped. */
+    private fun applyTapback(
+        reactions: Map<String, List<String>>,
+        reactorId: String,
+        emoji: String,
+        remove: Boolean,
+    ): Map<String, List<String>> {
+        val map = reactions.mapValues { it.value.toMutableList() }.toMutableMap()
+        if (remove) {
+            map[emoji]?.remove(reactorId)
+        } else {
+            for (reactors in map.values) reactors.remove(reactorId)
+            map.getOrPut(emoji) { mutableListOf() }.add(reactorId)
+        }
+        return map.entries.filter { it.value.isNotEmpty() }.associate { it.key to it.value.toList() }
     }
 
     override suspend fun loadOlder(roomId: String, limit: Int): Boolean {
