@@ -189,7 +189,7 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                 ) {
                     Text("Set up smart txt", style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        "Connect your Apple ID to sync your messages on this device.",
+                        "Connect your Apple account to sync your messages on this device.",
                         style = MaterialTheme.typography.bodyMedium,
                         textAlign = TextAlign.Center,
                     )
@@ -218,7 +218,7 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                 ) {
                     Text("Sign in", style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        "Enter the Apple ID you use for messages.",
+                        "Enter the phone number or Apple account you use for messages.",
                         style = MaterialTheme.typography.bodyMedium,
                         textAlign = TextAlign.Center,
                     )
@@ -230,7 +230,7 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
                         Text(
-                            "Apple ID",
+                            "Phone number or Apple account",
                             style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.fillMaxWidth(),
@@ -239,7 +239,7 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                         OutlinedTextField(
                             value = appleId,
                             onValueChange = { appleId = it; error = null },
-                            placeholder = { Text("Apple ID") },
+                            placeholder = { Text("Phone number or Apple account") },
                             singleLine = true,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
                             modifier = Modifier
