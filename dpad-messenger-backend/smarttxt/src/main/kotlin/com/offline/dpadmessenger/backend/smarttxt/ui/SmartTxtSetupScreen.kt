@@ -223,8 +223,10 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                         textAlign = TextAlign.Center,
                     )
 
-                    // Apple ID — static label above + matching placeholder (no
-                    // Material floating label).
+                    // Extra breathing room between the description and the fields.
+                    Spacer(Modifier.height(16.dp))
+
+                    // Phone number or Apple account — static label above the field.
                     Column(
                         modifier = Modifier.fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -239,7 +241,6 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                         OutlinedTextField(
                             value = appleId,
                             onValueChange = { appleId = it; error = null },
-                            placeholder = { Text("Phone number or Apple account") },
                             singleLine = true,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
                             modifier = Modifier
@@ -275,7 +276,6 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                         OutlinedTextField(
                             value = password,
                             onValueChange = { password = it; error = null },
-                            placeholder = { Text("Password") },
                             singleLine = true,
                             visualTransformation = if (passwordVisible)
                                 VisualTransformation.None else PasswordVisualTransformation(),
