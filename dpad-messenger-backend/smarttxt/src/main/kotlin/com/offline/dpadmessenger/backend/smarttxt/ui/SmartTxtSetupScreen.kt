@@ -216,15 +216,23 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Text("Sign in", style = MaterialTheme.typography.headlineSmall)
-                    Text(
-                        "Enter the phone number or Apple account you use for messages.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        textAlign = TextAlign.Center,
-                    )
+                    // Title + description kept close together (their own tight gap),
+                    // separate from the outer column's 12dp rhythm.
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text("Sign in", style = MaterialTheme.typography.headlineSmall)
+                        Text(
+                            "Enter the phone number or Apple account you use for messages.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
 
-                    // Extra breathing room between the description and the fields.
-                    Spacer(Modifier.height(16.dp))
+                    // A little breathing room between the description and the fields.
+                    Spacer(Modifier.height(12.dp))
 
                     // Phone number or Apple account — static label above the field.
                     Column(
