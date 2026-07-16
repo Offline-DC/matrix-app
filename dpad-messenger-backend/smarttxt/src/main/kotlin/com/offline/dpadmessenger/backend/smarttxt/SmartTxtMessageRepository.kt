@@ -568,8 +568,12 @@ internal class SmartTxtMessageRepository(
     /** iMessage-style one-liner for a received reaction, e.g.
      *  Molly emphasized "Your only living grandparent…". Used for BOTH the
      *  notification and the chat-list preview so they read identically. */
-    private fun tapbackSummary(senderAddress: String, emoji: String, targetBody: String): String {
-        val reactor = contactName(senderAddress) ?: prettyHandle(senderAddress)
+    private fun tapbackSummary(senderAddress: String, emoji: String, targetBody: String): String =
+        tapbackSentence(contactName(senderAddress) ?: prettyHandle(senderAddress), emoji, targetBody)
+
+    /** "<reactor> <verb> "<snippet>"" — [reactor] is a contact name, or "You" for
+     *  the local user's own reaction. */
+    private fun tapbackSentence(reactor: String, emoji: String, targetBody: String): String {
         val snippet = targetBody.ifBlank { "your message" }
             .let { if (it.length > 30) it.take(30).trim() + "…" else it }
         return "$reactor ${tapbackVerb(emoji)} “$snippet”"
@@ -810,10 +814,23 @@ internal class SmartTxtMessageRepository(
      *  of truth and reconciles either way. */
     override suspend fun toggleReaction(roomId: String, messageId: String, emoji: String) {
         var adding = false
+        var targetBody = ""
         writeLock.withLock {
             updateMessage(roomId, messageId) { m ->
                 adding = ME !in m.reactions[emoji].orEmpty()
+                targetBody = m.body
                 m.copy(reactions = applyTapback(m.reactions, ME, emoji, remove = !adding))
+            }
+            // Treat MY reaction like iMessage: ADDING a tapback bumps the chat to the
+            // top of the list and shows "You liked …" as the row preview (removing one
+            // doesn't bump). Same roomActivity path a received reaction uses.
+            if (adding) {
+                roomActivity.value = roomActivity.value.toMutableMap().apply {
+                    put(roomId, ReactionActivity(
+                        timestampMs = System.currentTimeMillis(),
+                        preview = tapbackSentence("You", emoji, targetBody),
+                    ))
+                }
             }
             requestSave()
         }

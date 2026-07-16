@@ -873,21 +873,24 @@ private fun TapbackOverlay(
         ),
         horizontalArrangement = Arrangement.spacedBy((-10).dp),
     ) {
-        // One badge per distinct emoji (SmartTxt stacks tapbacks by type). The
-        // grey fill + surface-colored outline reads on both the blue outgoing
-        // bubble and the neutral incoming one.
-        reactions.keys.take(3).forEach { emoji ->
-            Box(
-                modifier = Modifier
-                    .size(28.dp)
-                    .clip(CircleShape)
-                    .background(colors.incomingBubble)
-                    .border(2.dp, MaterialTheme.colorScheme.surface, CircleShape),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(emoji, style = MaterialTheme.typography.bodyLarge)
+        // One badge PER REACTOR, not per distinct emoji: iMessage stacks a separate
+        // tapback for each person, so two people who both ❤️ a message show two
+        // hearts. The grey fill + surface-colored outline reads on both the blue
+        // outgoing bubble and the neutral incoming one.
+        reactions.flatMap { (emoji, reactors) -> List(reactors.size) { emoji } }
+            .take(3)
+            .forEach { emoji ->
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(colors.incomingBubble)
+                        .border(2.dp, MaterialTheme.colorScheme.surface, CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(emoji, style = MaterialTheme.typography.bodyLarge)
+                }
             }
-        }
     }
 }
 
