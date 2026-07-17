@@ -1916,6 +1916,10 @@ fn push_relay_event(msg: MessageInst) {
             "type": "tapback",
             "chatGuid": chat_guid,
             "targetGuid": react.to_uuid,
+            // The reaction message's OWN guid, so a later cross-device "read up to this
+            // reaction" can resolve the room: we fold reactions into their target message
+            // and never store one under this guid, so the app can't look it up otherwise.
+            "guid": msg.id.clone(),
             "emoji": emoji,
             "senderAddress": sender,
             "isFromMe": is_from_me,

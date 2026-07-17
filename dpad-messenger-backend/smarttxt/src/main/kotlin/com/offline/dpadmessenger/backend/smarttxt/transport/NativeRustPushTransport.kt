@@ -195,6 +195,7 @@ class NativeRustPushTransport(
                         isFromMe = obj["isFromMe"]?.jsonPrimitive?.content == "true",
                         remove = obj["remove"]?.jsonPrimitive?.content == "true",
                         timestampMs = obj["timestampMs"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
+                        guid = obj["guid"]?.jsonPrimitive?.content ?: "",
                     ),
                 )
                 RelayProtocol.P_CHAT_READ -> {

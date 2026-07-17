@@ -152,6 +152,11 @@ sealed class TransportEvent {
         /** The reaction's real send time (ms). 0 if unknown. Used to bump the chat
          *  list by when the reaction happened, not when it was received. */
         val timestampMs: Long = 0L,
+        /** The reaction message's OWN guid (Apple's message id for this tapback). Lets a
+         *  cross-device "read up to this reaction" resolve the room, since reactions are
+         *  folded into their target and never stored as their own message. Blank if
+         *  unknown (older FFI / relay that doesn't send it). */
+        val guid: String = "",
     ) : TransportEvent()
 
     /** A whole poll cycle's worth of status changes / tapbacks, so a bulk

@@ -322,6 +322,7 @@ class RelayWebSocketTransport(
                         senderAddress = obj.str("senderAddress"),
                         isFromMe = obj["isFromMe"]?.jsonPrimitive?.content == "true",
                         remove = obj["remove"]?.jsonPrimitive?.content == "true",
+                        guid = obj.str("guid"),
                     ),
                 )
                 RelayProtocol.P_TYPING -> _events.emit(

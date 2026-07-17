@@ -84,6 +84,17 @@ internal class SmartTxtMessageRepository(
     // target bubble instead of adding a standalone message.
     private data class ReactionActivity(val timestampMs: Long, val preview: String)
     private val roomActivity = MutableStateFlow<Map<String, ReactionActivity>>(emptyMap())
+
+    // Reaction guid (UPPERCASE) → room. A cross-device read syncs "read up to <guid>";
+    // for a reaction that guid is the tapback's OWN message id — which we never store as
+    // a message (reactions fold into their target). Without this map such a read can't be
+    // resolved to a room, so the reaction's notification/unread never clears on this
+    // device. Bounded + synchronized: written under writeLock (onTapbacks), read from the
+    // poll coroutine (onChatReadElsewhere).
+    private val reactionRoomByGuid: MutableMap<String, String> =
+        java.util.Collections.synchronizedMap(object : LinkedHashMap<String, String>(64, 0.75f, false) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 4000
+        })
     private val roomNameById = HashMap<String, String>()
     private val writeLock = Mutex()
 
@@ -536,6 +547,9 @@ internal class SmartTxtMessageRepository(
         var activityChanged = false
         var unreadChanged = false
         for (e in items) {
+            // Remember which room this reaction lives in, keyed by its own guid, so a
+            // later cross-device "read up to <this reaction>" clears the right room.
+            if (e.guid.isNotBlank()) reactionRoomByGuid[e.guid.uppercase()] = e.chatGuid
             val reactorId = if (e.isFromMe) ME else handleToUserId(e.senderAddress)
             val list = byRoom[e.chatGuid].orEmpty().toMutableList()
             val ti = list.indexOfFirst { it.id == e.targetGuid }
@@ -1018,9 +1032,13 @@ internal class SmartTxtMessageRepository(
     private suspend fun onChatReadElsewhere(chatGuid: String, messageGuid: String = "") {
         val roomId = when {
             chatGuid.isNotBlank() -> chatGuid
-            messageGuid.isNotBlank() -> messagesByRoom.value.entries
-                .firstOrNull { (_, msgs) -> msgs.any { it.id.equals(messageGuid, ignoreCase = true) } }
-                ?.key
+            messageGuid.isNotBlank() ->
+                messagesByRoom.value.entries
+                    .firstOrNull { (_, msgs) -> msgs.any { it.id.equals(messageGuid, ignoreCase = true) } }
+                    ?.key
+                    // The read points at a reaction we folded into its target (no stored
+                    // message carries this guid) — resolve it via the reaction→room map.
+                    ?: reactionRoomByGuid[messageGuid.uppercase()]
             else -> null
         }
         if (roomId.isNullOrBlank()) {
