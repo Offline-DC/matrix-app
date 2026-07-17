@@ -1480,7 +1480,7 @@ internal class SmartTxtMessageRepository(
         private const val ME = "me"
         private const val KEY_AUTO_DELETE = "autoDeleteOldMessages"
         private const val KEY_READ_RECEIPTS = "sendReadReceipts"
-        private const val AUTO_DELETE_AGE_MS = 30L * 24 * 60 * 60 * 1000 // 30 days
+        private const val AUTO_DELETE_AGE_MS = 3L * 24 * 60 * 60 * 1000 // 3 days (matches Signal/gmessages + the settings copy)
         // Hard cap on messages kept IN MEMORY (and persisted) per conversation, so a
         // very chatty thread can't balloon RAM / the on-disk snapshot on a 1 GB
         // device. The chat view is a lazy list; older history stays reachable on the
