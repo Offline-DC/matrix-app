@@ -96,10 +96,12 @@ class NativeRustPushTransport(
 
     override suspend fun editMessage(chatGuid: String, targetGuid: String, newText: String): Boolean = false
     override suspend fun unsendMessage(chatGuid: String, targetGuid: String): Boolean = false
-    // Syncs "read on device" to my OWN other Apple devices (clears their
-    // notification) without telling the sender — see nativeMarkRead.
-    override suspend fun markRead(chatGuid: String): Boolean =
-        RustPushBridge.NATIVE_AVAILABLE && runCatching { RustPushNative.nativeMarkRead(chatGuid) }.getOrDefault(false)
+    // Sends a read receipt (command 102) marking read up to lastReadGuid. Clears the
+    // notification on my OWN other Apple devices; only tells the sender when
+    // sendReceipt is true (the user opted in via Settings) — see nativeMarkRead.
+    override suspend fun markRead(chatGuid: String, lastReadGuid: String, sendReceipt: Boolean): Boolean =
+        RustPushBridge.NATIVE_AVAILABLE &&
+            runCatching { RustPushNative.nativeMarkRead(chatGuid, lastReadGuid, sendReceipt) }.getOrDefault(false)
     override suspend fun setTyping(chatGuid: String, typing: Boolean) {}
     override suspend fun listContacts(): List<RelayContact> = emptyList()
     override suspend fun createChat(addresses: List<String>, title: String?): RelayChat? {

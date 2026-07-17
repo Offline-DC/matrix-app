@@ -70,9 +70,12 @@ interface SmartTxtTransport {
     /** SmartTxt unsend (2-min window). Returns false if rejected/expired. */
     suspend fun unsendMessage(chatGuid: String, targetGuid: String): Boolean
 
-    /** Send a read receipt for a chat (respects the user's per-account setting
-     *  upstream of this call). */
-    suspend fun markRead(chatGuid: String): Boolean
+    /** Mark [chatGuid] read up to [lastReadGuid] — the guid of the newest message
+     *  FROM THEM. Always syncs read state to the user's OWN other Apple devices so
+     *  their notification clears. [sendReceipt] gates the peer-facing receipt: when
+     *  false (default) only the user's own devices are told; when true the sender is
+     *  told too ("Read"). */
+    suspend fun markRead(chatGuid: String, lastReadGuid: String, sendReceipt: Boolean): Boolean
 
     /** Typing indicator. Best-effort, no ack. */
     suspend fun setTyping(chatGuid: String, typing: Boolean)

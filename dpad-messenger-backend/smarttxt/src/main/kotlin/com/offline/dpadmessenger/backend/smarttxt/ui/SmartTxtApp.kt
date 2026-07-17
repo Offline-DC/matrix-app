@@ -18,6 +18,7 @@ import com.offline.dpadmessenger.backend.smarttxt.SmartTxtAccountStore
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtRepository
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtStatus
 import com.offline.dpadmessenger.data.MessageRepository
+import com.offline.dpadmessenger.data.ReadReceiptSettings
 import com.offline.dpadmessenger.data.RetentionSettings
 import com.offline.dpadmessenger.ui.DpadMessengerApp
 import com.offline.dpadmessenger.ui.util.TimeFormatPreference
@@ -118,6 +119,7 @@ private fun SmartTxtChat(
 ) {
     val context = LocalContext.current
     val retention = repository as? RetentionSettings
+    val readReceipts = repository as? ReadReceiptSettings
     val scope = rememberCoroutineScope()
 
     // If the relay link died and couldn't refresh, show a reconnect prompt instead
@@ -132,6 +134,9 @@ private fun SmartTxtChat(
     }
 
     val autoDelete = retention?.autoDeleteEnabled?.collectAsState()?.value ?: true
+    // Read receipts: off by default. When off, reading still clears the notification
+    // on the user's own Apple devices; only the sender-facing "Read" is suppressed.
+    val sendReadReceipts = readReceipts?.sendReadReceipts?.collectAsState()?.value ?: false
 
     // "Send from" default handle: the registered numbers/emails, the saved default,
     // and a setter that persists + pushes it to the native send path.
@@ -171,6 +176,8 @@ private fun SmartTxtChat(
         // null) hides both Settings rows. There's no real ~2-week IDS session here.
         autoDeleteEnabled = autoDelete,
         onAutoDeleteChange = retention?.let { r -> { enabled: Boolean -> r.setAutoDeleteEnabled(enabled) } },
+        sendReadReceipts = sendReadReceipts,
+        onSendReadReceiptsChange = readReceipts?.let { r -> { enabled: Boolean -> r.setSendReadReceipts(enabled) } },
         use24HourTime = use24Hour,
         onUse24HourTimeChange = { enabled ->
             use24Hour = enabled

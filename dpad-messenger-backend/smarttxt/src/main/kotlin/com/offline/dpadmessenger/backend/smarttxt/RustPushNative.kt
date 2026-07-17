@@ -142,10 +142,12 @@ object RustPushNative {
     /** Send a tapback using a BlueBubbles associatedMessageType code. */
     external fun nativeSendTapback(chatGuid: String, targetGuid: String, associatedMessageType: Int): Boolean
 
-    /** Sync "read on device" for [chatGuid] to my OWN other Apple devices (clears
-     *  their notification), WITHOUT sending a read receipt to the sender. Returns
-     *  true if the sync was sent. */
-    external fun nativeMarkRead(chatGuid: String): Boolean
+    /** Send a read receipt (iMessage command 102) for [chatGuid], marking read up to
+     *  [lastReadGuid] — the guid of the newest message FROM THEM. This is the command
+     *  Apple devices act on to clear a chat's notification. When [tellSender] is false
+     *  (the default) only my OWN other Apple devices are told, so the sender never sees
+     *  "Read"; when true, the sender is told too. Returns true if the receipt was sent. */
+    external fun nativeMarkRead(chatGuid: String, lastReadGuid: String, tellSender: Boolean): Boolean
 
     /** Drain queued inbound events as a JSON array of objects shaped like the
      *  relay wire (type + fields), e.g.

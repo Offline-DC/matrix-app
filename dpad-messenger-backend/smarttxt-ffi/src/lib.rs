@@ -1470,11 +1470,15 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     }
 }
 
-/// Sync "read on device" to MY OTHER Apple devices for `chat_guid`, so they clear
-/// this conversation's notification + unread. This is the read-receipts-OFF path:
-/// it sends `Message::MessageReadOnDevice` — a self-device sync — and NEVER
-/// `Message::Read` (the actual read receipt), so the OTHER party is never told we
-/// read their message. Best-effort: returns false if not connected or no handle.
+/// Send a read receipt (iMessage command 102, `Message::Read`) for `chat_guid`,
+/// marking read up to `last_read_guid` — the guid of the newest message FROM THEM.
+/// This is the command Apple devices act on to clear a conversation's notification;
+/// it is NOT `Message::MessageReadOnDevice` (147), which rustpush uses only as the
+/// SMS-activation confirmation. `tell_sender` gates delivery: false (the default)
+/// targets ONLY my own handle, so my OTHER devices clear their notification and the
+/// sender is never told "Read"; true also targets the chat's other party, so they
+/// see "Read". Best-effort: returns false if not connected, no handle, or no
+/// iMessage targets (e.g. an SMS thread).
 #[no_mangle]
 pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeMarkRead<
     'l,
@@ -1482,8 +1486,12 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
     chat_guid: JString<'l>,
+    last_read_guid: JString<'l>,
+    tell_sender: jboolean,
 ) -> jboolean {
     let chat = jstr(&mut env, &chat_guid);
+    let last_guid = jstr(&mut env, &last_read_guid);
+    let tell_sender = tell_sender == JNI_TRUE;
     let client = st().client.clone();
     let Some(client) = client else {
         return JNI_FALSE;
@@ -1495,27 +1503,61 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         else {
             return false;
         };
-        // participants = the chat's OTHER party, so my other devices can map this to
-        // the right conversation; prepare_send adds MY handle, which is how the sync
-        // reaches my own devices. MessageReadOnDevice carries no payload and is a
-        // self-read notification — not a read receipt shown to the sender.
+        // Send a REAL read receipt: command 102 (Message::Read). This is the message
+        // Apple devices act on to clear a chat's notification — NOT MessageReadOnDevice
+        // (147), which in rustpush is the SMS-activation confirmation (see aps_client.rs:
+        // it's auto-sent in reply to command 145 EnableSmsActivation, Display = "confirmed
+        // sms activation"). A read receipt references the message it read up to: its own
+        // `id` is that message's guid, mirroring how rustpush parses an inbound 102.
+        //
+        // Who gets told is decided by the participant list:
+        //  - tell_sender = false (default): ONLY my own handle. prepare_send resolves my
+        //    handle's own devices and send_message drops MY CURRENT token, so the receipt
+        //    reaches my OTHER devices (clearing their notification) and is NEVER delivered
+        //    to the sender. (If a device turns out to key notification-clearing off the
+        //    conversation participants rather than the read guid, the alternative is to
+        //    keep the full participant list but restrict `inst.target` to my own device
+        //    tokens — validate on-device / against a capture before relying on either.)
+        //  - tell_sender = true: include the chat's other party, so they see "Read".
+        let participants = if tell_sender {
+            participants_from_chat_guid(&chat)
+        } else {
+            vec![handle.clone()]
+        };
+        // Grep-able trace of what this read actually does: which chat, which message it
+        // marks read up to, whether the sender is told, and how many participants it
+        // targets (self-only ⇒ 1, since only my own handle is listed). Pair this with the
+        // "ID send message … command: 102" line to confirm the 147→102 switch is live.
+        let participant_count = participants.len();
+        log::info!(
+            "nativeMarkRead: chat={chat} up_to_guid={last_guid} tell_sender={tell_sender} \
+             from={handle} participants={participant_count} → Message::Read (cmd 102)"
+        );
         let mut inst = MessageInst::new(
             ConversationData {
-                participants: participants_from_chat_guid(&chat),
+                participants,
                 cv_name: None,
                 sender_guid: Some(Uuid::new_v4().to_string()),
                 after_guid: None,
             },
             &handle,
-            Message::MessageReadOnDevice,
+            Message::Read,
         );
+        // A read receipt's id IS the guid of the message being marked read (Apple reuses
+        // the original message's uuid). Skip only if the caller had no inbound message.
+        if !last_guid.is_empty() {
+            inst.id = last_guid.to_uppercase();
+        }
         match client.send(&mut inst).await {
-            Ok(_) => true,
+            Ok(_) => {
+                log::info!("nativeMarkRead: sent read (cmd 102) for chat={chat} up_to_guid={}", inst.id);
+                true
+            }
             Err(e) => {
-                // Expected on a green/SMS thread: read-on-device is an iMessage-only
-                // self-sync, and an SMS contact has no iMessage targets, so this
-                // always returns NoValidTargets. Not a real failure — debug, not warn,
-                // so it doesn't look like the cause when diagnosing send problems.
+                // Expected on a green/SMS thread: a read receipt is iMessage-only, and an
+                // SMS contact has no iMessage targets, so this returns NoValidTargets.
+                // Not a real failure — debug, not warn, so it doesn't look like the cause
+                // when diagnosing send problems.
                 log::debug!("nativeMarkRead: skipped ({e:?}) — no iMessage targets (SMS thread?)");
                 false
             }

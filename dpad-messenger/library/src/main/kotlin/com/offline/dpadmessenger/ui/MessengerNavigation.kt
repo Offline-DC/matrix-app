@@ -79,6 +79,9 @@ fun DpadMessengerApp(
     /** Auto-delete-old-messages setting (hidden when change handler is null). */
     autoDeleteEnabled: Boolean = true,
     onAutoDeleteChange: ((Boolean) -> Unit)? = null,
+    /** Send-read-receipts setting (hidden when change handler is null). */
+    sendReadReceipts: Boolean = false,
+    onSendReadReceiptsChange: ((Boolean) -> Unit)? = null,
     /** 24-hour clock setting (hidden when change handler is null). */
     use24HourTime: Boolean = false,
     onUse24HourTimeChange: ((Boolean) -> Unit)? = null,
@@ -224,6 +227,8 @@ fun DpadMessengerApp(
                     onDarkThemeChange = { onToggleDarkTheme?.invoke(it) },
                     autoDeleteEnabled = autoDeleteEnabled,
                     onAutoDeleteChange = onAutoDeleteChange,
+                    sendReadReceipts = sendReadReceipts,
+                    onSendReadReceiptsChange = onSendReadReceiptsChange,
                     use24HourTime = use24HourTime,
                     onUse24HourTimeChange = onUse24HourTimeChange,
                     sendHandles = sendHandles,

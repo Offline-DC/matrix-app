@@ -128,6 +128,22 @@ fun MessageContextSheet(
                     }
                 }
             }
+            // When this message was sent/received. The SmartTxt skin hides the
+            // per-bubble timestamp (only the date header + the last-bubble receipt
+            // carry a time), so this sheet is the one place to see an individual
+            // message's time — shown for every message, between the reactions above
+            // and the actions below.
+            Text(
+                text = "at " + com.offline.dpadmessenger.ui.util.formatTimeShort(message.timestampMs),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                // Left-aligned so it lines up with the Reply row's left edge below,
+                // matching the sheet's other left-anchored content (not centered).
+                textAlign = androidx.compose.ui.text.style.TextAlign.Start,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 2.dp),
+            )
             Box(
                 modifier = Modifier
                     .padding(vertical = 8.dp)

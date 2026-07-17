@@ -108,7 +108,8 @@ class SmartTxtSession(
     suspend fun unsendMessage(chatGuid: String, targetGuid: String): Boolean =
         transport.unsendMessage(chatGuid, targetGuid)
 
-    suspend fun markRead(chatGuid: String): Boolean = transport.markRead(chatGuid)
+    suspend fun markRead(chatGuid: String, lastReadGuid: String, sendReceipt: Boolean): Boolean =
+        transport.markRead(chatGuid, lastReadGuid, sendReceipt)
 
     suspend fun setTyping(chatGuid: String, typing: Boolean) = transport.setTyping(chatGuid, typing)
 

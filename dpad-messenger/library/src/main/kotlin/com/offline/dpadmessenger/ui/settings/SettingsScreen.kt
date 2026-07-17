@@ -70,6 +70,12 @@ fun SettingsScreen(
      *  null (repositories without local retention). */
     autoDeleteEnabled: Boolean = true,
     onAutoDeleteChange: ((Boolean) -> Unit)? = null,
+    /** Send-read-receipts toggle. Hidden when [onSendReadReceiptsChange] is null
+     *  (repositories that can't send receipts, e.g. the mock). Off by default:
+     *  reading still clears the notification on the user's own devices, but the
+     *  sender isn't told "Read" unless this is on. */
+    sendReadReceipts: Boolean = false,
+    onSendReadReceiptsChange: ((Boolean) -> Unit)? = null,
     /** 24-hour clock toggle. Hidden when [onUse24HourTimeChange] is null. */
     use24HourTime: Boolean = false,
     onUse24HourTimeChange: ((Boolean) -> Unit)? = null,
@@ -149,13 +155,22 @@ fun SettingsScreen(
                 }
             }
             val showHandlePicker = onDefaultSendHandleChange != null && sendHandles.isNotEmpty()
-            if (onAutoDeleteChange != null || showHandlePicker) {
+            if (onAutoDeleteChange != null || onSendReadReceiptsChange != null || showHandlePicker) {
                 SettingHeader("Messages")
                 if (showHandlePicker) {
                     HandlePickerRow(
                         handles = sendHandles,
                         selected = defaultSendHandle.ifBlank { sendHandles.first() },
                         onSelect = onDefaultSendHandleChange!!,
+                    )
+                }
+                if (onSendReadReceiptsChange != null) {
+                    ToggleRow(
+                        title = "Send read receipts",
+                        subtitle = "Let people see when you've read their message. " +
+                            "When off, reading still clears the notification on your other devices.",
+                        checked = sendReadReceipts,
+                        onCheckedChange = onSendReadReceiptsChange,
                     )
                 }
                 if (onAutoDeleteChange != null) {

@@ -122,7 +122,7 @@ class MockRelayTransport : SmartTxtTransport {
         return true
     }
 
-    override suspend fun markRead(chatGuid: String): Boolean {
+    override suspend fun markRead(chatGuid: String, lastReadGuid: String, sendReceipt: Boolean): Boolean {
         lock.withLock { chats[chatGuid]?.let { chats[chatGuid] = it.copy(unread = false) } }
         return true
     }

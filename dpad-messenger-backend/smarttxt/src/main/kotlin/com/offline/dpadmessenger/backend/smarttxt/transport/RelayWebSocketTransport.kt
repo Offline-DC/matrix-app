@@ -210,9 +210,16 @@ class RelayWebSocketTransport(
             request(RelayProtocol.T_UNSEND) { put("chatGuid", chatGuid); put("targetGuid", targetGuid) }; true
         }.getOrDefault(false)
 
-    override suspend fun markRead(chatGuid: String): Boolean =
-        runCatching { request(RelayProtocol.T_MARK_READ) { put("chatGuid", chatGuid) }; true }
-            .getOrDefault(false)
+    override suspend fun markRead(chatGuid: String, lastReadGuid: String, sendReceipt: Boolean): Boolean =
+        runCatching {
+            request(RelayProtocol.T_MARK_READ) {
+                put("chatGuid", chatGuid)
+                // Newest inbound guid + opt-in flag: forward-compatible extras the relay
+                // can use to send a proper read receipt. Older relays ignore them.
+                put("lastReadGuid", lastReadGuid)
+                put("sendReceipt", sendReceipt)
+            }; true
+        }.getOrDefault(false)
 
     override suspend fun setTyping(chatGuid: String, typing: Boolean) {
         runCatching { request(RelayProtocol.T_SET_TYPING) { put("chatGuid", chatGuid); put("typing", typing) } }

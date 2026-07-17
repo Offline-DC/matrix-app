@@ -21,6 +21,7 @@ import com.offline.dpadmessenger.data.MediaDownloader
 import com.offline.dpadmessenger.data.Message
 import com.offline.dpadmessenger.data.MessageRepository
 import com.offline.dpadmessenger.data.MessageStatus
+import com.offline.dpadmessenger.data.ReadReceiptSettings
 import com.offline.dpadmessenger.data.RetentionSettings
 import com.offline.dpadmessenger.data.Room
 import com.offline.dpadmessenger.data.SmsThreadInfo
@@ -61,8 +62,8 @@ internal class SmartTxtMessageRepository(
     private val session: SmartTxtSession,
     context: Context,
 ) : MessageRepository, InitialSyncAware, ConversationStarter, GroupConversationStarter,
-    ContactsSource, MediaDownloader, AttachmentSender, RetentionSettings, ThreadActions, SmsThreadInfo,
-    AttachmentResendCapable {
+    ContactsSource, MediaDownloader, AttachmentSender, RetentionSettings, ReadReceiptSettings,
+    ThreadActions, SmsThreadInfo, AttachmentResendCapable {
 
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -95,10 +96,17 @@ internal class SmartTxtMessageRepository(
     private val _autoDelete = MutableStateFlow(prefs.getBoolean(KEY_AUTO_DELETE, true))
     override val autoDeleteEnabled: StateFlow<Boolean> = _autoDelete.asStateFlow()
 
-    /** Whether to send read receipts (so the sender sees "Read"). Off by default. */
-    var sendReadReceipts: Boolean
-        get() = prefs.getBoolean(KEY_READ_RECEIPTS, false)
-        set(value) { prefs.edit().putBoolean(KEY_READ_RECEIPTS, value).apply() }
+    // Whether to send peer-facing read receipts (so the SENDER sees "Read"). Off by
+    // default: reading a chat still clears the notification on MY other Apple devices,
+    // but the sender isn't told unless the user opts in via Settings. Backed by a
+    // StateFlow so the settings toggle reflects/persists live (ReadReceiptSettings).
+    private val _sendReadReceipts = MutableStateFlow(prefs.getBoolean(KEY_READ_RECEIPTS, false))
+    override val sendReadReceipts: StateFlow<Boolean> = _sendReadReceipts.asStateFlow()
+
+    override fun setSendReadReceipts(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_READ_RECEIPTS, enabled).apply()
+        _sendReadReceipts.value = enabled
+    }
 
     private val sessionStartMs = System.currentTimeMillis()
     @Volatile private var activeRoomId: String? = null
@@ -633,7 +641,16 @@ internal class SmartTxtMessageRepository(
         val screenOn = runCatching {
             (appContext.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager).isInteractive
         }.getOrDefault(true)
-        if (screenOn && rm.chatGuid == activeRoomId) { Log.d(TAG, "notify skip: active room ${rm.chatGuid}"); return }
+        if (screenOn && rm.chatGuid == activeRoomId) {
+            Log.d(TAG, "notify skip: active room ${rm.chatGuid}")
+            // The user is LOOKING at this chat, so a message landing now is already seen.
+            // markRoomRead only fires on room OPEN, so without this an in-thread arrival is
+            // never acknowledged and lingers as unread on the user's OTHER devices (the
+            // reported "opened the thread but a later message still shows unread on my Mac").
+            // isFromMe / !isNew are already excluded at the top of maybeNotify.
+            markReadInActiveRoom(rm.chatGuid, mapped.id)
+            return
+        }
         if (rm.chatGuid in mutedRooms.value) { notifier.clearConversation(rm.chatGuid, reason = "muted"); return }
         if (mapped.timestampMs < sessionStartMs - 10_000L) {
             Log.d(TAG, "notify skip: backfill ts=${mapped.timestampMs} sessionStart=$sessionStartMs")
@@ -648,6 +665,22 @@ internal class SmartTxtMessageRepository(
             sender = userById(mapped.senderId).displayName,
             body = body,
         )
+    }
+
+    /** Send a read receipt for a message that arrived while its thread was already open.
+     *  [markRoomRead] only runs on room OPEN, so an in-thread arrival would otherwise
+     *  never be acknowledged and would stay unread on the user's other devices. Uses the
+     *  message's OWN guid — it's the newest inbound by construction (it just arrived) —
+     *  rather than re-reading messagesByRoom, which the current batch may not have
+     *  published yet. Respects the read-receipts toggle (self-only vs peer-facing). */
+    private fun markReadInActiveRoom(roomId: String, lastReadGuid: String) {
+        if (lastReadGuid.isBlank()) return
+        val tellSender = _sendReadReceipts.value
+        Log.i(TAG, "markReadActive room=$roomId guid=$lastReadGuid tellSender=$tellSender → sending read")
+        scope.launch {
+            runCatching { session.markRead(roomId, lastReadGuid, tellSender) }
+                .onFailure { Log.w(TAG, "markReadActive room=$roomId read threw", it) }
+        }
     }
 
     // ---- MessageRepository reads -------------------------------------------
@@ -941,12 +974,32 @@ internal class SmartTxtMessageRepository(
         // chat left it "active" forever and suppressed that chat's notifications.
         notifier.clearConversation(roomId)
         writeLock.withLock { unreadByRoom.value = unreadByRoom.value + (roomId to 0); requestSave() }
-        // Always sync "read on device" so my OTHER Apple devices clear this chat's
-        // notification. This is NOT a read receipt — session.markRead sends the
-        // self-only MessageReadOnDevice, never Message::Read — so the sender is never
-        // told. (sendReadReceipts, when true, would additionally send a peer-facing
-        // receipt; that path isn't wired, by product decision.)
-        scope.launch { runCatching { session.markRead(roomId) } }
+        // Sync "read" so my OTHER Apple devices clear this chat's notification. A read
+        // receipt references the message it read UP TO, so send the guid of the newest
+        // message FROM THEM (an outgoing/self bubble isn't something to "read", and a
+        // deleted one no longer exists). No inbound message ⇒ nothing to mark read.
+        //
+        // sendReadReceipts gates who's told: false (default) → only my own devices, the
+        // sender never sees "Read"; true → the sender is told too. See session.markRead
+        // / nativeMarkRead for how the participant targeting enforces that.
+        val lastInboundGuid = messagesByRoom.value[roomId]
+            ?.lastOrNull { !it.isOutgoing && !it.isDeleted }
+            ?.id
+        if (lastInboundGuid.isNullOrBlank()) {
+            // No inbound message (e.g. a thread where only I've sent, or one whose
+            // inbound messages are all deleted) — nothing to mark read. Logged so a
+            // "still unread on my Mac" report can be traced to "read never attempted".
+            Log.i(TAG, "markRoomRead room=$roomId — no inbound message, skipping read")
+            return
+        }
+        val tellSender = _sendReadReceipts.value
+        Log.i(TAG, "markRoomRead room=$roomId lastInbound=$lastInboundGuid tellSender=$tellSender → sending read")
+        scope.launch {
+            val ok = runCatching { session.markRead(roomId, lastInboundGuid, tellSender) }
+                .onFailure { Log.w(TAG, "markRoomRead room=$roomId read threw", it) }
+                .getOrDefault(false)
+            Log.i(TAG, "markRoomRead room=$roomId read sent=$ok (guid=$lastInboundGuid)")
+        }
     }
 
     /** A chat was read on ANOTHER of my devices (iMessage synced it here). Clear its
