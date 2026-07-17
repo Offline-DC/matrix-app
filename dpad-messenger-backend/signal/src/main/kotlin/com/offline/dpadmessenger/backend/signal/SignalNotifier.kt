@@ -103,6 +103,15 @@ class SignalNotifier(context: Context) {
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setDefaults(NotificationCompat.DEFAULT_ALL)
+            // Each conversation gets its OWN group key + NO summary, so the OS never
+            // auto-bundles the launcher's notifications under a generated, blank-title
+            // group summary — the phantom, title-less "com.offlineinc.dumbdownlauncher"
+            // row (the OS "ranker_group" autogroup). Without this these Signal texts
+            // are pulled into that autogroup alongside Smart Txt + app-update tiles.
+            // Same fix as SmartTxtNotifier and the podcast player (explicit group +
+            // setGroupSummary(false) → standalone singleton group, no summary needed).
+            .setGroup(GROUP_KEY_PREFIX + conversationId)
+            .setGroupSummary(false)
             .setAutoCancel(true)
             .setContentIntent(openMessengerIntent(conversationId))
             .build()
@@ -177,6 +186,10 @@ class SignalNotifier(context: Context) {
         private const val CHANNEL_ID = "signal_incoming_v1"
         private const val NOTIFICATION_ID_BASE = 5200
         private const val MAX_LINES = 6
+        // Per-conversation group key. Each notification is its OWN singleton group
+        // (with setGroupSummary(false)) so the OS never auto-bundles the launcher's
+        // notifications under a generated blank-title summary — see notifyIncoming.
+        private const val GROUP_KEY_PREFIX = "signal_convo_"
         /** How long to hold the screen-wake lock (auto-releases). */
         private const val WAKE_MS = 5000L
         /** Must match `SignalMessengerActivity.EXTRA_CONVERSATION_ID`. */

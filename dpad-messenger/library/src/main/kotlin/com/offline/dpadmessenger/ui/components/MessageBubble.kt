@@ -1030,7 +1030,7 @@ private fun MediaBlock(
         }
 
         loadedPath != null && attachment.kind == com.offline.dpadmessenger.data.AttachmentKind.IMAGE ->
-            MediaThumbnail(loadedPath, box)
+            MediaThumbnail(loadedPath, attachment.mimeType, box)
 
         loadedPath != null && attachment.kind == com.offline.dpadmessenger.data.AttachmentKind.VIDEO ->
             Box(box.background(Color.Black), contentAlignment = Alignment.Center) {
@@ -1071,17 +1071,29 @@ private fun MediaBlock(
 }
 
 @Composable
-private fun MediaThumbnail(path: String, modifier: Modifier) {
-    // null = still decoding; Decoded(null) = decode finished but failed (e.g.
+private fun MediaThumbnail(path: String, mimeType: String, modifier: Modifier) {
+    // An animated GIF / WebP decodes to a moving drawable so the thumbnail actually
+    // animates instead of freezing on frame one. A still image (incl. a static WebP,
+    // which decodeAnimatedDrawable returns null for) takes the still-frame path below.
+    val maybeAnimated = com.offline.dpadmessenger.ui.util.isMaybeAnimatedImage(path, mimeType)
+    // null = still decoding; Decoded(all null) = decode finished but failed (e.g.
     // an HEIC this device's codec can't handle) → show a clear message rather
     // than an endless spinner.
     val result by androidx.compose.runtime.produceState<Decoded?>(
         // Synchronous cache hit shows instantly (no spinner flash on scroll-back).
-        initialValue = com.offline.dpadmessenger.ui.util.cachedBitmap(path, 400)?.let { Decoded(it) },
-        path,
+        // Skipped for animated candidates — the still cache holds only frame one.
+        initialValue = if (maybeAnimated) null
+            else com.offline.dpadmessenger.ui.util.cachedBitmap(path, 400)?.let { Decoded(bitmap = it) },
+        path, mimeType,
     ) {
         value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            Decoded(com.offline.dpadmessenger.ui.util.decodeDownscaledCached(path, maxEdge = 400))
+            if (maybeAnimated) {
+                com.offline.dpadmessenger.ui.util.decodeAnimatedDrawable(path, maxEdge = 400)
+                    ?.let { Decoded(animated = it) }
+                    ?: Decoded(bitmap = com.offline.dpadmessenger.ui.util.decodeDownscaledCached(path, maxEdge = 400))
+            } else {
+                Decoded(bitmap = com.offline.dpadmessenger.ui.util.decodeDownscaledCached(path, maxEdge = 400))
+            }
         }
     }
     when (val r = result) {
@@ -1091,16 +1103,21 @@ private fun MediaThumbnail(path: String, modifier: Modifier) {
         ) { androidx.compose.material3.CircularProgressIndicator(Modifier.size(24.dp)) }
 
         else -> {
+            val anim = r.animated
             val bmp = r.bitmap
-            if (bmp != null) {
-                Image(
+            when {
+                anim != null -> com.offline.dpadmessenger.ui.util.AnimatedImage(
+                    drawable = anim,
+                    modifier = modifier,
+                    scaleType = android.widget.ImageView.ScaleType.CENTER_CROP,
+                )
+                bmp != null -> Image(
                     bitmap = bmp,
                     contentDescription = null,
                     contentScale = androidx.compose.ui.layout.ContentScale.Crop,
                     modifier = modifier,
                 )
-            } else {
-                Box(
+                else -> Box(
                     modifier.background(MaterialTheme.colorScheme.surfaceVariant),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -1124,9 +1141,14 @@ private fun MediaThumbnail(path: String, modifier: Modifier) {
     }
 }
 
-/** Wrapper so a finished-but-failed decode (bitmap == null) is distinguishable
- *  from "still decoding" (the produceState value is still null). */
-private data class Decoded(val bitmap: androidx.compose.ui.graphics.ImageBitmap?)
+/** Result of decoding a media thumbnail. [animated] wins when the source is a
+ *  GIF/WebP that actually animates; otherwise [bitmap] holds the still frame.
+ *  Both null (once decoding has FINISHED) means the decode failed — distinct from
+ *  "still decoding", which is the produceState value still being null. */
+private data class Decoded(
+    val bitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
+    val animated: android.graphics.drawable.AnimatedImageDrawable? = null,
+)
 
 /** OK-key hold (ms) that counts as a long-press on a media bubble. */
 private const val LONG_PRESS_MS = 400L

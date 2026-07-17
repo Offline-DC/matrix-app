@@ -78,13 +78,18 @@ internal class SmartTxtNotifier(context: Context) {
             .setContentText(body)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            // Deliberately NOT grouped. A shared group key makes Android
-            // auto-generate a blank group-summary notification once 2+
-            // conversations are showing, and the launcher's notification list
-            // renders that summary as a stray, title-less
-            // "com.offlineinc.dumbdownlauncher" row. Posting each conversation
-            // standalone means no summary is ever generated — the same reason the
-            // podcast player keeps its media notification out of a multi-item group.
+            // Give each conversation its OWN group key with NO summary, so the system
+            // treats it as a standalone (singleton) group and never bundles the app's
+            // texts under a generated, blank-title group summary — the phantom,
+            // title-less "com.offlineinc.dumbdownlauncher" row on these launchers.
+            // NOTE: leaving them UNGROUPED (the old approach) does NOT prevent this —
+            // Android auto-groups 2+ ungrouped notifications from one app and
+            // synthesizes that blank summary ITSELF. An explicit per-notification
+            // group excludes them from auto-bundling, and a singleton group needs no
+            // summary. Mirrors the podcast player's fix (explicit group +
+            // setGroupSummary(false)); see PlaybackService.NOTIF_GROUP.
+            .setGroup(GROUP_KEY_PREFIX + roomId)
+            .setGroupSummary(false)
             .setAutoCancel(true)
 
         tapIntent(roomId)?.let { builder.setContentIntent(it) }
@@ -115,5 +120,9 @@ internal class SmartTxtNotifier(context: Context) {
     companion object {
         private const val CHANNEL_ID = "smarttxt_texts_v1"
         private const val MAX_LINES = 6
+        // Per-conversation group key. Each notification gets its OWN singleton group
+        // (paired with setGroupSummary(false)) so the OS never auto-bundles the app's
+        // texts under a generated blank-title summary — see notifyIncoming.
+        private const val GROUP_KEY_PREFIX = "smarttxt_convo_"
     }
 }

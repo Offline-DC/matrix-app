@@ -324,6 +324,15 @@ class RelayWebSocketTransport(
                     val c = json.decodeFromJsonElement(RelayChat.serializer(), it)
                     _events.emit(TransportEvent.ChatsUpdated(listOf(c)))
                 }
+                // A chat was read on another of my devices. The native transport
+                // already surfaces this (see NativeRustPushTransport.parseAndEmit);
+                // without this case the relay's chat_read frame parsed, matched no
+                // branch, and was silently dropped — so read state never synced to
+                // this device. Blank-guard mirrors the native side.
+                RelayProtocol.P_CHAT_READ -> {
+                    val chatGuid = obj.str("chatGuid")
+                    if (chatGuid.isNotBlank()) _events.emit(TransportEvent.ChatRead(chatGuid))
+                }
                 RelayProtocol.P_AUTH_EXPIRED -> _events.emit(TransportEvent.AuthExpired)
             }
         }

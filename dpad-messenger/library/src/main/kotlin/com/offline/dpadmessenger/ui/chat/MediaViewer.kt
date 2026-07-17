@@ -94,28 +94,44 @@ private fun ImageView(path: String) {
     // OOM risk on back-to-back opens. Routed through the shared LRU cache.
     val dm = LocalContext.current.resources.displayMetrics
     val maxEdge = maxOf(dm.widthPixels, dm.heightPixels).coerceIn(480, 1080)
-    // null = decoding; ImageResult(null) = decode failed (e.g. HEIC with no codec).
+    // A GIF / animated WebP plays as a moving drawable at full screen; a still
+    // image keeps the decoded-bitmap path. Detected by the downloaded file's
+    // extension (our media cache names files by their mime type).
+    val maybeAnimated = com.offline.dpadmessenger.ui.util.isMaybeAnimatedImage(path, null)
+    // null = decoding; ImageResult(all null) = decode failed (e.g. HEIC with no codec).
     val result by produceState<ImageResult?>(
-        initialValue = com.offline.dpadmessenger.ui.util.cachedBitmap(path, maxEdge)?.let { ImageResult(it) },
+        initialValue = if (maybeAnimated) null
+            else com.offline.dpadmessenger.ui.util.cachedBitmap(path, maxEdge)?.let { ImageResult(bitmap = it) },
         path, maxEdge,
     ) {
         value = withContext(Dispatchers.IO) {
-            ImageResult(com.offline.dpadmessenger.ui.util.decodeDownscaledCached(path, maxEdge))
+            if (maybeAnimated) {
+                com.offline.dpadmessenger.ui.util.decodeAnimatedDrawable(path, maxEdge)
+                    ?.let { ImageResult(animated = it) }
+                    ?: ImageResult(bitmap = com.offline.dpadmessenger.ui.util.decodeDownscaledCached(path, maxEdge))
+            } else {
+                ImageResult(bitmap = com.offline.dpadmessenger.ui.util.decodeDownscaledCached(path, maxEdge))
+            }
         }
     }
     when (val r = result) {
         null -> CircularProgressIndicator(color = Color.White)
         else -> {
+            val anim = r.animated
             val bmp = r.bitmap
-            if (bmp != null) {
-                Image(
+            when {
+                anim != null -> com.offline.dpadmessenger.ui.util.AnimatedImage(
+                    drawable = anim,
+                    modifier = Modifier.fillMaxSize(),
+                    scaleType = android.widget.ImageView.ScaleType.FIT_CENTER,
+                )
+                bmp != null -> Image(
                     bitmap = bmp,
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize(),
                 )
-            } else {
-                Text(
+                else -> Text(
                     text = "Can't preview this photo on this device.",
                     color = Color.White,
                 )
@@ -124,8 +140,12 @@ private fun ImageView(path: String) {
     }
 }
 
-/** Distinguishes a finished-but-failed decode from "still decoding". */
-private data class ImageResult(val bitmap: androidx.compose.ui.graphics.ImageBitmap?)
+/** Distinguishes a finished-but-failed decode from "still decoding", and carries
+ *  an animated drawable when the source is a GIF/WebP that actually animates. */
+private data class ImageResult(
+    val bitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
+    val animated: android.graphics.drawable.AnimatedImageDrawable? = null,
+)
 
 @Composable
 private fun VideoPlayer(path: String) {

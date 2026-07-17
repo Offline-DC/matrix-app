@@ -108,6 +108,28 @@ internal class SmartTxtMessageRepository(
     private val saveRequests = Channel<Unit>(Channel.CONFLATED)
     private fun requestSave() { saveRequests.trySend(Unit) }
 
+    // Debounced address-book refresh. The contacts provider fires several change
+    // notifications for a single edit, so coalesce them (CONFLATED + a short settle)
+    // into one heavier re-read (index re-warm + name re-heal).
+    private val contactsRefresh = Channel<Unit>(Channel.CONFLATED)
+
+    // Watches the device address book so a contact added or edited WHILE the app is
+    // running becomes searchable in the new-message picker AND resolves in threads
+    // without a restart. Otherwise listContacts()'s cachedContacts and
+    // contactIndexCache each hold their first read forever, so a freshly added
+    // contact only showed up after a cold start (the reported bug). Registered in
+    // init, unregistered in shutdown.
+    private val contactsObserver = object : android.database.ContentObserver(
+        android.os.Handler(android.os.Looper.getMainLooper()),
+    ) {
+        override fun onChange(selfChange: Boolean) {
+            // Invalidate the picker cache immediately so even a picker opened right
+            // away re-reads fresh; debounce the heavier index re-warm + name re-heal.
+            cachedContacts = null
+            contactsRefresh.trySend(Unit)
+        }
+    }
+
     // Voice memos auto-download as soon as they arrive, the way iMessage does. Two
     // reasons: they're tiny (tens of KB — a photo this eager would be rude), and the
     // bubble physically cannot show the memo's LENGTH until the file is on disk, so
@@ -130,8 +152,11 @@ internal class SmartTxtMessageRepository(
 
     init {
         notifier.ensureChannel()
+        registerContactsObserver()
         scope.launch { session.events.collect { handleEvent(it) } }
         scope.launch { for (r in saveRequests) { delay(1500); persistToCache() } }
+        // Coalesced re-read after the address book changes (see [contactsObserver]).
+        scope.launch { for (r in contactsRefresh) { delay(400); refreshContacts() } }
         // Drain the voice-memo prefetch queue one at a time (see [maybePrefetchAudio]).
         scope.launch {
             for ((room, id) in audioPrefetchQueue) {
@@ -152,6 +177,12 @@ internal class SmartTxtMessageRepository(
         //    parallel with it raced the restore against the first inbound message.
         scope.launch {
             restoreFromCache()
+            // Warm the device address book into the contact index BEFORE connecting:
+            // Apple replays its backlog on connect, so the index must be ready or a
+            // sender's first message bakes the raw number/email in permanently (the
+            // "names show in the picker but not in threads" bug). Also heals any
+            // raw-handle names restored from a cache written during an earlier cold start.
+            warmContacts()
             session.seedSeen(messagesByRoom.value.values.flatten().map { it.id })
             session.connect()
         }
@@ -268,6 +299,7 @@ internal class SmartTxtMessageRepository(
     }
 
     fun shutdown(clearCache: Boolean) {
+        runCatching { appContext.contentResolver.unregisterContentObserver(contactsObserver) }
         session.shutdown()
         if (clearCache) cache.clear()
         scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
@@ -321,6 +353,7 @@ internal class SmartTxtMessageRepository(
         rooms.value = roomMap.values.toList()
         unreadByRoom.value = unread
         requestSave()
+        maybeHealContactsLater()
     }
 
     private suspend fun onMessages(msgs: List<RelayMessage>) = writeLock.withLock {
@@ -458,6 +491,7 @@ internal class SmartTxtMessageRepository(
         messagesByRoom.value = byRoom
         unreadByRoom.value = unread
         requestSave()
+        maybeHealContactsLater()
     }
 
     /** Apply a whole batch of status changes with a SINGLE state update. */
@@ -971,7 +1005,10 @@ internal class SmartTxtMessageRepository(
 
     // ---- ContactsSource -----------------------------------------------------
 
-    private var cachedContacts: List<ContactEntry>? = null
+    // @Volatile: invalidated from the contacts observer (main thread) and read from
+    // listContacts() on a coroutine dispatcher, so the null-out must be visible across
+    // threads.
+    @Volatile private var cachedContacts: List<ContactEntry>? = null
 
     override suspend fun listContacts(): List<ContactEntry> {
         cachedContacts?.let { return it }
@@ -1243,6 +1280,100 @@ internal class SmartTxtMessageRepository(
         val hit = contactIndex()[key]
         if (hit == null) Log.d(TAG, "contactName miss: handle=$handle canon=$key")
         return hit
+    }
+
+    // Contact-name resolution can arrive AFTER a sender's first message. The device
+    // address book ([contactIndex]) is read lazily; if a backlog syncs in before it's
+    // ever been read — or before READ_CONTACTS is effective at cold boot — a sender's
+    // User is created with the raw number/email, and the `uid !in users` guard in
+    // onMessages then never re-resolves it. Names showed in the new-message picker
+    // (which reads the same address book) but not in threads, and only "fixed" after
+    // the contact was touched there. Closed two ways: warm the index BEFORE connect
+    // ([warmContacts]) and heal any raw-handle names once it's available ([reresolveNames],
+    // triggered eagerly at startup and, as a safety net, by [maybeHealContactsLater]).
+    private val contactsHealed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Read the address book into [contactIndexCache] off the main thread, then
+     *  upgrade any user / 1:1-room still showing a raw handle. Called BEFORE
+     *  session.connect() so Apple's replayed backlog resolves names on first sight
+     *  instead of baking the raw handle in permanently. */
+    private suspend fun warmContacts() {
+        val index = withContext(Dispatchers.IO) { contactIndex() }
+        if (index.isEmpty()) return   // not readable yet — a later message heals it
+        if (contactsHealed.compareAndSet(false, true)) reresolveNames(index)
+    }
+
+    /** Safety net for contacts that only become readable AFTER connect (permission
+     *  granted late, or a slow provider at cold boot): the first event whose
+     *  [contactIndex] read has since populated triggers a one-time heal. Cheap (a
+     *  volatile read) and deadlock-free — the heal runs in its own coroutine, never
+     *  under the caller's write lock. */
+    private fun maybeHealContactsLater() {
+        if (contactsHealed.get()) return
+        val idx = contactIndexCache ?: return
+        if (idx.isEmpty()) return
+        if (contactsHealed.compareAndSet(false, true)) scope.launch { reresolveNames(idx) }
+    }
+
+    /** Replace raw-handle display names (users) and 1:1 room titles with the contact
+     *  name now that [index] is populated. Never clobbers an already-resolved name
+     *  (e.g. one the relay supplied) — see [isRawHandleName]. */
+    private suspend fun reresolveNames(index: Map<String, String>) = writeLock.withLock {
+        var usersChanged = false
+        val users = usersById.value.toMutableMap()
+        for ((uid, u) in users) {
+            if (uid == ME) continue
+            if (!isRawHandleName(u.displayName, uid)) continue
+            val resolved = index[Handles.canon(uid)] ?: continue
+            if (resolved != u.displayName) { users[uid] = u.copy(displayName = resolved); usersChanged = true }
+        }
+        if (usersChanged) usersById.value = users
+
+        var roomsChanged = false
+        val healed = rooms.value.map { room ->
+            if (ChatGuid.isGroup(room.id)) return@map room        // group titles aren't a 1:1 handle
+            val addr = room.id.substringAfterLast(';')
+            if (!isRawHandleName(room.name, addr)) return@map room
+            val resolved = index[Handles.canon(addr)] ?: return@map room
+            if (resolved == room.name) return@map room
+            roomNameById[room.id] = resolved
+            roomsChanged = true
+            room.copy(name = resolved)
+        }
+        if (roomsChanged) rooms.value = healed
+
+        if (usersChanged || roomsChanged) {
+            requestSave()
+            Log.i(TAG, "contacts warmed: healed raw-handle names (users=$usersChanged rooms=$roomsChanged)")
+        }
+    }
+
+    /** True if [name] is still just the raw handle (blank, or the number/email in any
+     *  format) rather than a resolved contact name — so it's safe to upgrade once the
+     *  address book loads. Canon-equality so "+1 (248)…" and "+1248…" both count,
+     *  without overwriting a real name. */
+    private fun isRawHandleName(name: String, handle: String): Boolean =
+        name.isBlank() || name == prettyHandle(handle) || Handles.canon(name) == Handles.canon(handle)
+
+    private fun registerContactsObserver() {
+        runCatching {
+            appContext.contentResolver.registerContentObserver(
+                android.provider.ContactsContract.AUTHORITY_URI,
+                /* notifyForDescendants = */ true,
+                contactsObserver,
+            )
+        }.onFailure { Log.w(TAG, "contacts observer register failed", it) }
+    }
+
+    /** The device address book changed: drop the cached reads so the picker re-queries
+     *  fresh, and re-warm the index + re-heal names so open threads and the chat list
+     *  pick up a newly added contact's name too — all without a restart. */
+    private suspend fun refreshContacts() {
+        contactIndexCache = null
+        cachedContacts = null
+        contactsHealed.set(false)
+        Log.i(TAG, "address book changed — refreshing contacts")
+        warmContacts()
     }
 
     private fun colorFor(id: String): String {
