@@ -75,14 +75,17 @@ class ChatViewModel(
 
     private val _isSmsProbe = MutableStateFlow(false)
 
-    /** True when this thread sends as green SMS. Combines any SMS message already
-     *  in the thread with a one-shot probe of the recipient, so a brand-new SMS
-     *  thread reads green (and colors the send button) BEFORE the first send. */
+    /** True when this thread CURRENTLY sends as green SMS. Tracks the newest message's
+     *  service, so when blue iMessages resume in a thread that had some green SMS the
+     *  composer returns to blue. (Deriving it from "any past message was SMS" stuck it
+     *  green forever.) An empty thread falls back to a one-shot recipient probe, so a
+     *  brand-new SMS thread still reads green BEFORE the first send. */
     val isSms: StateFlow<Boolean> = combine(
         repository.observeMessages(roomId),
         _isSmsProbe,
-    ) { messages, probe -> probe || messages.any { it.isSms } }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+    ) { messages, probe ->
+        messages.filter { !it.isDeleted }.maxByOrNull { it.timestampMs }?.isSms ?: probe
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     init {
         viewModelScope.launch {

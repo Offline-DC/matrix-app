@@ -1,6 +1,7 @@
 package com.offline.dpadmessenger.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.lazy.LazyRow
@@ -42,6 +44,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import com.offline.dpadmessenger.data.DefaultReactions
 import com.offline.dpadmessenger.data.Message
 import com.offline.dpadmessenger.data.MessageStatus
+import com.offline.dpadmessenger.focus.dpadFocusHighlight
 import com.offline.dpadmessenger.focus.dpadRow
 
 /**
@@ -212,8 +215,15 @@ private fun FailedNotice(reason: String?) {
         modifier = Modifier
             .fillMaxWidth()
             .padding(top = 4.dp)
+            // Make the notice a focusable DPAD stop: pressing Down past the last action
+            // lands here, and a focusable in a verticalScroll auto-scrolls itself into
+            // view — the action rows above slide off the top so the whole multi-line
+            // error (e.g. the SMS-forwarding steps) can be read on a 240x320 screen.
+            // Read-only: no onClick, it's just a scroll/reading target.
+            .dpadFocusHighlight(shape = RoundedCornerShape(10.dp), focusedTint = Color.Transparent)
             .clip(RoundedCornerShape(10.dp))
             .background(MaterialTheme.colorScheme.errorContainer)
+            .focusable()
             .padding(horizontal = 12.dp, vertical = 10.dp),
     ) {
         Icon(

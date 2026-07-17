@@ -338,7 +338,12 @@ class RelayWebSocketTransport(
                 // this device. Blank-guard mirrors the native side.
                 RelayProtocol.P_CHAT_READ -> {
                     val chatGuid = obj.str("chatGuid")
-                    if (chatGuid.isNotBlank()) _events.emit(TransportEvent.ChatRead(chatGuid))
+                    // messageGuid (read-up-to message) resolves the room when chatGuid
+                    // is blank; older relays omit it, hence the default-blank read.
+                    val messageGuid = obj.str("messageGuid")
+                    if (chatGuid.isNotBlank() || messageGuid.isNotBlank()) {
+                        _events.emit(TransportEvent.ChatRead(chatGuid, messageGuid))
+                    }
                 }
                 RelayProtocol.P_AUTH_EXPIRED -> _events.emit(TransportEvent.AuthExpired)
             }

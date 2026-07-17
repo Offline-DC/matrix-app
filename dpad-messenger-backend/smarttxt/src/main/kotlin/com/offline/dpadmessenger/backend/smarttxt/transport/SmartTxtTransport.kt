@@ -164,8 +164,10 @@ sealed class TransportEvent {
     data class TypingChanged(val chatGuid: String, val typing: Boolean) : TransportEvent()
 
     /** A chat was read on another of my devices — clear its unread + notification
-     *  here (the read didn't happen on THIS device, so nothing else clears it). */
-    data class ChatRead(val chatGuid: String) : TransportEvent()
+     *  here (the read didn't happen on THIS device, so nothing else clears it).
+     *  [chatGuid] may be blank when Apple's self-synced read carries no counterpart;
+     *  [messageGuid] (the guid of the message read up to) then identifies the room. */
+    data class ChatRead(val chatGuid: String, val messageGuid: String = "") : TransportEvent()
 
     /** Credentials died and could not be refreshed — re-register needed. */
     data object AuthExpired : TransportEvent()

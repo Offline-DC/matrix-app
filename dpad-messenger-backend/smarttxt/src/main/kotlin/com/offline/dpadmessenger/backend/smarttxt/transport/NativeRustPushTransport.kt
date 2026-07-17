@@ -170,7 +170,7 @@ class NativeRustPushTransport(
         val messages = ArrayList<RelayMessage>()
         val statuses = ArrayList<TransportEvent.MessageStatusChanged>()
         val tapbacks = ArrayList<TransportEvent.TapbackUpdated>()
-        val chatReads = ArrayList<String>()
+        val chatReads = ArrayList<TransportEvent.ChatRead>()
         for (el in arr) {
             val obj = el.jsonObject
             when (obj["type"]?.jsonPrimitive?.content) {
@@ -197,8 +197,14 @@ class NativeRustPushTransport(
                         timestampMs = obj["timestampMs"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
                     ),
                 )
-                RelayProtocol.P_CHAT_READ -> obj["chatGuid"]?.jsonPrimitive?.content?.let {
-                    if (it.isNotBlank()) chatReads.add(it)
+                RelayProtocol.P_CHAT_READ -> {
+                    // chatGuid may be blank for a self-synced read with no counterpart;
+                    // messageGuid (the read-up-to message) then names the room.
+                    val chatGuid = obj["chatGuid"]?.jsonPrimitive?.content ?: ""
+                    val messageGuid = obj["messageGuid"]?.jsonPrimitive?.content ?: ""
+                    if (chatGuid.isNotBlank() || messageGuid.isNotBlank()) {
+                        chatReads.add(TransportEvent.ChatRead(chatGuid, messageGuid))
+                    }
                 }
             }
         }
@@ -208,7 +214,7 @@ class NativeRustPushTransport(
         if (tapbacks.isNotEmpty()) _events.emit(TransportEvent.TapbackBatch(tapbacks))
         // Read-elsewhere last, so a chat that got a new message AND a read in the same
         // batch ends cleared (read wins) rather than re-notified.
-        for (chatGuid in chatReads) _events.emit(TransportEvent.ChatRead(chatGuid))
+        for (read in chatReads) _events.emit(read)
     }
 
     private companion object {

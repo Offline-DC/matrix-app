@@ -1792,6 +1792,12 @@ fn push_relay_event(msg: MessageInst) {
         }
         _ => false,
     };
+    // A Read whose sender ISN'T me is a peer "they read my message" receipt, not a
+    // cross-device sync — log it (grep-able) so a "read on my phone didn't clear the
+    // flip" report can be told apart from the self-sync path below.
+    if matches!(&msg.message, Message::Read | Message::MessageReadOnDevice) && !read_elsewhere {
+        log::info!("recv read-on-device SKIP: sender={:?} is not one of my handles", msg.sender);
+    }
     if read_elsewhere {
         let sender = msg.sender.clone().unwrap_or_default();
         let my: Vec<String> = st().self_handles.iter().map(|h| canon(h)).collect();
@@ -1815,17 +1821,34 @@ fn push_relay_event(msg: MessageInst) {
         counterparts.dedup();
         // Match the chat_guid the text path computes (incl. cv_name grouping) so the
         // notification id (roomId.hashCode()) lines up on the Kotlin side.
+        //
+        // BUT a read that Apple self-syncs across MY OWN devices frequently arrives
+        // with NO counterpart in its conversation (participants = just me, or no
+        // conversation at all) — so we often CAN'T name the chat from participants and
+        // used to silently drop it here ("read on my phone didn't clear the flip"). So
+        // also ship the read's message guid (msg.id = the guid of the message read up
+        // to): when chatGuid is empty the app resolves the room from that guid instead.
         let is_group = counterparts.len() > 1 || cv_name.is_some();
         let chat_guid = if is_group {
             format!("iMessage;+;{}", counterparts.join(","))
+        } else if let Some(other) = counterparts.first() {
+            format!("iMessage;-;{other}")
         } else {
-            match counterparts.first() {
-                Some(other) => format!("iMessage;-;{other}"),
-                None => return, // can't tell which chat — nothing to clear
-            }
+            String::new()
         };
-        log::info!("recv read-on-device → clear unread/notif for chat={chat_guid}");
-        st().inbound.push_back(serde_json::json!({ "type": "chat_read", "chatGuid": chat_guid }));
+        let read_guid = msg.id.to_uppercase();
+        log::info!(
+            "recv read-on-device: sender={sender} chat={chat_guid:?} up_to_guid={read_guid} \
+             counterparts={counterparts:?}"
+        );
+        if chat_guid.is_empty() && read_guid.is_empty() {
+            return; // no chat AND no message guid — genuinely nothing to act on
+        }
+        st().inbound.push_back(serde_json::json!({
+            "type": "chat_read",
+            "chatGuid": chat_guid,
+            "messageGuid": read_guid,
+        }));
         return;
     }
     // Sync window: drop messages/reactions older than SYNC_WINDOW_MS so a big

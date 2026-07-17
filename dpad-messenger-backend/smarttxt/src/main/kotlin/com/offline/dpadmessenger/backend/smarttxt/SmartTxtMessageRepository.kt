@@ -324,7 +324,7 @@ internal class SmartTxtMessageRepository(
             is TransportEvent.TapbackUpdated -> onTapbacks(listOf(e))
             is TransportEvent.TapbackBatch -> onTapbacks(e.items)
             is TransportEvent.TypingChanged -> { /* no UI slot yet; ignore */ }
-            is TransportEvent.ChatRead -> onChatReadElsewhere(e.chatGuid)
+            is TransportEvent.ChatRead -> onChatReadElsewhere(e.chatGuid, e.messageGuid)
             TransportEvent.Connected -> { Log.i(TAG, "session connected"); _authExpired.value = false }
             TransportEvent.Disconnected -> Log.i(TAG, "session disconnected")
             TransportEvent.AuthExpired -> { Log.w(TAG, "auth expired"); _authExpired.value = true }
@@ -749,9 +749,12 @@ internal class SmartTxtMessageRepository(
             id = tmpId, roomId = roomId, senderId = ME, body = body,
             timestampMs = nextOutgoingTimestamp(roomId), status = MessageStatus.SENDING,
             isOutgoing = true, replyToId = replyToId,
-            // Green immediately on an SMS thread (from the composer's probe / prior
-            // SMS in the thread) so it doesn't flash blue before the delivered event.
-            isSms = smsThreadCache[roomId] == true || messagesByRoom.value[roomId]?.any { it.isSms } == true,
+            // Green immediately when the thread's CURRENT service is SMS — the newest
+            // message's service, else the composer's recipient probe — so it doesn't
+            // flash blue before the delivered event. NOT "any past SMS", which colored
+            // new sends green forever even after the recipient returned to iMessage.
+            isSms = messagesByRoom.value[roomId]?.filter { !it.isDeleted }?.maxByOrNull { it.timestampMs }?.isSms
+                ?: (smsThreadCache[roomId] == true),
         )
         writeLock.withLock {
             messagesByRoom.value = messagesByRoom.value + (roomId to (messagesByRoom.value[roomId].orEmpty() + optimistic))
@@ -1005,9 +1008,26 @@ internal class SmartTxtMessageRepository(
     /** A chat was read on ANOTHER of my devices (iMessage synced it here). Clear its
      *  notification + unread so this device matches — the read didn't happen here, so
      *  [markRoomRead] never ran. Does NOT set [activeRoomId] (the room isn't open) and
-     *  doesn't send a read receipt (the reading device already did). */
-    private suspend fun onChatReadElsewhere(roomId: String) {
-        Log.i(TAG, "read elsewhere → clearing notif/unread for $roomId")
+     *  doesn't send a read receipt (the reading device already did).
+     *
+     *  [chatGuid] is used directly when present. When it's blank (Apple's self-synced
+     *  read carried no counterpart, so the FFI couldn't name the chat), fall back to
+     *  [messageGuid] — the guid of the message that was read up to — and resolve the
+     *  room that contains it. That guid IS the room's notification key, so clearing it
+     *  cancels the right notification. */
+    private suspend fun onChatReadElsewhere(chatGuid: String, messageGuid: String = "") {
+        val roomId = when {
+            chatGuid.isNotBlank() -> chatGuid
+            messageGuid.isNotBlank() -> messagesByRoom.value.entries
+                .firstOrNull { (_, msgs) -> msgs.any { it.id.equals(messageGuid, ignoreCase = true) } }
+                ?.key
+            else -> null
+        }
+        if (roomId.isNullOrBlank()) {
+            Log.i(TAG, "read elsewhere → unresolved (chat='$chatGuid' msg='$messageGuid')")
+            return
+        }
+        Log.i(TAG, "read elsewhere → clearing notif/unread for $roomId (via ${if (chatGuid.isNotBlank()) "chatGuid" else "messageGuid=$messageGuid"})")
         notifier.clearConversation(roomId, reason = "read-elsewhere")
         writeLock.withLock { unreadByRoom.value = unreadByRoom.value + (roomId to 0); requestSave() }
     }
@@ -1039,9 +1059,13 @@ internal class SmartTxtMessageRepository(
     private val smsThreadCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
     override suspend fun isSmsThread(roomId: String): Boolean {
+        val newest = messagesByRoom.value[roomId]?.filter { !it.isDeleted }?.maxByOrNull { it.timestampMs }
         val result = when {
-            // Any SMS message already in the thread → definitely green.
-            messagesByRoom.value[roomId]?.any { it.isSms } == true -> true
+            // The newest message's service = the thread's CURRENT service. (Was: ANY
+            // historical SMS, which stuck a mixed thread green forever even after the
+            // recipient came back to iMessage.) An empty thread falls through to the
+            // group check + native reachability probe.
+            newest != null -> newest.isSms
             // Groups are iMessage/MMS — treat as blue.
             ChatGuid.isGroup(roomId) -> false
             else -> {
