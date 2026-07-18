@@ -1,0 +1,29 @@
+# Host-only test harness for the persisted attachment stash. It compiles the SAME file
+# the FFI crate ships (../src/attachment_stash.rs) and runs its #[cfg(test)] suite on the
+# host — no Android NDK needed. Run: `cargo test` from this directory.
+#
+# Separate from ../identity-tests on purpose: that harness is deliberately
+# dependency-free (std + serde) and compiles in a second. This one needs rustpush for the
+# real `Attachment`/`MMCSFile` types — testing against a hand-rolled copy of those structs
+# would prove nothing about the plist round-trip, which is the whole risk being covered.
+#
+# Isolated workspace ([workspace] below) so it is never pulled into the Android build of
+# the parent smarttxt-ffi crate.
+[package]
+name = "stash-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+plist = "1"
+log = "0.4"
+# Same feature set as the shipped crate, so `Attachment` is byte-identical to what runs
+# on the phone. default-features = false keeps open-absinthe/unicorn out of the graph.
+rustpush = { path = "../../../../rustpush", default-features = false, features = [
+    "remote-anisette-v3",
+    "macos-remote-validation",
+] }

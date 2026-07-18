@@ -47,7 +47,7 @@ use uuid::Uuid;
 
 use rustpush::{
     authenticate_apple, login_apple_delegates, register, APSConnection, APSConnectionResource,
-    APSState, AppleAccount, Attachment, ConversationData, IDSNGMIdentity, IDSUser, IMClient,
+    APSState, AppleAccount, Attachment, AttachmentType, ConversationData, IDSNGMIdentity, IDSUser, IMClient,
     IndexedMessagePart, LoginDelegate, LoginState, MMCSFile, Message, MessageInst, MessagePart,
     MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType, Reaction,
     VerifyBody, MADRID_SERVICE,
@@ -78,6 +78,12 @@ static SMS_ACTIVE: AtomicBool = AtomicBool::new(false);
 // Group-chat identity (gid-keying) lives in a dependency-free module so it can be
 // unit-tested on the host (see group_identity.rs + identity-tests/). `canon` moved
 // there too since the identity helpers need it and it belongs with handle logic.
+mod attachment_stash;
+use attachment_stash::{
+    inline_bytes, load_attachments, remove_blob, save_attachments, stash_entry, write_blob,
+    StashedAttachment, ATTACHMENT_INLINE_BUDGET, ATTACHMENT_STASH_CAP,
+};
+
 mod group_identity;
 use group_identity::{
     canon, effective_send_guid, members_csv, resolve_group_guid, send_identity, updated_meta,
@@ -144,7 +150,20 @@ struct AppState {
     /// Received attachments, keyed by the guid we hand Kotlin ("<msgid>:<idx>").
     /// `nativeDownloadAttachment` looks the rustpush `Attachment` back up here and
     /// streams it from MMCS (or returns the inline bytes) on demand.
+    ///
+    /// PERSISTED to attachments.plist. This map used to be memory-only, which made
+    /// every attachment received before the current launch permanently undownloadable
+    /// ("NO stashed attachment … stash has 0 entries") — the process dies often on a
+    /// 916 MB phone, so that was most of them. An `Attachment` carries the whole MMCS
+    /// coordinate set (url / object / signature / key / size), so keeping it is enough
+    /// to fetch the bytes later. BlueBubbles never hits this because a Mac has already
+    /// downloaded every attachment into ~/Library/Messages/Attachments and its server
+    /// just serves those files; with rustpush there is no such local copy.
     attachments: std::collections::HashMap<String, Attachment>,
+    /// Insertion order of the `attachments` keys, so the stash can be FIFO-capped at
+    /// [`ATTACHMENT_STASH_CAP`] instead of growing without bound. Rebuilt from the
+    /// persisted file's order on load; not stored separately.
+    attachment_order: VecDeque<String>,
 
     /// Guids of messages/reactions the app ALREADY has, so an Apple replay is
     /// dropped instead of re-delivered (see `push_relay_event`).
@@ -351,6 +370,16 @@ fn save_group_meta(dir: &str, map: &std::collections::HashMap<String, GroupMeta>
         }
         Err(e) => log::warn!("serialize group_meta failed: {e}"),
     }
+}
+
+/// Snapshot the stash in insertion order as a metadata-only index: inline payloads are
+/// blanked here because they already live in their own blob files, which is what keeps
+/// this cheap to rewrite.
+fn ordered_attachments(s: &AppState) -> Vec<StashedAttachment> {
+    s.attachment_order
+        .iter()
+        .filter_map(|k| s.attachments.get(k).map(|att| stash_entry(k, att)))
+        .collect()
 }
 
 /// Record/refresh a group's identity for `chat_guid` (the pure decision lives in
@@ -1157,6 +1186,15 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         .map(|(guid, m)| (members_csv(&m.participants), guid.clone()))
         .filter(|(k, _)| !k.is_empty())
         .collect();
+    // Attachment references, so "tap to download" still works for a message that
+    // arrived in an earlier session instead of failing with an empty stash.
+    let stashed = load_attachments(&dir);
+    s.attachment_order = stashed.iter().map(|i| i.key.clone()).collect();
+    s.attachments = stashed.into_iter().map(|i| (i.key, i.att)).collect();
+    log::info!(
+        "nativeInit: restored {} attachment ref(s)",
+        s.attachments.len()
+    );
     s.os_config = Some(Arc::new(cfg));
     // Restore a prior registration so a warm start skips login/2FA.
     if let Some(saved) = load_saved(&dir) {
@@ -2189,11 +2227,62 @@ fn push_relay_event(msg: MessageInst) {
                 "status": if is_from_me { "delivered" } else { "" },
             }
         });
-        let mut s = st();
-        for (guid, att) in stash {
-            s.attachments.insert(guid, att);
+        // Stash the attachment refs and persist them, so the download still works after
+        // the process restarts. Only touches the disk when this message actually carried
+        // an attachment, which is rare enough that the write costs nothing in practice.
+        // Inline payloads (MMS pictures) go to their own blob files FIRST — written once,
+        // before the lock is taken — so the index rewritten below stays a few hundred KB
+        // no matter how much attachment history is retained. Writing them into the index
+        // instead would mean re-serialising every retained byte on every new attachment.
+        if !stash.is_empty() {
+            let dir = st().files_dir.clone();
+            for (key, att) in &stash {
+                if let AttachmentType::Inline(data) = &att.a_type {
+                    if !data.is_empty() {
+                        write_blob(&dir, key, data);
+                    }
+                }
+            }
         }
-        s.inbound.push_back(event);
+        let persist = {
+            let mut s = st();
+            let changed = !stash.is_empty();
+            for (guid, att) in stash {
+                if s.attachments.insert(guid.clone(), att).is_none() {
+                    s.attachment_order.push_back(guid);
+                }
+            }
+            // Evict oldest-first until BOTH limits hold: the entry count, and the inline
+            // bytes actually written to disk (MMCS refs are free, MMS payloads are not).
+            let mut inline_total: usize = s
+                .attachment_order
+                .iter()
+                .filter_map(|k| s.attachments.get(k))
+                .map(inline_bytes)
+                .sum();
+            let mut evicted: Vec<String> = Vec::new();
+            while s.attachment_order.len() > ATTACHMENT_STASH_CAP
+                || inline_total > ATTACHMENT_INLINE_BUDGET
+            {
+                let Some(key) = s.attachment_order.pop_front() else { break };
+                if let Some(att) = s.attachments.remove(&key) {
+                    inline_total = inline_total.saturating_sub(inline_bytes(&att));
+                }
+                evicted.push(key);
+            }
+            s.inbound.push_back(event);
+            if changed {
+                Some((s.files_dir.clone(), ordered_attachments(&s), evicted))
+            } else {
+                None
+            }
+        }; // guard dropped here — never hold the AppState lock across disk I/O
+        if let Some((dir, items, evicted)) = persist {
+            for key in &evicted {
+                remove_blob(&dir, key);
+            }
+            save_attachments(&dir, &items);
+        }
     }
 }
 
@@ -2454,14 +2543,14 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let attachment = st().attachments.get(&key).cloned();
     let stash_len = st().attachments.len();
     if attachment.is_none() {
-        // The stash is IN-MEMORY only, populated when a message is received; it is
-        // lost on process restart. A guid received in a previous session (or a
-        // self-synced send whose parts were never stashed) will miss here — which
-        // is the usual reason a "tap to retry" never succeeds.
+        // The stash is persisted (attachments.plist) and reloaded at init, so a prior
+        // session is no longer a reason to miss. A miss now means the reference was
+        // evicted past ATTACHMENT_STASH_CAP, the message predates persistence, or its
+        // parts were never stashed.
         log::warn!(
             "nativeDownloadAttachment: NO stashed attachment for key='{key}' \
-             (stash has {stash_len} entries) — attachment reference not in memory \
-             (received in a prior session, or never stashed). Cannot download."
+             (stash has {stash_len} entries) — reference evicted, or the message \
+             predates attachment persistence. Cannot download."
         );
     }
     if connection.is_none() {
