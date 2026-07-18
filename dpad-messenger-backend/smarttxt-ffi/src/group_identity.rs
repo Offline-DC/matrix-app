@@ -153,6 +153,33 @@ pub fn send_identity(chat: &str, meta: Option<&GroupMeta>) -> SendIdentity {
     }
 }
 
+/// The guid to actually SEND on for `chat`. A legacy member-keyed group guid
+/// ("iMessage;+;a,b,c") — e.g. a reply typed in an old room that hasn't folded yet —
+/// redirects to its gid-keyed guid so the message threads into the real conversation.
+/// The redirect fires ONLY when exactly one known group has that member set; if two
+/// groups share the same people (the very ambiguity that caused the original bug) we do
+/// NOT guess and leave the guid as-is. 1:1 and already-gid guids pass straight through.
+pub fn effective_send_guid(chat: &str, groups: &HashMap<String, GroupMeta>) -> String {
+    if !chat.contains(";+;") || is_gid_keyed(chat) {
+        return chat.to_string();
+    }
+    let key = members_csv(
+        &group_ident(chat)
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+    );
+    let mut hits = groups
+        .iter()
+        .filter(|(guid, m)| is_gid_keyed(guid) && members_csv(&m.participants) == key)
+        .map(|(guid, _)| guid);
+    match (hits.next(), hits.next()) {
+        (Some(guid), None) => guid.clone(), // exactly one match → safe to redirect
+        _ => chat.to_string(),              // none, or ambiguous → don't guess
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +303,42 @@ mod tests {
         let named = resolve_group_guid(Some("gid-aaaa"), &sibs(), &HashMap::new());
         let other = resolve_group_guid(Some("gid-bbbb"), &sibs(), &HashMap::new());
         assert_ne!(named, other);
+    }
+
+    #[test]
+    fn effective_send_guid_redirects_legacy_to_gid_when_unambiguous() {
+        // A reply typed in an old member-keyed room redirects to the one known gid.
+        let mut groups: HashMap<String, GroupMeta> = HashMap::new();
+        let gid = "iMessage;+;c71a3485-5e0d-4974-8b3d-c55bf2edea8a";
+        groups.insert(gid.to_string(), GroupMeta { participants: sibs(), cv_name: Some("sibs & sav".into()) });
+        let legacy = format!("iMessage;+;{}", members_csv(&sibs()));
+        assert_eq!(effective_send_guid(&legacy, &groups), gid);
+    }
+
+    #[test]
+    fn effective_send_guid_passthrough_when_unknown() {
+        // No gid learned for these people yet → leave the legacy guid alone.
+        let groups: HashMap<String, GroupMeta> = HashMap::new();
+        let legacy = format!("iMessage;+;{}", members_csv(&sibs()));
+        assert_eq!(effective_send_guid(&legacy, &groups), legacy);
+    }
+
+    #[test]
+    fn effective_send_guid_no_guess_when_ambiguous() {
+        // Two groups with the SAME members → never guess; keep the legacy guid.
+        let mut groups: HashMap<String, GroupMeta> = HashMap::new();
+        groups.insert("iMessage;+;gid-aaaa".into(), GroupMeta { participants: sibs(), cv_name: Some("sibs & sav".into()) });
+        groups.insert("iMessage;+;gid-bbbb".into(), GroupMeta { participants: sibs(), cv_name: None });
+        let legacy = format!("iMessage;+;{}", members_csv(&sibs()));
+        assert_eq!(effective_send_guid(&legacy, &groups), legacy);
+    }
+
+    #[test]
+    fn effective_send_guid_passes_through_gid_and_dm() {
+        let mut groups: HashMap<String, GroupMeta> = HashMap::new();
+        groups.insert("iMessage;+;c71a3485".into(), GroupMeta { participants: sibs(), cv_name: None });
+        assert_eq!(effective_send_guid("iMessage;+;c71a3485", &groups), "iMessage;+;c71a3485"); // already gid
+        assert_eq!(effective_send_guid("iMessage;-;+18048334449", &groups), "iMessage;-;+18048334449"); // 1:1
     }
 
     #[test]

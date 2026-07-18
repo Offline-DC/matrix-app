@@ -375,8 +375,95 @@ internal class SmartTxtMessageRepository(
         maybeHealContactsLater()
     }
 
+    /**
+     * One-time upgrade fold. Before gid-keying, a group was keyed by its member set
+     * ("iMessage;+;a,b,c"); now it's keyed by Apple's group id ("iMessage;+;<gid>").
+     * On upgrade, the first inbound message on a group arrives gid-keyed and would spawn
+     * a NEW room, leaving the old member-keyed room (with its history) as a duplicate.
+     *
+     * Here we detect that: for each gid-keyed group message that carries members, we
+     * recompute the legacy member-set id and, if such a room exists, move its messages,
+     * unread count, name/members, active-room and reaction pointers into the gid room and
+     * drop the legacy one. Idempotent — once folded there's no legacy room left to match,
+     * so it's a no-op on every subsequent batch. Must be called INSIDE [writeLock] and
+     * BEFORE the caller snapshots the state maps.
+     */
+    private fun foldLegacyGroupRooms(msgs: List<RelayMessage>) {
+        // Distinct gid-keyed groups in this batch that tell us their members.
+        val gidToMembers = LinkedHashMap<String, List<String>>()
+        for (rm in msgs) {
+            if (!ChatGuid.isGroup(rm.chatGuid)) continue
+            if (ChatGuid.identifier(rm.chatGuid).contains(',')) continue // already member-keyed
+            if (rm.participants.isEmpty()) continue
+            gidToMembers.getOrPut(rm.chatGuid) { rm.participants }
+        }
+        if (gidToMembers.isEmpty()) return
+
+        var msgMap: Map<String, List<Message>>? = null
+        var unreadMap: Map<String, Int>? = null
+        var roomList: List<Room>? = null
+
+        for ((gid, members) in gidToMembers) {
+            // Reproduce the OLD member-set guid exactly (canon + dedup + sort, comma-joined).
+            val legacyId = "iMessage;+;" + members.map { Handles.canon(it) }
+                .filter { it.isNotBlank() }.distinct().sorted().joinToString(",")
+            if (legacyId == gid) continue
+            val curRooms = roomList ?: rooms.value
+            if (curRooms.none { it.id == legacyId }) continue // nothing to fold
+
+            // Messages: merge legacy into gid, dedup by id, keep chronological order, cap.
+            val m = (msgMap ?: messagesByRoom.value).toMutableMap()
+            val legacyMsgs = m[legacyId].orEmpty()
+            if (legacyMsgs.isNotEmpty()) {
+                val gidMsgs = m[gid].orEmpty()
+                val seen = gidMsgs.mapTo(HashSet()) { it.id }
+                val merged = (gidMsgs + legacyMsgs.filterNot { it.id in seen })
+                    .sortedBy { it.timestampMs }
+                m[gid] = if (merged.size > MAX_MESSAGES_PER_ROOM) merged.takeLast(MAX_MESSAGES_PER_ROOM) else merged
+            }
+            m.remove(legacyId)
+            msgMap = m
+
+            // Unread: carry the legacy count over, then drop it.
+            val u = (unreadMap ?: unreadByRoom.value).toMutableMap()
+            val combined = (u[gid] ?: 0) + (u[legacyId] ?: 0)
+            if (combined > 0) u[gid] = combined
+            u.remove(legacyId)
+            unreadMap = u
+
+            // Rooms: drop legacy; if the gid room already exists but lacks name/members
+            // (message-driven rooms can), seed them from the legacy room.
+            val legacyRoom = curRooms.firstOrNull { it.id == legacyId }
+            roomList = curRooms.filterNot { it.id == legacyId }.map { r ->
+                if (r.id == gid && legacyRoom != null) r.copy(
+                    name = if (r.name.isBlank()) legacyRoom.name else r.name,
+                    memberIds = if (r.memberIds.isEmpty()) legacyRoom.memberIds else r.memberIds,
+                    isGroup = true,
+                ) else r
+            }
+
+            // Side maps + active room + notification.
+            roomNameById.remove(legacyId)
+            for ((k, v) in reactionRoomByGuid.entries.toList()) {
+                if (v == legacyId) reactionRoomByGuid[k] = gid
+            }
+            smsThreadCache.remove(legacyId)
+            if (activeRoomId == legacyId) activeRoomId = gid
+            notifier.clearConversation(legacyId, reason = "gid-migration")
+            Log.i(TAG, "folded legacy group room $legacyId → $gid")
+        }
+
+        msgMap?.let { messagesByRoom.value = it }
+        unreadMap?.let { unreadByRoom.value = it }
+        roomList?.let { rooms.value = it }
+        if (msgMap != null || unreadMap != null || roomList != null) requestSave()
+    }
+
     private suspend fun onMessages(msgs: List<RelayMessage>) = writeLock.withLock {
         if (msgs.isEmpty()) return@withLock
+        // Upgrade fold: pull any pre-gid (member-keyed) group room into its gid room
+        // BEFORE we build the working maps below, so the merge is picked up here.
+        foldLegacyGroupRooms(msgs)
         val byRoom = messagesByRoom.value.toMutableMap()
         val unread = unreadByRoom.value.toMutableMap()
         val users = usersById.value.toMutableMap()

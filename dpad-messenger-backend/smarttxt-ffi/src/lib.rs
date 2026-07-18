@@ -80,7 +80,8 @@ static SMS_ACTIVE: AtomicBool = AtomicBool::new(false);
 // there too since the identity helpers need it and it belongs with handle logic.
 mod group_identity;
 use group_identity::{
-    canon, members_csv, resolve_group_guid, send_identity, updated_meta, GroupMeta,
+    canon, effective_send_guid, members_csv, resolve_group_guid, send_identity, updated_meta,
+    GroupMeta,
 };
 
 #[derive(Default)]
@@ -390,6 +391,10 @@ fn group_chat_guid(gid: &Option<String>, counterparts: &[String], cv_name: &Opti
 /// 1:1 it targets the single recipient.
 fn conv_data_for(chat: &str) -> ConversationData {
     if chat.contains(";+;") {
+        // A reply from a not-yet-folded legacy member-keyed room redirects to its gid
+        // (only when unambiguous) so it still threads into the real conversation.
+        let chat = effective_send_guid(chat, &st().group_meta);
+        let chat = chat.as_str();
         let meta = st().group_meta.get(chat).cloned();
         let id = send_identity(chat, meta.as_ref());
         let participants = if id.participant_addrs.is_empty() {
