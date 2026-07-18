@@ -443,8 +443,11 @@ internal class SmartTxtMessageRepository(
                 val roomName = roomNameById[rm.chatGuid] ?: when {
                     rm.chatName.isNotBlank() -> rm.chatName
                     ChatGuid.isGroup(rm.chatGuid) ->
-                        ChatGuid.identifier(rm.chatGuid).split(",").filter { it.isNotBlank() }
+                        // A group guid is now the opaque Apple gid, so name it from the
+                        // message's participant list (not by parsing the guid).
+                        rm.participants.filter { it.isNotBlank() }
                             .joinToString(", ") { contactName(it) ?: prettyHandle(it) }
+                            .ifBlank { "Group" }
                     else -> {
                         // Name a 1:1 after the OTHER party — always the chat guid's
                         // tail (iMessage;-;<counterpart>). Do NOT use senderAddress:
@@ -465,17 +468,30 @@ internal class SmartTxtMessageRepository(
                     name = roomName,
                     isGroup = isGroupRoom,
                     memberIds = if (isGroupRoom) {
-                        ChatGuid.identifier(rm.chatGuid).split(",").filter { it.isNotBlank() }
-                            .map { handleToUserId(it) }
+                        // Members come from the message (the guid is now an opaque gid).
+                        rm.participants.filter { it.isNotBlank() }.map { handleToUserId(it) }
                     } else {
                         emptyList()
                     },
                 )
             } else if (ChatGuid.isGroup(rm.chatGuid)) {
-                // Heal a group room saved before isGroup was set (senders were hidden).
                 val existing = rooms.value.firstOrNull { it.id == rm.chatGuid }
-                if (existing != null && !existing.isGroup) {
-                    rooms.value = rooms.value.map { if (it.id == rm.chatGuid) it.copy(isGroup = true) else it }
+                if (existing != null) {
+                    // Adopt a group RENAME (a later message carries the new cv_name), and
+                    // heal the isGroup flag / empty members from this message's participants.
+                    val renamed = rm.chatName.isNotBlank() && rm.chatName != existing.name
+                    val members = rm.participants.filter { it.isNotBlank() }.map { handleToUserId(it) }
+                    val backfillMembers = existing.memberIds.isEmpty() && members.isNotEmpty()
+                    if (renamed) roomNameById[rm.chatGuid] = rm.chatName
+                    if (!existing.isGroup || renamed || backfillMembers) {
+                        rooms.value = rooms.value.map {
+                            if (it.id == rm.chatGuid) it.copy(
+                                isGroup = true,
+                                name = if (renamed) rm.chatName else it.name,
+                                memberIds = if (backfillMembers) members else it.memberIds,
+                            ) else it
+                        }
+                    }
                 }
             } else {
                 // Self-heal a 1:1 room whose saved name is wrong: blank, a raw

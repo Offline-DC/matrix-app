@@ -242,6 +242,10 @@ data class RelayMessage(
     val isUnsent: Boolean = false,
     /** Group conversation display name (iMessage cv_name); blank for 1:1. */
     val chatName: String = "",
+    /** Group members (OTHER-party addresses) for this message's conversation. Sent by
+     *  the native side because a group guid is now the opaque Apple gid, so members can
+     *  no longer be parsed out of it. Empty for a 1:1. */
+    val participants: List<String> = emptyList(),
 )
 
 @Serializable
