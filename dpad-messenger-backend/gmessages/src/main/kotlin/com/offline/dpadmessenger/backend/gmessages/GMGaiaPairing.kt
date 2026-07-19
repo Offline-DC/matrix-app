@@ -64,6 +64,19 @@ class GMGaiaPairing(
     private val waiters = ConcurrentHashMap<String, ArrayBlockingQueue<RpcResponse>>()
     @Volatile private var pollOpen = false
     @Volatile private var stopPoll = false
+
+    // ---- support diagnostics ------------------------------------------------
+    // "no SERVER_INIT (timeout)" has at least four distinct causes that are
+    // indistinguishable from the error message alone. These counters let the
+    // DIAG line emitted on timeout name which one actually happened, so a
+    // customer's rolling logcat is enough to triage without a repro. See the
+    // decision table at the CLIENT_INIT timeout in run().
+    @Volatile private var pollOpenedAtMs = 0L
+    @Volatile private var pollElementCount = 0
+    @Volatile private var pollReopenCount = 0
+    @Volatile private var pollHttpFailures = 0
+    @Volatile private var lastPollHttpCode = 0
+    @Volatile private var lastPollFailure: String? = null
     // Set only by an explicit cancel() — never automatically. The indefinite
     // CLIENT_FINISHED wait checks this each poll chunk so a deliberate cancel
     // (or process teardown) can still break it; otherwise the flip keeps
@@ -95,11 +108,23 @@ class GMGaiaPairing(
             // phone needs the receive channel open to deliver SERVER_INIT).
             var waited = 0
             while (!pollOpen && waited < 8000) { Thread.sleep(200); waited += 200 }
-            Log.i(TAG, "long-poll open=$pollOpen after ${waited}ms")
+            if (pollOpen) {
+                Log.i(TAG, "long-poll open=true after ${waited}ms — proceeding to CLIENT_INIT")
+            } else {
+                // We proceed anyway (unchanged behaviour), but this is the single
+                // most valuable line in a failed-pairing report: SERVER_INIT
+                // cannot be delivered to a receive channel that never opened, so
+                // a timeout following THIS warning is our bug, not the user's
+                // phone — and the remedy is a code fix, not "reinstall Messages".
+                Log.w(TAG, "long-poll NOT open after ${waited}ms — sending CLIENT_INIT into a channel " +
+                    "that is not listening; httpFailures=$pollHttpFailures " +
+                    "lastHttp=$lastPollHttpCode lastFailure=${lastPollFailure ?: "none"}")
+            }
 
             val session = UKey2Session()
             val (initMsg, _) = session.preparePayloads()
 
+            val clientInitAtMs = System.currentTimeMillis()
             // 1) CLIENT_INIT -> SERVER_INIT
             val serverInitResp = sendPairingMessage(
                 action = ACTION_CLIENT_INIT,
@@ -108,7 +133,26 @@ class GMGaiaPairing(
                 isInit = true,
                 timeoutMs = 20_000,
             ) ?: run {
-                Log.w(TAG, "no SERVER_INIT (timeout)")
+                // TRIAGE TABLE — read this line first on a "phone didn't answer"
+                // report. The user-facing message blames the phone, but only the
+                // last row is actually the phone's fault:
+                //   pollOpen=false                -> receive channel never opened
+                //                                    (our bug / flip network)
+                //   httpFailures>0, lastHttp=401/403 -> credentials rejected;
+                //                                    check the body in the
+                //                                    "long-poll HTTP" warning
+                //   pollOpen=true, elements=0     -> channel healthy, server sent
+                //                                    us nothing at all
+                //   pollOpen=true, elements>0     -> traffic flowed but no
+                //                                    SERVER_INIT for our reqId ->
+                //                                    routed to the wrong device,
+                //                                    or the phone stayed silent
+                val openMs = if (pollOpenedAtMs > 0L) System.currentTimeMillis() - pollOpenedAtMs else 0L
+                Log.w(TAG, "no SERVER_INIT (timeout after ${System.currentTimeMillis() - clientInitAtMs}ms) — " +
+                    "DIAG pollOpen=$pollOpen openFor=${openMs}ms reopens=$pollReopenCount " +
+                    "elements=$pollElementCount httpFailures=$pollHttpFailures " +
+                    "lastHttp=$lastPollHttpCode lastFailure=${lastPollFailure ?: "none"} " +
+                    "dest=${destRegB64.take(24)}… attempt=$pairingAttemptId")
                 lastError = "Your phone didn't answer the pairing request. Open Google Messages on " +
                     "your phone, make sure it's online and set as your texting app, then try again."
                 return false
@@ -274,7 +318,17 @@ class GMGaiaPairing(
             try {
                 http.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) {
-                        Log.w(TAG, "long-poll HTTP ${resp.code}; retrying")
+                        // The body carries the real reason (UNAUTHENTICATED,
+                        // PERMISSION_DENIED, SESSION_COOKIE_INVALID, …). Without
+                        // it a 401 here is indistinguishable from a transient 5xx
+                        // in a support log, which is the difference between "the
+                        // desktop login is bad" and "Google had a blip".
+                        val why = runCatching { resp.body?.string().orEmpty() }.getOrDefault("")
+                        pollHttpFailures++
+                        lastPollHttpCode = resp.code
+                        lastPollFailure = "HTTP ${resp.code}: ${why.take(160)}"
+                        Log.w(TAG, "long-poll HTTP ${resp.code} (failure #$pollHttpFailures); " +
+                            "body=${why.take(300)}")
                         Thread.sleep(1500)
                         return@use
                     }
@@ -282,12 +336,18 @@ class GMGaiaPairing(
                     val splitter = PbLite.StreamSplitter()
                     val buf = okio.Buffer()
                     pollOpen = true
-                    Log.i(TAG, "long-poll stream open")
+                    pollOpenedAtMs = System.currentTimeMillis()
+                    pollReopenCount++
+                    Log.i(TAG, "long-poll stream open (open #$pollReopenCount)")
                     while (!stopPoll) {
                         val read = source.read(buf, 8192L)
                         if (read == -1L) break
                         if (read == 0L) continue
                         for (element in splitter.feed(buf.readUtf8())) {
+                            // Counted so the timeout DIAG can distinguish "the
+                            // server sent us nothing" from "traffic flowed but
+                            // never a SERVER_INIT for our requestId".
+                            pollElementCount++
                             runCatching { handleElement(element) }
                                 .onFailure { Log.w(TAG, "element parse failed", it) }
                         }
