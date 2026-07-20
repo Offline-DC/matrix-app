@@ -44,7 +44,15 @@ internal class SmartTxtNotifier(context: Context) {
         mgr.createNotificationChannel(channel)
     }
 
-    fun notifyIncoming(roomId: String, title: String, sender: String, body: String) {
+    fun notifyIncoming(
+        roomId: String,
+        title: String,
+        sender: String,
+        body: String,
+        /** True only for a real group thread. Drives whether a conversation title is
+         *  set at all — see the note in the builder below. Defaults to the safe case. */
+        isGroup: Boolean = false,
+    ) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             !nm.areNotificationsEnabled()
         ) {
@@ -56,11 +64,19 @@ internal class SmartTxtNotifier(context: Context) {
 
         val me = Person.Builder().setName("You").build()
         val style = NotificationCompat.MessagingStyle(me)
-            // Only set a conversation title when it differs from the sender
-            // (i.e. a group). For a 1:1 the title IS the sender, and setting
-            // both makes the launcher's notification list render the name twice
-            // ("Sam Rivera: Sam Rivera"). Mirrors GoogleMessagesNotifier.
-            .setConversationTitle(title.takeIf { it != sender })
+            // Conversation title ONLY for real groups. A 1:1 already renders the
+            // sender, so setting both makes the launcher's notification list print
+            // the party twice.
+            //
+            // This used to infer "is a group" from `title != sender`, which quietly
+            // failed whenever the two names came from different pipelines and
+            // disagreed for the SAME person — the room name resolves via
+            // contactName() ?: prettyHandle() while the sender uses the user map's
+            // displayName. A short code rendered "+97854: 97854" (one prettified,
+            // one raw) and a saved contact rendered "noah: +15616762279" (one
+            // resolved, one not). Both are 1:1 chats; string inequality is simply
+            // not the same question as "is this a group".
+            .setConversationTitle(title.takeIf { isGroup })
             .setGroupConversation(false)
         lines.forEach { line ->
             val person = Person.Builder().setName(line.sender).build()

@@ -1,6 +1,8 @@
 package com.offline.dpadmessenger.backend.smarttxt
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
 import android.util.Log
 import com.offline.dpadmessenger.backend.smarttxt.relay.HttpValidationDataRelay
 import com.offline.dpadmessenger.backend.smarttxt.relay.StubValidationDataRelay
@@ -15,6 +17,7 @@ import com.offline.dpadmessenger.data.MessageRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.runBlocking
 
 /**
  * Factory + process-scoped holder for the SmartTxt backend. Mirror of
@@ -116,13 +119,66 @@ object SmartTxtRepository {
      *  to the setup screen on relaunch. Call this early (the entry composable). */
     fun restoreStatus(context: Context) {
         if (_status.value != SmartTxtStatus.UNREGISTERED) return
-        val store = SmartTxtAccountStore(context.applicationContext)
+        val appContext = context.applicationContext
+        val store = SmartTxtAccountStore(appContext)
         _status.value = when {
             store.isRegistered() -> SmartTxtStatus.REGISTERED
             store.isSeeded() -> SmartTxtStatus.SEEDED
             else -> SmartTxtStatus.UNREGISTERED
         }
         Log.i(TAG, "restoreStatus → ${_status.value}")
+
+        // RE-ARM THE RENEWAL ON EVERY COLD START. This used to be scheduled ONLY
+        // from finishRegister()/markRegisteredExternally() — i.e. once, at sign-in.
+        // If that work item ever left WorkManager's DB (force-stop, an OEM battery
+        // manager, cleared app data, a half-completed migration) nothing ever
+        // re-scheduled it, the IDS registration silently aged out, and the device
+        // kept RECEIVING while every send failed — invisible to the user, because
+        // [status] still says REGISTERED. Observed in the field: a device whose
+        // registration had been overdue for 3.7 days ("Reregistering in -323914
+        // seconds") and only recovered because a relaunch let rustpush's own
+        // in-process timer fire. KEEP policy makes this idempotent, so calling it
+        // on every launch is free and matches what the launcher's other workers
+        // already do.
+        if (_status.value == SmartTxtStatus.REGISTERED) {
+            // OFF THE MAIN THREAD. This function is documented as safe to call from
+            // the entry composable, so it can land on the UI thread — and both calls
+            // below touch disk (WorkManager's DB; another EncryptedSharedPreferences
+            // decrypt + JSON parse in lastRegisteredMs()). Individually cheap, but
+            // this runs on every launch on every handset and the store is keystore-
+            // backed crypto, so it must never sit on the UI thread. runCatching so a
+            // WorkManager failure can never take down the launcher.
+            Thread {
+                runCatching {
+                    SmartTxtRenewalWorker.schedule(appContext)
+                    logRegistrationAge(store.lastRegisteredMs())
+                }.onFailure { Log.w(TAG, "renewal re-arm failed: ${it.message}") }
+            }.start()
+        }
+    }
+
+    /** True when the registration is old enough that sends are at risk. Deliberately
+     *  well under Apple's ~45-day IDS re-registration interval so we self-heal long
+     *  before the user notices, and well over the 12h worker period so a couple of
+     *  missed runs don't churn. */
+    private fun isRegistrationStale(store: SmartTxtAccountStore): Boolean {
+        val at = store.lastRegisteredMs()
+        return at > 0L && (System.currentTimeMillis() - at) > STALE_AFTER_MS
+    }
+
+    /** One greppable line with the registration age — `adb logcat -s IMsgRepoHolder`
+     *  tells you instantly whether a handset is drifting, no backend required. */
+    private fun logRegistrationAge(at: Long) {
+        if (at <= 0L) {
+            Log.i(TAG, "registration age: never registered")
+            return
+        }
+        val ageMs = System.currentTimeMillis() - at
+        Log.i(
+            TAG,
+            "registration age: ${ageMs / DAY_MS}d ${(ageMs % DAY_MS) / HOUR_MS}h " +
+                "(lastRegisteredMs=$at, stale=${ageMs > STALE_AFTER_MS})",
+        )
     }
 
     @Synchronized
@@ -349,11 +405,347 @@ object SmartTxtRepository {
         // Off the main thread so reading EncryptedSharedPreferences + the native
         // connect never block the launcher's Application.onCreate (ANR risk).
         Thread {
-            if (!SmartTxtAccountStore(appContext).isRegistered()) return@Thread
+            val store = SmartTxtAccountStore(appContext)
+            if (!store.isRegistered()) return@Thread
             restoreStatus(appContext)
+            // Build the repo/session once, then make sure the CLIENT is actually up.
             runCatching { connect(appContext) }
                 .onFailure { Log.w(TAG, "background sync start on boot failed: ${it.message}") }
+            // Register the network watcher BEFORE the retry ladder, not after. It used
+            // to go last, so during the ~40s of retries nothing was listening — a
+            // network arriving mid-ladder was missed entirely.
+            registerNetworkRecovery(appContext)
+            connectWithRetry(appContext)
+            healIfUnhealthy(appContext, store)
         }.start()
+    }
+
+    /**
+     * True when the iMessage client is BUILT, not merely when a socket is open.
+     *
+     * Falls back to [RustPushNative.nativeIsConnected] if the bundled `.so` predates
+     * `nativeHasClient` — the JNI call throws UnsatisfiedLinkError on version skew,
+     * and degrading to the old (weaker) signal beats crashing or looping forever.
+     */
+    private fun nativeClientReady(): Boolean {
+        if (!RustPushBridge.NATIVE_AVAILABLE) return false
+        return runCatching { RustPushNative.nativeHasClient() }.getOrElse {
+            Log.w(TAG, "nativeHasClient unavailable (old .so?) — falling back to nativeIsConnected")
+            runCatching { RustPushNative.nativeIsConnected() }.getOrDefault(false)
+        }
+    }
+
+    /**
+     * Get the client up, and return whether it is.
+     *
+     * The subtlety: a plain retry of `nativeConnect` does NOT help in the failure we
+     * actually shipped. It short-circuits on `connected && connection.is_some()` and
+     * returns true without rebuilding anything — so when the socket is up but the
+     * client build failed, retrying is a no-op. Tearing the connection down first
+     * forces `nativeConnect` back through the full path, including
+     * `build_client_guarded`.
+     *
+     * Only does that when the client is actually down, so a healthy process never
+     * churns its APNs socket (two sockets on one push token makes Apple drop both).
+     */
+    private fun ensureClientUp(appContext: Context): Boolean = synchronized(healLock) {
+        doEnsureClientUp(appContext)
+    }
+
+    /** Body of [ensureClientUp]; always called under [healLock] so the boot ladder,
+     *  the network callback and the Settings row can never drive overlapping
+     *  reconnects. `synchronized` is reentrant, so [fixConnectionBlocking] taking the
+     *  same lock before calling in is fine. */
+    private fun doEnsureClientUp(appContext: Context): Boolean {
+        if (nativeClientReady()) return true
+        if (!ensureNativeInit(appContext)) {
+            appendConnectLog(appContext, "ensureClientUp: nativeInit FAILED")
+            return false
+        }
+        runCatching { RustPushNative.nativeDisconnect() }
+        val connected = runCatching { RustPushNative.nativeConnect() }.getOrElse {
+            Log.w(TAG, "ensureClientUp: nativeConnect threw: ${it.message}")
+            false
+        }
+        val ready = nativeClientReady()
+        appendConnectLog(appContext, "ensureClientUp: nativeConnect=$connected clientReady=$ready")
+        return ready
+    }
+
+    /**
+     * THE BOOT FIX. This used to be a single `connect()` whose failure was logged and
+     * forgotten, so a launcher that started before WiFi came up — it's the persistent
+     * HOME app, so it starts very early — left the client dead for the entire life of
+     * the process. On a phone nobody reboots, that is forever: two handsets sat dead
+     * for 24h+ after a power-off, unable to send OR receive, until a force-stop.
+     */
+    private fun connectWithRetry(appContext: Context) {
+        // The session's OWN connect is already in flight from connect() above, and it
+        // reaches nativeConnect by a different path than ensureClientUp — so the lock
+        // can't serialise it. Poll first and let it finish. Without this, both raced
+        // into the FFI's 4-attempt APNs ladder at once and the log showed two fully
+        // interleaved connect sequences.
+        repeat(BOOT_CONNECT_GRACE_POLLS) {
+            if (nativeClientReady()) return
+            runCatching { Thread.sleep(BOOT_CONNECT_GRACE_MS) }
+        }
+        for (attempt in 1..BOOT_CONNECT_ATTEMPTS) {
+            if (ensureClientUp(appContext)) {
+                if (attempt > 1) Log.i(TAG, "boot connect recovered on attempt $attempt")
+                return
+            }
+            Log.w(TAG, "boot connect attempt $attempt/$BOOT_CONNECT_ATTEMPTS: client still down")
+            if (attempt < BOOT_CONNECT_ATTEMPTS) {
+                runCatching { Thread.sleep(BOOT_CONNECT_BACKOFF_MS * attempt) }
+            }
+        }
+        // Not fatal: the network callback below picks it up the moment we get an
+        // interface, which is the common case for a boot that raced WiFi.
+        Log.w(TAG, "boot connect exhausted — leaving it to the network callback")
+        appendConnectLog(appContext, "boot connect EXHAUSTED after $BOOT_CONNECT_ATTEMPTS attempts")
+    }
+
+    /**
+     * Reconnect as soon as the device actually has a network. This is what makes a
+     * no-network boot self-heal in seconds instead of waiting on the retry ladder —
+     * and it's the same trick the launcher's DeviceRegistrar already uses.
+     * Registered once per process; cheap no-op when the client is already up.
+     */
+    private fun registerNetworkRecovery(appContext: Context) {
+        if (!networkRecoveryRegistered.compareAndSet(false, true)) return
+        val cm = runCatching {
+            appContext.getSystemService(ConnectivityManager::class.java)
+        }.getOrNull() ?: return
+        runCatching {
+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    // Callback runs on a system binder thread — never do native work here.
+                    Thread {
+                        runCatching {
+                            if (!nativeClientReady()) {
+                                Log.w(TAG, "network available and client is DOWN — reconnecting")
+                                appendConnectLog(appContext, "network available, client down → reconnect")
+                                ensureClientUp(appContext)
+                            }
+                        }.onFailure { Log.w(TAG, "network reconnect failed: ${it.message}") }
+                    }.start()
+                }
+            })
+            Log.i(TAG, "network recovery callback registered")
+        }.onFailure {
+            networkRecoveryRegistered.set(false)
+            Log.w(TAG, "network callback registration failed: ${it.message}")
+        }
+    }
+
+    /**
+     * Small capped log that OUTLIVES logcat. The ring buffer rolls in hours; these
+     * failures aren't reported for days, which is why the original cause took two
+     * handsets and a four-hour investigation to pin down. Best-effort — never throws.
+     */
+    private fun appendConnectLog(appContext: Context, line: String) {
+        runCatching {
+            val f = java.io.File(appContext.filesDir, CONNECT_LOG_NAME)
+            val stamp = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
+                .format(java.util.Date())
+            f.appendText("$stamp $line\n")
+            if (f.length() > CONNECT_LOG_MAX_BYTES) {
+                val keep = f.readLines().takeLast(CONNECT_LOG_KEEP_LINES)
+                f.writeText(keep.joinToString("\n", postfix = "\n"))
+            }
+        }
+    }
+
+    /**
+     * Belt-and-braces for [SmartTxtRenewalWorker]: WorkManager is not a guarantee.
+     * Its work item can be dropped by a force-stop or an OEM battery manager, and
+     * even when scheduled it's only best-effort under Doze — so a device can sit
+     * de-registered indefinitely while the UI happily says REGISTERED.
+     *
+     * On every launch, once connected, check the registration age ourselves and
+     * silently re-register if it's stale. Runs on the caller's background thread.
+     * Silent by design: transient faults are retried in code and then left to the
+     * periodic worker, so nothing reaches the user. Unrecoverable causes are logged
+     * for support rather than shown — the user can reach the same recovery from the
+     * Settings row, and a banner would need the shared room list, which is out of
+     * scope here.
+     */
+    private fun healIfUnhealthy(appContext: Context, store: SmartTxtAccountStore) {
+        // The ENTIRE body is defensive. This runs on the boot path of every handset,
+        // not just broken ones, so nothing in here may ever propagate out and take
+        // down the launcher — which is the HOME app, so a crash here is a brick.
+        try {
+            // Two independent reasons to act, and the client one matters MORE. Gating
+            // purely on registration age was wrong: a handset was found completely
+            // dead — no sends, no receives — with 18 days of registration left, so an
+            // age check would never have fired. A dead client is the actual failure;
+            // a stale registration is usually just its downstream symptom (no client
+            // ⇒ no reregister timer ⇒ drift).
+            val clientDown = !nativeClientReady()
+            val stale = isRegistrationStale(store)
+            if (!clientDown && !stale) return
+            Log.w(TAG, "unhealthy on launch: clientDown=$clientDown staleRegistration=$stale")
+            // In-process re-entry guard. Skip rather than queue: this is a boot
+            // thread, and blocking it behind an in-flight attempt buys nothing.
+            if (!healing.compareAndSet(false, true)) {
+                Log.i(TAG, "self-heal already in flight — skipping")
+                return
+            }
+            try {
+                // PERSISTED BACKOFF. A device that keeps failing would otherwise hit
+                // Apple once per boot, and on a reboot loop that's a fast route to
+                // rate-limiting the account — a far worse outcome than the stale
+                // registration we're repairing. At most one automatic attempt per
+                // cooldown. The user-initiated Settings row deliberately does NOT go
+                // through here, so tapping it always tries immediately.
+                val prefs = appContext.getSharedPreferences(HEAL_PREFS, Context.MODE_PRIVATE)
+                val lastAttempt = prefs.getLong(KEY_LAST_HEAL_ATTEMPT, 0L)
+                val sinceMs = System.currentTimeMillis() - lastAttempt
+                if (lastAttempt > 0L && sinceMs < HEAL_COOLDOWN_MS) {
+                    Log.i(TAG, "self-heal on cooldown — last attempt ${sinceMs / (60L * 1000L)}m ago")
+                    return
+                }
+                prefs.edit().putLong(KEY_LAST_HEAL_ATTEMPT, System.currentTimeMillis()).apply()
+
+                Log.w(TAG, "registration is stale — self-healing with a silent re-register")
+                when (val r = fixConnection(appContext)) {
+                    is FixOutcome.Recovered ->
+                        Log.i(TAG, "stale registration healed silently")
+                    is FixOutcome.RetryingInBackground -> {
+                        // Transient. Already retried in code; the 12h worker and the
+                        // next launch will keep at it. Explicitly do NOT flag the
+                        // user — there is nothing for them to do.
+                        Log.w(TAG, "stale registration heal deferred to background retry")
+                    }
+                    is FixOutcome.NeedsUser ->
+                        Log.w(TAG, "stale registration needs user action: ${r.message}")
+                }
+            } finally {
+                healing.set(false)
+            }
+        } catch (t: Throwable) {
+            // Suppressed on purpose — a broken self-heal must degrade to "messaging
+            // is stale", never to "the phone's launcher died on boot".
+            Log.e(TAG, "self-heal threw — suppressed to protect the boot path", t)
+        }
+    }
+
+    /**
+     * The full recovery ladder, and the one thing both the automatic staleness
+     * check and the Settings "Re-register now" row call.
+     *
+     * Why this is not just [reregisterNow]: that path goes straight to
+     * `bridge().reregister()`, which needs a LIVE native client. In the exact state
+     * we're recovering from — process up but `st().client == None` — it fails with
+     * "the iMessage engine isn't running yet", i.e. the dev hook is useless in the
+     * only situation anyone needs it. So rebuild the client FIRST, then re-register.
+     *
+     * Blocking; callers must be off the main thread.
+     */
+    /**
+     * What the UI should do about a recovery attempt. Deliberately NOT a raw
+     * error string: most failures here are transient (a flaky NAC/anisette call,
+     * a dropped connection) and the right response is to retry in code, not to
+     * put a technical message in front of someone holding a dumb phone.
+     */
+    sealed class FixOutcome {
+        /** Registered again. Sending works. */
+        object Recovered : FixOutcome()
+        /** Didn't get there this time, but it's a transient class of failure and
+         *  the periodic renewal + next-launch heal will keep trying. Nothing is
+         *  required of the user, so don't show them an error. */
+        object RetryingInBackground : FixOutcome()
+        /** Genuinely unrecoverable without the user (not signed in, missing
+         *  identity, missing native library) — this one has to be surfaced, or we
+         *  recreate the original bug where a broken phone looks fine. */
+        data class NeedsUser(val message: String) : FixOutcome()
+    }
+
+    /**
+     * [fixConnectionBlocking] plus retry and classification — this is what the UI
+     * should call. Retries transient failures [FIX_ATTEMPTS] times with a short
+     * backoff so the overwhelmingly common case (a hiccup talking to Apple)
+     * resolves in code and the user never sees a failure at all.
+     *
+     * Blocking; callers must be off the main thread.
+     */
+    fun fixConnection(context: Context): FixOutcome {
+        var last: RegistrationResult.Failure? = null
+        repeat(FIX_ATTEMPTS) { attempt ->
+            when (val r = runCatching { fixConnectionBlocking(context) }.getOrElse {
+                RegistrationResult.Failure(it.message ?: "unknown error")
+            }) {
+                is RegistrationResult.Success -> return FixOutcome.Recovered
+                is RegistrationResult.Failure -> {
+                    // Terminal causes can't be retried away — more attempts would
+                    // just hammer Apple for nothing.
+                    if (isTerminalFailure(r.message)) return FixOutcome.NeedsUser(r.message)
+                    last = r
+                    Log.w(TAG, "fixConnection attempt ${attempt + 1}/$FIX_ATTEMPTS failed: ${r.message}")
+                    if (attempt < FIX_ATTEMPTS - 1) {
+                        runCatching { Thread.sleep(FIX_BACKOFF_MS * (attempt + 1)) }
+                    }
+                }
+            }
+        }
+        // Exhausted retries on a transient fault. Keep it out of the user's face —
+        // the 12h renewal worker and the next-launch heal will pick it up.
+        Log.w(TAG, "fixConnection exhausted retries, leaving it to the background: ${last?.message}")
+        return FixOutcome.RetryingInBackground
+    }
+
+    /** Failures no amount of retrying will fix — they need the user to do something. */
+    private fun isTerminalFailure(message: String): Boolean =
+        message == NOT_SIGNED_IN_MESSAGE ||
+            message == NATIVE_MISSING_MESSAGE ||
+            message == IDENTITY_MISSING_MESSAGE
+
+    fun fixConnectionBlocking(context: Context): RegistrationResult = synchronized(healLock) {
+        doFixConnection(context)
+    }
+
+    private fun doFixConnection(context: Context): RegistrationResult {
+        val appContext = context.applicationContext
+        val store = SmartTxtAccountStore(appContext)
+        if (!store.isRegistered()) return RegistrationResult.Failure(NOT_SIGNED_IN_MESSAGE)
+
+        // 1. The native runtime has to be up before anything else can work.
+        if (!ensureNativeInit(appContext)) return RegistrationResult.Failure(initFailureMessage())
+
+        // 2. Rebuild the client if it isn't live.
+        //    This used to guard on nativeIsConnected(), which was wrong in the one
+        //    state that matters: that flag is set when the APNs socket opens, BEFORE
+        //    the client is built, so it reads true when the client is dead — the
+        //    reconnect was skipped and we fell straight through to a reregister that
+        //    fails on `client == None`. ensureClientUp asks whether the CLIENT exists
+        //    and tears the connection down first so the rebuild actually happens.
+        if (!ensureClientUp(appContext)) {
+            return RegistrationResult.Failure(RECONNECT_FAILED_MESSAGE)
+        }
+
+        // 3. Now that a client exists, force the re-registration.
+        return when (val r = runBlocking { bridge().reregister() }) {
+            is RustPushBridge.ReregisterResult.Success -> {
+                val account = store.loadAccount()
+                    ?: return RegistrationResult.Failure(NOT_SIGNED_IN_MESSAGE)
+                val updated = account.copy(
+                    lastRegisteredMs = System.currentTimeMillis(),
+                    handles = r.handles.ifEmpty { account.handles },
+                )
+                store.saveAccount(updated)
+                store.markRegistered(updated.lastRegisteredMs)
+                // Re-arm the periodic renewal too — if we got here it may well have
+                // been missing, which is what let the registration go stale.
+                SmartTxtRenewalWorker.schedule(appContext)
+                _status.value = SmartTxtStatus.REGISTERED
+                Log.i(TAG, "fixConnection: recovered")
+                RegistrationResult.Success(updated)
+            }
+            is RustPushBridge.ReregisterResult.Failure -> {
+                Log.w(TAG, "fixConnection: re-register failed: ${r.message}")
+                RegistrationResult.Failure(r.message)
+            }
+        }
     }
 
     @Synchronized
@@ -388,6 +780,69 @@ object SmartTxtRepository {
     }
 
     private const val TAG = "IMsgRepoHolder"
+
+    private const val HOUR_MS = 60L * 60L * 1000L
+    private const val DAY_MS = 24L * HOUR_MS
+
+    /** Re-register once the stamp is older than this. Apple's IDS interval is ~45
+     *  days (rustpush reported "Reregistering in 3887700 seconds" after a fresh
+     *  one), so 7 days self-heals with a very wide margin while staying far above
+     *  the worker's 12h period — a couple of missed runs won't cause churn. */
+    private const val STALE_AFTER_MS = 7L * DAY_MS
+
+    /** Guards against two re-registrations running at once (a boot-path heal racing
+     *  a user tapping the Settings row). Re-registration talks to Apple, so
+     *  overlapping attempts are exactly what we must not do. */
+    private val healing = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Serialises [fixConnectionBlocking] without taking the object monitor — the
+     *  other @Synchronized members (create/transport/bridge/shutdown) share that
+     *  monitor, and this call blocks for ~30s, so holding it would stall them. */
+    private val healLock = Any()
+
+    private const val HEAL_PREFS = "smarttxt_heal"
+    private const val KEY_LAST_HEAL_ATTEMPT = "lastHealAttemptMs"
+
+    /** Minimum gap between AUTOMATIC heal attempts. A device stuck in a failing
+     *  state would otherwise call Apple once per boot; on a reboot loop that risks
+     *  rate-limiting the Apple ID, which is worse than the stale registration. The
+     *  user-initiated Settings row bypasses this. */
+    private const val HEAL_COOLDOWN_MS = 6L * HOUR_MS
+
+    /** Transient-failure retries inside one heal attempt. Covers the common case —
+     *  a flaky NAC/anisette call or a dropped connection — without ever surfacing
+     *  anything to the user. */
+    private const val FIX_ATTEMPTS = 3
+    private const val FIX_BACKOFF_MS = 4_000L
+
+    /** Boot connect retry. Short and bounded on purpose — [registerNetworkRecovery]
+     *  is the real recovery for a boot that lost the race with WiFi; this only covers
+     *  a brief race. 4 attempts with linear backoff ≈ 18s, all on a background thread. */
+    private const val BOOT_CONNECT_ATTEMPTS = 4
+    private const val BOOT_CONNECT_BACKOFF_MS = 3_000L
+
+    /** Wait out the session's own in-flight connect before forcing our own. The FFI's
+     *  internal APNs ladder takes ~7s to exhaust, so ~12s covers it either way. */
+    private const val BOOT_CONNECT_GRACE_POLLS = 12
+    private const val BOOT_CONNECT_GRACE_MS = 1_000L
+
+    /** One network callback per process. */
+    private val networkRecoveryRegistered = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Capped connect log that outlives logcat's ring buffer. Read it with:
+     *  `adb shell su -c 'cat /data/data/<pkg>/files/smarttxt_connect_log.txt'` */
+    private const val CONNECT_LOG_NAME = "smarttxt_connect_log.txt"
+    private const val CONNECT_LOG_MAX_BYTES = 32L * 1024L
+    private const val CONNECT_LOG_KEEP_LINES = 200
+
+    /** No account at all — recovery is impossible, the user has to sign in. */
+    const val NOT_SIGNED_IN_MESSAGE =
+        "You're not signed in to iMessage yet. Open Smart Txt setup to sign in."
+
+    /** We had an account and a live runtime, but couldn't get an APNs connection —
+     *  almost always plain connectivity rather than anything identity-related. */
+    const val RECONNECT_FAILED_MESSAGE =
+        "Couldn't reach Apple to reconnect. Check your internet connection and try again."
 
     /** Shown when nativeInit fails because the identity isn't usable. The `dumb` is the
      *  ONLY file required — rustpush rebuilds the whole device identity from it, so

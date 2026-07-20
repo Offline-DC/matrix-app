@@ -1144,6 +1144,26 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     if st().connected { JNI_TRUE } else { JNI_FALSE }
 }
 
+/// Is the iMessage CLIENT actually built — i.e. can we send and are we receiving?
+///
+/// Not the same question as `nativeIsConnected`, and the difference is the whole
+/// bug: `nativeConnect` sets `connected = true` as soon as the APNs socket is up,
+/// BEFORE `build_client_guarded` runs. If that build fails (or was never reached
+/// because APNs failed at boot) the app sits with `connected == true` and
+/// `client == None` — every send hits the "not connected" guard and no receive loop
+/// exists — while `nativeIsConnected` cheerfully reports healthy. That state
+/// survived 24h+ in the field on two handsets.
+///
+/// `nativeIsRegistered` doesn't answer it either: it ORs in saved users, so it's
+/// true from persisted state alone.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeHasClient(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    if st().client.is_some() { JNI_TRUE } else { JNI_FALSE }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeIsRegistered(
     _env: JNIEnv,
@@ -1450,7 +1470,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 ) -> jstring {
     let client = st().client.clone();
     let Some(client) = client else {
-        return out(&mut env, err_json("Not connected — the iMessage engine isn't running yet. Reopen the app and try again."));
+        return out(&mut env, err_json("iMessage isn't connected right now. Open Smart Txt Settings and tap Re-register now to reconnect, then restart your phone."));
     };
     log::info!("nativeReregister: forcing IDS re-registration (reusing identity — no login)…");
     let result = rt().block_on(async move {
@@ -1792,13 +1812,15 @@ fn push_relay_event(msg: MessageInst) {
         }
         _ => false,
     };
-    // A Read whose sender ISN'T me is a peer "they read my message" receipt, not a
-    // cross-device sync — log it (grep-able) so a "read on my phone didn't clear the
-    // flip" report can be told apart from the self-sync path below.
-    if matches!(&msg.message, Message::Read | Message::MessageReadOnDevice) && !read_elsewhere {
-        log::info!("recv read-on-device SKIP: sender={:?} is not one of my handles", msg.sender);
-    }
-    if read_elsewhere {
+    // A Read whose sender ISN'T me is the PEER receipt — "they read MY message" —
+    // which is what flips an outgoing bubble from Delivered to Read. It used to be
+    // logged and dropped here. Note MessageReadOnDevice always sets read_elsewhere,
+    // so this can only ever be a Message::Read.
+    //
+    // Both cases need exactly the same conversation → chat_guid derivation, so they
+    // share the block below and differ only in the event pushed at the end.
+    let peer_read = matches!(&msg.message, Message::Read) && !read_elsewhere;
+    if read_elsewhere || peer_read {
         let sender = msg.sender.clone().unwrap_or_default();
         let my: Vec<String> = st().self_handles.iter().map(|h| canon(h)).collect();
         let participants: Vec<String> = msg
@@ -1838,17 +1860,30 @@ fn push_relay_event(msg: MessageInst) {
         };
         let read_guid = msg.id.to_uppercase();
         log::info!(
-            "recv read-on-device: sender={sender} chat={chat_guid:?} up_to_guid={read_guid} \
-             counterparts={counterparts:?}"
+            "recv {}: sender={sender} chat={chat_guid:?} up_to_guid={read_guid} \
+             counterparts={counterparts:?}",
+            if peer_read { "peer-read-receipt" } else { "read-on-device" }
         );
         if chat_guid.is_empty() && read_guid.is_empty() {
             return; // no chat AND no message guid — genuinely nothing to act on
         }
-        st().inbound.push_back(serde_json::json!({
-            "type": "chat_read",
-            "chatGuid": chat_guid,
-            "messageGuid": read_guid,
-        }));
+        if peer_read {
+            // They read what I sent. `guid` is the message read UP TO — Apple reuses
+            // the original message's uuid as the receipt's id — so the app flips every
+            // outgoing message in the chat up to and including it, not just this one.
+            st().inbound.push_back(serde_json::json!({
+                "type": "message_status",
+                "chatGuid": chat_guid,
+                "guid": read_guid,
+                "status": "read",
+            }));
+        } else {
+            st().inbound.push_back(serde_json::json!({
+                "type": "chat_read",
+                "chatGuid": chat_guid,
+                "messageGuid": read_guid,
+            }));
+        }
         return;
     }
     // Sync window: drop messages/reactions older than SYNC_WINDOW_MS so a big
@@ -2109,7 +2144,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let reply_to = jstr(&mut env, &reply_to);
     let client = st().client.clone();
     let Some(client) = client else {
-        return out(&mut env, "ERR:Not connected — the iMessage engine isn't running yet. Reopen the app and try again.".to_string());
+        return out(&mut env, "ERR:iMessage isn't connected right now. Open Smart Txt Settings and tap Re-register now to reconnect, or restart your phone.".to_string());
     };
 
     let guid = rt().block_on(async move {
@@ -2226,7 +2261,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let client = st().client.clone();
     let connection = st().connection.clone();
     let (Some(client), Some(connection)) = (client, connection) else {
-        return out(&mut env, "ERR:Not connected — the iMessage engine isn't running yet. Reopen the app and try again.".to_string());
+        return out(&mut env, "ERR:iMessage isn't connected right now. Open Smart Txt Settings and tap Re-register now to reconnect, or restart your phone.".to_string());
     };
     let voice = mime_s.starts_with("audio/");
     let uti = uti_for_mime(&mime_s);

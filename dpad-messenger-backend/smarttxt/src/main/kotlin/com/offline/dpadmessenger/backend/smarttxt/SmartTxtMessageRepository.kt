@@ -523,6 +523,30 @@ internal class SmartTxtMessageRepository(
             val list = byRoom[e.chatGuid].orEmpty().toMutableList()
             val idx = list.indexOfFirst { it.id == e.guid || (e.tempGuid != null && it.id == e.tempGuid) }
             if (idx < 0) continue
+            if (status == MessageStatus.READ) {
+                // A read receipt marks the thread read UP TO this message, not just
+                // this one — Apple reuses the read message's own uuid as the receipt
+                // id — so flip everything I sent at or before it. Compares on
+                // timestamp rather than list index so it doesn't quietly depend on
+                // how this list happens to be ordered.
+                val upToMs = list[idx].timestampMs
+                var any = false
+                for (i in list.indices) {
+                    val m = list[i]
+                    if (!m.isOutgoing || m.timestampMs > upToMs) continue
+                    // Only SENT/DELIVERED advance. Explicitly NOT a statusRank
+                    // comparison: FAILED ranks below READ, so a rank test would
+                    // silently turn a failed message into "Read".
+                    if (m.status != MessageStatus.SENT && m.status != MessageStatus.DELIVERED) continue
+                    list[i] = m.copy(status = MessageStatus.READ)
+                    any = true
+                }
+                if (any) {
+                    byRoom[e.chatGuid] = list
+                    changed = true
+                }
+                continue
+            }
             // Reconcile the optimistic id → server guid, and only advance status.
             val cur = list[idx]
             val advanced = if (statusRank(status) >= statusRank(cur.status)) status else cur.status
@@ -618,8 +642,16 @@ internal class SmartTxtMessageRepository(
             title = roomNameById[e.chatGuid] ?: reactor,
             sender = reactor,
             body = tapbackSummary(e.senderAddress, e.emoji, targetBody),
+            isGroup = isGroupChat(e.chatGuid),
         )
     }
+
+    /** Group vs 1:1, straight off the chat guid. Apple's convention (which the FFI
+     *  follows when it builds these) is `<service>;+;a,b,c` for a group and
+     *  `<service>;-;other` for a 1:1 — so the room id already carries the answer and
+     *  we don't have to re-derive it from a participant list that may not be loaded
+     *  yet when a notification fires. */
+    private fun isGroupChat(chatGuid: String): Boolean = chatGuid.contains(";+;")
 
     /** iMessage-style one-liner for a received reaction, e.g.
      *  Molly emphasized "Your only living grandparent…". Used for BOTH the
@@ -678,6 +710,7 @@ internal class SmartTxtMessageRepository(
             title = roomNameById[rm.chatGuid] ?: userById(mapped.senderId).displayName,
             sender = userById(mapped.senderId).displayName,
             body = body,
+            isGroup = isGroupChat(rm.chatGuid),
         )
     }
 

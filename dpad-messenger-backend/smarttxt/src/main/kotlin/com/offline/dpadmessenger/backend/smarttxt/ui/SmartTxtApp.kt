@@ -12,7 +12,6 @@ import androidx.compose.ui.Modifier
 import android.widget.Toast
 import androidx.compose.ui.platform.LocalContext
 import com.offline.dpadmessenger.backend.smarttxt.OpenBubblesMigrator
-import com.offline.dpadmessenger.backend.smarttxt.RegistrationResult
 import com.offline.dpadmessenger.backend.smarttxt.RustPushNative
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtAccountStore
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtRepository
@@ -194,15 +193,30 @@ private fun SmartTxtChat(
             }
             Unit
         } else null,
-        // Test hook: force the periodic IDS re-registration on demand (no sign-in).
-        // Toasts the outcome; the humanized failure text comes from the bridge.
+        // Settings → "Re-register now". This is the USER-FACING recovery for the
+        // silent-de-registration failure, so it runs the full ladder
+        // ([SmartTxtRepository.fixConnectionBlocking]) rather than the old shallow
+        // [SmartTxtRepository.reregisterNow]. The difference matters: reregisterNow
+        // goes straight to the native client and fails with "the iMessage engine
+        // isn't running yet" whenever that client is dead — which is precisely the
+        // state a stuck device is in, i.e. it broke in the only case it was needed.
+        // The ladder reconnects first, so the button works from a cold/dead client.
+        // reregisterNow() is left in place as a narrower API for manual testing.
         onReregister = {
-            Toast.makeText(context, "Re-registering…", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "Reconnecting iMessage…", Toast.LENGTH_SHORT).show()
             scope.launch {
-                val r = withContext(Dispatchers.IO) { SmartTxtRepository.reregisterNow(context) }
-                val msg = when (r) {
-                    is RegistrationResult.Success -> "iMessage re-registered."
-                    is RegistrationResult.Failure -> r.message
+                val outcome = withContext(Dispatchers.IO) {
+                    SmartTxtRepository.fixConnection(context)
+                }
+                // Never surface a raw error. Transient faults are retried in code and
+                // then handed to the background renewal, so the only message that
+                // ever asks anything of the user is the genuinely unrecoverable one.
+                val msg = when (outcome) {
+                    is SmartTxtRepository.FixOutcome.Recovered ->
+                        "iMessage reconnected. Try sending again."
+                    is SmartTxtRepository.FixOutcome.RetryingInBackground ->
+                        "Still reconnecting in the background — you can keep using Smart Txt."
+                    is SmartTxtRepository.FixOutcome.NeedsUser -> outcome.message
                 }
                 Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
             }

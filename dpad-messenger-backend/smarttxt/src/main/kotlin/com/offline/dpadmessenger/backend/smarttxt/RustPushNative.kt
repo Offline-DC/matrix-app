@@ -74,6 +74,12 @@ object RustPushNative {
     /** Open the APNs courier socket (rustpush `APNSConnection`). */
     external fun nativeConnect(): Boolean
     external fun nativeIsConnected(): Boolean
+
+    /** True when the iMessage client is actually BUILT — sends work and the receive
+     *  loop is running. [nativeIsConnected] only reports the APNs socket, which comes
+     *  up before the client is built, so it returns true in the exact state where
+     *  nothing works. Prefer this for any liveness/recovery decision. */
+    external fun nativeHasClient(): Boolean
     external fun nativeDisconnect()
 
     /** Full LOGOUT: wipe the in-memory session + delete the persisted LOGIN files
