@@ -89,12 +89,14 @@ object ChatGuid {
      *  emits for the same person (phone/email/format variants collapse). */
     fun forDm(address: String, service: String = "iMessage"): String = "$service;-;${Handles.canon(address)}"
 
-    /** Group guid from a member set: "iMessage;+;a,b,c" (canon + deduped +
-     *  sorted), matching the native receive path (counterparts sorted) so a group
-     *  you create threads with the inbound messages for the same people. */
-    fun forGroup(members: List<String>, service: String = "iMessage"): String =
-        "$service;+;" + members.map { Handles.canon(it) }.filter { it.isNotBlank() }
-            .distinct().sorted().joinToString(",")
+    /** Group guid from Apple's stable group id (gid): "iMessage;+;<gid>". A group is
+     *  identified by this opaque id — NOT its member set — so two groups with the same
+     *  people (e.g. a named "sibs & sav" and an unnamed thread) stay distinct and a
+     *  reply threads into the exact conversation. Matches BlueBubbles/OpenBubbles chat
+     *  GUIDs, and the native side (which keys inbound groups by the same gid). The gid
+     *  is lowercased so it keys identically however it's cased. */
+    fun forGroup(groupId: String, service: String = "iMessage"): String =
+        "$service;+;${groupId.trim().lowercase()}"
 }
 
 /**

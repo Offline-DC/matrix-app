@@ -1,0 +1,16 @@
+# Host-only test harness for the portable group-identity logic. It compiles the SAME
+# file the FFI crate ships (../src/group_identity.rs) and runs its #[cfg(test)] suite on
+# the host — no Android NDK / rustpush needed. Run: `cargo test` from this directory.
+#
+# It's an isolated workspace ([workspace] below) so it is never pulled into the Android
+# build of the parent smarttxt-ffi crate (which build-rustpush-so.sh compiles on its own).
+[package]
+name = "identity-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

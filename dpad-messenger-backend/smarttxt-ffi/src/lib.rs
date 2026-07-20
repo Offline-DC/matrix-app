@@ -47,7 +47,7 @@ use uuid::Uuid;
 
 use rustpush::{
     authenticate_apple, login_apple_delegates, register, APSConnection, APSConnectionResource,
-    APSState, AppleAccount, Attachment, ConversationData, IDSNGMIdentity, IDSUser, IMClient,
+    APSState, AppleAccount, Attachment, AttachmentType, ConversationData, IDSNGMIdentity, IDSUser, IMClient,
     IndexedMessagePart, LoginDelegate, LoginState, MMCSFile, Message, MessageInst, MessagePart,
     MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType, Reaction,
     VerifyBody, MADRID_SERVICE,
@@ -74,6 +74,21 @@ static RECV_GEN: AtomicU64 = AtomicU64::new(0);
 /// (received as `Message::EnableSmsActivation`). Gates green (SMS) sends; persisted
 /// to `<dir>/sms_active` so it survives restarts (the iPhone won't re-announce it).
 static SMS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+// Group-chat identity (gid-keying) lives in a dependency-free module so it can be
+// unit-tested on the host (see group_identity.rs + identity-tests/). `canon` moved
+// there too since the identity helpers need it and it belongs with handle logic.
+mod attachment_stash;
+use attachment_stash::{
+    inline_bytes, load_attachments, remove_blob, save_attachments, stash_entry, write_blob,
+    StashedAttachment, ATTACHMENT_INLINE_BUDGET, ATTACHMENT_STASH_CAP,
+};
+
+mod group_identity;
+use group_identity::{
+    canon, effective_send_guid, members_csv, resolve_group_guid, send_identity, updated_meta,
+    GroupMeta,
+};
 
 #[derive(Default)]
 struct AppState {
@@ -112,6 +127,22 @@ struct AppState {
     /// Persisted to thread_handles.json so this survives a warm start.
     thread_handles: std::collections::HashMap<String, String>,
 
+    /// Per-GROUP identity: gid-keyed chat_guid ("iMessage;+;<gid>") → the group's
+    /// member set (canon addresses) + display name (cv_name). A group is identified by
+    /// Apple's stable group id (the plist `gid`, which rustpush surfaces as
+    /// `ConversationData.sender_guid`), NOT by its participants — two groups with the
+    /// same people (a named "sibs & sav" and an unnamed thread) have different gids.
+    /// Learned from inbound group messages and app-created groups (nativeRegisterGroup),
+    /// then REPLAYED verbatim on every outbound (text/attachment/tapback/read) so a
+    /// reply carries the group's real gid + name and threads into the SAME conversation
+    /// instead of forking a new members-only one. Persisted to group_meta.json.
+    group_meta: std::collections::HashMap<String, GroupMeta>,
+    /// Reverse index: sorted-canon-members CSV → gid-keyed chat_guid. Lets a group
+    /// message that arrives WITHOUT a gid (some group MMS/SMS) map onto the known gid
+    /// thread for the same people instead of forking a members-keyed guid. Rebuilt from
+    /// group_meta on load; not persisted separately.
+    group_by_members: std::collections::HashMap<String, String>,
+
     connected: bool,
     receive_started: bool,
     /// Relay-wire-shaped event JSON objects waiting for `nativePollEvents`.
@@ -119,7 +150,20 @@ struct AppState {
     /// Received attachments, keyed by the guid we hand Kotlin ("<msgid>:<idx>").
     /// `nativeDownloadAttachment` looks the rustpush `Attachment` back up here and
     /// streams it from MMCS (or returns the inline bytes) on demand.
+    ///
+    /// PERSISTED to attachments.plist. This map used to be memory-only, which made
+    /// every attachment received before the current launch permanently undownloadable
+    /// ("NO stashed attachment … stash has 0 entries") — the process dies often on a
+    /// 916 MB phone, so that was most of them. An `Attachment` carries the whole MMCS
+    /// coordinate set (url / object / signature / key / size), so keeping it is enough
+    /// to fetch the bytes later. BlueBubbles never hits this because a Mac has already
+    /// downloaded every attachment into ~/Library/Messages/Attachments and its server
+    /// just serves those files; with rustpush there is no such local copy.
     attachments: std::collections::HashMap<String, Attachment>,
+    /// Insertion order of the `attachments` keys, so the stash can be FIFO-capped at
+    /// [`ATTACHMENT_STASH_CAP`] instead of growing without bound. Rebuilt from the
+    /// persisted file's order on load; not stored separately.
+    attachment_order: VecDeque<String>,
 
     /// Guids of messages/reactions the app ALREADY has, so an Apple replay is
     /// dropped instead of re-delivered (see `push_relay_event`).
@@ -301,6 +345,105 @@ fn save_thread_handles(dir: &str, map: &std::collections::HashMap<String, String
             }
         }
         Err(e) => log::warn!("serialize thread_handles failed: {e}"),
+    }
+}
+
+// ---- group identity (gid-keyed) -------------------------------------------
+
+/// Persisted map of gid-keyed chat_guid → GroupMeta (members + name), so a reply to a
+/// group threads into the SAME Apple conversation across a warm start.
+fn group_meta_path(dir: &str) -> PathBuf {
+    Path::new(dir).join("group_meta.json")
+}
+fn load_group_meta(dir: &str) -> std::collections::HashMap<String, GroupMeta> {
+    std::fs::read(group_meta_path(dir))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+fn save_group_meta(dir: &str, map: &std::collections::HashMap<String, GroupMeta>) {
+    match serde_json::to_vec(map) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(group_meta_path(dir), json) {
+                log::warn!("persist group_meta failed: {e}");
+            }
+        }
+        Err(e) => log::warn!("serialize group_meta failed: {e}"),
+    }
+}
+
+/// Snapshot the stash in insertion order as a metadata-only index: inline payloads are
+/// blanked here because they already live in their own blob files, which is what keeps
+/// this cheap to rewrite.
+fn ordered_attachments(s: &AppState) -> Vec<StashedAttachment> {
+    s.attachment_order
+        .iter()
+        .filter_map(|k| s.attachments.get(k).map(|att| stash_entry(k, att)))
+        .collect()
+}
+
+/// Record/refresh a group's identity for `chat_guid` (the pure decision lives in
+/// [group_identity::updated_meta]). Persists only on a real change, mirroring
+/// [remember_thread_handle].
+fn remember_group_meta(chat_guid: &str, members: &[String], cv_name: &Option<String>) {
+    if chat_guid.is_empty() {
+        return;
+    }
+    let key = members_csv(members);
+    let (dir, snapshot) = {
+        let mut s = st();
+        let new_meta = updated_meta(s.group_meta.get(chat_guid), members, cv_name);
+        if s.group_meta.get(chat_guid) == Some(&new_meta) {
+            return; // unchanged — skip the disk write
+        }
+        s.group_meta.insert(chat_guid.to_string(), new_meta);
+        if !key.is_empty() {
+            s.group_by_members.insert(key, chat_guid.to_string());
+        }
+        (s.files_dir.clone(), s.group_meta.clone())
+    };
+    save_group_meta(&dir, &snapshot);
+}
+
+/// The stable chat guid for an INBOUND group conversation ([resolve_group_guid]), plus
+/// the side-effect of recording/refreshing its meta. `counterparts` are the canon
+/// OTHER-party addresses (sorted + deduped by the caller).
+fn group_chat_guid(gid: &Option<String>, counterparts: &[String], cv_name: &Option<String>) -> String {
+    let guid = resolve_group_guid(gid.as_deref(), counterparts, &st().group_by_members);
+    remember_group_meta(&guid, counterparts, cv_name);
+    guid
+}
+
+/// The ConversationData for sending into `chat`. For a GROUP it replays the stored gid
+/// + members + name ([send_identity]) so the message threads into the SAME Apple
+/// conversation; a legacy members-keyed guid (no real gid) mints a random one. For a
+/// 1:1 it targets the single recipient.
+fn conv_data_for(chat: &str) -> ConversationData {
+    if chat.contains(";+;") {
+        // A reply from a not-yet-folded legacy member-keyed room redirects to its gid
+        // (only when unambiguous) so it still threads into the real conversation.
+        let chat = effective_send_guid(chat, &st().group_meta);
+        let chat = chat.as_str();
+        let meta = st().group_meta.get(chat).cloned();
+        let id = send_identity(chat, meta.as_ref());
+        let participants = if id.participant_addrs.is_empty() {
+            participants_from_chat_guid(chat) // ultimate fallback: parse the guid
+        } else {
+            id.participant_addrs.iter().map(|a| to_handle(a)).collect()
+        };
+        ConversationData {
+            participants,
+            cv_name: id.cv_name,
+            sender_guid: id.gid.or_else(|| Some(Uuid::new_v4().to_string())),
+            after_guid: None,
+        }
+    } else {
+        ConversationData {
+            participants: participants_from_chat_guid(chat),
+            cv_name: None,
+            sender_guid: Some(Uuid::new_v4().to_string()),
+            after_guid: None,
+        }
     }
 }
 
@@ -1034,6 +1177,24 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let mut s = st();
     s.files_dir = dir.clone();
     s.thread_handles = load_thread_handles(&dir);
+    // Group identities (gid → members + name), plus the members→gid reverse index
+    // rebuilt from them, so replies to existing groups thread correctly after a restart.
+    s.group_meta = load_group_meta(&dir);
+    s.group_by_members = s
+        .group_meta
+        .iter()
+        .map(|(guid, m)| (members_csv(&m.participants), guid.clone()))
+        .filter(|(k, _)| !k.is_empty())
+        .collect();
+    // Attachment references, so "tap to download" still works for a message that
+    // arrived in an earlier session instead of failing with an empty stash.
+    let stashed = load_attachments(&dir);
+    s.attachment_order = stashed.iter().map(|i| i.key.clone()).collect();
+    s.attachments = stashed.into_iter().map(|i| (i.key, i.att)).collect();
+    log::info!(
+        "nativeInit: restored {} attachment ref(s)",
+        s.attachments.len()
+    );
     s.os_config = Some(Arc::new(cfg));
     // Restore a prior registration so a warm start skips login/2FA.
     if let Some(saved) = load_saved(&dir) {
@@ -1539,30 +1700,24 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         //    keep the full participant list but restrict `inst.target` to my own device
         //    tokens — validate on-device / against a capture before relying on either.)
         //  - tell_sender = true: include the chat's other party, so they see "Read".
-        let participants = if tell_sender {
-            participants_from_chat_guid(&chat)
-        } else {
-            vec![handle.clone()]
-        };
+        // Start from the group's real identity (gid + members + name) so the receipt is
+        // scoped to the exact conversation, then apply the tell_sender participant rule.
+        let mut conv = conv_data_for(&chat);
+        if !tell_sender {
+            // self-only: target ONLY my own handle so the receipt reaches my OTHER
+            // devices (clearing their notification) and never the sender.
+            conv.participants = vec![handle.clone()];
+        }
         // Grep-able trace of what this read actually does: which chat, which message it
         // marks read up to, whether the sender is told, and how many participants it
         // targets (self-only ⇒ 1, since only my own handle is listed). Pair this with the
         // "ID send message … command: 102" line to confirm the 147→102 switch is live.
-        let participant_count = participants.len();
+        let participant_count = conv.participants.len();
         log::info!(
             "nativeMarkRead: chat={chat} up_to_guid={last_guid} tell_sender={tell_sender} \
              from={handle} participants={participant_count} → Message::Read (cmd 102)"
         );
-        let mut inst = MessageInst::new(
-            ConversationData {
-                participants,
-                cv_name: None,
-                sender_guid: Some(Uuid::new_v4().to_string()),
-                after_guid: None,
-            },
-            &handle,
-            Message::Read,
-        );
+        let mut inst = MessageInst::new(conv, &handle, Message::Read);
         // A read receipt's id IS the guid of the message being marked read (Apple reuses
         // the original message's uuid). Skip only if the caller had no inbound message.
         if !last_guid.is_empty() {
@@ -1749,33 +1904,10 @@ async fn recover() -> Result<(), String> {
     Ok(())
 }
 
-/// Canonical handle key. MUST match Kotlin `Handles.canon` byte-for-byte so a
-/// person's inbound thread, outbound thread, and contact entry all key the same:
-/// scheme stripped, email lowercased, phone reduced to "+<digits>" (US 10-digit
-/// gets a +1). This is what merges the phone/email/format-variant splits.
-fn canon(handle: &str) -> String {
-    let s = handle.trim();
-    let s = s
-        .strip_prefix("tel:")
-        .or_else(|| s.strip_prefix("mailto:"))
-        .unwrap_or(s)
-        .trim();
-    if s.contains('@') {
-        return s.to_lowercase();
-    }
-    let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
-    if s.starts_with('+') {
-        format!("+{digits}")
-    } else if digits.len() == 10 {
-        format!("+1{digits}")
-    } else if digits.len() == 11 && digits.starts_with('1') {
-        format!("+{digits}")
-    } else if digits.is_empty() {
-        s.to_lowercase()
-    } else {
-        format!("+{digits}")
-    }
-}
+// `canon` (canonical handle key: scheme stripped, email lowercased, phone → "+<digits>"
+// with a +1 for US 10-digit) now lives in group_identity.rs, imported above, so the
+// identity helpers and their host tests share one definition. It MUST stay byte-for-byte
+// equal to Kotlin `Handles.canon` so inbound/outbound/contact entries all key the same.
 
 /// Only surface messages/reactions from the last few days. A big offline backlog
 /// on catch-up is dropped here so it never reaches storage or the UI — the sweet
@@ -1850,9 +1982,10 @@ fn push_relay_event(msg: MessageInst) {
         // used to silently drop it here ("read on my phone didn't clear the flip"). So
         // also ship the read's message guid (msg.id = the guid of the message read up
         // to): when chatGuid is empty the app resolves the room from that guid instead.
+        let gid = msg.conversation.as_ref().and_then(|c| c.sender_guid.clone());
         let is_group = counterparts.len() > 1 || cv_name.is_some();
         let chat_guid = if is_group {
-            format!("iMessage;+;{}", counterparts.join(","))
+            group_chat_guid(&gid, &counterparts, &cv_name)
         } else if let Some(other) = counterparts.first() {
             format!("iMessage;-;{other}")
         } else {
@@ -1938,8 +2071,16 @@ fn push_relay_event(msg: MessageInst) {
             .collect();
         counterparts.sort();
         counterparts.dedup();
-        let chat_guid = if counterparts.len() > 1 {
-            format!("iMessage;+;{}", counterparts.join(","))
+        // Same gid-keying as the message path, so a reaction lands on the exact group
+        // conversation (and folds into its target message) instead of a members-only one.
+        let gid = msg.conversation.as_ref().and_then(|c| c.sender_guid.clone());
+        let cv_name = msg
+            .conversation
+            .as_ref()
+            .and_then(|c| c.cv_name.clone())
+            .filter(|s| !s.is_empty());
+        let chat_guid = if counterparts.len() > 1 || cv_name.is_some() {
+            group_chat_guid(&gid, &counterparts, &cv_name)
         } else {
             format!("iMessage;-;{}", counterparts.first().cloned().unwrap_or_else(|| canon(&sender)))
         };
@@ -2001,12 +2142,14 @@ fn push_relay_event(msg: MessageInst) {
             .as_ref()
             .and_then(|c| c.cv_name.clone())
             .filter(|s| !s.is_empty());
-        // Group = more than one other party (or a named conversation). Give it a
-        // stable guid from the sorted other-participant set so it doesn't collapse
-        // into a single-person thread.
+        // Group = more than one other party (or a named conversation). Key it by
+        // Apple's stable group id (gid) — NOT the member set — so a named group and an
+        // unnamed group with the same people stay distinct AND a reply threads into the
+        // exact conversation (see group_chat_guid). A 1:1 stays keyed by the other party.
+        let gid = msg.conversation.as_ref().and_then(|c| c.sender_guid.clone());
         let is_group = counterparts.len() > 1 || cv_name.is_some();
         let chat_guid = if is_group {
-            format!("iMessage;+;{}", counterparts.join(","))
+            group_chat_guid(&gid, &counterparts, &cv_name)
         } else {
             let other = counterparts.first().cloned().unwrap_or_else(|| canon(&sender));
             format!("iMessage;-;{other}")
@@ -2110,17 +2253,71 @@ fn push_relay_event(msg: MessageInst) {
                 "service": service,
                 "attachments": att_json,
                 "chatName": cv_name.clone().unwrap_or_default(),
+                // The group's OTHER-party addresses, so the repo can show members and
+                // per-sender names without parsing them out of the (now gid-keyed) guid.
+                "participants": counterparts,
                 "replyToGuid": normal.reply_guid.clone().unwrap_or_default(),
                 // A message I sent (incl. from another device that synced here) was
                 // at least delivered — show the receipt, don't leave it plain "Sent".
                 "status": if is_from_me { "delivered" } else { "" },
             }
         });
-        let mut s = st();
-        for (guid, att) in stash {
-            s.attachments.insert(guid, att);
+        // Stash the attachment refs and persist them, so the download still works after
+        // the process restarts. Only touches the disk when this message actually carried
+        // an attachment, which is rare enough that the write costs nothing in practice.
+        // Inline payloads (MMS pictures) go to their own blob files FIRST — written once,
+        // before the lock is taken — so the index rewritten below stays a few hundred KB
+        // no matter how much attachment history is retained. Writing them into the index
+        // instead would mean re-serialising every retained byte on every new attachment.
+        if !stash.is_empty() {
+            let dir = st().files_dir.clone();
+            for (key, att) in &stash {
+                if let AttachmentType::Inline(data) = &att.a_type {
+                    if !data.is_empty() {
+                        write_blob(&dir, key, data);
+                    }
+                }
+            }
         }
-        s.inbound.push_back(event);
+        let persist = {
+            let mut s = st();
+            let changed = !stash.is_empty();
+            for (guid, att) in stash {
+                if s.attachments.insert(guid.clone(), att).is_none() {
+                    s.attachment_order.push_back(guid);
+                }
+            }
+            // Evict oldest-first until BOTH limits hold: the entry count, and the inline
+            // bytes actually written to disk (MMCS refs are free, MMS payloads are not).
+            let mut inline_total: usize = s
+                .attachment_order
+                .iter()
+                .filter_map(|k| s.attachments.get(k))
+                .map(inline_bytes)
+                .sum();
+            let mut evicted: Vec<String> = Vec::new();
+            while s.attachment_order.len() > ATTACHMENT_STASH_CAP
+                || inline_total > ATTACHMENT_INLINE_BUDGET
+            {
+                let Some(key) = s.attachment_order.pop_front() else { break };
+                if let Some(att) = s.attachments.remove(&key) {
+                    inline_total = inline_total.saturating_sub(inline_bytes(&att));
+                }
+                evicted.push(key);
+            }
+            s.inbound.push_back(event);
+            if changed {
+                Some((s.files_dir.clone(), ordered_attachments(&s), evicted))
+            } else {
+                None
+            }
+        }; // guard dropped here — never hold the AppState lock across disk I/O
+        if let Some((dir, items, evicted)) = persist {
+            for key in &evicted {
+                remove_blob(&dir, key);
+            }
+            save_attachments(&dir, &items);
+        }
     }
 }
 
@@ -2193,14 +2390,10 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             msg.reply_part = Some("0:0:0".to_string());
         }
         let mut inst = MessageInst::new(
-            ConversationData {
-                // All members for a group ("iMessage;+;a,b,c"); the single
-                // recipient for a 1:1. rustpush adds the sender (&handle) itself.
-                participants: participants_from_chat_guid(&chat),
-                cv_name: None,
-                sender_guid: Some(Uuid::new_v4().to_string()),
-                after_guid: None,
-            },
+            // Replay the group's real gid + members + name (or the 1:1 recipient) so the
+            // message threads into the SAME Apple conversation instead of forking a new
+            // members-only one. rustpush adds the sender (&handle) itself.
+            conv_data_for(&chat),
             &handle,
             Message::Message(msg),
         );
@@ -2342,13 +2535,9 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         };
         normal.voice = voice;
         let mut inst = MessageInst::new(
-            ConversationData {
-                // All members for a group; the single recipient for a 1:1.
-                participants: participants_from_chat_guid(&chat),
-                cv_name: None,
-                sender_guid: Some(Uuid::new_v4().to_string()),
-                after_guid: None,
-            },
+            // Replay the group's real gid + members + name (or the 1:1 recipient) so the
+            // attachment threads into the SAME conversation instead of a members-only one.
+            conv_data_for(&chat),
             &handle,
             Message::Message(normal),
         );
@@ -2389,14 +2578,14 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let attachment = st().attachments.get(&key).cloned();
     let stash_len = st().attachments.len();
     if attachment.is_none() {
-        // The stash is IN-MEMORY only, populated when a message is received; it is
-        // lost on process restart. A guid received in a previous session (or a
-        // self-synced send whose parts were never stashed) will miss here — which
-        // is the usual reason a "tap to retry" never succeeds.
+        // The stash is persisted (attachments.plist) and reloaded at init, so a prior
+        // session is no longer a reason to miss. A miss now means the reference was
+        // evicted past ATTACHMENT_STASH_CAP, the message predates persistence, or its
+        // parts were never stashed.
         log::warn!(
             "nativeDownloadAttachment: NO stashed attachment for key='{key}' \
-             (stash has {stash_len} entries) — attachment reference not in memory \
-             (received in a prior session, or never stashed). Cannot download."
+             (stash has {stash_len} entries) — reference evicted, or the message \
+             predates attachment persistence. Cannot download."
         );
     }
     if connection.is_none() {
@@ -2557,6 +2746,31 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     st().send_handle = h;
 }
 
+/// Seed the identity of an app-CREATED group so its sends thread correctly. The Kotlin
+/// side generates a fresh gid, forms the guid ("iMessage;+;<gid>"), and calls this with
+/// the comma-separated member addresses + optional name. Stored in group_meta so every
+/// outbound (text/attachment/tapback/read) replays this gid + members + name — exactly
+/// as if the group had been learned from an inbound message.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeRegisterGroup<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    chat_guid: JString<'l>,
+    participants_csv: JString<'l>,
+    name: JString<'l>,
+) {
+    let chat = jstr(&mut env, &chat_guid);
+    let csv = jstr(&mut env, &participants_csv);
+    let name = jstr(&mut env, &name);
+    let members: Vec<String> =
+        csv.split(',').map(|s| canon(s)).filter(|s| !s.is_empty()).collect();
+    let cv_name = if name.trim().is_empty() { None } else { Some(name) };
+    log::info!("nativeRegisterGroup: chat={chat} members={members:?} name={cv_name:?}");
+    remember_group_meta(&chat, &members, &cv_name);
+}
+
 /// Is `handle` reachable on iMessage? Drives the composer color (blue = iMessage,
 /// green = SMS) BEFORE anything is sent. Defaults to true (iMessage/blue) when the
 /// client isn't up or the lookup fails, so we never wrongly show green.
@@ -2706,12 +2920,9 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             embedded_profile: None,
         };
         let mut inst = MessageInst::new(
-            ConversationData {
-                participants: participants_from_chat_guid(&chat),
-                cv_name: None,
-                sender_guid: Some(Uuid::new_v4().to_string()),
-                after_guid: None,
-            },
+            // Replay the group's real gid + members + name (or the 1:1 recipient) so the
+            // tapback lands on the SAME conversation as the message it reacts to.
+            conv_data_for(&chat),
             &handle,
             Message::React(react),
         );

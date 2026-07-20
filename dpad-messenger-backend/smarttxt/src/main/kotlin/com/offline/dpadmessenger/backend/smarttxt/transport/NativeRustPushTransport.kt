@@ -116,12 +116,19 @@ class NativeRustPushTransport(
                 guid = ChatGuid.forDm(members[0]), displayName = "",
                 participants = listOf(RelayParticipant(address = addresses.first())),
             )
-            // Group — guid is the sorted member set ("iMessage;+;a,b,c"), matching
-            // the native receive guid so inbound group messages thread into it.
-            else -> RelayChat(
-                guid = ChatGuid.forGroup(members), displayName = title.orEmpty(), isGroup = true,
-                participants = addresses.map { RelayParticipant(address = it) },
-            )
+            // Group — key it by a fresh Apple-style group id (gid), like a real client
+            // starting a new group. Seed that identity natively (gid → members + name)
+            // so every send replays it and threads into THIS conversation instead of a
+            // members-only one; a later inbound message on the same gid folds in cleanly.
+            else -> {
+                val gid = java.util.UUID.randomUUID().toString()
+                val guid = ChatGuid.forGroup(gid)
+                RustPushNative.runCatchingNativeRegisterGroup(guid, members.joinToString(","), title.orEmpty())
+                RelayChat(
+                    guid = guid, displayName = title.orEmpty(), isGroup = true,
+                    participants = addresses.map { RelayParticipant(address = it) },
+                )
+            }
         }
     }
     override suspend fun sendAttachment(

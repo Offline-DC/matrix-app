@@ -72,7 +72,15 @@ class GMGaiaClient(context: Context) {
                 "On the computer, finish signing in at messages.google.com, then re-generate the code and rescan."
             return false
         }
-        Log.i(TAG, "run: starting with ${cookies.size} cookies")
+        // Cookie NAMES + a hashed fingerprint (never values — see helper). The
+        // fingerprint is the only way to tell, from a support log, whether a
+        // retry sent fresh cookies or re-sent the same ones; the *SIDTS flags
+        // matter because those are the short-lived rotating cookies whose
+        // absence/staleness has bitten this flow before.
+        Log.i(TAG, "run: starting with ${cookies.size} cookies; names=${cookies.keys.sorted()}; " +
+            "fp=${cookieFingerprint(cookies)}; " +
+            "has1PSIDTS=${!cookies["__Secure-1PSIDTS"].isNullOrBlank()} " +
+            "has3PSIDTS=${!cookies["__Secure-3PSIDTS"].isNullOrBlank()}")
 
         val deviceUuid = fetchConfig(cookies)
         // Reuse ONE persisted web-device UUID instead of minting a fresh random one
@@ -86,6 +94,24 @@ class GMGaiaClient(context: Context) {
         val sessionId = deviceUuid ?: store.getOrCreateDeviceSessionId()
         return signInGaia(cookies, sessionId, onEmoji)
     }
+
+    /**
+     * Stable, non-reversible fingerprint of a cookie set, for support logs.
+     *
+     * Cookie values are LIVE SESSION CREDENTIALS and the rolling logcat gets
+     * emailed to us by customers, so they are hashed and never written out.
+     * Comparing fingerprints across attempts answers the one question the names
+     * alone cannot: did the retry deliver fresh cookies, or re-send the same
+     * stale ones? (The companion app has no refresh path, so the latter is a
+     * real possibility.) Pair with the logcat timestamps to get their age.
+     */
+    private fun cookieFingerprint(cookies: Map<String, String>): String = runCatching {
+        val canon = cookies.toSortedMap().entries.joinToString("&") { "${it.key}=${it.value}" }
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(canon.toByteArray(Charsets.UTF_8))
+            .take(4)
+            .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    }.getOrDefault("??")
 
     // ---- Step 1: FetchConfig -----------------------------------------------
 
