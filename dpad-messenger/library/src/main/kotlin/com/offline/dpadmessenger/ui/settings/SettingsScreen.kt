@@ -73,7 +73,10 @@ fun SettingsScreen(
     /** Send-read-receipts toggle. Hidden when [onSendReadReceiptsChange] is null
      *  (repositories that can't send receipts, e.g. the mock). Off by default:
      *  reading still clears the notification on the user's own devices, but the
-     *  sender isn't told "Read" unless this is on. */
+     *  sender isn't told "Read" unless this is on.
+     *
+     *  THIS DEVICE ONLY. Read receipts are per-device on Apple and do not sync, so
+     *  this cannot turn them off on the user's iPhone or Mac — the copy says so. */
     sendReadReceipts: Boolean = false,
     onSendReadReceiptsChange: ((Boolean) -> Unit)? = null,
     /** 24-hour clock toggle. Hidden when [onUse24HourTimeChange] is null. */
@@ -167,8 +170,16 @@ fun SettingsScreen(
                 if (onSendReadReceiptsChange != null) {
                     ToggleRow(
                         title = "Send read receipts",
-                        subtitle = "Let people see when you've read their message. " +
-                            "When off, reading still clears the notification on your other devices.",
+                        // Say "this phone" explicitly. Read receipts are a PER-DEVICE
+                        // setting on Apple — turning them off here does not turn them
+                        // off on the user's iPhone or Mac, and if they read the message
+                        // there the sender still sees "Read". The old copy didn't say
+                        // that, so people turned it off here, saw "Read" anyway, and
+                        // reported it as broken.
+                        subtitle = "Let people see when you've read their message on this phone. " +
+                            "Your iPhone and Mac each have their own setting — turn it off " +
+                            "there too. When off, reading still clears the notification on " +
+                            "your other devices.",
                         checked = sendReadReceipts,
                         onCheckedChange = onSendReadReceiptsChange,
                     )
