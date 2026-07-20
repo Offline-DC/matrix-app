@@ -57,6 +57,11 @@ data class Message(
     /** Unix epoch milliseconds. */
     val timestampMs: Long,
     val status: MessageStatus = MessageStatus.SENT,
+    /** When the recipient read this message, for the iMessage-style "Read 1:20 PM"
+     *  receipt under the newest outgoing bubble. Null means either not read yet or
+     *  the backend doesn't report read times — in which case the receipt falls back
+     *  to a bare "Read", exactly as before. Only Smart Txt populates it today. */
+    val readAtMs: Long? = null,
     /** True when the local user sent this message. */
     val isOutgoing: Boolean = false,
     /** Event id of the parent message if this is a reply. */

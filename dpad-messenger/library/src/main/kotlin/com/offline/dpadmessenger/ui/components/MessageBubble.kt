@@ -74,6 +74,7 @@ import com.offline.dpadmessenger.focus.dpadFocusHighlight
 import com.offline.dpadmessenger.focus.onDpadAction
 import com.offline.dpadmessenger.ui.theme.SmartTxtFocusBorder
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
+import com.offline.dpadmessenger.ui.util.formatRelativeShort
 import com.offline.dpadmessenger.ui.util.formatTimeShort
 
 /**
@@ -606,7 +607,7 @@ fun MessageBubble(
             // statusGlyph) means the text just swaps in place, no reflow.
             if (colors.smarttxt && isOutgoing && showReceipt && !message.isDeleted) {
                 Text(
-                    text = statusGlyph(message.status, true),
+                    text = statusGlyph(message.status, true, message.readAtMs),
                     style = MaterialTheme.typography.labelSmall,
                     color = if (message.status == MessageStatus.FAILED) {
                         MaterialTheme.colorScheme.error
@@ -894,7 +895,7 @@ private fun TapbackOverlay(
     }
 }
 
-private fun statusGlyph(status: MessageStatus, smarttxt: Boolean): String =
+private fun statusGlyph(status: MessageStatus, smarttxt: Boolean, readAtMs: Long? = null): String =
     if (smarttxt) when (status) {
         // SmartTxt shows the delivery state as words under the last sent bubble.
         MessageStatus.SENDING -> "Sending…"
@@ -905,7 +906,11 @@ private fun statusGlyph(status: MessageStatus, smarttxt: Boolean): String =
         // the thread jump). Real SmartTxt likewise never rests on a bare "Sent".
         MessageStatus.SENT -> "Sending…"
         MessageStatus.DELIVERED -> "Delivered"
-        MessageStatus.READ -> "Read"
+        // "Read 1:20 PM" / "Read Yesterday" / "Read 14 May", like real iMessage.
+        // formatRelativeShort already does exactly this split (time today, then
+        // "Yesterday", then a date) and honours the 24-hour setting. Falls back to a
+        // bare "Read" when the backend doesn't report a read time.
+        MessageStatus.READ -> readAtMs?.let { "Read ${formatRelativeShort(it)}" } ?: "Read"
         MessageStatus.FAILED -> "Not Delivered"
     } else when (status) {
         MessageStatus.SENDING -> "…"

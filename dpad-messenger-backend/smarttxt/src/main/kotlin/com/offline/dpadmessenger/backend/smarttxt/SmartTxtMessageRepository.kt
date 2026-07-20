@@ -633,6 +633,7 @@ internal class SmartTxtMessageRepository(
                 // timestamp rather than list index so it doesn't quietly depend on
                 // how this list happens to be ordered.
                 val upToMs = list[idx].timestampMs
+                val readAtMs = System.currentTimeMillis()
                 var any = false
                 for (i in list.indices) {
                     val m = list[i]
@@ -641,7 +642,13 @@ internal class SmartTxtMessageRepository(
                     // comparison: FAILED ranks below READ, so a rank test would
                     // silently turn a failed message into "Read".
                     if (m.status != MessageStatus.SENT && m.status != MessageStatus.DELIVERED) continue
-                    list[i] = m.copy(status = MessageStatus.READ)
+                    // Stamp WHEN it was read so the bubble can show "Read 1:20 PM".
+                    // Receipt arrival time, not a time carried in the receipt: Apple
+                    // delivers these within a second or two of the actual read, and
+                    // using arrival keeps this Kotlin-side (no FFI change, no .so
+                    // rebuild). Every message in one fan-out shares the stamp, which
+                    // is correct — they were all read in the same act.
+                    list[i] = m.copy(status = MessageStatus.READ, readAtMs = readAtMs)
                     any = true
                 }
                 if (any) {
@@ -745,16 +752,9 @@ internal class SmartTxtMessageRepository(
             title = roomNameById[e.chatGuid] ?: reactor,
             sender = reactor,
             body = tapbackSummary(e.senderAddress, e.emoji, targetBody),
-            isGroup = isGroupChat(e.chatGuid),
+            isGroup = ChatGuid.isGroup(e.chatGuid),
         )
     }
-
-    /** Group vs 1:1, straight off the chat guid. Apple's convention (which the FFI
-     *  follows when it builds these) is `<service>;+;a,b,c` for a group and
-     *  `<service>;-;other` for a 1:1 — so the room id already carries the answer and
-     *  we don't have to re-derive it from a participant list that may not be loaded
-     *  yet when a notification fires. */
-    private fun isGroupChat(chatGuid: String): Boolean = chatGuid.contains(";+;")
 
     /** iMessage-style one-liner for a received reaction, e.g.
      *  Molly emphasized "Your only living grandparent…". Used for BOTH the
@@ -813,7 +813,7 @@ internal class SmartTxtMessageRepository(
             title = roomNameById[rm.chatGuid] ?: userById(mapped.senderId).displayName,
             sender = userById(mapped.senderId).displayName,
             body = body,
-            isGroup = isGroupChat(rm.chatGuid),
+            isGroup = ChatGuid.isGroup(rm.chatGuid),
         )
     }
 
