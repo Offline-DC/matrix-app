@@ -1419,7 +1419,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     // Clone for the async closure; the originals are stored in state below.
     let apple_c = apple.clone();
     let pw_c = pw_hash.clone();
-    let result = block_on_timeout(45, "Login timed out — the anisette/Apple server didn't respond", async move {
+    let result = block_on_timeout(90, "Login timed out — the anisette/Apple server didn't respond", async move {
         let gsa = os_config.get_gsa_config(&*connection.state.read().await, false);
         let anisette = default_provider(gsa.clone(), Path::new(&dir).join("anisette"));
         let mut account = rustpush::AppleAccount::new_with_anisette(gsa, anisette)
@@ -1498,7 +1498,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         }
     };
 
-    let result = block_on_timeout(45, "2FA verification timed out — Apple didn't respond", async move {
+    let result = block_on_timeout(90, "2FA verification timed out — Apple didn't respond", async move {
         let verified = if let Some(body) = sms_body {
             account.verify_sms_2fa(code, body).await.map_err(|e| format!("verify_sms_2fa: {e}"))?
         } else {
@@ -1553,7 +1553,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     };
     log::info!("nativeRegister: begin (IDS auth + activation; validation data comes from the NAC server)");
 
-    let result = block_on_timeout(60, "Registration timed out — anisette/Apple/NAC server didn't respond", async move {
+    let result = block_on_timeout(120, "Registration timed out — anisette/Apple/NAC server didn't respond", async move {
         // iMessage is IDS-only. Requesting MobileMe triggers ICLOUD_UNSUPPORTED_DEVICE.
         log::info!("nativeRegister: [1/3] login_apple_delegates (IDS)…");
         let delegates = login_apple_delegates(&account, None, os_config.as_ref(), &[LoginDelegate::IDS])
