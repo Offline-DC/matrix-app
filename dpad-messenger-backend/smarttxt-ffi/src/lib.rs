@@ -1139,6 +1139,9 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     relay_code: JString,
 ) -> jboolean {
     init_logger();
+    // ANISETTE-URL-CHECK: log the anisette v3 server this .so was compiled with, at
+    // INFO so it shows in `adb logcat -s smarttxt_ffi` on every launch (no sign-in needed).
+    log::info!("anisette: configured server = {}", omnisette::DEFAULT_ANISETTE_URL_V3);
     // The rustls stack (reqwest) needs a process crypto provider; ring is bundled.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
