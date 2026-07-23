@@ -104,13 +104,6 @@ struct AppState {
     users: Vec<IDSUser>,
     identity: Option<IDSNGMIdentity>,
     client: Option<Arc<IMClient>>,
-    /// My own registered handles (raw form), used for SENDING (pick a from-handle).
-    my_handles: Vec<String>,
-    /// Broader "who am I" set — registered handles PLUS every address the account
-    /// could use (aliases, e.g. a gmail on the Apple ID) PLUS the login Apple ID.
-    /// Used to detect self-sends (incl. from another device under an alias) and to
-    /// exclude myself when deciding a thread's other participant(s).
-    self_handles: Vec<String>,
 
     /// The DEFAULT handle for NEW conversations (raw rustpush form, e.g. "tel:+1…"
     /// or "mailto:…"). Empty = fall back to the first registered handle. Set from
@@ -1668,12 +1661,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let result = rt().block_on(async move {
         // Display, not Debug, so an IDS 6004/6005/rate-limit surfaces its human text.
         client.identity.refresh_now().await.map_err(|e| format!("{e}"))?;
-        // WRITE BACK the refreshed sets. refresh_now() → generate() → register() has
-        // already re-queried id-get-handles and re-registered; without this the FFI's
-        // my_handles/self_handles stay frozen at login-time and a newly-vended number
-        // is invisible to the send-handle picker AND to participant filtering until a
-        // full re-login.
-        Ok::<Vec<String>, String>(refresh_identity_handles(&client).await)
+        Ok::<Vec<String>, String>(client.identity.get_handles().await)
     });
     match result {
         Ok(handles) => {
@@ -1685,6 +1673,25 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             out(&mut env, err_json(e))
         }
     }
+}
+
+/// Proactively reconcile registered handles against what IDS vends and reregister if
+/// they differ (see [reconcile_handles]). Exposed so the Kotlin side can run it on
+/// connect / foreground / renewal — the "many triggers" that keep handles current the
+/// way OpenBubbles does. Returns `{ok, handles}`.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeReconcileHandles<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jstring {
+    let Some(client) = st().client.clone() else {
+        return out(&mut env, err_json("iMessage isn't connected right now."));
+    };
+    let handles = rt().block_on(async move { reconcile_handles(&client).await });
+    log::info!("nativeReconcileHandles: handles={handles:?}");
+    out(&mut env, serde_json::json!({ "ok": true, "handles": handles }).to_string())
 }
 
 /// Send a read receipt (iMessage command 102, `Message::Read`) for `chat_guid`,
@@ -1798,12 +1805,11 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
     )
     .await;
     let client = Arc::new(client);
-    // Populate my_handles/self_handles from IDS (registered + aliases + Apple ID) via
-    // the shared helper, THEN publish the client — so nothing observes a client with an
-    // empty handle set. The SAME refresh runs on every re-register (see nativeReregister),
-    // so a handle IDS vends later is adopted without a full re-login.
-    let _ = refresh_identity_handles(&client).await;
+    // OB-style handle reconciliation: publish the client, then reregister if IDS is
+    // vending handles we haven't registered (possible != registered). Handles are read
+    // live from rustpush (get_handles) wherever needed — nothing is cached.
     st().client = Some(client.clone());
+    let _ = reconcile_handles(&client).await;
     // Restore whether SMS forwarding was previously enabled by the iPhone.
     SMS_ACTIVE.store(load_sms_active(&dir), Ordering::SeqCst);
 
@@ -1826,10 +1832,13 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
                     // but AWAIT it before taking the next message, so messages are
                     // decrypted and queued in strict receive order (no concurrent-task
                     // reordering).
+                    // Read handles live from rustpush (get_handles = cheap local read)
+                    // and pass them into the sync event handler — no cached self set.
+                    let my_handles = client.identity.get_handles().await;
                     let client = client.clone();
                     let joined = rt().spawn(async move { client.handle(apns_msg).await }).await;
                     match joined {
-                        Ok(Ok(Some(msg))) => push_relay_event(msg),
+                        Ok(Ok(Some(msg))) => push_relay_event(msg, &my_handles),
                         Ok(Ok(None)) => {}
                         Ok(Err(e)) => {
                             let dbg = format!("{e:?}");
@@ -1935,7 +1944,7 @@ const SYNC_WINDOW_MS: u64 = 3 * 24 * 60 * 60 * 1000; // 3 days
 
 /// Map a received rustpush `Message` to a relay-wire event and queue it.
 /// VERIFY: field access on the rustpush Message variants against your pinned rev.
-fn push_relay_event(msg: MessageInst) {
+fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1958,7 +1967,7 @@ fn push_relay_event(msg: MessageInst) {
         Message::MessageReadOnDevice => true,
         Message::Read => {
             let sender = msg.sender.clone().unwrap_or_default();
-            !sender.is_empty() && st().self_handles.iter().any(|h| canon(h) == canon(&sender))
+            !sender.is_empty() && my_handles.iter().any(|h| canon(h) == canon(&sender))
         }
         _ => false,
     };
@@ -1972,7 +1981,7 @@ fn push_relay_event(msg: MessageInst) {
     let peer_read = matches!(&msg.message, Message::Read) && !read_elsewhere;
     if read_elsewhere || peer_read {
         let sender = msg.sender.clone().unwrap_or_default();
-        let my: Vec<String> = st().self_handles.iter().map(|h| canon(h)).collect();
+        let my: Vec<String> = my_handles.iter().map(|h| canon(h)).collect();
         let participants: Vec<String> = msg
             .conversation
             .as_ref()
@@ -2074,7 +2083,7 @@ fn push_relay_event(msg: MessageInst) {
             _ => return, // extension/sticker reactions not handled here
         };
         let sender = msg.sender.clone().unwrap_or_default();
-        let my: Vec<String> = st().self_handles.iter().map(|h| canon(h)).collect();
+        let my: Vec<String> = my_handles.iter().map(|h| canon(h)).collect();
         let is_from_me = my.contains(&canon(&sender));
         let participants: Vec<String> = msg
             .conversation
@@ -2130,7 +2139,7 @@ fn push_relay_event(msg: MessageInst) {
         // conversation.participants (both parties for a 1:1, everyone for a group).
         // Canonicalise + drop my own handles so outbound/inbound AND cross-device
         // self-sends collapse into one thread, and phone/email/format variants merge.
-        let my: Vec<String> = st().self_handles.iter().map(|h| canon(h)).collect();
+        let my: Vec<String> = my_handles.iter().map(|h| canon(h)).collect();
         // A forwarded SMS arrives with the APNs sender set to MY OWN forwarding
         // number (the iPhone gateway); the real other party is the SMS from_handle.
         // Use it as the effective sender so the text reads as received FROM them
@@ -2243,7 +2252,7 @@ fn push_relay_event(msg: MessageInst) {
         // addressed — used only when we don't already know. (Groups route over
         // iMessage to everyone regardless, so they don't need a pinned self-handle.)
         if service == "iMessage" && !is_group {
-            let my_registered = st().my_handles.clone();
+            let my_registered = my_handles.to_vec();
             if is_from_me {
                 if my_registered.iter().any(|h| h == &sender) {
                     remember_thread_handle(&chat_guid, &sender);
@@ -2637,39 +2646,31 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     }
 }
 
-/// Re-read this account's handles from IDS and write them into `my_handles`
-/// (registered / send-eligible) and `self_handles` (the broad "who am I" set used to
-/// pick a from-handle AND to exclude myself when computing a thread's other
-/// participants). Mirrors the population done once at login, so a re-register or
-/// reconnect ADOPTS a handle IDS newly vends — e.g. a phone number missing from the
-/// first `id-get-handles` that only shows up on a later query — without a full
-/// sign-out/in.
-///
-/// Call with NO state lock held: it awaits IDS first, then takes `st()` only for the
-/// synchronous write (never across an await).
-async fn refresh_identity_handles(client: &Arc<IMClient>) -> Vec<String> {
-    let handles = client.identity.get_handles().await;
-    // Broad self set = registered + IDS aliases + the login Apple ID. get_possible_handles
-    // hits IDS and can transiently fail; on failure KEEP the aliases we already knew
-    // rather than collapsing to registered-only — otherwise a blip re-introduces the
-    // "my own number leaks in as a participant" fork the instant a refresh fails.
-    let possible = client.identity.get_possible_handles().await.ok();
-
-    let mut s = st();
-    let mut self_handles = handles.clone();
-    match possible {
-        Some(p) => self_handles.extend(p.into_iter()),
-        None => self_handles.extend(s.self_handles.iter().cloned()),
+/// OpenBubbles-style handle reconciliation. rustpush only compares IDS-vended handles
+/// against registered ones REACTIVELY (on an IDS command-66 push; see identity_manager).
+/// This is the PROACTIVE form: if `get_possible_handles()` (what Apple says this account
+/// can use) differs from `get_handles()` (what we've actually registered), force a
+/// reregister to adopt the delta. Run on login and on the app's reconnect/foreground/
+/// renewal triggers so a handle Apple vends without a push (e.g. a phone number missing
+/// from the first id-get-handles) is still picked up. Handles are then read live from
+/// rustpush (get_handles) wherever needed — nothing is cached. Mirrors OB's
+/// `if real_handles != my_handles { refresh }`.
+async fn reconcile_handles(client: &Arc<IMClient>) -> Vec<String> {
+    let my: std::collections::HashSet<String> =
+        client.identity.get_handles().await.into_iter().collect();
+    match client.identity.get_possible_handles().await {
+        Ok(possible) if possible != my => {
+            log::info!(
+                "reconcile: IDS vends handles we haven't registered (possible={possible:?} registered={my:?}) — reregistering"
+            );
+            if let Err(e) = client.identity.refresh_now().await {
+                log::warn!("reconcile: reregister failed: {e}");
+            }
+        }
+        Ok(_) => log::info!("reconcile: registered handles already match IDS"),
+        Err(e) => log::warn!("reconcile: get_possible_handles failed ({e}) — keeping current handles"),
     }
-    if !s.apple_id.is_empty() {
-        self_handles.push(s.apple_id.clone());
-    }
-    self_handles.sort();
-    self_handles.dedup();
-    s.my_handles = handles.clone();
-    s.self_handles = self_handles;
-    log::info!("handles refreshed: my={:?} self={:?}", s.my_handles, s.self_handles);
-    handles
+    client.identity.get_handles().await
 }
 
 /// The user's chosen send-from handle if it's still one of their registered
@@ -2730,9 +2731,9 @@ enum Route {
 /// Build the green-SMS route from my own account's phone handle, or a user-facing
 /// reason we can't. Shared by `decide_route`'s "confirmed not on iMessage" and
 /// "couldn't check" paths.
-fn sms_route() -> Route {
+fn sms_route(my_handles: &[String]) -> Route {
     // Forward from my own phone number (the tel: handle on my account).
-    match st().my_handles.iter().find(|h| h.starts_with("tel:")).cloned() {
+    match my_handles.iter().find(|h| h.starts_with("tel:")).cloned() {
         Some(number) => Route::Sms { using_number: number },
         None => Route::Block("Your iCloud account has no phone number to text from.".to_string()),
     }
@@ -2757,7 +2758,7 @@ async fn decide_route(client: &IMClient, handle: &str, recipient: &str) -> Route
             // blip doesn't misroute a real iMessage contact to a text.
             if is_phone && sms_active {
                 log::warn!("decide_route[{recipient}]: validate failed ({e:?}) — forwarding on, routing SMS");
-                return sms_route();
+                return sms_route(&client.identity.get_handles().await);
             }
             log::warn!("decide_route[{recipient}]: validate failed ({e:?}); defaulting to iMessage");
             return Route::IMessage;
@@ -2781,7 +2782,7 @@ async fn decide_route(client: &IMClient, handle: &str, recipient: &str) -> Route
                 .to_string(),
         );
     }
-    sms_route()
+    sms_route(&client.identity.get_handles().await)
 }
 
 /// Set the handle outgoing messages are sent FROM (the Settings "default send"
