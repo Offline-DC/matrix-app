@@ -114,6 +114,7 @@ class RustPushBridge(
         appleId: String,
         password: String,
         twoFactorProvider: (suspend () -> String?)?,
+        fsaProvider: (suspend (FsaChallenge) -> FsaResponse?)? = null,
     ): RegistrationResult {
         if (!NATIVE_AVAILABLE) return RegistrationResult.Failure("native library not loaded")
         return try {
@@ -143,6 +144,46 @@ class RustPushBridge(
             if (authErr != null) {
                 Log.w(TAG, "sign-in: authenticate failed: $authErr")
                 return RegistrationResult.Failure(humanizeLoginError(authErr))
+            }
+            if (auth["status"]?.jsonPrimitive?.content == "needs_fsa") {
+                // Apple wants a security-key (FSA) verification, which is answered on
+                // the paired companion phone. Surface the challenge to the UI (which
+                // shows the "look at the dumb down app" screen and relays every field
+                // to the companion over typesync). We have no code to submit and the
+                // response path isn't wired yet, so this suspends until the user backs
+                // out; treat that as a cancel.
+                val challenge = FsaChallenge(
+                    challenge = auth["challenge"]?.jsonPrimitive?.content.orEmpty(),
+                    keyHandles = auth["keyHandles"]?.jsonArray
+                        ?.mapNotNull { it.jsonPrimitive.content }
+                        .orEmpty(),
+                    rpId = auth["rpId"]?.jsonPrimitive?.content.orEmpty(),
+                    allowedCredentials = auth["allowedCredentials"]?.jsonPrimitive?.content.orEmpty(),
+                )
+                if (fsaProvider == null) {
+                    return RegistrationResult.Failure(
+                        "This account needs a security key to sign in, which isn't supported here.")
+                }
+                // Show the screen, relay the challenge to the companion, and wait for
+                // the companion's CTAP2 assertion (or null if the user backs out).
+                val response = fsaProvider.invoke(challenge)
+                    ?: return RegistrationResult.Failure("Sign-in cancelled.")
+                // Submit the assertion to Apple; on success we fall through to register.
+                val verify = json.parseToJsonElement(
+                    RustPushNative.nativeSubmitFsa(
+                        response.challenge,
+                        response.clientData,
+                        response.signatureData,
+                        response.authenticatorData,
+                        response.credentialId,
+                        response.userHandle,
+                        response.rpId,
+                    )
+                ).jsonObject
+                verify["error"]?.jsonPrimitive?.content?.let {
+                    Log.w(TAG, "sign-in: FSA verify failed: $it")
+                    return RegistrationResult.Failure(humanizeLoginError(it))
+                }
             }
             if (auth["status"]?.jsonPrimitive?.content == "needs_2fa") {
                 val code = twoFactorProvider?.invoke()

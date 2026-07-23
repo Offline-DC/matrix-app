@@ -75,6 +75,21 @@ object SmartTxtConfig {
     @Volatile
     var validationRelayAuthToken: String? = null
 
+    // ---- FSA (security-key) relay to the companion phone --------------------
+
+    /**
+     * Host-provided sink that relays an [FsaChallenge] to the paired companion
+     * smartphone over the launcher's typesync channel. Null when the host hasn't
+     * wired it (e.g. mock/tests) — the FSA screen then simply shows its
+     * instructions without relaying. The launcher sets this in
+     * `DumbDownApp.onCreate` alongside the other config, e.g.:
+     * ```
+     * SmartTxtConfig.fsaChallengeSender = LauncherFsaChallengeSender
+     * ```
+     */
+    @Volatile
+    var fsaChallengeSender: FsaChallengeSender? = null
+
     /**
      * Intent extra key carrying the conversation id when the host messenger
      * Activity is opened from an incoming-message notification. Public so the

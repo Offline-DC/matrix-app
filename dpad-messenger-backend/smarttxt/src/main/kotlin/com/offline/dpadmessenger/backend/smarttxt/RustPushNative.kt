@@ -108,6 +108,21 @@ object RustPushNative {
     /** Submit the 6-digit 2FA code. Returns {"status":"ok"} or {"error":"…"}. */
     external fun nativeSubmit2fa(code: String): String
 
+    /**
+     * Submit a security-key (FSA) assertion produced by the companion phone.
+     * All fields are the strings Apple's endpoint expects (binary values arrive
+     * base64-encoded). Returns {"status":"logged_in"} or {"error":"…"}.
+     */
+    external fun nativeSubmitFsa(
+        challenge: String,
+        clientData: String,
+        signatureData: String,
+        authenticatorData: String,
+        credentialId: String,
+        userHandle: String,
+        rpId: String,
+    ): String
+
     // ---- registration (the §2.2 four-call sequence, native) -----------------
 
     /**
