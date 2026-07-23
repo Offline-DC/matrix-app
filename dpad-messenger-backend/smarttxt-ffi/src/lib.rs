@@ -1668,7 +1668,12 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let result = rt().block_on(async move {
         // Display, not Debug, so an IDS 6004/6005/rate-limit surfaces its human text.
         client.identity.refresh_now().await.map_err(|e| format!("{e}"))?;
-        Ok::<Vec<String>, String>(client.identity.get_handles().await)
+        // WRITE BACK the refreshed sets. refresh_now() → generate() → register() has
+        // already re-queried id-get-handles and re-registered; without this the FFI's
+        // my_handles/self_handles stay frozen at login-time and a newly-vended number
+        // is invisible to the send-handle picker AND to participant filtering until a
+        // full re-login.
+        Ok::<Vec<String>, String>(refresh_identity_handles(&client).await)
     });
     match result {
         Ok(handles) => {
@@ -1793,30 +1798,12 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
     )
     .await;
     let client = Arc::new(client);
-    let handles = client.identity.get_handles().await;
-    // Broader self set for self-send detection: aliases on the account (a gmail,
-    // etc.) that get_handles() may omit. get_possible_handles hits IDS, so tolerate
-    // failure and fall back to the registered handles.
-    let possible = client
-        .identity
-        .get_possible_handles()
-        .await
-        .map(|s| s.into_iter().collect::<Vec<_>>())
-        .unwrap_or_default();
-    {
-        let mut s = st();
-        let mut self_handles = handles.clone();
-        self_handles.extend(possible);
-        if !s.apple_id.is_empty() {
-            self_handles.push(s.apple_id.clone());
-        }
-        self_handles.sort();
-        self_handles.dedup();
-        s.client = Some(client.clone());
-        s.my_handles = handles;
-        s.self_handles = self_handles;
-        log::info!("handles: my={:?} self={:?}", s.my_handles, s.self_handles);
-    }
+    // Populate my_handles/self_handles from IDS (registered + aliases + Apple ID) via
+    // the shared helper, THEN publish the client — so nothing observes a client with an
+    // empty handle set. The SAME refresh runs on every re-register (see nativeReregister),
+    // so a handle IDS vends later is adopted without a full re-login.
+    let _ = refresh_identity_handles(&client).await;
+    st().client = Some(client.clone());
     // Restore whether SMS forwarding was previously enabled by the iPhone.
     SMS_ACTIVE.store(load_sms_active(&dir), Ordering::SeqCst);
 
@@ -2648,6 +2635,41 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             .unwrap_or(std::ptr::null_mut()),
         None => std::ptr::null_mut(),
     }
+}
+
+/// Re-read this account's handles from IDS and write them into `my_handles`
+/// (registered / send-eligible) and `self_handles` (the broad "who am I" set used to
+/// pick a from-handle AND to exclude myself when computing a thread's other
+/// participants). Mirrors the population done once at login, so a re-register or
+/// reconnect ADOPTS a handle IDS newly vends — e.g. a phone number missing from the
+/// first `id-get-handles` that only shows up on a later query — without a full
+/// sign-out/in.
+///
+/// Call with NO state lock held: it awaits IDS first, then takes `st()` only for the
+/// synchronous write (never across an await).
+async fn refresh_identity_handles(client: &Arc<IMClient>) -> Vec<String> {
+    let handles = client.identity.get_handles().await;
+    // Broad self set = registered + IDS aliases + the login Apple ID. get_possible_handles
+    // hits IDS and can transiently fail; on failure KEEP the aliases we already knew
+    // rather than collapsing to registered-only — otherwise a blip re-introduces the
+    // "my own number leaks in as a participant" fork the instant a refresh fails.
+    let possible = client.identity.get_possible_handles().await.ok();
+
+    let mut s = st();
+    let mut self_handles = handles.clone();
+    match possible {
+        Some(p) => self_handles.extend(p.into_iter()),
+        None => self_handles.extend(s.self_handles.iter().cloned()),
+    }
+    if !s.apple_id.is_empty() {
+        self_handles.push(s.apple_id.clone());
+    }
+    self_handles.sort();
+    self_handles.dedup();
+    s.my_handles = handles.clone();
+    s.self_handles = self_handles;
+    log::info!("handles refreshed: my={:?} self={:?}", s.my_handles, s.self_handles);
+    handles
 }
 
 /// The user's chosen send-from handle if it's still one of their registered
