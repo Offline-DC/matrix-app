@@ -242,7 +242,9 @@ fn st() -> MutexGuard<'static, AppState> {
 
 fn init_logger() {
     android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("SmartTxtRust"),
     );
     // Install a panic hook ONCE that routes Rust panics through `log` (→ logcat).
     // The default hook writes to stderr, which Android discards — so a panic on a
@@ -837,6 +839,31 @@ fn convert_anisette(ob_state: &str, out_state: &str) -> Result<usize, String> {
 
 /// Write an omnisette-format anisette `state.plist` (keychain_identifier + adi_pb),
 /// creating the parent `anisette/` dir if needed.
+fn adi_pb_shape(adi: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    match serde_json::from_slice::<serde_json::Value>(adi) {
+        Ok(serde_json::Value::Object(map)) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys.iter().map(|k| {
+                let v = &map[k.as_str()];
+                match k.as_str() {
+                    "version" | "flavor" | "rinfo" => format!("{k}={v}"),
+                    _ => match v.as_str() {
+                        Some(s) => format!("{k}=<b64 {} chars / {} bytes>", s.len(), b64.decode(s).map(|d| d.len()).unwrap_or(0)),
+                        None => format!("{k}=<non-string>"),
+                    },
+                }
+            }).collect();
+            format!("json_ok=true total={}B keys=[{}] {}", adi.len(),
+                keys.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(","), parts.join(" "))
+        }
+        Ok(_) => format!("json_ok=true(non-object) total={}B", adi.len()),
+        Err(e) => format!("json_ok=false total={}B first_byte=0x{:02x} ({e})", adi.len(), adi.first().copied().unwrap_or(0)),
+    }
+}
+
 fn write_anisette(out_state: &str, keychain: &[u8], adi_pb: &[u8]) -> Result<(), String> {
     if let Some(parent) = Path::new(out_state).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
@@ -846,6 +873,7 @@ fn write_anisette(out_state: &str, keychain: &[u8], adi_pb: &[u8]) -> Result<(),
     d.insert("adi_pb".into(), plist::Value::Data(adi_pb.to_vec()));
     plist::Value::Dictionary(d).to_file_xml(out_state)
         .map_err(|e| format!("write anisette state.plist ({out_state}): {e}"))?;
+    log::info!("ADI_STRUCT [source=migrated-adi] keychain_id={}B {}", keychain.len(), adi_pb_shape(adi_pb));
     log::info!("convert_anisette: wrote {out_state} (adi_pb {} bytes)", adi_pb.len());
     Ok(())
 }
