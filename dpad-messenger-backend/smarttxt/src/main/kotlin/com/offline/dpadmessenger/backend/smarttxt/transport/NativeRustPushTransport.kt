@@ -62,7 +62,9 @@ class NativeRustPushTransport(
     /** Interactive sign-in (Apple ID + password + 2FA) — drives the full native
      *  login → register through the OpenBubbles relay. */
     override suspend fun register(request: RegisterRequest): RegisterResult =
-        when (val r = bridge.registerWithLogin(request.appleId, request.password, request.twoFactorProvider)) {
+        when (val r = bridge.registerWithLogin(
+            request.appleId, request.password, request.twoFactorProvider, request.fsaProvider,
+        )) {
             is RegistrationResult.Success -> RegisterResult.Success(r.account.handles)
             is RegistrationResult.Failure -> RegisterResult.Failure(r.message)
         }

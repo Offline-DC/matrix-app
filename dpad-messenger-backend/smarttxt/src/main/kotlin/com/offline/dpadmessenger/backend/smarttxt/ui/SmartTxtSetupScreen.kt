@@ -23,6 +23,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -75,7 +76,7 @@ import kotlinx.coroutines.launch
  */
 
 /** Local UI steps for the sign-in flow. */
-private enum class SignInStep { INTRO, CREDENTIALS, TWO_FACTOR, REGISTERING, SUCCESS }
+private enum class SignInStep { INTRO, CREDENTIALS, TWO_FACTOR, FSA, REGISTERING, SUCCESS }
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
@@ -97,6 +98,11 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
     // complete it (code / null).
     var pending2fa by remember { mutableStateOf<CompletableDeferred<String?>?>(null) }
 
+    // FSA (security-key) challenge relayed to the companion phone. `pendingFsa`
+    // holds the challenge while on the FSA screen; the companion's response (or a
+    // Back cancel) arrives via SmartTxtFsaBridge.
+    var pendingFsa by remember { mutableStateOf<com.offline.dpadmessenger.backend.smarttxt.FsaChallenge?>(null) }
+
     var error by remember { mutableStateOf<String?>(null) }
     // Loading shown ON the buttons (Sign in / Verify) instead of a full-screen
     // "Registering…" page between steps.
@@ -111,6 +117,7 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
     val eyeFr = remember { FocusRequester() }
     val twoFactorFr = remember { FocusRequester() }
     val verifyFr = remember { FocusRequester() }
+    val fsaBackFr = remember { FocusRequester() }
 
     // The chat unlocks the instant the repository flips REGISTERED (the gate
     // swaps this screen out); mirror that here so the flow shows SUCCESS.
@@ -144,6 +151,19 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                     signingIn = false
                     step = SignInStep.TWO_FACTOR
                     deferred.await()
+                },
+                fsaProvider = { challenge ->
+                    // Apple wants a security-key verification, answered on the paired
+                    // companion phone. Show the FSA screen (which relays the challenge
+                    // over typesync) and suspend until the companion's assertion is
+                    // delivered (launcher → SmartTxtFsaBridge), or the user backs out.
+                    pendingFsa = challenge
+                    signingIn = false
+                    step = SignInStep.FSA
+                    val response =
+                        com.offline.dpadmessenger.backend.smarttxt.SmartTxtFsaBridge.awaitResponse()
+                    if (response != null) step = SignInStep.REGISTERING
+                    response
                 },
             )
             pending2fa = null
@@ -462,6 +482,65 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                             deferred?.complete(null)
                         },
                         modifier = Modifier.fillMaxWidth(),
+                        primary = false,
+                    )
+                }
+            }
+
+            SignInStep.FSA -> {
+                // Relay the challenge to the companion for as long as this screen is
+                // shown. The sender sends it now and re-sends on every relay/companion
+                // (re)connection until stop() — and onDispose (leaving this step)
+                // calls stop(), so retransmission is bounded to the FSA screen.
+                val challenge = pendingFsa
+                DisposableEffect(challenge) {
+                    if (challenge != null) {
+                        com.offline.dpadmessenger.backend.smarttxt.SmartTxtConfig
+                            .fsaChallengeSender?.start(challenge)
+                    }
+                    onDispose {
+                        com.offline.dpadmessenger.backend.smarttxt.SmartTxtConfig
+                            .fsaChallengeSender?.stop()
+                    }
+                }
+                AutoFocus(fsaBackFr)
+                // Request a one-time code from the relay (minted only for this
+                // authenticated phone) and show it; the user types it into the
+                // web/desktop FSA client. Nobody who only knows the phone number
+                // can produce this code.
+                var webCode by remember { mutableStateOf<String?>(null) }
+                DisposableEffect(Unit) {
+                    val sender = com.offline.dpadmessenger.backend.smarttxt.SmartTxtConfig.fsaChallengeSender
+                    sender?.requestWebCode { code -> webCode = code }
+                    onDispose { sender?.stopWebCode() }
+                }
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState()),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Text("Approve with your security key", style = MaterialTheme.typography.headlineSmall)
+                    Text(
+                        "Download desktop app from dumb.co/fsa " +
+                            "and enter this code:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                    )
+                    Text(
+                        webCode ?: "Getting your code…",
+                        style = MaterialTheme.typography.headlineSmall,
+                    )
+                    CircularProgressIndicator()
+                    DpadButton(
+                        text = "Back",
+                        onClick = {
+                            pendingFsa = null
+                            com.offline.dpadmessenger.backend.smarttxt.SmartTxtFsaBridge.cancel()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        focusRequester = fsaBackFr,
                         primary = false,
                     )
                 }

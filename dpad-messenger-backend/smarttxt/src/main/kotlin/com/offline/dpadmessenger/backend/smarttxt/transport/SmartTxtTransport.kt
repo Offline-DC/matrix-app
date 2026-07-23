@@ -284,6 +284,14 @@ class RegisterRequest(
     val appleId: String,
     val password: String = "",
     val twoFactorProvider: (suspend () -> String?)? = null,
+    /** Invoked when Apple demands an FSA (security-key) challenge instead of a
+     *  code. Receives the challenge so the UI can show its screen and relay it to
+     *  the companion, and suspends until the companion's assertion comes back (or
+     *  null if the user cancels). */
+    val fsaProvider: (
+        suspend (com.offline.dpadmessenger.backend.smarttxt.FsaChallenge)
+        -> com.offline.dpadmessenger.backend.smarttxt.FsaResponse?
+    )? = null,
 )
 
 /** Result of [SmartTxtTransport.register]. */

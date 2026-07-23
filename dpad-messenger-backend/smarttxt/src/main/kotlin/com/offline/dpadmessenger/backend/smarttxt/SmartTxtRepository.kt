@@ -264,6 +264,7 @@ object SmartTxtRepository {
         appleId: String,
         password: String,
         twoFactorProvider: (suspend () -> String?)? = null,
+        fsaProvider: (suspend (FsaChallenge) -> FsaResponse?)? = null,
     ): RegistrationResult {
         val appContext = context.applicationContext
         if (!ensureNativeInit(appContext)) {
@@ -280,6 +281,7 @@ object SmartTxtRepository {
             appleId = appleId,
             password = password,
             twoFactorProvider = twoFactorProvider,
+            fsaProvider = fsaProvider,
         )
         return finishRegister(appContext, store, appleId, session().register(request))
     }

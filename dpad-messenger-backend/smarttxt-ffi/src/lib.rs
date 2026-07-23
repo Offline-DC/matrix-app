@@ -50,7 +50,7 @@ use rustpush::{
     APSState, AppleAccount, Attachment, AttachmentType, ConversationData, IDSNGMIdentity, IDSUser, IMClient,
     IndexedMessagePart, LoginDelegate, LoginState, MMCSFile, Message, MessageInst, MessagePart,
     MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType, Reaction,
-    VerifyBody, MADRID_SERVICE,
+    VerifyBody, AuthenticationFSAResponse, MADRID_SERVICE,
 };
 // The remote NAC path (self-contained; no open-absinthe/unicorn). Present because
 // the FFI enables rustpush's `macos-remote-validation` feature.
@@ -1459,7 +1459,11 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             .map_err(|e| format!("login_email_pass: {e}"))?;
         log::info!("login_email_pass → {state:?}");
 
-        // Returns (status_json, sms_body). status = "logged_in" | "needs_2fa".
+        // Returns (status_json, sms_body, fsa_challenge_json).
+        // status = "logged_in" | "needs_2fa" | "needs_fsa".
+        // For an FSA (security-key) challenge we carry the challenge fields out as
+        // JSON so the Kotlin layer can relay them to the companion phone.
+        let mut fsa: Option<serde_json::Value> = None;
         let (status, sms) = match state {
             LoginState::LoggedIn => ("logged_in", None),
             LoginState::Needs2FAVerification => ("needs_2fa", None),
@@ -1468,15 +1472,49 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
                 ("needs_2fa", None)
             }
             LoginState::NeedsSMS2FA => {
-                match account.send_sms_2fa_to_devices(1).await.map_err(|e| format!("send_sms_2fa: {e}"))? {
-                    LoginState::NeedsSMS2FAVerification(body) => ("needs_2fa", Some(body)),
-                    other => {
-                        log::warn!("send_sms_2fa unexpected: {other:?}");
-                        ("needs_2fa", None)
+                // get_auth_extras fetches the trusted-phone options and, on a 201,
+                // has already dispatched the SMS — surfaced via extras.new_state.
+                // It can also surface a security-key (FSA) challenge instead.
+                let extras = account.get_auth_extras().await.map_err(|e| format!("get_auth_extras: {e}"))?;
+                match extras.new_state {
+                    // A security-key challenge — hand the fields up to Kotlin to
+                    // relay to the companion; no SMS body in this branch.
+                    Some(LoginState::NeedsFSAVerification(challenge)) => {
+                        fsa = Some(serde_json::json!({
+                            "challenge": challenge.challenge,
+                            "keyHandles": challenge.key_handles,
+                            "rpId": challenge.rp_id,
+                            "allowedCredentials": challenge.allowed_credentials,
+                        }));
+                        ("needs_fsa", None)
+                    }
+                    // Already sent by get_auth_extras; reuse the body it built.
+                    Some(LoginState::NeedsSMS2FAVerification(body)) => ("needs_2fa", Some(body)),
+                    // Not sent yet — dispatch it ourselves against the first trusted number.
+                    _ => {
+                        let sms = match account.send_sms_2fa_to_devices(1).await.map_err(|e| format!("send_sms_2fa: {e}"))? {
+                            LoginState::NeedsSMS2FAVerification(body) => Some(body),
+                            other => {
+                                log::warn!("send_sms_2fa unexpected: {other:?}");
+                                None
+                            }
+                        };
+                        ("needs_2fa", sms)
                     }
                 }
             }
             LoginState::NeedsSMS2FAVerification(body) => ("needs_2fa", Some(body)),
+            // Apple can also drive the FSA (security-key) challenge directly out of
+            // login_email_pass; surface it the same way as the get_auth_extras path.
+            LoginState::NeedsFSAVerification(challenge) => {
+                fsa = Some(serde_json::json!({
+                    "challenge": challenge.challenge,
+                    "keyHandles": challenge.key_handles,
+                    "rpId": challenge.rp_id,
+                    "allowedCredentials": challenge.allowed_credentials,
+                }));
+                ("needs_fsa", None)
+            }
             LoginState::NeedsExtraStep(s) => {
                 if account.get_pet().is_some() { ("logged_in", None) } else {
                     return Err(format!("login needs extra step: {s}"));
@@ -1484,11 +1522,11 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             }
             LoginState::NeedsLogin => return Err("bad credentials".to_string()),
         };
-        Ok::<_, String>((account, status, sms))
+        Ok::<_, String>((account, status, sms, fsa))
     });
 
     match result {
-        Ok((account, status, sms)) => {
+        Ok((account, status, sms, fsa)) => {
             let mut s = st();
             s.apple_id = apple;
             s.pw_hash = pw_hash;
@@ -1496,7 +1534,16 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             s.account = Some(account);
             // Persist for recover-on-close (hashed only).
             save_creds(&s.files_dir, &s.apple_id, &s.pw_hash);
-            out(&mut env, serde_json::json!({ "status": status }).to_string())
+            // Base response is {"status": ...}; on an FSA challenge, merge the
+            // challenge fields (challenge/keyHandles/rpId/allowedCredentials) so
+            // Kotlin can relay every field to the companion.
+            let mut resp = serde_json::json!({ "status": status });
+            if let (Some(fsa), Some(obj)) = (fsa, resp.as_object_mut()) {
+                if let Some(fsa_obj) = fsa.as_object() {
+                    for (k, v) in fsa_obj { obj.insert(k.clone(), v.clone()); }
+                }
+            }
+            out(&mut env, resp.to_string())
         }
         Err(e) => {
             log::error!("nativeAuthenticate: {e}");
@@ -1551,6 +1598,72 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         }
         Err(e) => {
             log::error!("nativeSubmit2fa: {e}");
+            out(&mut env, err_json(e))
+        }
+    }
+}
+
+/// Submit a security-key (FSA) assertion produced by the companion phone. Mirrors
+/// [nativeSubmit2fa]: verify with Apple, ensure we collected a PET, then the caller
+/// proceeds to nativeRegister. All fields are the strings Apple's endpoint expects
+/// (the companion base64-encodes the binary ones).
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeSubmitFsa<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    challenge: JString<'l>,
+    client_data: JString<'l>,
+    signature_data: JString<'l>,
+    authenticator_data: JString<'l>,
+    credential_id: JString<'l>,
+    user_handle: JString<'l>,
+    rp_id: JString<'l>,
+) -> jstring {
+    let body = AuthenticationFSAResponse {
+        challenge: jstr(&mut env, &challenge),
+        client_data: jstr(&mut env, &client_data),
+        signature_data: jstr(&mut env, &signature_data),
+        authenticator_data: jstr(&mut env, &authenticator_data),
+        credential_id: jstr(&mut env, &credential_id),
+        user_handle: jstr(&mut env, &user_handle),
+        rp_id: jstr(&mut env, &rp_id),
+    };
+
+    let (mut account, apple, pw_hash) = {
+        let mut s = st();
+        match s.account.take() {
+            Some(a) => (a, s.apple_id.clone(), s.pw_hash.clone()),
+            None => return out(&mut env, err_json("no login in progress")),
+        }
+    };
+
+    let result = block_on_timeout(45, "FSA verification timed out — Apple didn't respond", async move {
+        let verified = account.verify_security_key(body).await.map_err(|e| format!("verify_security_key: {e}"))?;
+        log::info!("FSA verify → {verified:?}");
+        match verified {
+            LoginState::LoggedIn | LoginState::NeedsExtraStep(_) => {}
+            LoginState::NeedsLogin => {
+                // Same PET trick as the 2FA path: the verify can succeed without
+                // issuing a PET, so re-run SRP to collect it.
+                account.login_email_pass(&apple, &pw_hash).await.map_err(|e| format!("post-fsa re-login: {e}"))?;
+            }
+            other => return Err(format!("unexpected FSA result: {other:?}")),
+        }
+        if account.get_pet().is_none() {
+            return Err("no PET after FSA — registration would fail".to_string());
+        }
+        Ok::<_, String>(account)
+    });
+
+    match result {
+        Ok(account) => {
+            st().account = Some(account);
+            out(&mut env, serde_json::json!({ "status": "logged_in" }).to_string())
+        }
+        Err(e) => {
+            log::error!("nativeSubmitFsa: {e}");
             out(&mut env, err_json(e))
         }
     }
