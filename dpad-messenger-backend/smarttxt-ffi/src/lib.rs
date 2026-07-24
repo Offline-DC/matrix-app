@@ -2465,6 +2465,15 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
 // JNI: outbound + inbound drain
 // =============================================================================
 
+/// Shown on the bubble when a send is attempted with no live `IMClient`. In the field
+/// that almost always means the phone has no working data connection — the client is
+/// built on connect and torn down when the network goes away — so the copy points at
+/// the network instead of at re-registering. The old text ("iMessage isn't connected…
+/// tap Re-register now") sent a user whose data plan had simply run out into Settings
+/// to fix something that wasn't broken.
+const ERR_SEND_OFFLINE: &str =
+    "ERR:Message not sent — network error. Check your connection and try again.";
+
 #[no_mangle]
 pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeSendText<
     'l,
@@ -2481,7 +2490,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let reply_to = jstr(&mut env, &reply_to);
     let client = st().client.clone();
     let Some(client) = client else {
-        return out(&mut env, "ERR:iMessage isn't connected right now. Open Smart Txt Settings and tap Re-register now to reconnect, or restart your phone.".to_string());
+        return out(&mut env, ERR_SEND_OFFLINE.to_string());
     };
 
     let guid = rt().block_on(async move {
@@ -2594,7 +2603,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let client = st().client.clone();
     let connection = st().connection.clone();
     let (Some(client), Some(connection)) = (client, connection) else {
-        return out(&mut env, "ERR:iMessage isn't connected right now. Open Smart Txt Settings and tap Re-register now to reconnect, or restart your phone.".to_string());
+        return out(&mut env, ERR_SEND_OFFLINE.to_string());
     };
     let voice = mime_s.starts_with("audio/");
     let uti = uti_for_mime(&mime_s);
