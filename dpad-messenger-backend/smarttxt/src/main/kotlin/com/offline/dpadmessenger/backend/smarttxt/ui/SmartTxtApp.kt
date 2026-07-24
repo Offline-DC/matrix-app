@@ -48,6 +48,13 @@ fun SmartTxtApp(
     // Restore a previous sign-in on a fresh process BEFORE reading status, so a
     // returning user lands on their chats instead of the setup screen.
     remember { SmartTxtRepository.restoreStatus(context) }
+    // Warm the rolling log ring on app entry — BEFORE the sign-in gate below — so
+    // it's already capturing on the login/setup screen. That's when "Report error"
+    // is most likely tapped (a failed sign-in); a cold ring would otherwise hand
+    // back a stale window. Idempotent, so safe on every entry/recomposition.
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) { SmartTxtLogRing.ensureStarted(context.applicationContext) }
+    }
     val status by SmartTxtRepository.status.collectAsState()
     // Post-login handle picker: shown once after registration, before the chats.
     var handlesConfigured by remember { mutableStateOf(SmartTxtAccountStore(context).handlesConfigured()) }
@@ -122,14 +129,6 @@ private fun SmartTxtChat(
     val retention = repository as? RetentionSettings
     val readReceipts = repository as? ReadReceiptSettings
     val scope = rememberCoroutineScope()
-
-    // Always-on rolling capture of Smart Txt's own logs (SmartTxtRust + the
-    // IMsg*/RustPush* Kotlin tags) into a ~5MB on-disk ring, so "Export logs"
-    // below can hand support a recent log window without the user turning on
-    // the launcher's diagnostics "rolling adb logs". Idempotent + cheap.
-    LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) { SmartTxtLogRing.ensureStarted(context.applicationContext) }
-    }
 
     // If the relay link died and couldn't refresh, show a reconnect prompt instead
     // of a chat that silently can't send (like gmessages).

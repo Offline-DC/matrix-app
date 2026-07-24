@@ -47,7 +47,9 @@ import java.util.TimeZone
  * delete the rest. Plain text (no gzip) so the export is directly readable; the
  * export zip compresses it for transport anyway.
  *
- * Started (idempotently) from the Smart Txt chat UI via [ensureStarted]. Because
+ * Started (idempotently) from Smart Txt app entry (the top-level gate) via
+ * [ensureStarted] — BEFORE the sign-in gate, so it's already capturing on the
+ * login/setup screen, which is when "Report error" is most likely tapped. Because
  * the launcher is the `android:persistent` HOME app, once started the tail keeps
  * running for the life of the process.
  */

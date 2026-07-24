@@ -43,6 +43,14 @@ Impact:
   This helps battery and *all* captures, but it removes the lock traces everywhere,
   which the "stuck/deadlock" class occasionally needs. Do (A) first; consider (B)
   only if battery beats deadlock-diagnosability, ideally behind a build flag.
+- **(C) ✅ SHIPPED — warm the ring on app entry.** `SmartTxtLogRing.ensureStarted`
+  now runs at the top of `SmartTxtApp` (before the sign-in gate), not only in the
+  signed-in chat screen, so the ring is already capturing on the login/setup screen.
+  This closes a cold-ring race where the *first* "Report error" tap on a login
+  failure returned a stale window (the exporter zips right after starting a cold
+  ring, beating its first logcat buffer dump). **Diagnostic tell:** if a bundle's
+  newest log line is hours older than `meta.txt` `capturedAtMs`, it was captured
+  cold/stale — ask for a second capture (or the build predates this fix).
 
 ## Finding 2: gaps (signals we wish the bundle had)
 
