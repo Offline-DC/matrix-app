@@ -71,5 +71,8 @@ fun SmartTxtErrorScreen(
             onClick = onRetry,
             focusRequester = retryFr,
         )
+        // DPAD-Down from Retry reaches this: ship the Smart Txt logs to support
+        // straight from the connect-error screen (same upload as Export logs).
+        ReportErrorButton(modifier = Modifier.padding(top = 12.dp))
     }
 }

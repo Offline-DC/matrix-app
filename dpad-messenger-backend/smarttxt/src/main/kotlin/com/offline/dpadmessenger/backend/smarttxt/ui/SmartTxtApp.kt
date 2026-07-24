@@ -14,6 +14,8 @@ import androidx.compose.ui.platform.LocalContext
 import com.offline.dpadmessenger.backend.smarttxt.OpenBubblesMigrator
 import com.offline.dpadmessenger.backend.smarttxt.RustPushNative
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtAccountStore
+import com.offline.dpadmessenger.backend.smarttxt.SmartTxtLogExporter
+import com.offline.dpadmessenger.backend.smarttxt.SmartTxtLogRing
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtRepository
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtStatus
 import com.offline.dpadmessenger.data.MessageRepository
@@ -121,6 +123,14 @@ private fun SmartTxtChat(
     val readReceipts = repository as? ReadReceiptSettings
     val scope = rememberCoroutineScope()
 
+    // Always-on rolling capture of Smart Txt's own logs (SmartTxtRust + the
+    // IMsg*/RustPush* Kotlin tags) into a ~5MB on-disk ring, so "Export logs"
+    // below can hand support a recent log window without the user turning on
+    // the launcher's diagnostics "rolling adb logs". Idempotent + cheap.
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) { SmartTxtLogRing.ensureStarted(context.applicationContext) }
+    }
+
     // If the relay link died and couldn't refresh, show a reconnect prompt instead
     // of a chat that silently can't send (like gmessages).
     val authExpired = SmartTxtRepository.authExpiredFlow()?.collectAsState()?.value ?: false
@@ -218,6 +228,20 @@ private fun SmartTxtChat(
                         "Still reconnecting in the background — you can keep using Smart Txt."
                     is SmartTxtRepository.FixOutcome.NeedsUser -> outcome.message
                 }
+                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+            }
+            Unit
+        },
+        onExportLogs = {
+            Toast.makeText(context, "Exporting Smart Txt logs...", Toast.LENGTH_SHORT).show()
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    SmartTxtLogExporter.export(context.applicationContext)
+                }
+                val msg = result.fold(
+                    onSuccess = { ref -> "Logs sent to support. Reference: $ref" },
+                    onFailure = { e -> "Couldn't send logs: ${e.message ?: "unknown error"}" },
+                )
                 Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
             }
             Unit

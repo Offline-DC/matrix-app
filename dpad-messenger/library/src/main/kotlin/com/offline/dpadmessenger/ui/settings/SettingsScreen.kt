@@ -92,6 +92,10 @@ fun SettingsScreen(
     /** Force an IDS re-registration now (the periodic renewal, on demand). Shows a
      *  "Re-register now" row when set; null hides it. Host handles the result feedback. */
     onReregister: (() -> Unit)? = null,
+    /** Export this device's Smart Txt logs to support (zips the rolling
+     *  Smart-Txt-only log ring and uploads it). Shown just above Log out when
+     *  set; null hides the row. Host handles the result feedback. */
+    onExportLogs: (() -> Unit)? = null,
 ) {
     // Land focus on the back button on entry, so the screen has a visible
     // highlight and DPAD navigation works immediately (every other screen sets
@@ -214,6 +218,13 @@ fun SettingsScreen(
                     title = "Re-register now",
                     subtitle = "Refresh this device's iMessage registration (no sign-in needed)",
                     onClick = onReregister,
+                )
+            }
+            if (onExportLogs != null) {
+                ActionRow(
+                    title = "Export logs",
+                    subtitle = "Send Smart Txt logs to support to help diagnose an issue",
+                    onClick = onExportLogs,
                 )
             }
             ActionRow(

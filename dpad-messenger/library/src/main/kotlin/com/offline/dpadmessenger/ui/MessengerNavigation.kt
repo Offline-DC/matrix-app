@@ -94,6 +94,9 @@ fun DpadMessengerApp(
     /** Force an IDS re-registration now (periodic renewal, on demand). Adds a
      *  "Re-register now" row to Settings when set; null hides it. */
     onReregister: (() -> Unit)? = null,
+    /** Export Smart Txt logs to support. Adds an "Export logs" row to Settings
+     *  (just above Log out) when set; null hides it. */
+    onExportLogs: (() -> Unit)? = null,
     /** Deep link: open this conversation on top of the room list (set when
      *  the user tapped a message notification). [initialRoomKey] must change
      *  per tap so a fresh notification re-navigates. */
@@ -235,6 +238,7 @@ fun DpadMessengerApp(
                     defaultSendHandle = defaultSendHandle,
                     onDefaultSendHandleChange = onDefaultSendHandleChange,
                     onReregister = onReregister,
+                    onExportLogs = onExportLogs,
                 )
             }
         }

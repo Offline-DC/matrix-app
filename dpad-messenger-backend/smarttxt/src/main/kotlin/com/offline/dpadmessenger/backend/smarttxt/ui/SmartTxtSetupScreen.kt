@@ -391,6 +391,14 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                                 .fillMaxWidth()
                                 .bringIntoViewRequester(bivError),
                         )
+                        // A dpad-navigable "Report error" right under the message,
+                        // so a failed sign-in can ship us the Smart Txt logs on the
+                        // spot — same capture + upload as Settings -> Export logs.
+                        ReportErrorButton(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp),
+                        )
                     }
                 }
             }
