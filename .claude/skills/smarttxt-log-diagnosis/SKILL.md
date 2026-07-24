@@ -38,17 +38,26 @@ have to re-derive them under time pressure.
 ## Before you read a single log line: strip the noise
 
 The Rust engine logs **every mutex lock/unlock** (`rustpush::util`) and APNs
-internals (`rustpush::aps`) at INFO. In a real capture that is ~95% of all lines
-(measured on one bundle: 31,440 `rustpush::util` + 5,405 `rustpush::aps` out of
-~39,000; the useful `smarttxt_ffi` lines were 149). Always pre-filter first:
+internals (`rustpush::aps`) at INFO — on a raw capture ~95% of all lines
+(measured: 31,440 `rustpush::util` + 5,405 `rustpush::aps` out of ~39,000; the
+useful `smarttxt_ffi` lines were 149).
+
+As of the current build the always-on ring (`SmartTxtLogRing`) drops those two
+sub-streams at the source, so **Export-logs / Report-error bundles are already
+signal-dense** and the filter below is a near no-op on them. **Raw `rolling-logcat`
+dumps and manual `adb` captures still carry the full flood**, so run it anyway
+(it's harmless when there's nothing to strip):
 
 ```bash
-# From an Export-logs zip or a rolling-logcat dump. gunzip any segment-*.log.gz first.
+# gunzip any segment-*.log.gz first.
 cat current.log segment-*.log 2>/dev/null \
-  | grep -aE ' SmartTxtRust: (smarttxt_ffi|rustpush::(ids|imessage|macos_remote)::)' \
-  | grep -avE 'rustpush::util|rustpush::aps' \
+  | grep -avE 'rustpush::util:|rustpush::aps:' \
   > signal.log
 ```
+
+This keeps everything else — the Rust signal AND the Kotlin-tag lines
+(`IMsgRepo`, `IMsgRenewal`, `ObMigrator`, …) the tree relies on. For a
+Rust-engine-only view, append `| grep -aE ' SmartTxtRust: '`.
 
 Every grep below runs on `signal.log`. (Exception: a *deadlock / stuck* bug is the
 one case where the `rustpush::util` lock traces matter — see that symptom.)

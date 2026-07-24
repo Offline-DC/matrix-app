@@ -25,7 +25,10 @@ import java.util.TimeZone
  *     Kotlin `IMsg*` / `RustPush*` / `ObMigrator` tags — and silences everything
  *     else with `*:S`. So the exported bundle is Smart-Txt-only, and support
  *     never has to wade through (or ask the user to turn on) the launcher's
- *     full-device "rolling adb logs".
+ *     full-device "rolling adb logs". Within that `SmartTxtRust` stream we also
+ *     drop rustpush's mutex-lock (`rustpush::util`) and APNs (`rustpush::aps`)
+ *     flood — ~95% of Rust lines on a real capture — so the fixed window stays
+ *     dense with signal (see [isNoise]).
  *  2. **No root.** Every one of those tags is emitted from *this* process (the
  *     Rust engine runs in-process over JNI; the APNs socket lives in the
  *     launcher process too), so a plain `logcat` — which is limited to the
@@ -86,6 +89,19 @@ internal object SmartTxtLogRing {
         "RustPushNative",
         "ObMigrator",
     )
+
+    /**
+     * Sub-streams to drop even though they carry the `SmartTxtRust` tag: rustpush
+     * logs every mutex lock/unlock (`rustpush::util`) and APNs socket internals
+     * (`rustpush::aps`) at INFO — on a real capture ~95% of all Rust lines. They're
+     * useless for the handle / registration / threading / routing issues this ring
+     * exists to catch (a deadlock needs a manual raw-logcat capture instead), and at
+     * that volume they'd evict the useful history from the fixed ~5 MB window almost
+     * immediately. The tag prefix is uniform, so we can't drop them at the logcat
+     * filterspec level — we filter here, per line, before they hit the ring.
+     */
+    private fun isNoise(line: String): Boolean =
+        line.contains("rustpush::util:") || line.contains("rustpush::aps:")
 
     @Volatile private var started = false
     @Volatile private var stopped = false
@@ -166,6 +182,7 @@ internal object SmartTxtLogRing {
             while (!stopped) {
                 val line = reader.readLine() ?: break
                 if (resetBackoff) { backoffMs = RESPAWN_INITIAL_MS; resetBackoff = false }
+                if (isNoise(line)) continue   // drop the rustpush::util/aps flood before it fills the ring
                 writeLine(line + "\n")
             }
         }

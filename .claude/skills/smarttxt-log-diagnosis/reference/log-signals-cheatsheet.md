@@ -4,17 +4,20 @@ The exact lines worth grepping, what each means, and where it's emitted. All Rus
 lines are logcat tag `SmartTxtRust`; the `module:` shown is the target in the body.
 Line numbers are `smarttxt-ffi/src/lib.rs` and `rustpush/src/…` at the pinned revs.
 
-## Always start here (strip the ~95% noise)
+## Always start here (strip the noise)
 
 ```bash
+# Export-logs / Report-error bundles are already stripped at the source (current
+# build); raw rolling-logcat / adb captures are not. Harmless to run either way.
 cat current.log segment-*.log 2>/dev/null \
-  | grep -aE ' SmartTxtRust: (smarttxt_ffi|rustpush::(ids|imessage|macos_remote)::)' \
-  | grep -avE 'rustpush::util|rustpush::aps' > signal.log
+  | grep -avE 'rustpush::util:|rustpush::aps:' > signal.log
 ```
 
 `rustpush::util` (mutex lock/unlock) and `rustpush::aps` (APNs internals) log at
-INFO and are pure noise for everything except a **deadlock** investigation — there,
-keep `rustpush::util` and look for a `Locked …` mutex with no matching `dropped`.
+INFO and were ~95% of a raw capture — pure noise except for a **deadlock**
+investigation (there, capture raw, keep `rustpush::util`, and look for a `Locked …`
+mutex with no matching `dropped`). The negative filter also keeps the Kotlin-tag
+lines; for a Rust-only view append `| grep -aE ' SmartTxtRust: '`.
 
 ## Connect / lifecycle
 

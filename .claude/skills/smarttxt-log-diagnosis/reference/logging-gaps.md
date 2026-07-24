@@ -30,14 +30,13 @@ Impact:
 3. Every diagnosis must pre-filter (this skill does), which is fine for a human but
    wastes the ring's fixed budget.
 
-**Proposed fixes (review):**
-- **(A) Cheapest, highest value — filter the always-on ring in-process.** In
-  `SmartTxtLogRing.writeLine(...)`, drop lines whose body contains `rustpush::util:`
-  or `rustpush::aps:` before writing. That is a ~2-line change scoped to the ring;
-  it does not touch what the manual capture scripts or a full logcat can still see,
-  and it makes the exported window roughly **20× denser in signal**. Recommended.
-  (Deadlock captures already use `smarttxt-stuck-capture.sh`, which pulls raw logcat
-  and keeps the lock traces — so nothing needed for deadlocks is lost.)
+**Fixes:**
+- **(A) ✅ SHIPPED — filter the always-on ring in-process.** `SmartTxtLogRing` now
+  drops any line containing `rustpush::util:` or `rustpush::aps:` in the tail loop
+  (`isNoise`, before `writeLine`), so the ~5 MB window is ~20× denser in signal and
+  future Export-logs / Report-error bundles arrive pre-stripped. It doesn't touch
+  what the manual capture scripts or a full logcat can still see, so deadlock
+  captures (`smarttxt-stuck-capture.sh`, raw) keep the lock traces.
 - **(B) Source-level, bigger blast radius — quiet the modules globally.** Give the
   FFI `android_logger` a per-target filter (android_logger 0.13 `Config::with_filter`
   with an env-logger-style directive, e.g. `rustpush::util=warn,rustpush::aps=warn`).
@@ -79,14 +78,15 @@ Impact:
 
 ## Prioritized recommendation
 
-1. **Filter `rustpush::util` / `rustpush::aps` out of `SmartTxtLogRing`** (Finding 1A)
-   — biggest bang, tiny diff, directly improves the Report-error bundles.
+1. ✅ **DONE — `rustpush::util` / `rustpush::aps` filtered out of `SmartTxtLogRing`**
+   (Finding 1A). Export-logs / Report-error bundles are now signal-dense at the source.
 2. **Always log `possible=[…] registered=[…]` at login/reconcile** (Finding 2, #1)
-   — turns the most common investigation into a one-line read.
+   — turns the most common investigation into a one-line read. **← now the top open item.**
 3. Log the per-user handle list at rustpush register time (Finding 2, #2).
 4. Add the IDS error to empty-`valid` route lines; add a handle-set-changed diff
    (Finding 2, #3–4) — nice-to-have.
 
 Net verdict: **current logging is ~sufficient for the common cases after noise
-stripping; the highest-value change is not *more* logging but *less noise* in the
-always-on ring, followed by one always-on possible-vs-registered handle line.**
+stripping. The highest-value change — cutting the noise in the always-on ring — is
+now shipped; the top remaining item is one always-on possible-vs-registered handle
+line at login.**
