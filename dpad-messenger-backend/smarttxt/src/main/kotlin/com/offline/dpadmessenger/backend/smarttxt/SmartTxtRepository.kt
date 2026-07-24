@@ -14,6 +14,7 @@ import com.offline.dpadmessenger.backend.smarttxt.transport.RegisterRequest
 import com.offline.dpadmessenger.backend.smarttxt.transport.RegisterResult
 import com.offline.dpadmessenger.backend.smarttxt.transport.RelayWebSocketTransport
 import com.offline.dpadmessenger.data.MessageRepository
+import org.json.JSONObject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -128,42 +129,106 @@ object SmartTxtRepository {
         }
         Log.i(TAG, "restoreStatus → ${_status.value}")
 
-        // RE-ARM THE RENEWAL ON EVERY COLD START. This used to be scheduled ONLY
-        // from finishRegister()/markRegisteredExternally() — i.e. once, at sign-in.
-        // If that work item ever left WorkManager's DB (force-stop, an OEM battery
-        // manager, cleared app data, a half-completed migration) nothing ever
-        // re-scheduled it, the IDS registration silently aged out, and the device
-        // kept RECEIVING while every send failed — invisible to the user, because
-        // [status] still says REGISTERED. Observed in the field: a device whose
-        // registration had been overdue for 3.7 days ("Reregistering in -323914
-        // seconds") and only recovered because a relaunch let rustpush's own
-        // in-process timer fire. KEEP policy makes this idempotent, so calling it
-        // on every launch is free and matches what the launcher's other workers
-        // already do.
+        // CHECK REGISTRATION HEALTH ON EVERY COLD START. There used to be a 12h
+        // WorkManager job here re-running the whole register flow; it duplicated
+        // rustpush's own re-registration timer (IdentityResource::schedule_rereg,
+        // on Apple's real ~45-day cadence with a 5min-to-24h backoff) and could
+        // never actually succeed, because nativeRegister needs the in-memory
+        // AppleAccount that only exists right after an interactive sign-in.
+        // rustpush owns the schedule now; all this does is ASK for the state, and
+        // the only answer it acts on is a terminal one. The field case that
+        // motivated the old worker — a handset overdue by 3.7 days
+        // ("Reregistering in -323914 seconds") that recovered on relaunch — was
+        // rustpush's in-process timer being dead, which a launch-time client
+        // liveness check (healIfUnhealthy) addresses directly.
         if (_status.value == SmartTxtStatus.REGISTERED) {
             // OFF THE MAIN THREAD. This function is documented as safe to call from
             // the entry composable, so it can land on the UI thread — and both calls
-            // below touch disk (WorkManager's DB; another EncryptedSharedPreferences
-            // decrypt + JSON parse in lastRegisteredMs()). Individually cheap, but
-            // this runs on every launch on every handset and the store is keystore-
-            // backed crypto, so it must never sit on the UI thread. runCatching so a
-            // WorkManager failure can never take down the launcher.
+            // below touch disk (an EncryptedSharedPreferences decrypt + JSON parse in
+            // lastRegisteredMs, and a JNI hop in checkRegistrationHealth). Individually
+            // cheap, but this runs on every launch on every handset and the store is
+            // keystore-backed crypto, so it must never sit on the UI thread.
             Thread {
                 runCatching {
-                    SmartTxtRenewalWorker.schedule(appContext)
                     logRegistrationAge(store.lastRegisteredMs())
-                }.onFailure { Log.w(TAG, "renewal re-arm failed: ${it.message}") }
+                    checkRegistrationHealth(appContext)
+                }.onFailure { Log.w(TAG, "launch registration check failed: ${it.message}") }
             }.start()
         }
     }
 
-    /** True when the registration is old enough that sends are at risk. Deliberately
-     *  well under Apple's ~45-day IDS re-registration interval so we self-heal long
-     *  before the user notices, and well over the 12h worker period so a couple of
-     *  missed runs don't churn. */
-    private fun isRegistrationStale(store: SmartTxtAccountStore): Boolean {
-        val at = store.lastRegisteredMs()
-        return at > 0L && (System.currentTimeMillis() - at) > STALE_AFTER_MS
+    /**
+     * The one registration outcome the app must act on: rustpush has given up.
+     *
+     * Reached two ways — the live push path (rustpush's `resource_state` watch
+     * channel → `TransportEvent.RegistrationFailed`) and the cold-start pull
+     * ([checkRegistrationHealth]). Both funnel here so there is exactly ONE
+     * user-visible outcome for the condition.
+     *
+     * A terminal failure is an IDS 6005: Apple invalidated the registration and
+     * wants a real sign-in. Deliberately NOT the reconnect screen — that offers
+     * `reauth()`, which cannot fix a 6005. Tear down the session but keep history,
+     * and flip [status] to UNREGISTERED so the sign-in screen shows. This is what
+     * OpenBubbles does with `markFailedToLogin`.
+     */
+    fun onTerminalRegistrationFailure(context: Context, error: String) {
+        Log.w(
+            TAG,
+            "REGSTATE FAILED TERMINAL (needs_relogin): $error — Apple invalidated this " +
+                "registration. NOT retrying (rustpush marked it DoNotRetry); routing the " +
+                "user to sign in again, keeping history.",
+        )
+        _nativeError.value =
+            "Apple signed this device out of iMessage. Sign in again to keep sending."
+        signOutKeepingHistory(context)
+    }
+
+    /**
+     * Ask rustpush what the IDS registration is actually doing, and act on the
+     * ONE answer that needs us: a terminal failure.
+     *
+     * rustpush owns all retry — Apple's ~45-day re-registration cadence, plus a
+     * 5-minute-to-24-hour exponential backoff with unlimited retries for
+     * anything transient. We deliberately do NOT retry anything here. The single
+     * case it refuses to retry is an IDS 6005, which it reports as
+     * `needs_relogin` (a `Failed` state with no `retry_wait`), because Apple has
+     * invalidated the registration and wants a real sign-in.
+     *
+     * On that signal we tear the session down but KEEP history
+     * ([signOutKeepingHistory]) and flip [status] to UNREGISTERED, which is what
+     * routes the UI back to the sign-in screen. This mirrors OpenBubbles'
+     * `markFailedToLogin`. It replaces an earlier native auto-recover that
+     * silently re-logged-in from a stored password hash on every 6005 with no
+     * backoff or cap — the exact pattern that gets an Apple ID rate-limited.
+     *
+     * Blocking (one JNI call); callers must be off the main thread.
+     */
+    fun checkRegistrationHealth(context: Context) {
+        val raw = RustPushNative.runCatchingNativeRegisterState()
+        val obj = runCatching { JSONObject(raw) }.getOrNull()
+        if (obj == null) {
+            Log.w(TAG, "REGSTATE unparseable: $raw")
+            return
+        }
+        when (val state = obj.optString("state", "unknown")) {
+            "registered" -> Log.i(TAG, "REGSTATE registered; next re-register in ${obj.optLong("next_s", -1L)}s")
+            "registering" -> Log.i(TAG, "REGSTATE registering (rustpush is working on it)")
+            "no_client", "unknown" -> Log.i(TAG, "REGSTATE $state — no signal, leaving status alone")
+            "failed" -> {
+                val error = obj.optString("error", "unknown error")
+                if (obj.optBoolean("needs_relogin", false)) {
+                    onTerminalRegistrationFailure(context, error)
+                } else {
+                    // Transient: rustpush is already backing off and WILL retry. Do nothing.
+                    Log.i(
+                        TAG,
+                        "REGSTATE failed but retryable — rustpush retries in " +
+                            "${obj.optLong("retry_wait", -1L)}s: $error. Not intervening.",
+                    )
+                }
+            }
+            else -> Log.w(TAG, "REGSTATE unrecognised state '$state': $raw")
+        }
     }
 
     /** One greppable line with the registration age — `adb logcat -s IMsgRepoHolder`
@@ -177,7 +242,7 @@ object SmartTxtRepository {
         Log.i(
             TAG,
             "registration age: ${ageMs / DAY_MS}d ${(ageMs % DAY_MS) / HOUR_MS}h " +
-                "(lastRegisteredMs=$at, stale=${ageMs > STALE_AFTER_MS})",
+                "(lastRegisteredMs=$at; rustpush owns the real re-register schedule)",
         )
     }
 
@@ -305,7 +370,6 @@ object SmartTxtRepository {
             )
             store.saveAccount(account)
             store.markRegistered(account.lastRegisteredMs)
-            SmartTxtRenewalWorker.schedule(appContext)
             connectInBackground(appContext)
             _status.value = SmartTxtStatus.REGISTERED
             RegistrationResult.Success(account)
@@ -314,21 +378,6 @@ object SmartTxtRepository {
             _status.value = SmartTxtStatus.UNREGISTERED
             Log.w(TAG, "registration failed: ${result.message}")
             RegistrationResult.Failure(result.message)
-        }
-    }
-
-    /** Re-register (renewal). Called by [SmartTxtRenewalWorker]. */
-    suspend fun renew(context: Context): RegistrationResult {
-        val store = SmartTxtAccountStore(context.applicationContext)
-        val config = store.loadConfig() ?: return RegistrationResult.Failure("no dumb file to renew from")
-        val account = store.loadAccount() ?: return RegistrationResult.Failure("no account to renew")
-        return when (val r = session().register(config, account.appleId)) {
-            is RegisterResult.Success -> {
-                val updated = account.copy(lastRegisteredMs = System.currentTimeMillis(), handles = r.handles)
-                store.saveAccount(updated); store.markRegistered(updated.lastRegisteredMs)
-                RegistrationResult.Success(updated)
-            }
-            is RegisterResult.Failure -> RegistrationResult.Failure(r.message)
         }
     }
 
@@ -363,7 +412,6 @@ object SmartTxtRepository {
      *  as [finishRegister] minus the live register call. */
     fun markRegisteredExternally(context: Context) {
         val appContext = context.applicationContext
-        SmartTxtRenewalWorker.schedule(appContext)
         connectInBackground(appContext)
         _status.value = SmartTxtStatus.REGISTERED
         Log.i(TAG, "markRegisteredExternally → REGISTERED")
@@ -559,10 +607,9 @@ object SmartTxtRepository {
     }
 
     /**
-     * Belt-and-braces for [SmartTxtRenewalWorker]: WorkManager is not a guarantee.
-     * Its work item can be dropped by a force-stop or an OEM battery manager, and
-     * even when scheduled it's only best-effort under Doze — so a device can sit
-     * de-registered indefinitely while the UI happily says REGISTERED.
+     * Belt-and-braces for rustpush's in-process re-registration timer: it only
+     * runs while the process is alive, so a handset that was force-stopped can come
+     * back with no client and nothing driving it.
      *
      * On every launch, once connected, check the registration age ourselves and
      * silently re-register if it's stale. Runs on the caller's background thread.
@@ -583,10 +630,14 @@ object SmartTxtRepository {
             // age check would never have fired. A dead client is the actual failure;
             // a stale registration is usually just its downstream symptom (no client
             // ⇒ no reregister timer ⇒ drift).
+            // Registration AGE is no longer consulted: rustpush computes the real
+            // re-registration time itself (calculate_rereg_time_s, surfaced as
+            // `next_s` by nativeRegisterState) on Apple's ~45-day cadence, and
+            // schedules it. A local 7-day guess only ever fired early. A dead
+            // client is the actual failure worth healing here.
             val clientDown = !nativeClientReady()
-            val stale = isRegistrationStale(store)
-            if (!clientDown && !stale) return
-            Log.w(TAG, "unhealthy on launch: clientDown=$clientDown staleRegistration=$stale")
+            if (!clientDown) return
+            Log.w(TAG, "unhealthy on launch: clientDown=true")
             // In-process re-entry guard. Skip rather than queue: this is a boot
             // thread, and blocking it behind an in-flight attempt buys nothing.
             if (!healing.compareAndSet(false, true)) {
@@ -736,9 +787,6 @@ object SmartTxtRepository {
                 )
                 store.saveAccount(updated)
                 store.markRegistered(updated.lastRegisteredMs)
-                // Re-arm the periodic renewal too — if we got here it may well have
-                // been missing, which is what let the registration go stale.
-                SmartTxtRenewalWorker.schedule(appContext)
                 _status.value = SmartTxtStatus.REGISTERED
                 Log.i(TAG, "fixConnection: recovered")
                 RegistrationResult.Success(updated)
@@ -786,11 +834,6 @@ object SmartTxtRepository {
     private const val HOUR_MS = 60L * 60L * 1000L
     private const val DAY_MS = 24L * HOUR_MS
 
-    /** Re-register once the stamp is older than this. Apple's IDS interval is ~45
-     *  days (rustpush reported "Reregistering in 3887700 seconds" after a fresh
-     *  one), so 7 days self-heals with a very wide margin while staying far above
-     *  the worker's 12h period — a couple of missed runs won't cause churn. */
-    private const val STALE_AFTER_MS = 7L * DAY_MS
 
     /** Guards against two re-registrations running at once (a boot-path heal racing
      *  a user tapping the Settings row). Re-registration talks to Apple, so

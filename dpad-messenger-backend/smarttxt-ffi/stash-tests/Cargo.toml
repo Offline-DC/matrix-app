@@ -25,5 +25,4 @@ log = "0.4"
 # on the phone. default-features = false keeps open-absinthe/unicorn out of the graph.
 rustpush = { path = "../../../../rustpush", default-features = false, features = [
     "remote-anisette-v3",
-    "macos-remote-validation",
 ] }

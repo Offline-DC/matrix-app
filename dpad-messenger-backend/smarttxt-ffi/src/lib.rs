@@ -50,11 +50,14 @@ use rustpush::{
     APSState, AppleAccount, Attachment, AttachmentType, ConversationData, IDSNGMIdentity, IDSUser, IMClient,
     IndexedMessagePart, LoginDelegate, LoginState, MMCSFile, Message, MessageInst, MessagePart,
     MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType, Reaction,
-    VerifyBody, AuthenticationFSAResponse, MADRID_SERVICE,
+    VerifyBody, AuthenticationFSAResponse, MADRID_SERVICE, ResourceState
 };
-// The remote NAC path (self-contained; no open-absinthe/unicorn). Present because
-// the FFI enables rustpush's `macos-remote-validation` feature.
-use rustpush::macos_remote::MacOSConfigRemote;
+// The remote NAC path. Lives HERE, not in rustpush: decoding the `dumb` hardware
+// file and minting a client UDID are app concerns — OpenBubbles does both in its own
+// FFI layer and never asks rustpush to parse a hardware file. Keeping it here also
+// keeps the rustpush fork close to upstream.
+mod macos_remote;
+use macos_remote::MacOSConfigRemote;
 
 // Anisette straight out of the box (do NOT reimplement). With the `remote-anisette-v3`
 // feature, `DefaultAnisetteProvider` = RemoteAnisetteProviderV3 (a remote anisette
@@ -64,9 +67,6 @@ use omnisette::{default_provider, DefaultAnisetteProvider};
 
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 static STATE: OnceCell<Mutex<AppState>> = OnceCell::new();
-/// True while a recover (re-login + re-register) is in flight, so a burst of
-/// "Resource has been closed" errors only kicks off ONE recover.
-static RECOVERING: AtomicBool = AtomicBool::new(false);
 /// Bumped every time a new receive loop starts; older loops see the mismatch and
 /// exit, so a recover's fresh loop replaces the dead one instead of doubling up.
 static RECV_GEN: AtomicU64 = AtomicU64::new(0);
@@ -277,8 +277,38 @@ fn err_json(msg: impl std::fmt::Display) -> String {
 
 // ---- persistence (mirrors imessage-register relay/apple.rs) -----------------
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+/// Tag for the keystore key that wraps the persisted IDS identity. Must stay stable
+/// — changing it makes every existing install's `config.plist` undecryptable.
+const IDENTITY_TAG: &str = "smarttxt";
+
+/// In-memory shape. NOT what goes on disk — see [`SavedStateDisk`].
+#[derive(Clone)]
 struct SavedState {
+    push: APSState,
+    users: Vec<IDSUser>,
+    identity: IDSNGMIdentity,
+}
+
+/// On-disk shape. `identity` is the keystore-encrypted blob produced by
+/// `IDSNGMIdentity::save` — rustpush's blessed path for exactly this.
+///
+/// It matters for this one type: `APSState.keypair` and `IDSRegistration.id_keypair`
+/// are `KeyPairNew<RsaKey>`, which serialize as a keystore ALIAS (the private half
+/// never leaves the keystore), but `IDSNGMIdentity`'s `device_key`/`pre_key` are raw
+/// `CompactECKey<Private>` — serializing that struct directly writes real private-key
+/// DER into the plist. Hence `save`/`restore`. OpenBubbles routes identity through
+/// `identity.save("openbubbles")` at every site that persists it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedStateDisk {
+    push: APSState,
+    users: Vec<IDSUser>,
+    identity: plist::Data,
+}
+
+/// The pre-encryption on-disk shape, kept only so existing installs can be read once
+/// and migrated. Remove once no shipped build writes it any more.
+#[derive(serde::Deserialize)]
+struct SavedStateLegacyPlaintext {
     push: APSState,
     users: Vec<IDSUser>,
     identity: IDSNGMIdentity,
@@ -292,34 +322,66 @@ fn config_path(dir: &str) -> PathBuf {
     Path::new(dir).join("config.plist")
 }
 fn load_saved(dir: &str) -> Option<SavedState> {
-    plist::from_file::<_, SavedState>(config_path(dir)).ok()
+    let path = config_path(dir);
+    // Preferred: identity stored as a keystore-encrypted blob.
+    if let Ok(d) = plist::from_file::<_, SavedStateDisk>(&path) {
+        let bytes: Vec<u8> = d.identity.into();
+        match IDSNGMIdentity::restore(&bytes, IDENTITY_TAG) {
+            Ok(identity) => {
+                return Some(SavedState { push: d.push, users: d.users, identity });
+            }
+            Err(e) => log::error!(
+                "config.plist: the identity blob would not decrypt ({e}). The keystore key \
+                 'ids:identity-storage-key:{IDENTITY_TAG}' may have been cleared — a re-sign-in \
+                 is required."
+            ),
+        }
+    }
+    // Legacy: identity written as a plaintext struct. Read it once and re-save encrypted.
+    match plist::from_file::<_, SavedStateLegacyPlaintext>(&path) {
+        Ok(l) => {
+            let migrated = SavedState { push: l.push, users: l.users, identity: l.identity };
+            log::warn!(
+                "IDENTITY_MIGRATE: config.plist held the IDS identity in PLAINTEXT (raw EC \
+                 private keys). Re-saving it keystore-encrypted via IDSNGMIdentity::save."
+            );
+            save_saved(dir, &migrated);
+            Some(migrated)
+        }
+        Err(e) => {
+            log::warn!("config.plist unreadable in both the encrypted and legacy shapes: {e}");
+            None
+        }
+    }
 }
 fn save_saved(dir: &str, s: &SavedState) {
-    if let Err(e) = plist::to_file_xml(config_path(dir), s) {
-        log::warn!("persist config.plist failed: {e}");
+    let encrypted = match s.identity.save(IDENTITY_TAG) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!("persist config.plist: identity encryption failed ({e}) — NOT writing the \
+                         identity in the clear as a fallback. State is unchanged on disk.");
+            return;
+        }
+    };
+    let blob_len = encrypted.len();
+    let disk = SavedStateDisk {
+        push: s.push.clone(),
+        users: s.users.clone(),
+        identity: encrypted.into(),
+    };
+    match plist::to_file_xml(config_path(dir), &disk) {
+        // Greppable positive confirmation: without this, "it worked" is only ever
+        // provable by the ABSENCE of an error, which is not evidence.
+        Ok(()) => log::info!(
+            "IDENTITY_SEALED: config.plist written with the IDS identity keystore-encrypted \
+             ({blob_len} B blob, tag '{IDENTITY_TAG}') — no private keys in the clear."
+        ),
+        Err(e) => log::warn!("persist config.plist failed: {e}"),
     }
 }
 
 /// Persist the Apple ID + SHA-256 password HASH (hex) so a recover after a 6005
 /// identity-close can re-login without re-prompting. Never the plaintext.
-fn save_creds(dir: &str, apple_id: &str, pw_hash: &[u8]) {
-    let hex: String = pw_hash.iter().map(|b| format!("{b:02x}")).collect();
-    let json = serde_json::json!({ "apple_id": apple_id, "pw_hash": hex }).to_string();
-    if let Err(e) = std::fs::write(Path::new(dir).join("creds.json"), json) {
-        log::warn!("persist creds failed: {e}");
-    }
-}
-fn load_creds(dir: &str) -> Option<(String, Vec<u8>)> {
-    let bytes = std::fs::read(Path::new(dir).join("creds.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let apple_id = v.get("apple_id")?.as_str()?.to_string();
-    let hex = v.get("pw_hash")?.as_str()?;
-    let pw_hash = (0..hex.len())
-        .step_by(2)
-        .filter_map(|i| hex.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
-        .collect();
-    Some((apple_id, pw_hash))
-}
 
 /// Per-conversation self-handle map (chat_guid → registered send-from handle).
 /// Persisted so replies to existing threads keep their handle across a warm start.
@@ -979,19 +1041,90 @@ fn load_remote_config(dir: &str) -> Option<MacOSConfigRemote> {
         Ok(d) if !d.is_empty() => d,
         _ => raw.clone(),
     };
-    match rustpush::macos_remote::MacOSConfigRemote::from_dumb_body(&body) {
-        Ok(cfg) => {
+    match MacOSConfigRemote::from_dumb_body(&body) {
+        Ok(mut cfg) => {
             std::env::set_var("SMARTTXT_DUMB_PATH", &dumb);
             // If os_config.plist is also present (older migration), verify the dumb-derived
             // config against it field-by-field. This does NOT change what we use — the
             // dumb-derived config is authoritative and self-consistent with the NAC
             // validation data (both come from the one dumb).
+            let mut persisted_udid: Option<String> = None;
             if os_config.exists() {
                 match plist::from_file::<_, MacOSConfigRemote>(&os_config) {
-                    Ok(old) => compare_configs(&cfg, &old),
+                    Ok(old) => {
+                        persisted_udid = old.udid.clone();
+                        compare_configs(&cfg, &old);
+                    }
                     Err(e) => log::warn!("config-verify: os_config.plist present but unreadable ({e}) — skipping compare"),
                 }
             }
+            // The client UDID is NOT carried in the dumb — it is this install's own
+            // identifier, exactly like OpenBubbles' generate_udid(). `from_dumb_body`
+            // mints a fresh one every call, so it MUST be pinned here: a UDID that
+            // changed on every launch would look like a new device to Apple each
+            // sign-in. Reuse the persisted value when it already has the OpenBubbles
+            // shape (64 hex); otherwise mint one and persist it, which migrates the
+            // old platform-UUID-derived value exactly once.
+            match persisted_udid {
+                Some(u) if macos_remote::is_openbubbles_shaped_udid(&u) => {
+                    cfg.udid = Some(u);
+                    log::info!("UDID_SHAPE: reusing persisted client UDID (64-hex, OpenBubbles-shaped) ✅");
+                }
+                other => {
+                    let had = other.as_deref().unwrap_or("<none>");
+                    match plist::to_file_xml(&os_config, &cfg) {
+                        Ok(()) => log::info!(
+                            "UDID_SHAPE: minted a NEW OpenBubbles-shaped client UDID (64 hex) and persisted it \
+                             to os_config.plist — previous value was {} chars ({}). X-Client-UDID now matches \
+                             OpenBubbles' shape.",
+                            had.len(),
+                            if had == "<none>" { "absent" } else { "legacy platform-UUID-derived" },
+                        ),
+                        Err(e) => log::error!(
+                            "UDID_SHAPE: could NOT persist os_config.plist ({e}) — the client UDID would change \
+                             on every launch, which looks like a new device to Apple each time. Fix storage/perms."
+                        ),
+                    }
+                }
+            }
+            // One greppable identity line for exported bundles. ROM is the field-11
+            // value (NOT io_mac_address, field 2) — the whole point of the prost
+            // rewrite in rustpush's macos_remote.rs.
+            let rom_hex = cfg.get_gsa_hardware_headers().get("X-Apple-I-ROM").cloned().unwrap_or_default();
+            // Self-check the field mapping that used to be wrong. `rom` is dumb field
+            // 11; `io_mac_address` is field 2. An earlier hand-rolled protobuf reader
+            // read field 2 and called it ROM, so every GSA request carried the MAC
+            // address while the NAC-signed validation data attested to the real ROM.
+            // Both values are re-decoded here with the real schema so the log PROVES
+            // which one the header carries instead of just printing it.
+            match cfg.rom_and_io_mac_hex() {
+                Some((rom_f11, mac_f2)) if rom_hex == rom_f11 && rom_f11 != mac_f2 => log::info!(
+                    "ROM_CHECK ✅ X-Apple-I-ROM={rom_hex} = dumb field 11 (rom). Field 2 \
+                     (io_mac_address)={mac_f2} is a DIFFERENT value and is correctly NOT used. \
+                     This matches OpenBubbles."
+                ),
+                Some((rom_f11, mac_f2)) if rom_hex == rom_f11 => log::info!(
+                    "ROM_CHECK ✅ X-Apple-I-ROM={rom_hex} = dumb field 11 (rom). Field 2 is \
+                     identical ({mac_f2}) on this device, so the old mapping was inert here — \
+                     the header is right either way."
+                ),
+                Some((rom_f11, mac_f2)) => log::error!(
+                    "ROM_CHECK ❌ X-Apple-I-ROM={rom_hex} does NOT match dumb field 11 \
+                     ({rom_f11}); field 2 (io_mac_address) is {mac_f2}. The rom/io_mac mapping \
+                     has REGRESSED — X-Apple-I-ROM will disagree with the NAC-signed \
+                     validation data on every login."
+                ),
+                None => log::warn!(
+                    "ROM_CHECK: couldn't re-decode the dumb for the rom/io_mac comparison \
+                     (hw_config missing or too short) — mapping unverified this run."
+                ),
+            }
+            log::info!(
+                "IDENTITY: product={} build={} macos={} proto={} rom={} (dumb field 11) udid_len={}",
+                cfg.inner.product_name, cfg.inner.os_build_num, cfg.version,
+                cfg.protocol_version, rom_hex,
+                cfg.udid.as_deref().unwrap_or("").len(),
+            );
             log::info!("nativeInit: identity built FROM THE DUMB ({} B) — os_config.plist not required", body.len());
             Some(cfg)
         }
@@ -1196,7 +1329,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         }
     };
     log::info!("nativeInit: OSConfig = MacOSConfigRemote (migrated identity → NAC {})",
-        rustpush::macos_remote::NAC_BASE_URL);
+        macos_remote::NAC_BASE_URL);
 
     let mut s = st();
     s.files_dir = dir.clone();
@@ -1275,33 +1408,24 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         saved_push.as_ref().map(|p| p.token.is_some()).unwrap_or(false),
     );
 
-    // Retry the APNs connect a few times: a transient "connection refused" to Apple's
-    // push bag (init-p01st.push.apple.com) is common right after the migration disables
-    // OpenBubbles (which briefly churns the network/push state).
-    let conn = rt().block_on(async move {
-        let mut last_err = None;
-        for attempt in 1..=4u32 {
-            let (connection, err) = APSConnectionResource::new(os_config.clone(), saved_push.clone()).await;
-            match err {
-                None => return Ok(connection),
-                Some(e) => {
-                    log::warn!("nativeConnect: APNs attempt {attempt}/4 failed: {e:?}");
-                    last_err = Some(e);
-                    if attempt < 4 {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-                }
-            }
-        }
-        Err(last_err.expect("loop ran at least once"))
-    });
-    let connection = match conn {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("nativeConnect: APNs failed: {e:?}");
-            return JNI_FALSE;
-        }
-    };
+    // ONE attempt, deliberately. `APSConnectionResource::new` always returns a live
+    // `ResourceManager` (rustpush aps.rs) wired with `max_times: usize::MAX` and a
+    // 30s-capped exponential backoff — even when this first attempt failed, the
+    // manager is ALREADY retrying in the background, and it also runs its own
+    // keepalive and self-healing reconnect. Looping here and discarding the failed
+    // connection therefore left an abandoned manager reconnecting with the SAME push
+    // token while we opened another one — the exact "two sockets on one push token
+    // makes Apple drop both" hazard noted above. OpenBubbles calls this once too
+    // (`setup_push` in its api.rs) and trusts the resource. Do the same.
+    let (connection, first_err) =
+        rt().block_on(async move { APSConnectionResource::new(os_config.clone(), saved_push.clone()).await });
+    if let Some(e) = first_err {
+        // NOT fatal: the resource retries on its own from here.
+        log::warn!(
+            "nativeConnect: first APNs attempt failed ({e:?}) — the rustpush resource \
+             manager is retrying in the background with backoff; not opening a second socket."
+        );
+    }
     {
         let mut s = st();
         s.connection = Some(connection);
@@ -1532,8 +1656,6 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             s.pw_hash = pw_hash;
             s.sms_2fa_body = sms;
             s.account = Some(account);
-            // Persist for recover-on-close (hashed only).
-            save_creds(&s.files_dir, &s.apple_id, &s.pw_hash);
             // Base response is {"status": ...}; on an FSA challenge, merge the
             // challenge fields (challenge/keyHandles/rpId/allowedCredentials) so
             // Kotlin can relay every field to the companion.
@@ -1788,6 +1910,130 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     }
 }
 
+/// Build the registration-state JSON from rustpush's `ResourceState`. Shared by the
+/// pull path (`nativeRegisterState`) and the push watcher (`spawn_regstate_watcher`)
+/// so the two can never disagree.
+async fn regstate_payload(client: &Arc<IMClient>) -> serde_json::Value {
+    // Clone out of the watch guard BEFORE any await — the guard isn't Send.
+    let state = { client.identity.resource_state.borrow().clone() };
+    match &state {
+        ResourceState::Generating => serde_json::json!({ "state": "registering" }),
+        ResourceState::Generated => {
+            let next_s = client.identity.calculate_rereg_time_s().await;
+            serde_json::json!({ "state": "registered", "next_s": next_s })
+        }
+        // Display, not Debug, so an IDS code surfaces its human text.
+        ResourceState::Failed(failure) => serde_json::json!({
+            "state": "failed",
+            "retry_wait": failure.retry_wait,
+            "needs_relogin": failure.retry_wait.is_none(),
+            "error": format!("{}", failure.error),
+        }),
+        ResourceState::Closed => serde_json::json!({
+            "state": "failed",
+            "needs_relogin": true,
+            "error": "identity closed by IDS (6005) — re-sign-in required",
+        }),
+    }
+}
+
+/// Watch rustpush's `resource_state` and push every change into the same `inbound`
+/// queue the app already drains every 500ms.
+///
+/// `resource_state` is a `watch` channel — a PUSH primitive. OpenBubbles subscribes
+/// to it (`reg_state.changed()` inside its poll future) so Dart learns about a
+/// terminal registration failure within one tick. Sampling it only at cold start left
+/// a window where the UI still said "registered" while every send failed.
+fn spawn_regstate_watcher(client: Arc<IMClient>, my_gen: u64) {
+    rt().spawn(async move {
+        let mut rx = client.identity.resource_state.subscribe();
+        // Emit the CURRENT state once before waiting on changes. tokio's `watch`
+        // marks the value as already seen at subscribe time, so `changed()` never
+        // fires for a resource that is ALREADY `Generated` — or, more importantly,
+        // already `Failed`. Without this, a client built on top of an
+        // already-terminal identity would never tell Kotlin anything.
+        {
+            let payload = regstate_payload(&client).await;
+            log::info!("REGSTATE(push, initial): {payload}");
+            st().inbound.push_back(serde_json::json!({
+                "type": "registration_state",
+                "state": payload,
+            }));
+        }
+        loop {
+            if rx.changed().await.is_err() {
+                break; // sender dropped
+            }
+            if RECV_GEN.load(Ordering::SeqCst) != my_gen {
+                break; // superseded by a newer client
+            }
+            let payload = regstate_payload(&client).await;
+            log::info!("REGSTATE(push): {payload}");
+            st().inbound.push_back(serde_json::json!({
+                "type": "registration_state",
+                "state": payload,
+            }));
+        }
+        log::info!("regstate watcher ended (gen {my_gen})");
+    });
+}
+
+/// The live IDS registration state, read straight out of rustpush's own
+/// `ResourceManager` — the mirror of OpenBubbles' `get_regstate`.
+///
+/// This is the ONLY thing Kotlin should use to judge registration health.
+/// rustpush owns all retry: it re-registers on Apple's ~45-day cadence and
+/// retries transient failures forever with a 5-minute-to-24-hour backoff.
+/// Kotlin's job is to notice the one case rustpush refuses to retry — a 6005,
+/// which arrives as `failed` with no `retry_wait` — and put the user on the
+/// sign-in screen instead of re-presenting rejected credentials.
+///
+/// ```json
+/// {"state":"registered","next_s":3887700}
+/// {"state":"registering"}
+/// {"state":"failed","retry_wait":300,"needs_relogin":false,"error":"..."}
+/// {"state":"failed","needs_relogin":true,"error":"..."}   // 6005 / closed
+/// {"state":"no_client"}                                   // not signed in yet
+/// ```
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeRegisterState<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jstring {
+    let client = st().client.clone();
+    let Some(client) = client else {
+        log::info!("REGSTATE: no_client (not signed in)");
+        return out(&mut env, serde_json::json!({ "state": "no_client" }).to_string());
+    };
+    let payload = rt().block_on(regstate_payload(&client));
+    // Greppable marker for exported log bundles.
+    log::info!("REGSTATE: {payload}");
+    out(&mut env, payload.to_string())
+}
+
+/// The handles IDS currently has registered for this device, read live from
+/// rustpush (`IdentityResource::get_handles`).
+///
+/// Exposed because the app was otherwise reading a snapshot persisted at the last
+/// register — the same stale-cache pattern that was already fixed once. OpenBubbles
+/// exposes this as a one-line passthrough and calls it live everywhere.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeHandles<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jstring {
+    let client = st().client.clone();
+    let Some(client) = client else {
+        return out(&mut env, err_json("iMessage isn't connected right now."));
+    };
+    let handles = rt().block_on(async move { client.identity.get_handles().await });
+    out(&mut env, serde_json::json!({ "handles": handles }).to_string())
+}
+
 /// Proactively reconcile registered handles against what IDS vends and reregister if
 /// they differ (see [reconcile_handles]). Exposed so the Kotlin side can run it on
 /// connect / foreground / renewal — the "many triggers" that keep handles current the
@@ -1931,6 +2177,7 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
     // fresh loop takes over. VERIFY: the subscribe/handle surface moves between
     // rustpush revisions — mirrors the imessage-register engine receive pattern.
     let my_gen = RECV_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    spawn_regstate_watcher(client.clone(), my_gen);
     let connection = st().connection.clone().unwrap();
     rt().spawn(async move {
         let mut sub = connection.messages_cont.subscribe();
@@ -1956,7 +2203,7 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
                         Ok(Err(e)) => {
                             let dbg = format!("{e:?}");
                             log::warn!("receive handle error: {dbg}");
-                            spawn_recover_if_closed(&dbg);
+                            note_if_identity_closed(&dbg);
                         }
                         Err(join_err) => log::error!("receive handle panicked: {join_err}"),
                     }
@@ -1969,79 +2216,38 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
     Ok(())
 }
 
-/// If `err_dbg` is the 6005 identity-closed error, kick off ONE background recover
-/// (fresh login + re-register + new IMClient). rustpush marks a 6005 resource
-/// `DoNotRetry`/`Closed` and never revives it, so a brand-new client is the only
-/// path back to receiving.
-fn spawn_recover_if_closed(err_dbg: &str) {
+/// Log — and ONLY log — when IDS has closed the identity.
+///
+/// A 6005 means Apple invalidated this registration and wants a real re-login.
+/// rustpush says so itself, then deliberately stops:
+///
+/// ```text
+/// info!("Auth returns 6005, relog required!");
+/// return Err(PushError::DoNotRetry(Box::new(err)))
+/// ```
+///
+/// `ResourceManager` parks the resource in `ResourceState::Failed { retry_wait:
+/// None }` and breaks out of its retry loop. Every OTHER failure it retries on
+/// its own, forever, with a 5-minute-to-24-hour exponential backoff — so there
+/// is nothing here for us to retry, and re-presenting rejected credentials in a
+/// loop is what gets an Apple ID rate-limited.
+///
+/// Kotlin picks the state up via `nativeRegisterState` and routes the user to a
+/// real sign-in — the same thing OpenBubbles does with `get_regstate` +
+/// `markFailedToLogin`.
+fn note_if_identity_closed(err_dbg: &str) {
     let closed = err_dbg.contains("ResourceClosed")
         || err_dbg.contains("Resource has been closed")
         || err_dbg.contains("6005");
-    if !closed {
-        return;
+    if closed {
+        // Greppable marker for exported log bundles.
+        log::warn!(
+            "IDENTITY_CLOSED: IDS closed this identity (6005). rustpush marked it \
+             DoNotRetry and will NOT retry — this is correct. No automatic re-login is \
+             attempted (that behaviour was removed). A real re-sign-in is required; \
+             Kotlin surfaces it via nativeRegisterState."
+        );
     }
-    if RECOVERING.swap(true, Ordering::SeqCst) {
-        return; // a recover is already in flight
-    }
-    rt().spawn(async {
-        // Reset the in-flight flag on ANY exit — normal, Err, or panic-unwind — so a
-        // panic inside recover() (contained here by tokio, not a UI hang) can't wedge
-        // auto-recovery permanently. A Drop guard fires even while unwinding.
-        struct ResetGuard;
-        impl Drop for ResetGuard {
-            fn drop(&mut self) { RECOVERING.store(false, Ordering::SeqCst); }
-        }
-        let _reset = ResetGuard;
-        log::warn!("identity closed (6005) — recovering: fresh login + re-register");
-        match recover().await {
-            Ok(()) => log::info!("recover ok — receiving again"),
-            Err(e) => log::error!("recover failed: {e}"),
-        }
-    });
-}
-
-/// Rebuild a working identity after a 6005-close: a FRESH login (new anisette —
-/// the point, since the stale anisette/token is what 6005'd) → IDS delegate →
-/// authenticate → register → new IMClient + receive loop. Needs the persisted
-/// hashed creds; if Apple now demands interactive 2FA we can't recover silently.
-async fn recover() -> Result<(), String> {
-    let (os_config, connection, dir) = {
-        let s = st();
-        (s.os_config.clone(), s.connection.clone(), s.files_dir.clone())
-    };
-    let os_config = os_config.ok_or("no os_config")?;
-    let connection = connection.ok_or("no connection")?;
-    let (apple_id, pw_hash) = load_creds(&dir).ok_or("no saved credentials to recover with")?;
-
-    let gsa = os_config.get_gsa_config(&*connection.state.read().await, false);
-    let anisette = default_provider(gsa.clone(), Path::new(&dir).join("anisette"));
-    let mut account = rustpush::AppleAccount::new_with_anisette(gsa, anisette)
-        .map_err(|e| format!("new_with_anisette: {e:?}"))?;
-    match account.login_email_pass(&apple_id, &pw_hash).await.map_err(|e| format!("login: {e:?}"))? {
-        LoginState::LoggedIn | LoginState::NeedsExtraStep(_) => {}
-        other => return Err(format!("recover needs interactive 2FA ({other:?}); re-sign-in required")),
-    }
-    if account.get_pet().is_none() {
-        return Err("no PET after recover login".to_string());
-    }
-
-    let delegates = login_apple_delegates(&account, None, os_config.as_ref(), &[LoginDelegate::IDS])
-        .await
-        .map_err(|e| format!("delegates: {e:?}"))?;
-    let ids = delegates.ids.ok_or("no IDS delegate")?;
-    let user = authenticate_apple(ids, os_config.as_ref())
-        .await
-        .map_err(|e| format!("authenticate: {e:?}"))?;
-    let mut users = vec![user];
-    let identity = IDSNGMIdentity::new().map_err(|e| format!("identity: {e:?}"))?;
-    register(os_config.as_ref(), &*connection.state.read().await, &[&MADRID_SERVICE], &mut users, &identity)
-        .await
-        .map_err(|e| format!("register: {e:?}"))?;
-
-    let push = connection.state.read().await.clone();
-    save_saved(&dir, &SavedState { push, users: users.clone(), identity: identity.clone() });
-    build_client_and_receive(users, identity).await?; // bumps RECV_GEN → dead loop exits
-    Ok(())
 }
 
 // `canon` (canonical handle key: scheme stripped, email lowercased, phone → "+<digits>"

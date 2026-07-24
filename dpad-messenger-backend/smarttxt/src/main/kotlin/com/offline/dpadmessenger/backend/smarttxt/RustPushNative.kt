@@ -139,6 +139,35 @@ object RustPushNative {
      *  client. Returns `{"ok":true,"handles":[…]}` or `{"error":"…"}`. */
     external fun nativeReregister(): String
 
+    /** The live IDS registration state, straight from rustpush's own
+     *  `ResourceManager` — the mirror of OpenBubbles' `get_regstate`.
+     *
+     *  rustpush owns ALL retry: it re-registers on Apple's ~45-day cadence and
+     *  retries transient failures forever with a 5-minute-to-24-hour backoff.
+     *  The one case it deliberately refuses to retry is an IDS 6005 ("relog
+     *  required"), which arrives here as `failed` with no `retry_wait` and
+     *  `needs_relogin: true` — that is the only case Kotlin should act on, by
+     *  sending the user to sign in again. Never auto-retry it: re-presenting
+     *  credentials Apple has already rejected is what gets an ID rate-limited.
+     *
+     *  Shapes:
+     *  `{"state":"registered","next_s":3887700}` /
+     *  `{"state":"registering"}` /
+     *  `{"state":"failed","retry_wait":300,"needs_relogin":false,"error":"…"}` /
+     *  `{"state":"failed","needs_relogin":true,"error":"…"}` /
+     *  `{"state":"no_client"}` */
+    external fun nativeRegisterState(): String
+
+    /** The handles IDS currently has registered, read LIVE from rustpush
+     *  (`IdentityResource::get_handles`) rather than from a persisted snapshot.
+     *  Returns `{"handles":[…]}` or `{"error":"…"}`. */
+    external fun nativeHandles(): String
+
+    /** Reconcile registered handles against what IDS vends, re-registering if they
+     *  differ. Safe to call on connect / foreground; rustpush debounces the
+     *  underlying refresh to once per 15s. Returns `{"ok":true,"handles":[…]}`. */
+    external fun nativeReconcileHandles(): String
+
     // ---- messaging ----------------------------------------------------------
 
     /** Send a text. Returns the server message guid, or "" on failure. */
@@ -249,6 +278,31 @@ object RustPushNative {
      *  "anisette not carried" (soft — it just re-provisions on first sign-in). */
     fun runCatchingNativeConvertAnisette(obStatePlist: String, outStatePlist: String): String =
         if (loaded) runCatching { nativeConvertAnisette(obStatePlist, outStatePlist) }
+            .getOrElse { """{"ok":false,"error":"${it.message?.replace('"', '\'')}"}""" }
+        else """{"ok":false,"error":"native library not loaded"}"""
+
+    /** Null-safe [nativeRegisterState]: an old `.so` without the symbol, or any
+     *  throw, reports `unknown` so callers treat it as "no signal" rather than
+     *  as a terminal failure. */
+    fun runCatchingNativeRegisterState(): String =
+        if (loaded) runCatching { nativeRegisterState() }
+            .getOrElse { """{"state":"unknown","error":"${it.message?.replace('"', '\'')}"}""" }
+        else """{"state":"unknown","error":"native library not loaded"}"""
+
+    /** Null-safe [nativeHandles]: returns an empty list rather than throwing when
+     *  the `.so` is missing or no client is up. */
+    fun runCatchingNativeHandles(): List<String> =
+        if (!loaded) emptyList()
+        else runCatching {
+            val obj = org.json.JSONObject(nativeHandles())
+            val arr = obj.optJSONArray("handles") ?: return@runCatching emptyList()
+            (0 until arr.length()).map { arr.getString(it) }
+        }.getOrDefault(emptyList())
+
+    /** Null-safe [nativeReconcileHandles]; failures are non-fatal (handles simply
+     *  stay as they were until the next trigger). */
+    fun runCatchingNativeReconcileHandles(): String =
+        if (loaded) runCatching { nativeReconcileHandles() }
             .getOrElse { """{"ok":false,"error":"${it.message?.replace('"', '\'')}"}""" }
         else """{"ok":false,"error":"native library not loaded"}"""
 

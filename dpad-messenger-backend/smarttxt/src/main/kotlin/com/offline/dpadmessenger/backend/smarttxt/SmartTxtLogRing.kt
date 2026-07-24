@@ -103,7 +103,12 @@ internal object SmartTxtLogRing {
      * filterspec level — we filter here, per line, before they hit the ring.
      */
     private fun isNoise(line: String): Boolean =
-        line.contains("rustpush::util:") || line.contains("rustpush::aps:")
+        // `rustpush::util` is the mutex-lock flood — EXCEPT for the ResourceManager
+        // lifecycle lines ("Resource Identity: ..."), which are the only on-device
+        // evidence of whether rustpush retried, backed off, or gave up on the IDS
+        // registration. Those are exactly what an exported bundle needs, so keep them.
+        (line.contains("rustpush::util:") && !line.contains("Resource Identity")) ||
+            line.contains("rustpush::aps:")
 
     @Volatile private var started = false
     @Volatile private var stopped = false

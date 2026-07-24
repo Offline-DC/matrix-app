@@ -339,6 +339,11 @@ internal class SmartTxtMessageRepository(
             TransportEvent.Connected -> { Log.i(TAG, "session connected"); _authExpired.value = false }
             TransportEvent.Disconnected -> Log.i(TAG, "session disconnected")
             TransportEvent.AuthExpired -> { Log.w(TAG, "auth expired"); _authExpired.value = true }
+            is TransportEvent.RegistrationFailed -> {
+                Log.w(TAG, "registration failed (needsRelogin=${e.needsRelogin}): ${e.error}")
+                // Only a terminal failure needs us; rustpush retries the rest itself.
+                if (e.needsRelogin) SmartTxtRepository.onTerminalRegistrationFailure(appContext, e.error)
+            }
         }
     }
 

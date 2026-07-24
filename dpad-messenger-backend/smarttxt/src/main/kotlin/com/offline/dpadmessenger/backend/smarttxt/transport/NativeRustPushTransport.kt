@@ -183,6 +183,19 @@ class NativeRustPushTransport(
         for (el in arr) {
             val obj = el.jsonObject
             when (obj["type"]?.jsonPrimitive?.content) {
+                RelayProtocol.P_REGISTRATION_STATE -> {
+                    // Pushed by rustpush's own resource_state watch channel, so a
+                    // terminal failure reaches the UI within one poll tick instead of
+                    // waiting for the next cold start.
+                    val st = obj["state"]?.jsonObject
+                    val state = st?.get("state")?.jsonPrimitive?.content ?: "unknown"
+                    val needsRelogin = st?.get("needs_relogin")?.jsonPrimitive?.content == "true"
+                    val error = st?.get("error")?.jsonPrimitive?.content.orEmpty()
+                    Log.i(TAG, "REGSTATE(push) $state needsRelogin=$needsRelogin $error")
+                    if (state == "failed") {
+                        _events.emit(TransportEvent.RegistrationFailed(needsRelogin, error))
+                    }
+                }
                 RelayProtocol.P_NEW_MESSAGE -> obj["message"]?.let {
                     messages.add(json.decodeFromJsonElement(RelayMessage.serializer(), it))
                 }

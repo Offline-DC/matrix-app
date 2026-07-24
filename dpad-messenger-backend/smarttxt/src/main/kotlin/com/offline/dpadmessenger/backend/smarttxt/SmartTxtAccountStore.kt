@@ -13,7 +13,8 @@ import kotlinx.serialization.json.Json
  *  - the **dumb file** — a serialized [MacOSConfig] (hardware identity)
  *  - the **Apple ID account** — [SmartTxtAccount] (IDS tokens + push token +
  *    handles + last-registered timestamp)
- *  - a renewal timestamp so [SmartTxtRenewalWorker] knows when to re-register
+ *  - a last-registered timestamp, for diagnostics only (rustpush owns the
+ *    real re-registration schedule via its own in-process timer)
  *
  * "Registered" = both blobs present AND a non-zero last-registered time. The UI
  * gates on [isRegistered] before showing the chat, exactly how the gmessages UI

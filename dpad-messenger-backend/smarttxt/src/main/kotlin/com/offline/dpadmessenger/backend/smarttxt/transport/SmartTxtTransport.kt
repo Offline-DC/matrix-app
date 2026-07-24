@@ -175,6 +175,12 @@ sealed class TransportEvent {
     data class ChatRead(val chatGuid: String, val messageGuid: String = "") : TransportEvent()
 
     /** Credentials died and could not be refreshed — re-register needed. */
+    /** rustpush's IDS registration state changed. [needsRelogin] marks the one
+     *  case rustpush deliberately refuses to retry — an IDS 6005 — which needs a
+     *  real sign-in, not a reconnect. Everything else it retries itself with
+     *  backoff, so those arrive here for logging only. */
+    data class RegistrationFailed(val needsRelogin: Boolean, val error: String) : TransportEvent()
+
     data object AuthExpired : TransportEvent()
 }
 

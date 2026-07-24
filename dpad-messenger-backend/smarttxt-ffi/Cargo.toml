@@ -36,6 +36,15 @@ plist = "1"
 # mid/metadata are raw <data> that get re-base64'd into the adi_pb JSON. Matches the
 # rustpush tree's base64 (0.21) so cargo doesn't compile a second copy.
 base64 = "0.21"
+
+# The dumb hardware file is a protobuf. Decoded here (not in rustpush) against
+# OpenBubbles' own schema — see build.rs and src/macos_remote.rs. Versions match
+# the rustpush tree so cargo doesn't compile a second copy of either.
+prost = "0.12.0"
+# `impl OSConfig for MacOSConfigRemote` — rustpush's trait is #[async_trait].
+async-trait = "0.1.73"
+# Client UDID generation (mirrors OpenBubbles' generate_udid).
+rand = { version = "0.8.5", features = ["min_const_gen"] }
 # For installing the process-global rustls crypto provider (ring) before any TLS,
 # same as the imessage-register harness. Match rustpush's rustls (0.23).
 #
@@ -64,20 +73,22 @@ rustls = { version = "0.23", default-features = false, features = ["logging", "s
 # Android) is never compiled. rustpush already gates its ONLY open-absinthe
 # reference (the `AbsintheError` use + variant in error.rs) behind that feature.
 #
-# `macos-remote-validation` turns on `MacOSConfigRemote` (macos_remote.rs), which
-# reuses the migrated OpenBubbles device identity but offloads NAC create/sign to
-# the LAN validation server. That module is FULLY self-contained — its own
-# `HardwareConfig`, and it pulls in NEITHER open-absinthe NOR unicorn — so the
-# feature is `[]` (adds no deps) and the crate still cross-compiles to Android.
+# `MacOSConfigRemote` (src/macos_remote.rs) is OURS, not rustpush's: it reuses the
+# migrated OpenBubbles device identity but offloads NAC create/sign to the validation
+# server. It implements rustpush's `OSConfig` trait on a local type (allowed by the
+# orphan rule), so rustpush needs no feature flag for it and stays near upstream.
 # nativeInit prefers it when a migrated os_config + dumb are present, else falls
 # back to `RelayConfig`.
 #
 # Path points at the vendored ~/repos/rustpush (the compiler-checked reference is
 # ../../imessage-register). To pin a git rev, swap `path` for `git`/`rev` —
 # rustpush has submodules, so clone with --recurse-submodules.
-rustpush = { path = "../../../rustpush", default-features = false, features = ["remote-anisette-v3", "macos-remote-validation"] }
+rustpush = { path = "../../../rustpush", default-features = false, features = ["remote-anisette-v3"] }
 omnisette = { path = "../../../rustpush/apple-private-apis/omnisette", features = ["remote-anisette-v3"] }
 keystore = { path = "../../../rustpush/keystore" }
+
+[build-dependencies]
+prost-build = { version = "0.12.0" }
 
 [profile.release]
 opt-level = "z"     # optimize for size — these go on a 916 MB-RAM flip phone

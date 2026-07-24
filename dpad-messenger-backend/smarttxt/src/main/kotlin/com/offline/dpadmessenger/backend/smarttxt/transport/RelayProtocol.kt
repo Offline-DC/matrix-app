@@ -47,6 +47,10 @@ object RelayProtocol {
     const val P_CHAT_UPDATED = "chat_updated"
     const val P_AUTH_EXPIRED = "auth_expired"
 
+    /** rustpush's own IDS registration state, pushed from its `resource_state`
+     *  watch channel by the native side (see `spawn_regstate_watcher`). */
+    const val P_REGISTRATION_STATE = "registration_state"
+
     const val T_ACK = "ack"
 
     /** Lenient JSON shared by all transports (forward-compatible with relay
