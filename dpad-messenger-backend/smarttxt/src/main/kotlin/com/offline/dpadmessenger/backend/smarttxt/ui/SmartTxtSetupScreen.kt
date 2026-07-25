@@ -80,7 +80,13 @@ private enum class SignInStep { INTRO, CREDENTIALS, TWO_FACTOR, FSA, REGISTERING
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
+fun SmartTxtSetupScreen(
+    modifier: Modifier = Modifier,
+    /** Shown above "Get started". Non-null when the user was signed out for a reason
+     *  they did not choose - currently only a terminal IDS 6005. Persisted, so it is
+     *  still here after a cold start. */
+    notice: String? = null,
+) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     val status by SmartTxtRepository.status.collectAsState()
@@ -213,6 +219,14 @@ fun SmartTxtSetupScreen(modifier: Modifier = Modifier) {
                         style = MaterialTheme.typography.bodyMedium,
                         textAlign = TextAlign.Center,
                     )
+                    if (notice != null) {
+                        Text(
+                            notice,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.error,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                     DpadButton(
                         text = "Get started",
                         onClick = { error = null; step = SignInStep.CREDENTIALS },

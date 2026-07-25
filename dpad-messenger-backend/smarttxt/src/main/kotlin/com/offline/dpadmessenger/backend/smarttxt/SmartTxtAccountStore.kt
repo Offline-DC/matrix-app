@@ -67,10 +67,43 @@ class SmartTxtAccountStore(context: Context) {
         return runCatching { json.decodeFromString(SmartTxtAccount.serializer(), s) }.getOrNull()
     }
 
-    /** Stamp the last successful IDS registration (drives renewal scheduling). */
+    /** Stamp the last successful IDS registration (drives renewal scheduling).
+     *  Also clears any recorded terminal failure - a successful register is the
+     *  only thing that resolves one. */
     fun markRegistered(atMs: Long = System.currentTimeMillis()) {
         val acct = loadAccount() ?: return
         saveAccount(acct.copy(lastRegisteredMs = atMs))
+        clearTerminalFailure()
+    }
+
+    /**
+     * Record that Apple invalidated this registration (IDS 6005) and clear the
+     * registration stamp.
+     *
+     * This MUST be persisted, not merely held in memory. [isRegistered] is the gate
+     * `SmartTxtRepository.restoreStatus` reads on every cold start, and it is defined
+     * purely as `lastRegisteredMs > 0`. Flipping only the in-memory status flow would
+     * route the user to sign-in now and then drop them straight back into a chat UI on
+     * a dead registration after the next process death - which on a ~1 GB phone is
+     * routine, not exceptional. Worse, each such launch re-presents the registration
+     * Apple already rejected, which is precisely the repeated-registration pattern this
+     * handler exists to prevent.
+     *
+     * The account and dumb file are deliberately KEPT: sign-in can prefill, and message
+     * history survives. OpenBubbles does the equivalent by persisting
+     * `finishedSetup = false` in markFailedToLogin.
+     */
+    fun markTerminalFailure(error: String) {
+        prefs.edit().putString(KEY_TERMINAL_ERROR, error).apply()
+        loadAccount()?.let { saveAccount(it.copy(lastRegisteredMs = 0L)) }
+    }
+
+    /** Why Apple signed this device out, or null. Survives process death so the
+     *  sign-in screen can still explain itself on a cold start. */
+    fun terminalFailure(): String? = prefs.getString(KEY_TERMINAL_ERROR, null)
+
+    fun clearTerminalFailure() {
+        prefs.edit().remove(KEY_TERMINAL_ERROR).apply()
     }
 
     fun lastRegisteredMs(): Long = loadAccount()?.lastRegisteredMs ?: 0L
@@ -116,6 +149,7 @@ class SmartTxtAccountStore(context: Context) {
         const val KEY_MACOS_CONFIG = "macOsConfig"
         const val KEY_ACCOUNT = "appleIdAccount"
         const val KEY_HANDLES_CONFIGURED = "handlesConfigured"
+        const val KEY_TERMINAL_ERROR = "terminalRegistrationError"
         const val KEY_ENABLED_HANDLES = "enabledHandles"
         const val KEY_DEFAULT_HANDLE = "defaultHandle"
     }

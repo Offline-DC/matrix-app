@@ -103,14 +103,22 @@ fun SmartTxtApp(
             // run the one-time "Transferring to new Smart Txt" migration — on
             // success it flips status to REGISTERED (→ chats above); on failure or
             // when there's nothing to migrate, fall through to setup.
+            // If Apple TERMINALLY invalidated the registration (IDS 6005), say so on
+            // the sign-in screen and skip the OpenBubbles transfer entirely: importing
+            // the same identity for the same Apple ID just earns another 6005, so the
+            // migration path would loop and silently mask the real problem.
+            val terminalFailure = remember { SmartTxtAccountStore(context).terminalFailure() }
+
             var migrate by remember { mutableStateOf<Boolean?>(null) } // null=checking
             LaunchedEffect(Unit) {
-                migrate = withContext(Dispatchers.IO) { OpenBubblesMigrator.available(context) }
+                migrate =
+                    if (terminalFailure != null) false
+                    else withContext(Dispatchers.IO) { OpenBubblesMigrator.available(context) }
             }
             when (migrate) {
                 null -> DuckLoadingIndicator(modifier = modifier)
                 true -> MigrationScreen(modifier = modifier, onFallbackToSetup = { migrate = false })
-                else -> SmartTxtSetupScreen(modifier = modifier)
+                else -> SmartTxtSetupScreen(modifier = modifier, notice = terminalFailure)
             }
         }
     }

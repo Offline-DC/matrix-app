@@ -178,8 +178,15 @@ object SmartTxtRepository {
                 "registration. NOT retrying (rustpush marked it DoNotRetry); routing the " +
                 "user to sign in again, keeping history.",
         )
-        _nativeError.value =
-            "Apple signed this device out of iMessage. Sign in again to keep sending."
+        val message = "Apple signed this device out of iMessage. Sign in again to keep sending."
+        _nativeError.value = message
+        // PERSIST before tearing down. signOutKeepingHistory only flips an in-memory
+        // StateFlow; the cold-start gate is isRegistered(), which reads lastRegisteredMs
+        // off disk. Without this the sign-out silently undoes itself on the next process
+        // death and the user lands back in a chat UI whose registration Apple has already
+        // rejected - re-presenting it on every launch thereafter.
+        runCatching { SmartTxtAccountStore(context.applicationContext).markTerminalFailure(message) }
+            .onFailure { Log.e(TAG, "could not persist the terminal failure: $it") }
         signOutKeepingHistory(context)
     }
 
