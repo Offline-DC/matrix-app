@@ -1048,16 +1048,19 @@ fn load_remote_config(dir: &str) -> Option<MacOSConfigRemote> {
             // config against it field-by-field. This does NOT change what we use — the
             // dumb-derived config is authoritative and self-consistent with the NAC
             // validation data (both come from the one dumb).
-            let mut persisted_udid: Option<String> = None;
+            //
+            // Read it now, but DEFER the compare until after the UDID is pinned below.
+            // `from_dumb_body` mints a fresh random UDID on every call, so comparing
+            // here would report `udid MISMATCH` on every single launch even when the
+            // persisted value is the one actually used — a permanently misleading log.
+            let mut persisted: Option<MacOSConfigRemote> = None;
             if os_config.exists() {
                 match plist::from_file::<_, MacOSConfigRemote>(&os_config) {
-                    Ok(old) => {
-                        persisted_udid = old.udid.clone();
-                        compare_configs(&cfg, &old);
-                    }
+                    Ok(old) => persisted = Some(old),
                     Err(e) => log::warn!("config-verify: os_config.plist present but unreadable ({e}) — skipping compare"),
                 }
             }
+            let persisted_udid = persisted.as_ref().and_then(|p| p.udid.clone());
             // The client UDID is NOT carried in the dumb — it is this install's own
             // identifier, exactly like OpenBubbles' generate_udid(). `from_dumb_body`
             // mints a fresh one every call, so it MUST be pinned here: a UDID that
@@ -1086,6 +1089,11 @@ fn load_remote_config(dir: &str) -> Option<MacOSConfigRemote> {
                         ),
                     }
                 }
+            }
+            // NOW compare — `cfg` is final, so every field shown is the one that will
+            // actually be presented to Apple.
+            if let Some(old) = &persisted {
+                compare_configs(&cfg, old);
             }
             // One greppable identity line for exported bundles. ROM is the field-11
             // value (NOT io_mac_address, field 2) — the whole point of the prost

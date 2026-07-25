@@ -103,12 +103,15 @@ internal object SmartTxtLogRing {
      * filterspec level — we filter here, per line, before they hit the ring.
      */
     private fun isNoise(line: String): Boolean =
-        // `rustpush::util` is the mutex-lock flood — EXCEPT for the ResourceManager
-        // lifecycle lines ("Resource Identity: ..."), which are the only on-device
-        // evidence of whether rustpush retried, backed off, or gave up on the IDS
-        // registration. Those are exactly what an exported bundle needs, so keep them.
-        (line.contains("rustpush::util:") && !line.contains("Resource Identity")) ||
-            line.contains("rustpush::aps:")
+        // NOTE: relaxing this filter does NOT surface rustpush's ResourceManager
+        // lifecycle lines ("Resource Identity: preparing/generating/final error").
+        // Those are `debug!` in rustpush's util.rs, and the Rust logger is capped at
+        // Info (`with_max_level(LevelFilter::Info)` in smarttxt-ffi's init_logger), so
+        // they never reach logcat at all — this filter never saw them. Raising the
+        // logger level is the only way to get them, at the cost of the mutex flood.
+        // For registration health, prefer the REGSTATE lines and rustpush's own
+        // info-level "Reregistering in N seconds", both of which are already captured.
+        line.contains("rustpush::util:") || line.contains("rustpush::aps:")
 
     @Volatile private var started = false
     @Volatile private var stopped = false
