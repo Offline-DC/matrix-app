@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -187,14 +189,15 @@ class NativeRustPushTransport(
                     // Pushed by rustpush's own resource_state watch channel, so a
                     // terminal failure reaches the UI within one poll tick instead of
                     // waiting for the next cold start.
-                    val st = obj["state"]?.jsonObject
-                    val state = st?.get("state")?.jsonPrimitive?.content ?: "unknown"
-                    val needsRelogin = st?.get("needs_relogin")?.jsonPrimitive?.content == "true"
-                    val error = st?.get("error")?.jsonPrimitive?.content.orEmpty()
-                    Log.i(TAG, "REGSTATE(push) $state needsRelogin=$needsRelogin $error")
-                    if (state == "failed") {
-                        _events.emit(TransportEvent.RegistrationFailed(needsRelogin, error))
-                    }
+                    val stateObj = obj["state"]?.jsonObject
+                    val ev = parseRegState(stateObj)
+                    val state = stateObj?.get("state")?.jsonPrimitive?.content ?: "unknown"
+                    Log.i(
+                        TAG,
+                        "REGSTATE(push) $state needsRelogin=${ev?.needsRelogin ?: false} " +
+                            (ev?.error.orEmpty()),
+                    )
+                    if (ev != null) _events.emit(ev)
                 }
                 RelayProtocol.P_NEW_MESSAGE -> obj["message"]?.let {
                     messages.add(json.decodeFromJsonElement(RelayMessage.serializer(), it))
@@ -245,4 +248,28 @@ class NativeRustPushTransport(
         const val POLL_INTERVAL_MS = 500L
         const val ERR_PREFIX = "ERR:"
     }
+}
+
+/**
+ * The one registration-state decision with user-visible consequences: does this
+ * payload mean "tear the session down and put the user back on the sign-in screen"?
+ *
+ * Pulled out of [NativeRustPushTransport.parseAndEmit] so a plain JVM test can reach
+ * it. A terminal IDS 6005 cannot be provoked on demand - Apple decides when to
+ * invalidate a registration - and shipping to more users does not exercise it either,
+ * because a user who signs in successfully never produces one. So this contract has
+ * to be pinned by test rather than observed in the wild. See RegistrationStateParseTest.
+ *
+ * Returns null when nothing should be emitted: registered, registering, no_client,
+ * or a malformed payload.
+ */
+internal fun parseRegState(st: JsonObject?): TransportEvent.RegistrationFailed? {
+    if (st == null) return null
+    if ((st["state"]?.jsonPrimitive?.content ?: "unknown") != "failed") return null
+    // rustpush omits retry_wait and sets needs_relogin ONLY for a DoNotRetry (6005).
+    // An absent or malformed key falls back to false: surface it, but do not sign out
+    // a user whose registration is merely retrying.
+    val needsRelogin = st["needs_relogin"]?.jsonPrimitive?.booleanOrNull ?: false
+    val error = st["error"]?.jsonPrimitive?.content.orEmpty()
+    return TransportEvent.RegistrationFailed(needsRelogin, error)
 }

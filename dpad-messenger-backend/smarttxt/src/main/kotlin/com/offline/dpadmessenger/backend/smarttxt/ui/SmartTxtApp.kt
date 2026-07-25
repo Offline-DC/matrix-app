@@ -175,6 +175,16 @@ private fun SmartTxtChat(
         mutableStateOf(saved)
     }
 
+    // Hidden diagnostics unlock: toggle 24-hour time DEBUG_TOGGLE_COUNT times in a
+    // row. The host is deliberately an inert display preference rather than
+    // "Re-register now" - a missed gesture there falls through to the normal click,
+    // which contacts Apple and mints a real re-registration, the one thing this whole
+    // area exists to avoid doing casually. The count is EVEN, so the preference lands
+    // back exactly where the user found it and the gesture leaves no trace.
+    var debugToggleCount by remember { mutableStateOf(0) }
+    var debugLastToggleMs by remember { mutableStateOf(0L) }
+    var showDebug by remember { mutableStateOf(false) }
+
     DpadMessengerApp(
         repository = repository,
         modifier = modifier,
@@ -191,6 +201,21 @@ private fun SmartTxtChat(
             use24Hour = enabled
             TimeFormatPreference.use24Hour = enabled
             settingsPrefs.edit().putBoolean("use24HourTime", enabled).apply()
+
+            // A gap longer than the window resets the run, so ordinary use of the
+            // toggle can never trip this.
+            val now = android.os.SystemClock.elapsedRealtime()
+            debugToggleCount =
+                if (now - debugLastToggleMs <= DEBUG_TOGGLE_WINDOW_MS) debugToggleCount + 1 else 1
+            debugLastToggleMs = now
+            if (debugToggleCount >= DEBUG_TOGGLE_COUNT) {
+                debugToggleCount = 0
+                showDebug = true
+                android.util.Log.w(
+                    "SmartTxtDebug",
+                    "DEBUG_MENU unlocked (24-hour toggle x" + DEBUG_TOGGLE_COUNT + ")",
+                )
+            }
         },
         sendHandles = sendHandles,
         defaultSendHandle = defaultHandle,
@@ -248,4 +273,15 @@ private fun SmartTxtChat(
         initialRoomId = initialRoomId,
         initialRoomKey = initialRoomKey,
     )
+
+    if (showDebug) {
+        SmartTxtDebugDialog(context = context, onDismiss = { showDebug = false })
+    }
 }
+
+/** Consecutive 24-hour-time toggles needed to reveal the hidden diagnostics. Even,
+ *  so the preference ends where it started. */
+private const val DEBUG_TOGGLE_COUNT = 10
+
+/** Max gap between toggles before the run resets. */
+private const val DEBUG_TOGGLE_WINDOW_MS = 3_000L

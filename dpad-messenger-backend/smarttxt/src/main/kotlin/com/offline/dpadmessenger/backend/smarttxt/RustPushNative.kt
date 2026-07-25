@@ -168,6 +168,17 @@ object RustPushNative {
      *  underlying refresh to once per 15s. Returns `{"ok":true,"handles":[…]}`. */
     external fun nativeReconcileHandles(): String
 
+    /** Inject a synthetic IDS registration state into the same inbound queue
+     *  rustpush's own `resource_state` watcher writes to, so the routing that
+     *  follows a terminal 6005 can be exercised on demand.
+     *
+     *  [kind] is a VARIANT NAME - "terminal" or "transient" - deliberately not a
+     *  JSON payload: the inbound queue is a trusted channel (everything else
+     *  writing to it is rustpush), so accepting caller-supplied JSON in a shipped
+     *  build would allow forging any event the app understands. Reachable only via
+     *  the hidden Settings gesture; there is no broadcast receiver. */
+    external fun nativeDebugInjectRegState(kind: String)
+
     // ---- messaging ----------------------------------------------------------
 
     /** Send a text. Returns the server message guid, or "" on failure. */

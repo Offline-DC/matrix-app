@@ -2021,6 +2021,58 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     out(&mut env, payload.to_string())
 }
 
+/// Push a synthetic registration state into the same `inbound` queue that
+/// `spawn_regstate_watcher` writes to, so the Kotlin routing that follows a terminal
+/// IDS 6005 can be exercised on demand.
+///
+/// WHY THIS SHIPS IN RELEASE. A 6005 cannot be provoked - Apple decides when to
+/// invalidate a registration - and shipping to more users does not test it either,
+/// since a user who signs in successfully never produces one. Reaching this requires
+/// physically navigating the hidden Settings gesture (toggle 24-hour time 10x); there
+/// is deliberately NO broadcast receiver, so adb alone cannot trigger it.
+///
+/// WHY IT TAKES A VARIANT NAME AND NOT JSON. `inbound` is a trusted channel -
+/// everything else that writes to it is rustpush. Accepting caller-supplied JSON in a
+/// shipped build would hand anyone who found this symbol a way to forge ANY event the
+/// app understands: fake messages, fake read receipts, fake delivery status. Two fixed
+/// variants can only reproduce states rustpush itself could already have published.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeDebugInjectRegState<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    kind: JString<'l>,
+) {
+    let kind = jstr(&mut env, &kind);
+    let state = match kind.as_str() {
+        // Mirrors ResourceState::Closed - the real 6005 shape.
+        "terminal" => serde_json::json!({
+            "state": "failed",
+            "needs_relogin": true,
+            "error": "SYNTHETIC terminal 6005 (injected from hidden diagnostics)",
+        }),
+        // Mirrors ResourceState::Failed WITH a retry_wait. Must NOT sign anyone out.
+        "transient" => serde_json::json!({
+            "state": "failed",
+            "retry_wait": 300,
+            "needs_relogin": false,
+            "error": "SYNTHETIC transient failure (injected from hidden diagnostics)",
+        }),
+        other => {
+            log::error!("nativeDebugInjectRegState: unknown variant {other:?} - ignoring");
+            return;
+        }
+    };
+    // warn!, and it says SYNTHETIC, so nobody reading an exported bundle six weeks from
+    // now mistakes an injected state for something Apple actually sent.
+    log::warn!("REGSTATE(SYNTHETIC - injected by hidden diagnostics, NOT from Apple): {state}");
+    st().inbound.push_back(serde_json::json!({
+        "type": "registration_state",
+        "state": state,
+    }));
+}
+
 /// The handles IDS currently has registered for this device, read live from
 /// rustpush (`IdentityResource::get_handles`).
 ///
