@@ -241,8 +241,28 @@ class RustPushBridge(
             // Display text, e.g. "Registration Error … (6005)".
             lower.contains("rate-limit") || lower.contains("rate limit") ||
                 lower.contains("temporarily disabled") || lower.contains("(6009)") ->
-                "Apple has temporarily limited iMessage for this account. This usually clears on " +
-                    "its own — wait a while (it can take hours) and try again."
+                // Deliberately says DEVICE, not account: Apple refuses this device's
+                // iMessage registration while leaving the Apple ID itself working
+                // everywhere else (confirmed on a real block — the user's iPhone and
+                // Mac kept working throughout). "Your account is limited" reads as a
+                // much bigger problem than it is and will generate support tickets.
+                //
+                // Deliberately does NOT say "try again". rustpush's own text for this
+                // condition (error.rs:38) warns that "trying to reconfigure or
+                // re-install to 'fix' the rate limit will result in being temporarily
+                // blocked" — retrying is the one action that makes it worse, so the
+                // copy steers away from it rather than inviting it.
+                //
+                // Deliberately omits Apple's apple.co/IMFT-mac escalation. rustpush
+                // pairs that link with "Do not mention you are using OpenBubbles";
+                // routing paying customers to Apple support with an instruction to
+                // conceal what they are running is not something we should build into
+                // a product flow, and at fleet scale it draws attention to every
+                // handset rather than resolving one. Keep it as an internal support
+                // option, not app copy.
+                "Apple hasn't activated iMessage on this device yet. Other devices aren't " +
+                    "affected, and this usually clears on its own. " +
+                    "Please wait a bit and try again. For assistance contact support@dumb.co"
             lower.contains("(6001)") ->
                 "iMessage can't register while Advanced Data Protection or Contact Key Verification " +
                     "is on. Turn both off in your Apple Account settings, then try again."
