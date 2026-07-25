@@ -580,6 +580,26 @@ object SmartTxtRepository {
                     Thread {
                         runCatching {
                             if (!nativeClientReady()) {
+                                // COOLDOWN. onAvailable fires on every default-network
+                                // change, so a handset flapping between WiFi and cellular
+                                // with a dead client would drive an unbounded reconnect
+                                // loop — each pass tearing down and rebuilding the APS
+                                // connection, which resets rustpush's backoff. rustpush
+                                // already retries on its own schedule; this callback
+                                // exists only to SHORTEN the wait when the network
+                                // genuinely returns, not to replace the retry.
+                                val now = android.os.SystemClock.elapsedRealtime()
+                                val prev = lastNetworkReconnectMs.get()
+                                if (prev != 0L && now - prev < NETWORK_RECONNECT_COOLDOWN_MS) {
+                                    Log.i(
+                                        TAG,
+                                        "network available, but a reconnect ran " +
+                                            "${(now - prev) / 1000}s ago — skipping " +
+                                            "(rustpush is still retrying on its own)",
+                                    )
+                                    return@runCatching
+                                }
+                                lastNetworkReconnectMs.set(now)
                                 Log.w(TAG, "network available and client is DOWN — reconnecting")
                                 appendConnectLog(appContext, "network available, client down → reconnect")
                                 ensureClientUp(appContext)
@@ -730,35 +750,133 @@ object SmartTxtRepository {
      * Blocking; callers must be off the main thread.
      */
     fun fixConnection(context: Context): FixOutcome {
-        var last: RegistrationResult.Failure? = null
-        repeat(FIX_ATTEMPTS) { attempt ->
-            when (val r = runCatching { fixConnectionBlocking(context) }.getOrElse {
-                RegistrationResult.Failure(it.message ?: "unknown error")
-            }) {
-                is RegistrationResult.Success -> return FixOutcome.Recovered
-                is RegistrationResult.Failure -> {
-                    // Terminal causes can't be retried away — more attempts would
-                    // just hammer Apple for nothing.
-                    if (isTerminalFailure(r.message)) return FixOutcome.NeedsUser(r.message)
-                    last = r
-                    Log.w(TAG, "fixConnection attempt ${attempt + 1}/$FIX_ATTEMPTS failed: ${r.message}")
-                    if (attempt < FIX_ATTEMPTS - 1) {
-                        runCatching { Thread.sleep(FIX_BACKOFF_MS * (attempt + 1)) }
-                    }
-                }
+        val appContext = context.applicationContext
+        if (!SmartTxtAccountStore(appContext).isRegistered()) {
+            return FixOutcome.NeedsUser(NOT_SIGNED_IN_MESSAGE)
+        }
+
+        // PHASE 1 — the LOCAL half, retried.
+        //
+        // Bringing the native runtime and the client back up fails transiently while
+        // the network is still coming up, and retrying it costs Apple nothing beyond
+        // the APNs connect rustpush would make on its own.
+        var lastLocal: String? = null
+        var clientUp = false
+        for (attempt in 0 until FIX_ATTEMPTS) {
+            val err = runCatching { prepareClient(appContext) }
+                .getOrElse { it.message ?: "unknown error" }
+            if (err == null) {
+                clientUp = true
+                break
+            }
+            if (isTerminalFailure(err)) return FixOutcome.NeedsUser(err)
+            lastLocal = err
+            Log.w(TAG, "fixConnection: client rebuild ${attempt + 1}/$FIX_ATTEMPTS failed: $err")
+            if (attempt < FIX_ATTEMPTS - 1) {
+                runCatching { Thread.sleep(FIX_BACKOFF_MS * (attempt + 1)) }
             }
         }
-        // Exhausted retries on a transient fault. Keep it out of the user's face —
-        // the 12h renewal worker and the next-launch heal will pick it up.
-        Log.w(TAG, "fixConnection exhausted retries, leaving it to the background: ${last?.message}")
-        return FixOutcome.RetryingInBackground
+        if (!clientUp) {
+            Log.w(TAG, "fixConnection: client would not come up ($lastLocal) — leaving it to rustpush")
+            return FixOutcome.RetryingInBackground
+        }
+
+        // PHASE 2 — the APPLE-FACING half, exactly ONCE.
+        //
+        // This used to sit inside the retry loop above, so a failing fix sent THREE
+        // re-registrations at t=0, +4s, +12s. Worse than it sounds: each one calls
+        // refresh_now(), which fires rustpush's retry_now_signal and wakes the
+        // ResourceManager out of its sleep, so the 5-minute floor rustpush would
+        // otherwise impose never applied. On an account that is already rate-limited
+        // that is the worst available response — and it is the one case where Smart
+        // Txt hit Apple HARDER than OpenBubbles, which sends exactly one (doReregister
+        // -> a single refresh_now, guarded by a busy flag).
+        //
+        // One attempt. If it fails, rustpush owns the retry: 5 minutes to 24 hours,
+        // unlimited attempts, already running.
+        val r = runCatching { reregisterOnce(appContext) }.getOrElse {
+            RegistrationResult.Failure(it.message ?: "unknown error")
+        }
+        return when (r) {
+            is RegistrationResult.Success -> FixOutcome.Recovered
+            is RegistrationResult.Failure ->
+                if (isTerminalFailure(r.message)) {
+                    FixOutcome.NeedsUser(r.message)
+                } else {
+                    Log.w(
+                        TAG,
+                        "fixConnection: re-register failed (${r.message}) — NOT retrying. " +
+                            "rustpush owns the backoff from here (5min→24h, unlimited).",
+                    )
+                    FixOutcome.RetryingInBackground
+                }
+        }
+    }
+
+    /** PHASE 1 of a fix: get the native runtime and a live client back up. Local work
+     *  only, so it is safe to retry. Returns null on success, else the failure text. */
+    private fun prepareClient(appContext: Context): String? = synchronized(healLock) {
+        when {
+            !ensureNativeInit(appContext) -> initFailureMessage()
+            !doEnsureClientUp(appContext) -> RECONNECT_FAILED_MESSAGE
+            else -> null
+        }
+    }
+
+    /** PHASE 2 of a fix: the Apple-facing half. Sends exactly ONE re-registration.
+     *  Never call this in a loop — see the note in [fixConnection]. */
+    private fun reregisterOnce(appContext: Context): RegistrationResult = synchronized(healLock) {
+        val store = SmartTxtAccountStore(appContext)
+        when (val r = runBlocking { bridge().reregister() }) {
+            is RustPushBridge.ReregisterResult.Success -> {
+                val account = store.loadAccount()
+                if (account == null) {
+                    RegistrationResult.Failure(NOT_SIGNED_IN_MESSAGE)
+                } else {
+                    val updated = account.copy(
+                        lastRegisteredMs = System.currentTimeMillis(),
+                        handles = r.handles.ifEmpty { account.handles },
+                    )
+                    store.saveAccount(updated)
+                    store.markRegistered(updated.lastRegisteredMs)
+                    _status.value = SmartTxtStatus.REGISTERED
+                    Log.i(TAG, "fixConnection: recovered")
+                    RegistrationResult.Success(updated)
+                }
+            }
+            is RustPushBridge.ReregisterResult.Failure -> {
+                Log.w(TAG, "fixConnection: re-register failed: ${r.message}")
+                RegistrationResult.Failure(r.message)
+            }
+        }
     }
 
     /** Failures no amount of retrying will fix — they need the user to do something. */
-    private fun isTerminalFailure(message: String): Boolean =
-        message == NOT_SIGNED_IN_MESSAGE ||
+    private fun isTerminalFailure(message: String): Boolean {
+        if (message == NOT_SIGNED_IN_MESSAGE ||
             message == NATIVE_MISSING_MESSAGE ||
             message == IDENTITY_MISSING_MESSAGE
+        ) {
+            return true
+        }
+        // The three above are LOCAL conditions. Everything Apple said used to fall
+        // through here as "transient" and get retried, which is exactly backwards for
+        // the replies that matter most. rustpush's own rate-limit text (error.rs:38)
+        // says it outright: "trying to reconfigure or re-install to 'fix' the rate
+        // limit will result in being temporarily blocked from iMessage." Retrying
+        // converts a soft limit into a hard one. A 6005 is marked DoNotRetry upstream
+        // and cannot be retried away either.
+        //
+        // Matched on rustpush's `#[error(...)]` Display text, because a String is all
+        // that survives the JNI boundary.
+        val m = message.lowercase()
+        return m.contains("do not retry") ||             // PushError::DoNotRetry
+            m.contains("rate-limited") ||                // error.rs:38
+            m.contains("temporarily disabled") ||        // error.rs:51 - iMessage access pulled
+            m.contains("trusted phone number") ||        // error.rs:65 - needs the user
+            m.contains("failed to authenticate") ||      // error.rs:63 - needs the user
+            (m.contains("registration error") && m.contains("6005"))
+    }
 
     fun fixConnectionBlocking(context: Context): RegistrationResult = synchronized(healLock) {
         doFixConnection(context)
@@ -769,40 +887,11 @@ object SmartTxtRepository {
         val store = SmartTxtAccountStore(appContext)
         if (!store.isRegistered()) return RegistrationResult.Failure(NOT_SIGNED_IN_MESSAGE)
 
-        // 1. The native runtime has to be up before anything else can work.
-        if (!ensureNativeInit(appContext)) return RegistrationResult.Failure(initFailureMessage())
-
-        // 2. Rebuild the client if it isn't live.
-        //    This used to guard on nativeIsConnected(), which was wrong in the one
-        //    state that matters: that flag is set when the APNs socket opens, BEFORE
-        //    the client is built, so it reads true when the client is dead — the
-        //    reconnect was skipped and we fell straight through to a reregister that
-        //    fails on `client == None`. ensureClientUp asks whether the CLIENT exists
-        //    and tears the connection down first so the rebuild actually happens.
-        if (!ensureClientUp(appContext)) {
-            return RegistrationResult.Failure(RECONNECT_FAILED_MESSAGE)
-        }
-
-        // 3. Now that a client exists, force the re-registration.
-        return when (val r = runBlocking { bridge().reregister() }) {
-            is RustPushBridge.ReregisterResult.Success -> {
-                val account = store.loadAccount()
-                    ?: return RegistrationResult.Failure(NOT_SIGNED_IN_MESSAGE)
-                val updated = account.copy(
-                    lastRegisteredMs = System.currentTimeMillis(),
-                    handles = r.handles.ifEmpty { account.handles },
-                )
-                store.saveAccount(updated)
-                store.markRegistered(updated.lastRegisteredMs)
-                _status.value = SmartTxtStatus.REGISTERED
-                Log.i(TAG, "fixConnection: recovered")
-                RegistrationResult.Success(updated)
-            }
-            is RustPushBridge.ReregisterResult.Failure -> {
-                Log.w(TAG, "fixConnection: re-register failed: ${r.message}")
-                RegistrationResult.Failure(r.message)
-            }
-        }
+        // The two phases, once each. [fixConnection] is the entry point the UI uses
+        // and it retries phase 1 only; this variant keeps the original single-shot
+        // semantics for any caller that wants the raw result.
+        prepareClient(appContext)?.let { return RegistrationResult.Failure(it) }
+        return reregisterOnce(appContext)
     }
 
     @Synchronized
@@ -847,6 +936,9 @@ object SmartTxtRepository {
      *  overlapping attempts are exactly what we must not do. */
     private val healing = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    /** Last network-triggered reconnect, for the [NETWORK_RECONNECT_COOLDOWN_MS] guard. */
+    private val lastNetworkReconnectMs = java.util.concurrent.atomic.AtomicLong(0L)
+
     /** Serialises [fixConnectionBlocking] without taking the object monitor — the
      *  other @Synchronized members (create/transport/bridge/shutdown) share that
      *  monitor, and this call blocks for ~30s, so holding it would stall them. */
@@ -864,6 +956,13 @@ object SmartTxtRepository {
     /** Transient-failure retries inside one heal attempt. Covers the common case —
      *  a flaky NAC/anisette call or a dropped connection — without ever surfacing
      *  anything to the user. */
+    /** Minimum gap between network-triggered reconnects. rustpush's APS resource
+     *  retries on its own (capped at 30s), so this only needs to be short enough to
+     *  feel responsive when the network really comes back. */
+    private const val NETWORK_RECONNECT_COOLDOWN_MS = 60_000L
+
+    /** Attempts for the LOCAL half of a fix only (native init + client rebuild).
+     *  The Apple-facing re-registration is sent exactly once — see [fixConnection]. */
     private const val FIX_ATTEMPTS = 3
     private const val FIX_BACKOFF_MS = 4_000L
 
