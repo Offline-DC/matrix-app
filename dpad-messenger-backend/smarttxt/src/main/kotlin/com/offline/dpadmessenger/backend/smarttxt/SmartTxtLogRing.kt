@@ -40,10 +40,10 @@ import java.util.TimeZone
  *
  *   smarttxt-logs/
  *     current.log                   <- actively being written
- *     segment-YYYYmmdd-HHMMSS.log    (the one rotated segment we keep)
+ *     segment-YYYYmmdd-HHMMSS.log    (up to [KEEP_SEGMENTS] rotated segments)
  *
  * The window is bounded to ~[MAX_TOTAL_BYTES]: `current.log` is capped at
- * [SEGMENT_BYTES], and on rotate we keep only the single newest segment and
+ * [SEGMENT_BYTES], and on rotate we keep the [KEEP_SEGMENTS] newest segments and
  * delete the rest. Plain text (no gzip) so the export is directly readable; the
  * export zip compresses it for transport anyway.
  *
@@ -57,10 +57,21 @@ internal object SmartTxtLogRing {
 
     private const val TAG = "IMsgLogRing"
 
-    /** Rotate current.log at this size. Two of these (current + one kept
-     *  segment) is the ~5 MB rolling window the export ships. */
+    /** Rotate current.log at this size. Kept deliberately SMALL relative to the
+     *  total budget: the window a user actually holds when they hit Export ranges
+     *  from [KEEP_SEGMENTS] x [SEGMENT_BYTES] (just after a rotate, when current.log
+     *  is nearly empty) up to the full [MAX_TOTAL_BYTES]. More, smaller segments
+     *  tighten that floor - one 5 MB segment would guarantee only 5 MB of history,
+     *  whereas three 2.5 MB segments guarantee 7.5 MB for the same 10 MB ceiling. */
     private const val SEGMENT_BYTES = 2_500_000L
-    private const val MAX_TOTAL_BYTES = 2L * SEGMENT_BYTES
+
+    /** Rotated segments kept alongside current.log. Raised from 1 to widen the
+     *  window without making individual files unwieldy: at roughly 2.6 KB/minute
+     *  under active messaging this covers ~48-64 hours, i.e. a whole weekend, which
+     *  is what makes a Monday export useful for measuring cold-start behaviour. */
+    private const val KEEP_SEGMENTS = 3
+
+    private const val MAX_TOTAL_BYTES = (KEEP_SEGMENTS + 1L) * SEGMENT_BYTES
 
     private const val DIRNAME = "smarttxt-logs"
     private const val CURRENT_FILENAME = "current.log"
@@ -242,12 +253,12 @@ internal object SmartTxtLogRing {
         currentWriter = OutputStreamWriter(FileOutputStream(fresh, /* append = */ true))
     }
 
-    /** Keep only the newest segment so the whole ring stays ~[MAX_TOTAL_BYTES]. */
+    /** Keep the [KEEP_SEGMENTS] newest segments so the ring stays ~[MAX_TOTAL_BYTES]. */
     private fun enforceRetention(d: File) {
         val newestFirst = d.listFiles { file ->
             file.isFile && file.name.startsWith(SEGMENT_PREFIX)
         }?.sortedByDescending { it.lastModified() } ?: return
-        newestFirst.drop(1).forEach { runCatching { it.delete() } }
+        newestFirst.drop(KEEP_SEGMENTS).forEach { runCatching { it.delete() } }
         // Safety net: if a single kept segment is somehow huge, trim to budget.
         var total = d.listFiles()?.sumOf { it.length() } ?: 0L
         if (total <= MAX_TOTAL_BYTES) return

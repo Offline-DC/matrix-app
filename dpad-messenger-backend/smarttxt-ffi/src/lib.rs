@@ -50,8 +50,39 @@ use rustpush::{
     APSState, AppleAccount, Attachment, AttachmentType, ConversationData, IDSNGMIdentity, IDSUser, IMClient,
     IndexedMessagePart, LoginDelegate, LoginState, MMCSFile, Message, MessageInst, MessagePart,
     MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType, Reaction,
-    VerifyBody, AuthenticationFSAResponse, MADRID_SERVICE, ResourceState
+    VerifyBody, AuthenticationFSAResponse, MADRID_SERVICE, ResourceState, IDSService
 };
+use rustpush::facetime::{FACETIME_SERVICE, VIDEO_SERVICE};
+use rustpush::findmy::MULTIPLEX_SERVICE;
+
+/// The IDS services this device registers for.
+///
+/// MUST stay identical to OpenBubbles (`rust/src/api/api.rs:863` and `:457`). This
+/// slice is serialised one-to-one into the `services` array of the `id-register`
+/// body (rustpush `ids/user.rs`: `("services", Value::Array(services))`), so this
+/// list is literally what Apple receives.
+///
+/// Smart Txt previously registered ONLY madrid. That made a device declaring
+/// `device_class: "MacOS"` register iMessage but never FaceTime or Find My - a
+/// shape no real Mac produces. It repeated on every automatic re-registration
+/// (the slice is stored on IdentityResource and reused by `generate`), and for a
+/// user migrating from OpenBubbles the first re-registration visibly STRIPPED
+/// three services off an identity Apple had already seen carrying four.
+///
+/// Known asymmetry, deliberate: we register these but do NOT subscribe to their
+/// APNs topics - `IMClient` asks only for
+/// `["com.apple.private.alloy.sms", "com.apple.madrid"]`
+/// (rustpush `imessage/aps_client.rs:125`). So the device is advertised as a
+/// FaceTime / Find My endpoint that never answers. That is indistinguishable from
+/// a Mac which is asleep or offline, so it should be inert - but note OpenBubbles
+/// registers the same four AND answers on them, because it builds FTClient and
+/// FindMyClient. We deliberately do not.
+const IDS_SERVICES: &[&IDSService] = &[
+    &MADRID_SERVICE,    // com.apple.madrid - iMessage. The only one we service.
+    &MULTIPLEX_SERVICE, // com.apple.private.alloy.multiplex1 - Find My
+    &FACETIME_SERVICE,  // com.apple.private.alloy.facetime.multi
+    &VIDEO_SERVICE,     // com.apple.ess - FaceTime video / lp / mw
+];
 // The remote NAC path. Lives HERE, not in rustpush: decoding the `dumb` hardware
 // file and minting a client UDID are app concerns — OpenBubbles does both in its own
 // FFI layer and never asks rustpush to parse a hardware file. Keeping it here also
@@ -1821,11 +1852,60 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     log::info!("nativeRegister: begin (IDS auth + activation; validation data comes from the NAC server)");
 
     let result = block_on_timeout(120, "Registration timed out — anisette/Apple/NAC server didn't respond", async move {
-        // iMessage is IDS-only. Requesting MobileMe triggers ICLOUD_UNSUPPORTED_DEVICE.
-        log::info!("nativeRegister: [1/3] login_apple_delegates (IDS)…");
-        let delegates = login_apple_delegates(&account, None, os_config.as_ref(), &[LoginDelegate::IDS])
+        // OpenBubbles emits a liveness/postdata beacon after login and BEFORE asking
+        // for delegates (api.rs:2178; again on restore at :677). Smart Txt never sent
+        // it at all, so every Smart Txt account signed in without a beacon that every
+        // OpenBubbles account emits. Non-fatal: OB ignores the failure on its restore
+        // path (`let _ = ...`), and a missing beacon must never block registration.
+        let mut account = account;
+        match account
+            .update_postdata("Apple Device", None, &["icloud", "imessage", "facetime"])
             .await
-            .map_err(|e| format!("login_apple_delegates: {e}"))?;
+        {
+            Ok(_) => log::info!(
+                "OB_PARITY postdata: update_postdata sent (icloud, imessage, facetime) ✅ \
+                 — matches OpenBubbles api.rs:2178"
+            ),
+            Err(e) => log::warn!(
+                "OB_PARITY postdata: update_postdata FAILED ({e}) — continuing, not fatal"
+            ),
+        }
+
+        // OpenBubbles requests BOTH delegates (api.rs:2189/:2191). Match it.
+        //
+        // The comment that used to sit here said "iMessage is IDS-only. Requesting
+        // MobileMe triggers ICLOUD_UNSUPPORTED_DEVICE." That may well have been true
+        // when this device was sending the WRONG ROM (dumb field 2, io_mac_address,
+        // instead of field 11) — Apple was being shown hardware that did not add up.
+        // OpenBubbles gets MobileMe accepted on a byte-identical OSConfig. So: try
+        // both, fall back to IDS-only rather than break sign-in, and log which path
+        // was taken so an exported bundle answers the question instead of us guessing.
+        log::info!("nativeRegister: [1/3] login_apple_delegates (IDS + MobileMe, as OpenBubbles does)…");
+        let delegates = match login_apple_delegates(
+            &account,
+            None,
+            os_config.as_ref(),
+            &[LoginDelegate::IDS, LoginDelegate::MobileMe],
+        )
+        .await
+        {
+            Ok(d) => {
+                log::info!(
+                    "OB_PARITY delegates: [IDS, MobileMe] ACCEPTED ✅ — matches OpenBubbles api.rs:2191"
+                );
+                d
+            }
+            Err(e) => {
+                log::warn!(
+                    "OB_PARITY delegates: MobileMe REFUSED ({e}) — falling back to IDS-only. \
+                     This DIVERGES from OpenBubbles. If you see this line, the old \
+                     ICLOUD_UNSUPPORTED_DEVICE comment was right and the ROM was not the cause."
+                );
+                login_apple_delegates(&account, None, os_config.as_ref(), &[LoginDelegate::IDS])
+                    .await
+                    .map_err(|e| format!("login_apple_delegates: {e}"))?
+            }
+        };
         let ids = delegates.ids.ok_or_else(|| "no IDS delegate".to_string())?;
         log::info!("nativeRegister: [2/3] authenticate_apple…");
         let user = authenticate_apple(ids, os_config.as_ref())
@@ -1839,7 +1919,13 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         // human 6001/6004/6005/6009 text; RateLimit / CustomerMessage likewise put
         // their message in Display. `{e:?}` would reduce all of that to
         // `RegisterFailed(IDSError(6005))`.
-        register(os_config.as_ref(), &*connection.state.read().await, &[&MADRID_SERVICE], &mut users, &identity)
+        log::info!(
+            "OB_PARITY services: registering {} IDS service(s) = \
+             [madrid, multiplex/findmy, facetime, ess/video] — matches OpenBubbles api.rs:863 \
+             (this was madrid-only before, which no real Mac does)",
+            IDS_SERVICES.len()
+        );
+        register(os_config.as_ref(), &*connection.state.read().await, IDS_SERVICES, &mut users, &identity)
             .await
             .map_err(|e| format!("register: {e}"))?;
         log::info!("nativeRegister: ✅ registered {} user(s)", users.len());
@@ -2213,11 +2299,19 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
     let os_config = os_config.ok_or("no os_config")?;
     let connection = connection.ok_or("no connection")?;
 
+    // Same list as nativeRegister: IdentityResource stores this slice and reuses it
+    // for every automatic re-registration, so a mismatch here would quietly undo the
+    // parity fix ~45 days later.
+    log::info!(
+        "OB_PARITY services: IMClient carries {} IDS service(s) — automatic re-registration \
+         will send the same list OpenBubbles sends",
+        IDS_SERVICES.len()
+    );
     let client = IMClient::new(
         connection.clone(),
         users,
         identity,
-        &[&MADRID_SERVICE],
+        IDS_SERVICES,
         Path::new(&dir).join("id_cache.plist"),
         os_config.clone(),
         Box::new(|_updated| {}),
