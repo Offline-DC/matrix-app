@@ -530,11 +530,14 @@ fun SmartTxtSetupScreen(
                 // authenticated phone) and show it; the user types it into the
                 // web/desktop FSA client. Nobody who only knows the phone number
                 // can produce this code.
+                val fsaSender = com.offline.dpadmessenger.backend.smarttxt.SmartTxtConfig.fsaChallengeSender
+                val companionLinked = remember { fsaSender?.isCompanionLinked() ?: false }
                 var webCode by remember { mutableStateOf<String?>(null) }
-                DisposableEffect(Unit) {
-                    val sender = com.offline.dpadmessenger.backend.smarttxt.SmartTxtConfig.fsaChallengeSender
-                    sender?.requestWebCode { code -> webCode = code }
-                    onDispose { sender?.stopWebCode() }
+                if (companionLinked) {
+                    DisposableEffect(Unit) {
+                        fsaSender?.requestWebCode { code -> webCode = code }
+                        onDispose { fsaSender?.stopWebCode() }
+                    }
                 }
                 Column(
                     modifier = Modifier
@@ -544,17 +547,31 @@ fun SmartTxtSetupScreen(
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     Text("Approve with your security key", style = MaterialTheme.typography.headlineSmall)
-                    Text(
-                        "Download desktop app from dumb.co/fsa " +
-                            "and enter this code:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        textAlign = TextAlign.Center,
-                    )
-                    Text(
-                        webCode ?: "Getting your code…",
-                        style = MaterialTheme.typography.headlineSmall,
-                    )
-                    CircularProgressIndicator()
+                    if (companionLinked) {
+                        Text(
+                            "Download desktop app from dumb.co/fsa " +
+                                "and enter this code:",
+                            style = MaterialTheme.typography.bodyMedium,
+                            textAlign = TextAlign.Center,
+                        )
+                        Text(
+                            webCode ?: "Getting your code…",
+                            style = MaterialTheme.typography.headlineSmall,
+                        )
+                        CircularProgressIndicator()
+                    } else {
+                        // No companion phone is linked, so the relay that delivers
+                        // the security-key challenge (and mints the desktop code)
+                        // can never connect. Point the user at the exact place to
+                        // link a device instead of spinning on "Getting your code…".
+                        Text(
+                            "No companion phone is linked yet. Open All Apps, choose " +
+                                "\"device setup\" to link your smartphone, then try " +
+                                "signing in again to approve with your security key.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                     DpadButton(
                         text = "Back",
                         onClick = {
