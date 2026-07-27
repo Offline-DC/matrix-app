@@ -565,7 +565,7 @@ fun SmartTxtSetupScreen(
                         // can never connect. Point the user at the exact place to
                         // link a device instead of spinning on "Getting your code…".
                         Text(
-                            "No companion phone is linked yet. Open All Apps, choose " +
+                            "Smartphone pairing is required to use your security key. Open All Apps, choose " +
                                 "\"device setup\" to link your smartphone, then try " +
                                 "signing in again to approve with your security key.",
                             style = MaterialTheme.typography.bodyMedium,
