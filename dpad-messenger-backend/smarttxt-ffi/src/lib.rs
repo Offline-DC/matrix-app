@@ -173,8 +173,9 @@ struct AppState {
 
     connected: bool,
     receive_started: bool,
-    /// Relay-wire-shaped event JSON objects waiting for `nativePollEvents`.
-    inbound: VecDeque<serde_json::Value>,
+    /// Relay-wire-shaped event JSON objects waiting for `nativePollEvents`, behind a
+    /// bounded queue that also tallies the burst (see [`mod@inbound`]).
+    inbound: inbound::InboundQueue,
     /// Received attachments, keyed by the guid we hand Kotlin ("<msgid>:<idx>").
     /// `nativeDownloadAttachment` looks the rustpush `Attachment` back up here and
     /// streams it from MMCS (or returns the inline bytes) on demand.
@@ -217,7 +218,7 @@ impl AppState {
     /// adapter so every producer goes through one bounded path instead of calling
     /// `inbound.push_back` directly.
     fn queue_event(&mut self, event: serde_json::Value) {
-        inbound::queue_event(&mut self.inbound, &mut self.seen_guids, event);
+        self.inbound.queue(&mut self.seen_guids, event);
     }
 }
 
@@ -3523,8 +3524,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     // next poll. See POLL_BATCH_MAX for why draining everything at once was the main
     // cause of the catch-up freeze. The transport loops immediately while batches come
     // back full (see NativeRustPushTransport.startPolling), so this costs no throughput.
-    let drained: Vec<serde_json::Value> =
-        inbound::drain_batch(&mut st().inbound, inbound::POLL_BATCH_MAX);
+    let drained: Vec<serde_json::Value> = st().inbound.drain_batch(inbound::POLL_BATCH_MAX);
     out(&mut env, serde_json::to_string(&drained).unwrap_or_else(|_| "[]".into()))
 }
 

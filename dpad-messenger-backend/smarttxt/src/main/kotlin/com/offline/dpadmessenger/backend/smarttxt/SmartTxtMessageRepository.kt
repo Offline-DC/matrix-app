@@ -162,16 +162,29 @@ internal class SmartTxtMessageRepository(
     /** Enter/leave the coalescing mode. On leaving, flush whatever was held back. */
     private fun onCatchUpChanged(active: Boolean) {
         if (saveCoalescer.catchUpActive == active) return
-        Log.i(TAG, "catch-up ${if (active) "started — coalescing saves" else "finished — flushing"}")
         _isCatchingUp.value = active
-        if (saveCoalescer.onCatchUpChanged(active, System.currentTimeMillis())) {
-            saveRequests.trySend(Unit)
+        val flush = saveCoalescer.onCatchUpChanged(active, System.currentTimeMillis())
+        if (flush) saveRequests.trySend(Unit)
+        if (active) {
+            Log.i(
+                TAG,
+                "CATCHUP repo: start rooms=${rooms.value.size} " +
+                    "messages=${messagesByRoom.value.values.sumOf { it.size }} — coalescing saves",
+            )
+            return
         }
-        if (!active) {
-            // Held back for the same reason: reresolveNames takes the write lock and
-            // walks every room, which would contend with the ingest for the whole drain.
-            maybeHealContactsLater()
-        }
+        // The counterpart line. `savesWithheld` far exceeding `savesWritten` is the
+        // evidence that the coalescing engaged; the two being equal means it didn't.
+        Log.i(
+            TAG,
+            "CATCHUP repo: done rooms=${rooms.value.size} " +
+                "messages=${messagesByRoom.value.values.sumOf { it.size }} " +
+                "savesWithheld=${saveCoalescer.lastWithheld} " +
+                "savesWritten=${saveCoalescer.lastWritten} flushedOnExit=$flush",
+        )
+        // Held back for the same reason: reresolveNames takes the write lock and walks
+        // every room, which would contend with the ingest for the whole drain.
+        maybeHealContactsLater()
     }
 
     // Debounced address-book refresh. The contacts provider fires several change

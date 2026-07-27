@@ -138,7 +138,73 @@ internal object SmartTxtLogExporter {
             append("android=").append(Build.VERSION.RELEASE)
                 .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n")
             append("capturedAtMs=").append(System.currentTimeMillis()).append('\n')
+            appendMemoryContext(context)
+            appendLogVolume()
+            appendReadingGuide()
         }
+    }
+
+    /**
+     * The headroom the app was working inside. Every conclusion drawn from a `CATCHUP`
+     * line is relative to these: a 40 MB peak is comfortable on one device and fatal on
+     * another, and `lowRamDevice=true` plus a small `memoryClassMb` is the profile where
+     * the low-memory killer takes the foreground app rather than a background one.
+     */
+    private fun StringBuilder.appendMemoryContext(context: Context) {
+        try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            append("memoryClassMb=").append(am.memoryClass).append('\n')
+            append("largeMemoryClassMb=").append(am.largeMemoryClass).append('\n')
+            append("lowRamDevice=").append(am.isLowRamDevice).append('\n')
+            val mi = android.app.ActivityManager.MemoryInfo()
+            am.getMemoryInfo(mi)
+            append("deviceTotalMemMb=").append(mi.totalMem / (1024 * 1024)).append('\n')
+            append("deviceAvailMemMb=").append(mi.availMem / (1024 * 1024)).append('\n')
+            append("deviceLowMemory=").append(mi.lowMemory).append('\n')
+        } catch (_: Throwable) {
+            append("memoryContext=unavailable\n")
+        }
+        val rt = Runtime.getRuntime()
+        append("heapUsedKbAtExport=").append((rt.totalMemory() - rt.freeMemory()) / 1024).append('\n')
+        append("heapLimitKb=").append(rt.maxMemory() / 1024).append('\n')
+    }
+
+    /**
+     * Evidence for the log-flood fix specifically. The rustpush mutex/APNs streams were
+     * always dropped by the ring, so they never appeared in the log text — meaning the
+     * text alone cannot show whether they were still being *produced*. This ratio can:
+     * after the source-level filter in smarttxt-ffi's init_logger, `droppedNoiseLines`
+     * should be a rounding error next to `keptLines`. A bundle where it still dominates
+     * is running a `.so` that predates the fix.
+     */
+    private fun StringBuilder.appendLogVolume() {
+        try {
+            val (kept, droppedNoise, bytes) = SmartTxtLogRing.volumeStats()
+            append("logKeptLines=").append(kept).append('\n')
+            append("logDroppedNoiseLines=").append(droppedNoise).append('\n')
+            append("logBytesWritten=").append(bytes).append('\n')
+            val total = kept + droppedNoise
+            append("logNoisePct=").append(if (total > 0) droppedNoise * 100 / total else 0).append('\n')
+        } catch (_: Throwable) {
+            append("logVolume=unavailable\n")
+        }
+    }
+
+    /**
+     * A bundle is usually read by whoever is on support that day, not by whoever wrote
+     * the catch-up path. Six lines of orientation cost nothing and save the reader from
+     * having to know which greps matter.
+     */
+    private fun StringBuilder.appendReadingGuide() {
+        append("\n# reading this bundle\n")
+        append("# grep CATCHUP            — one backlog drain, start to finish\n")
+        append("#   'CATCHUP native:'     — Rust queue: delivered / peakDepth / dropped\n")
+        append("#   'CATCHUP start|done'  — transport: events, duration, heap peak vs limit\n")
+        append("#   'CATCHUP repo:'       — savesWithheld vs savesWritten while draining\n")
+        append("# healthy: dropped=0, peakDepth well under 2000, peakPct well under 100,\n")
+        append("#          savesWithheld >> savesWritten, and the log continues past 'done'\n")
+        append("# a bundle that simply STOPS mid-drain is the old failure: the process was\n")
+        append("#   low-memory-killed, so check the launcher's system logcat for lowmemorykiller\n")
     }
 
     /** Launcher's cached IMEI when present (shared prefs, same package at

@@ -177,6 +177,12 @@ class NativeRustPushTransport(
     private fun startPolling() {
         if (pollJob?.isActive == true) return
         val pacer = CatchUpPacer()
+        // Measures the drain and prints the CATCHUP lines an "export logs" bundle is
+        // read for. Native heap comes from Android's allocator, which the pure
+        // CatchUpStats can't reach on its own.
+        val stats = CatchUpStats(
+            nativeHeapKb = { android.os.Debug.getNativeHeapAllocatedSize() / 1024 },
+        )
         pollJob = scope.launch {
             while (isActive) {
                 var delayMs = POLL_INTERVAL_MS
@@ -184,14 +190,26 @@ class NativeRustPushTransport(
                     val batchSize = parseAndEmit(bridge.pollNativeEvents())
                     val step = pacer.onBatch(batchSize)
                     delayMs = step.delayMs
-                    if (step.catchUpChanged) {
-                        Log.i(TAG, "catch-up ${if (step.catchUpActive) "started" else "finished"}")
-                        _events.emit(TransportEvent.CatchUpChanged(step.catchUpActive))
+                    if (step.catchUpChanged && step.catchUpActive) {
+                        // Sample the heap BEFORE announcing, so the start figure is the
+                        // baseline the peak is measured against.
+                        Log.i(TAG, stats.begin())
+                        _events.emit(TransportEvent.CatchUpChanged(true))
+                    }
+                    if (pacer.catchUpActive) stats.onBatch(batchSize)?.let { Log.i(TAG, it) }
+                    if (step.catchUpChanged && !step.catchUpActive) {
+                        stats.onBatch(batchSize)   // count the tail batch that ended it
+                        Log.i(TAG, stats.finish())
+                        _events.emit(TransportEvent.CatchUpChanged(false))
                     }
                 }.onFailure {
                     Log.w(TAG, "poll parse failed: ${it.message}")
                     // A parse failure tells us nothing about queue depth; fall back to the
                     // idle cadence rather than hot-looping on a payload that keeps failing.
+                    if (pacer.catchUpActive) {
+                        Log.w(TAG, "CATCHUP aborted mid-drain: ${stats.finish()}")
+                        _events.emit(TransportEvent.CatchUpChanged(false))
+                    }
                     pacer.reset()
                 }
                 delay(delayMs)

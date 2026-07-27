@@ -49,6 +49,23 @@ internal class SaveCoalescer(
      *  right after a periodic save does not immediately write again. */
     private var lastSaveMs = 0L
 
+    // ---- counters, for the CATCHUP line in an export-logs bundle -------------
+    // The work this class does is invisible by construction — it is defined by writes
+    // that DIDN'T happen — so the only way a support bundle can show it worked is to
+    // count them. `withheld` far exceeding `written` is the signal that the coalescing
+    // is doing its job; the two being equal means it isn't engaging at all.
+    private var withheldThisCatchUp = 0
+    private var writtenThisCatchUp = 0
+
+    /** Requests suppressed during the catch-up that just ended. */
+    var lastWithheld: Int = 0
+        private set
+
+    /** Whole-store writes that still happened during it (periodic valve + the final
+     *  flush). */
+    var lastWritten: Int = 0
+        private set
+
     /**
      * @return true if the caller should schedule the save now, false if it was withheld
      *  (it will be flushed by [onCatchUpChanged], or by the next request past the
@@ -57,10 +74,12 @@ internal class SaveCoalescer(
     fun onSaveRequested(nowMs: Long): Boolean {
         if (catchUpActive && nowMs - lastSaveMs < catchUpSaveIntervalMs) {
             pending = true
+            withheldThisCatchUp++
             return false
         }
         lastSaveMs = nowMs
         pending = false
+        if (catchUpActive) writtenThisCatchUp++
         return true
     }
 
@@ -71,10 +90,20 @@ internal class SaveCoalescer(
     fun onCatchUpChanged(active: Boolean, nowMs: Long): Boolean {
         if (catchUpActive == active) return false
         catchUpActive = active
-        if (active) return false
-        if (!pending) return false
-        pending = false
-        lastSaveMs = nowMs
-        return true
+        if (active) {
+            withheldThisCatchUp = 0
+            writtenThisCatchUp = 0
+            return false
+        }
+        val flush = pending
+        if (flush) {
+            pending = false
+            lastSaveMs = nowMs
+            writtenThisCatchUp++
+        }
+        // Freeze the tallies for the line the repository logs on the way out.
+        lastWithheld = withheldThisCatchUp
+        lastWritten = writtenThisCatchUp
+        return flush
     }
 }

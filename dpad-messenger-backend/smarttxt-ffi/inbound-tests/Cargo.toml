@@ -19,3 +19,6 @@ publish = false
 
 [dependencies]
 serde_json = "1"
+# The queue logs its burst summary through `log`; the harness needs the facade to
+# compile it, but installs no logger, so the lines are simply discarded here.
+log = "0.4"

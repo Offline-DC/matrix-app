@@ -133,6 +133,62 @@ class SaveCoalescerTest {
         assertTrue(c.onCatchUpChanged(false, 33_000L))
     }
 
+    // ---- the counters an export-logs bundle reports -------------------------
+
+    @Test
+    fun `a real catch-up reports far more withheld than written`() {
+        // This ratio IS the evidence in a support bundle. The coalescing is defined by
+        // writes that didn't happen, so nothing else in the logs can show it engaged.
+        val c = coalescer()
+        c.onCatchUpChanged(true, 0L)
+        repeat(40) { c.onSaveRequested(it * 200L) }   // 8 seconds of drain
+        c.onCatchUpChanged(false, 8_000L)
+        assertEquals(40, c.lastWithheld)
+        assertEquals("only the final flush reached disk", 1, c.lastWritten)
+    }
+
+    @Test
+    fun `a long catch-up counts its periodic writes too`() {
+        val c = coalescer()
+        c.onCatchUpChanged(true, 0L)
+        for (sec in 1..90) c.onSaveRequested(sec * 1_000L)   // 90s, valve fires at 30 and 60
+        c.onCatchUpChanged(false, 90_000L)
+        assertEquals(3, c.lastWritten)          // two valve writes + the exit flush
+        assertEquals(87, c.lastWithheld)
+    }
+
+    @Test
+    fun `counters describe the last catch-up, not every catch-up since launch`() {
+        // The same instance lives for the life of the repository, so a reconnect replay
+        // must report itself rather than the running total.
+        val c = coalescer()
+        c.onCatchUpChanged(true, 0L)
+        repeat(20) { c.onSaveRequested(it * 100L) }
+        c.onCatchUpChanged(false, 5_000L)
+        assertEquals(20, c.lastWithheld)
+
+        c.onCatchUpChanged(true, 100_000L)
+        repeat(3) { c.onSaveRequested(100_100L + it * 100L) }
+        c.onCatchUpChanged(false, 101_000L)
+        // 2 withheld, not 3: the first request lands more than an interval after the
+        // previous catch-up's flush, so the valve lets it through as an early baseline
+        // write. That is the intended behaviour — the guarantee is "at most one write
+        // per interval", not "never write until the end" — and it means a second
+        // catch-up gets something on disk immediately rather than risking the whole
+        // drain on the process surviving to the finish.
+        assertEquals(2, c.lastWithheld)
+        assertEquals(2, c.lastWritten)   // the baseline write + the exit flush
+    }
+
+    @Test
+    fun `a catch-up with nothing to save reports zeroes`() {
+        val c = coalescer()
+        c.onCatchUpChanged(true, 0L)
+        c.onCatchUpChanged(false, 3_000L)
+        assertEquals(0, c.lastWithheld)
+        assertEquals(0, c.lastWritten)
+    }
+
     @Test
     fun `the first request inside a catch-up is withheld even on a fresh clock`() {
         // Guards an off-by-one: lastSaveMs starts at 0, so a session whose first save

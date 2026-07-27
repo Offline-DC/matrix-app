@@ -124,6 +124,27 @@ internal object SmartTxtLogRing {
         // info-level "Reregistering in N seconds", both of which are already captured.
         line.contains("rustpush::util:") || line.contains("rustpush::aps:")
 
+    // ---- volume counters, surfaced in the export bundle's meta.txt ----------
+    //
+    // These exist to make the log-flood fix *measurable*. rustpush's `rustpush::util`
+    // (mutex tracing) and `rustpush::aps` (per-frame APNs) used to be ~95% of all Rust
+    // lines, and this ring threw them away per-line — which kept the window useful but
+    // did nothing about the cost of producing them: a String allocation and a logcat
+    // write each, tens of thousands of them during a catch-up, inside a ~15MB heap.
+    //
+    // They are now filtered at the source, in smarttxt-ffi's init_logger. That change
+    // is invisible in the log text itself (the lines were never in the file either
+    // way), so the only way an exported bundle can show it worked is this ratio:
+    // `droppedNoise` should now be a rounding error next to `kept`, where it used to
+    // dwarf it. If a bundle still shows a large droppedNoise, the .so predates the fix.
+    @Volatile private var keptLines = 0L
+    @Volatile private var droppedNoiseLines = 0L
+    @Volatile private var bytesWritten = 0L
+
+    /** Lines kept, lines dropped as rustpush noise, bytes written — since process start. */
+    fun volumeStats(): Triple<Long, Long, Long> =
+        Triple(keptLines, droppedNoiseLines, bytesWritten)
+
     @Volatile private var started = false
     @Volatile private var stopped = false
     private var thread: Thread? = null
@@ -203,7 +224,11 @@ internal object SmartTxtLogRing {
             while (!stopped) {
                 val line = reader.readLine() ?: break
                 if (resetBackoff) { backoffMs = RESPAWN_INITIAL_MS; resetBackoff = false }
-                if (isNoise(line)) continue   // drop the rustpush::util/aps flood before it fills the ring
+                if (isNoise(line)) {          // drop the rustpush::util/aps flood before it fills the ring
+                    droppedNoiseLines++
+                    continue
+                }
+                keptLines++
                 writeLine(line + "\n")
             }
         }
@@ -233,6 +258,7 @@ internal object SmartTxtLogRing {
         // between reads; logcat is line-buffered upstream so the cost is fine.
         w.flush()
         currentBytes += text.length
+        bytesWritten += text.length
         if (currentBytes >= SEGMENT_BYTES) rotate()
     }
 
