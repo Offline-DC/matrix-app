@@ -1909,41 +1909,28 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             ),
         }
 
-        // OpenBubbles requests BOTH delegates (api.rs:2189/:2191). Match it.
+        // IDS only — a DELIBERATE divergence from OpenBubbles, not an oversight.
         //
-        // The comment that used to sit here said "iMessage is IDS-only. Requesting
-        // MobileMe triggers ICLOUD_UNSUPPORTED_DEVICE." That may well have been true
-        // when this device was sending the WRONG ROM (dumb field 2, io_mac_address,
-        // instead of field 11) — Apple was being shown hardware that did not add up.
-        // OpenBubbles gets MobileMe accepted on a byte-identical OSConfig. So: try
-        // both, fall back to IDS-only rather than break sign-in, and log which path
-        // was taken so an exported bundle answers the question instead of us guessing.
-        log::info!("nativeRegister: [1/3] login_apple_delegates (IDS + MobileMe, as OpenBubbles does)…");
-        let delegates = match login_apple_delegates(
-            &account,
-            None,
-            os_config.as_ref(),
-            &[LoginDelegate::IDS, LoginDelegate::MobileMe],
-        )
-        .await
-        {
-            Ok(d) => {
-                log::info!(
-                    "OB_PARITY delegates: [IDS, MobileMe] ACCEPTED ✅ — matches OpenBubbles api.rs:2191"
-                );
-                d
-            }
-            Err(e) => {
-                log::warn!(
-                    "OB_PARITY delegates: MobileMe REFUSED ({e}) — falling back to IDS-only. \
-                     This DIVERGES from OpenBubbles. If you see this line, the old \
-                     ICLOUD_UNSUPPORTED_DEVICE comment was right and the ROM was not the cause."
-                );
-                login_apple_delegates(&account, None, os_config.as_ref(), &[LoginDelegate::IDS])
-                    .await
-                    .map_err(|e| format!("login_apple_delegates: {e}"))?
-            }
-        };
+        // OpenBubbles requests [IDS, MobileMe] (api.rs:2189/:2191) because it actually
+        // uses the iCloud side: it builds CloudKitClient, KeychainClient, FindMyClient,
+        // SharedStreamClient and the rest. Smart Txt builds none of those — we register
+        // for iMessage and nothing else. Asking Apple for a MobileMe delegate we never
+        // exercise means holding credentials for services this device does not touch,
+        // which is worse than not asking, not better.
+        //
+        // (An older comment here claimed MobileMe triggers ICLOUD_UNSUPPORTED_DEVICE.
+        // That was stale: once X-Apple-I-ROM was corrected to carry dumb field 11, Apple
+        // accepted [IDS, MobileMe] on this device on 25-26 Jul. So the delegate is
+        // available to us — we are choosing not to take it.)
+        log::info!("nativeRegister: [1/3] login_apple_delegates (IDS only — we use no iCloud services)…");
+        let delegates = login_apple_delegates(&account, None, os_config.as_ref(), &[LoginDelegate::IDS])
+            .await
+            .map_err(|e| format!("login_apple_delegates: {e}"))?;
+        log::info!(
+            "OB_PARITY delegates: [IDS] only — deliberate divergence from OpenBubbles' \
+             [IDS, MobileMe]: we build no CloudKit/Keychain/FindMy/SharedStreams clients, \
+             so the MobileMe delegate would be an unused credential."
+        );
         let ids = delegates.ids.ok_or_else(|| "no IDS delegate".to_string())?;
         log::info!("nativeRegister: [2/3] authenticate_apple…");
         let user = authenticate_apple(ids, os_config.as_ref())
