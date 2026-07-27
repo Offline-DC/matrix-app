@@ -35,6 +35,10 @@
 use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
+/// The bounded inbound event queue + its drain policy. Split out so the catch-up
+/// pacing logic is unit-testable without JNI, rustpush or an Android device.
+mod inbound;
+
 use std::io::Cursor;
 use once_cell::sync::OnceCell;
 use sha2::{Digest, Sha256};
@@ -207,6 +211,16 @@ struct AppState {
     seen_guids: std::collections::HashSet<String>,
 }
 
+impl AppState {
+    /// Queue a relay-wire event for `nativePollEvents`, enforcing [`inbound::INBOUND_CAP`].
+    /// The policy (and its unit tests) live in [`mod@inbound`]; this is the AppState
+    /// adapter so every producer goes through one bounded path instead of calling
+    /// `inbound.push_back` directly.
+    fn queue_event(&mut self, event: serde_json::Value) {
+        inbound::queue_event(&mut self.inbound, &mut self.seen_guids, event);
+    }
+}
+
 fn rt() -> &'static Runtime {
     RUNTIME.get_or_init(|| Runtime::new().expect("tokio runtime"))
 }
@@ -265,9 +279,32 @@ fn st() -> MutexGuard<'static, AppState> {
 }
 
 fn init_logger() {
+    // Per-target filter. `rustpush::util` (its mutex acquire/release tracing) and
+    // `rustpush::aps` (per-frame APS chatter) log at INFO on every operation and are
+    // ~95% of the Rust lines on a real capture — see SmartTxtLogRing.isNoise, which
+    // already drops them at capture time on the Kotlin side. Emitting them at all is
+    // what makes catch-up expensive: each line is a fresh String + a logcat write, and
+    // a backlog replay produces tens of thousands of them inside a ~15MB heap, driving
+    // GC churn on a device that is already under memory pressure. Silencing them at
+    // the source (rather than filtering downstream) removes the allocation entirely.
+    //
+    // env_logger's Filter resolves the LONGEST matching directive prefix, so the
+    // catch-all `None => Info` still applies to every other target while these two
+    // are held down to Warn — real problems in them still surface.
+    //
+    // env_logger is already a mandatory (non-optional) dependency of android_logger
+    // 0.13, so naming it directly in Cargo.toml pulls in nothing new.
+    let filter = {
+        let mut b = env_logger::filter::Builder::new();
+        b.filter(None, log::LevelFilter::Info);
+        b.filter(Some("rustpush::util"), log::LevelFilter::Warn);
+        b.filter(Some("rustpush::aps"), log::LevelFilter::Warn);
+        b.build()
+    };
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Info)
+            .with_filter(filter)
             .with_tag("SmartTxtRust"),
     );
     // Install a panic hook ONCE that routes Rust panics through `log` (→ logcat).
@@ -2049,7 +2086,7 @@ fn spawn_regstate_watcher(client: Arc<IMClient>, my_gen: u64) {
         {
             let payload = regstate_payload(&client).await;
             log::info!("REGSTATE(push, initial): {payload}");
-            st().inbound.push_back(serde_json::json!({
+            st().queue_event(serde_json::json!({
                 "type": "registration_state",
                 "state": payload,
             }));
@@ -2063,7 +2100,7 @@ fn spawn_regstate_watcher(client: Arc<IMClient>, my_gen: u64) {
             }
             let payload = regstate_payload(&client).await;
             log::info!("REGSTATE(push): {payload}");
-            st().inbound.push_back(serde_json::json!({
+            st().queue_event(serde_json::json!({
                 "type": "registration_state",
                 "state": payload,
             }));
@@ -2153,7 +2190,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     // warn!, and it says SYNTHETIC, so nobody reading an exported bundle six weeks from
     // now mistakes an injected state for something Apple actually sent.
     log::warn!("REGSTATE(SYNTHETIC - injected by hidden diagnostics, NOT from Apple): {state}");
-    st().inbound.push_back(serde_json::json!({
+    st().queue_event(serde_json::json!({
         "type": "registration_state",
         "state": state,
     }));
@@ -2427,7 +2464,7 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
         SMS_ACTIVE.store(*enabled, Ordering::SeqCst);
         let dir = st().files_dir.clone();
         save_sms_active(&dir, *enabled);
-        st().inbound.push_back(serde_json::json!({ "type": "sms_activation", "enabled": *enabled }));
+        st().queue_event(serde_json::json!({ "type": "sms_activation", "enabled": *enabled }));
         return;
     }
     // Cross-device read sync: Apple tells THIS device that I read a chat on another
@@ -2504,14 +2541,14 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
             // They read what I sent. `guid` is the message read UP TO — Apple reuses
             // the original message's uuid as the receipt's id — so the app flips every
             // outgoing message in the chat up to and including it, not just this one.
-            st().inbound.push_back(serde_json::json!({
+            st().queue_event(serde_json::json!({
                 "type": "message_status",
                 "chatGuid": chat_guid,
                 "guid": read_guid,
                 "status": "read",
             }));
         } else {
-            st().inbound.push_back(serde_json::json!({
+            st().queue_event(serde_json::json!({
                 "type": "chat_read",
                 "chatGuid": chat_guid,
                 "messageGuid": read_guid,
@@ -2588,7 +2625,7 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
             "recv tapback: target={} emoji={emoji} remove={remove} from_me={is_from_me} chat={chat_guid}",
             react.to_uuid
         );
-        st().inbound.push_back(serde_json::json!({
+        st().queue_event(serde_json::json!({
             "type": "tapback",
             "chatGuid": chat_guid,
             "targetGuid": react.to_uuid,
@@ -2805,7 +2842,7 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
                 }
                 evicted.push(key);
             }
-            s.inbound.push_back(event);
+            s.queue_event(event);
             if changed {
                 Some((s.files_dir.clone(), ordered_attachments(&s), evicted))
             } else {
@@ -2915,7 +2952,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
                 let guid = inst.id.clone(); // VERIFY: server guid field name on MessageInst
                 // Optimistic "delivered" so the bubble shows a receipt. Apple's real
                 // delivery receipt arrives later over APNs (via the receive loop).
-                st().inbound.push_back(serde_json::json!({
+                st().queue_event(serde_json::json!({
                     "type": "message_status",
                     "chatGuid": chat,
                     "guid": guid,
@@ -3054,7 +3091,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             Ok(_) => {
                 remember_thread_handle(&chat, &handle);
                 let guid = inst.id.clone();
-                st().inbound.push_back(serde_json::json!({
+                st().queue_event(serde_json::json!({
                     "type": "message_status",
                     "chatGuid": chat,
                     "guid": guid,
@@ -3482,7 +3519,12 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let drained: Vec<serde_json::Value> = st().inbound.drain(..).collect();
+    // Bounded drain — take at most POLL_BATCH_MAX, leaving the rest queued for the
+    // next poll. See POLL_BATCH_MAX for why draining everything at once was the main
+    // cause of the catch-up freeze. The transport loops immediately while batches come
+    // back full (see NativeRustPushTransport.startPolling), so this costs no throughput.
+    let drained: Vec<serde_json::Value> =
+        inbound::drain_batch(&mut st().inbound, inbound::POLL_BATCH_MAX);
     out(&mut env, serde_json::to_string(&drained).unwrap_or_else(|_| "[]".into()))
 }
 

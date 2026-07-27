@@ -165,6 +165,24 @@ sealed class TransportEvent {
     data class MessageStatusBatch(val items: List<MessageStatusChanged>) : TransportEvent()
     data class TapbackBatch(val items: List<TapbackUpdated>) : TransportEvent()
 
+    /**
+     * The transport is (or is no longer) working through a backlog burst — the
+     * replay Apple sends after the phone has been off, arriving as many bounded
+     * batches rather than one huge one.
+     *
+     * The repository uses this to coalesce its expensive per-batch work: a full
+     * cache re-serialize + Keystore-encrypted write costs the same whether one
+     * message changed or a thousand, so doing it on the normal 1.5s debounce for
+     * the whole length of a catch-up is pure waste on a low-RAM device — and it is
+     * exactly the waste that chunked delivery would otherwise introduce. Suppress
+     * while [active] is true, then do it once when it goes false.
+     *
+     * Advisory, never load-bearing: a transport that never emits it (relay, mock)
+     * simply behaves as it always did, and a catch-up that is cut short by the
+     * process dying is re-delivered by the next connect's replay anyway.
+     */
+    data class CatchUpChanged(val active: Boolean) : TransportEvent()
+
     /** Typing indicator toggled in a chat. */
     data class TypingChanged(val chatGuid: String, val typing: Boolean) : TransportEvent()
 

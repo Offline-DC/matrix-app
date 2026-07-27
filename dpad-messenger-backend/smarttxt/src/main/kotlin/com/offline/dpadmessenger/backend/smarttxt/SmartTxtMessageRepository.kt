@@ -25,6 +25,7 @@ import com.offline.dpadmessenger.data.ReadReceiptSettings
 import com.offline.dpadmessenger.data.RetentionSettings
 import com.offline.dpadmessenger.data.Room
 import com.offline.dpadmessenger.data.SmsThreadInfo
+import com.offline.dpadmessenger.data.SyncActivityAware
 import com.offline.dpadmessenger.data.RoomSummary
 import com.offline.dpadmessenger.data.ThreadActions
 import com.offline.dpadmessenger.data.User
@@ -61,7 +62,7 @@ import kotlinx.coroutines.withContext
 internal class SmartTxtMessageRepository(
     private val session: SmartTxtSession,
     context: Context,
-) : MessageRepository, InitialSyncAware, ConversationStarter, GroupConversationStarter,
+) : MessageRepository, InitialSyncAware, SyncActivityAware, ConversationStarter, GroupConversationStarter,
     ContactsSource, MediaDownloader, AttachmentSender, RetentionSettings, ReadReceiptSettings,
     ThreadActions, SmsThreadInfo, AttachmentResendCapable {
 
@@ -125,7 +126,53 @@ internal class SmartTxtMessageRepository(
 
     // Debounced persistence.
     private val saveRequests = Channel<Unit>(Channel.CONFLATED)
-    private fun requestSave() { saveRequests.trySend(Unit) }
+
+    // ---- catch-up coalescing -------------------------------------------------
+    //
+    // A catch-up (the backlog Apple replays after the phone has been off) now arrives
+    // as many bounded batches instead of one huge one — that is what stops the ingest
+    // from spiking the heap hard enough to get the foreground process LMK-killed. But
+    // many batches means many requestSave() calls, and persistToCache is a FULL
+    // re-serialize of every room + message plus a Keystore-encrypted write: its cost
+    // depends on the size of the store, not on how much changed. Left alone, the 1.5s
+    // debounce would fire that repeatedly for the entire length of the catch-up — a
+    // pathological amount of I/O and garbage on exactly the device that can least
+    // afford it.
+    //
+    // So while the transport reports a catch-up in progress we hold saves and the
+    // contact heal, and do each ONCE when it finishes. Skipping a save is safe: nothing
+    // is lost that the next connect's replay would not re-deliver.
+    //
+    // The decision itself is in [SaveCoalescer] — plain, clock-injected state so it can
+    // be unit-tested without an Android device or a real backlog.
+    private val saveCoalescer = SaveCoalescer()
+    private val catchUpActive: Boolean get() = saveCoalescer.catchUpActive
+
+    private val _isCatchingUp = MutableStateFlow(false)
+
+    /** [SyncActivityAware]: drives the small spinner in the room list header, so a
+     *  user looking at a partially-restored list can tell the difference between
+     *  "still coming in" and "this is everything". */
+    override val isCatchingUp: StateFlow<Boolean> = _isCatchingUp
+
+    private fun requestSave() {
+        if (saveCoalescer.onSaveRequested(System.currentTimeMillis())) saveRequests.trySend(Unit)
+    }
+
+    /** Enter/leave the coalescing mode. On leaving, flush whatever was held back. */
+    private fun onCatchUpChanged(active: Boolean) {
+        if (saveCoalescer.catchUpActive == active) return
+        Log.i(TAG, "catch-up ${if (active) "started — coalescing saves" else "finished — flushing"}")
+        _isCatchingUp.value = active
+        if (saveCoalescer.onCatchUpChanged(active, System.currentTimeMillis())) {
+            saveRequests.trySend(Unit)
+        }
+        if (!active) {
+            // Held back for the same reason: reresolveNames takes the write lock and
+            // walks every room, which would contend with the ingest for the whole drain.
+            maybeHealContactsLater()
+        }
+    }
 
     // Debounced address-book refresh. The contacts provider fires several change
     // notifications for a single edit, so coalesce them (CONFLATED + a short settle)
@@ -336,8 +383,11 @@ internal class SmartTxtMessageRepository(
             is TransportEvent.TapbackBatch -> onTapbacks(e.items)
             is TransportEvent.TypingChanged -> { /* no UI slot yet; ignore */ }
             is TransportEvent.ChatRead -> onChatReadElsewhere(e.chatGuid, e.messageGuid)
+            is TransportEvent.CatchUpChanged -> onCatchUpChanged(e.active)
             TransportEvent.Connected -> { Log.i(TAG, "session connected"); _authExpired.value = false }
-            TransportEvent.Disconnected -> Log.i(TAG, "session disconnected")
+            // A drop mid-drain means no "catch-up finished" is coming; leave the
+            // coalescing mode so the pending write isn't held indefinitely.
+            TransportEvent.Disconnected -> { Log.i(TAG, "session disconnected"); onCatchUpChanged(false) }
             TransportEvent.AuthExpired -> { Log.w(TAG, "auth expired"); _authExpired.value = true }
             is TransportEvent.RegistrationFailed -> {
                 Log.w(TAG, "registration failed (needsRelogin=${e.needsRelogin}): ${e.error}")
@@ -1546,6 +1596,10 @@ internal class SmartTxtMessageRepository(
      *  under the caller's write lock. */
     private fun maybeHealContactsLater() {
         if (contactsHealed.get()) return
+        // Deferred until the backlog is drained — [onCatchUpChanged] calls this again.
+        // The heal walks every room under the write lock, so running it mid-drain just
+        // contends with the ingest it is racing.
+        if (catchUpActive) return
         val idx = contactIndexCache ?: return
         if (idx.isEmpty()) return
         if (contactsHealed.compareAndSet(false, true)) scope.launch { reresolveNames(idx) }

@@ -160,21 +160,50 @@ class NativeRustPushTransport(
         scope.coroutineContext[Job]?.cancel()
     }
 
-    /** Drain rustpush's inbound queue and parse the relay-wire JSON into events. */
+    /**
+     * Drain rustpush's inbound queue and parse the relay-wire JSON into events.
+     *
+     * The native side now hands back at most [CatchUpPacer.NATIVE_POLL_BATCH_MAX] events
+     * per call (see `inbound::POLL_BATCH_MAX` in smarttxt-ffi), so a backlog arrives as
+     * many small batches instead of one enormous one. This loop paces itself off that:
+     * while batches come back full there is more waiting natively, so poll again almost
+     * immediately; once a batch comes back short the queue is drained and we settle back
+     * to the normal idle cadence.
+     *
+     * There is deliberately NO idle backoff beyond [POLL_INTERVAL_MS] — a longer idle
+     * gap would add latency to ordinary live messages, which is the common case and the
+     * one the user actually feels.
+     */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
+        val pacer = CatchUpPacer()
         pollJob = scope.launch {
             while (isActive) {
-                runCatching { parseAndEmit(bridge.pollNativeEvents()) }
-                    .onFailure { Log.w(TAG, "poll parse failed: ${it.message}") }
-                delay(POLL_INTERVAL_MS)
+                var delayMs = POLL_INTERVAL_MS
+                runCatching {
+                    val batchSize = parseAndEmit(bridge.pollNativeEvents())
+                    val step = pacer.onBatch(batchSize)
+                    delayMs = step.delayMs
+                    if (step.catchUpChanged) {
+                        Log.i(TAG, "catch-up ${if (step.catchUpActive) "started" else "finished"}")
+                        _events.emit(TransportEvent.CatchUpChanged(step.catchUpActive))
+                    }
+                }.onFailure {
+                    Log.w(TAG, "poll parse failed: ${it.message}")
+                    // A parse failure tells us nothing about queue depth; fall back to the
+                    // idle cadence rather than hot-looping on a payload that keeps failing.
+                    pacer.reset()
+                }
+                delay(delayMs)
             }
         }
     }
 
-    private suspend fun parseAndEmit(arrayJson: String) {
+    /** Parses one poll payload, emits its events, and returns how many events it held —
+     *  the signal [CatchUpPacer] paces on. */
+    private suspend fun parseAndEmit(arrayJson: String): Int {
         val arr = json.parseToJsonElement(arrayJson).jsonArray
-        if (arr.isEmpty()) return
+        if (arr.isEmpty()) return 0
         // Collect the WHOLE poll into per-kind batches, then emit one event per
         // kind — so a bulk catch-up of N messages/tapbacks causes a handful of
         // state updates + recompositions, not N of them (1 GB-device friendly).
@@ -241,12 +270,80 @@ class NativeRustPushTransport(
         // Read-elsewhere last, so a chat that got a new message AND a read in the same
         // batch ends cleared (read wins) rather than re-notified.
         for (read in chatReads) _events.emit(read)
+        return arr.size
     }
 
     private companion object {
         const val TAG = "IMsgNativeTransport"
         const val POLL_INTERVAL_MS = 500L
         const val ERR_PREFIX = "ERR:"
+    }
+}
+
+/**
+ * Decides how fast to poll next, and when the transport is in a "catch-up" burst.
+ *
+ * Pulled out of [NativeRustPushTransport] as plain, dependency-free state so a JVM test
+ * can drive it directly (same reason as [parseRegState] below): the behaviour that
+ * matters here — never stalling a backlog, never claiming catch-up over a single busy
+ * tick, always ending catch-up exactly once — cannot be provoked on demand on a device.
+ * Reproducing it in the wild needs a phone that has been switched off for a day.
+ */
+internal class CatchUpPacer(
+    private val batchLimit: Int = NATIVE_POLL_BATCH_MAX,
+    /** Cadence when the native queue is drained. Matches the pre-existing poll interval:
+     *  live-message latency must not regress. */
+    private val idleDelayMs: Long = 500L,
+    /** Gap between back-to-back drains. Small, but deliberately not zero — it yields the
+     *  thread so the GC and the UI get air between chunks, which is the whole point of
+     *  chunking in the first place. */
+    private val drainDelayMs: Long = 20L,
+    /** Full batches in a row before we call it a catch-up. One full batch is just a busy
+     *  moment (a group thread waking up); two in a row means a real backlog. */
+    private val catchUpThreshold: Int = 2,
+) {
+    /** Whether we are currently draining a backlog. */
+    var catchUpActive: Boolean = false
+        private set
+
+    private var fullStreak = 0
+
+    /** @param delayMs how long to wait before the next poll.
+     *  @param catchUpChanged true only on the tick where [catchUpActive] flipped, so the
+     *   caller emits exactly one event per transition. */
+    data class Step(val delayMs: Long, val catchUpChanged: Boolean, val catchUpActive: Boolean)
+
+    fun onBatch(size: Int): Step {
+        // A batch at the native cap means the native queue still holds more. A short
+        // batch means we drained it — even a zero-length one.
+        val full = size >= batchLimit
+        fullStreak = if (full) fullStreak + 1 else 0
+        val nowActive = if (full) fullStreak >= catchUpThreshold else false
+        val changed = nowActive != catchUpActive
+        catchUpActive = nowActive
+        return Step(
+            delayMs = if (full) drainDelayMs else idleDelayMs,
+            catchUpChanged = changed,
+            catchUpActive = nowActive,
+        )
+    }
+
+    /** Drop back to the idle state without reporting a transition. Used when a poll
+     *  failed, so we know nothing about the queue depth. */
+    fun reset() {
+        fullStreak = 0
+        catchUpActive = false
+    }
+
+    companion object {
+        /**
+         * Must match `inbound::POLL_BATCH_MAX` in smarttxt-ffi. Kotlin only uses it to
+         * ask "was this batch at the native cap", so a mismatch degrades gracefully
+         * rather than breaking: if the native cap grows, a full batch still reads as
+         * full here; if it shrinks below this, catch-up is simply never detected and
+         * the loop runs at the ordinary idle cadence, exactly as it did before.
+         */
+        const val NATIVE_POLL_BATCH_MAX = 50
     }
 }
 

@@ -95,6 +95,10 @@ fun RoomListScreen(
 ) {
     val rooms by viewModel.rooms.collectAsState()
     val isLoading by viewModel.isInitialLoading.collectAsState()
+    // True while the backend is pulling in a backlog (the phone was off for a day
+    // and the service is replaying what it stored). Shows a small spinner in the
+    // header's leading slot — see [CatchUpIndicator].
+    val isCatchingUp by viewModel.isCatchingUp.collectAsState()
     val lastOpenedRoomId by viewModel.lastOpenedRoomId.collectAsState()
     val mutedRooms by viewModel.mutedRooms.collectAsState()
     // Set when the user presses-and-holds a conversation: drives the context
@@ -129,6 +133,16 @@ fun RoomListScreen(
                 // below it with no rule between the two.
                 centerTitle = true,
                 seamless = LocalDpadMessengerColors.current.smarttxt,
+                // Leading slot: the catch-up spinner, and nothing else. With
+                // centerTitle the navigation slot is aligned CenterStart and the
+                // title is centered on the BAR, so this appears and disappears
+                // without shifting "Messages" — important, because it comes and
+                // goes on its own schedule rather than on a tap.
+                navigationIcon = if (isCatchingUp) {
+                    { CatchUpIndicator() }
+                } else {
+                    null
+                },
                 actions = {
                     CompactBarButton(
                         onClick = onSettingsClick,
@@ -496,6 +510,34 @@ private fun LoadingState(padding: PaddingValues) {
         contentAlignment = Alignment.Center,
     ) {
         CircularProgressIndicator()
+    }
+}
+
+/**
+ * The small spinner in the top-left of the Messages header, shown while the backend
+ * is ingesting a backlog — the replay that arrives after the phone has been off.
+ *
+ * Header rather than an overlay or a full-screen state on purpose: by the time this
+ * shows, the restored conversation list is already on screen and usable. The user's
+ * question at that moment is "is this everything, or is it still coming in", and a
+ * spinner beside the title answers it without taking anything away.
+ *
+ * Sized to fit the 36dp bar on a 240x320 screen — this is a flip phone, and a
+ * default 40dp indicator would be taller than the bar containing it.
+ */
+@Composable
+private fun CatchUpIndicator() {
+    Box(
+        modifier = Modifier.size(32.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        CircularProgressIndicator(
+            strokeWidth = 1.5.dp,
+            // Same gray as the profile button opposite it, so the header reads as
+            // one row of quiet chrome rather than an alert.
+            color = SmartTxtAvatarGray,
+            modifier = Modifier.size(14.dp),
+        )
     }
 }
 

@@ -1,0 +1,21 @@
+# Host-only test harness for the bounded inbound event queue. It compiles the SAME file
+# the FFI crate ships (../src/inbound.rs) and runs its #[cfg(test)] suite on the host —
+# no Android NDK / rustpush needed. Run: `cargo test` from this directory.
+#
+# Same shape as ../identity-tests: `inbound.rs` is deliberately dependency-free (std +
+# serde_json) precisely so the catch-up pacing rules can be verified here. The behaviour
+# under test — what happens when a phone that has been off for two days reconnects and
+# Apple replays its whole backlog — cannot be provoked on demand on a device.
+#
+# Isolated workspace ([workspace] below) so it is never pulled into the Android build of
+# the parent smarttxt-ffi crate (which build-rustpush-so.sh compiles on its own).
+[package]
+name = "inbound-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+serde_json = "1"

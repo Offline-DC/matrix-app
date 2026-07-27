@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.offline.dpadmessenger.data.InitialSyncAware
 import com.offline.dpadmessenger.data.MessageRepository
 import com.offline.dpadmessenger.data.RoomSummary
+import com.offline.dpadmessenger.data.SyncActivityAware
 import com.offline.dpadmessenger.data.ThreadActions
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -35,6 +36,21 @@ class RoomListViewModel(
                 }
             }
         } ?: MutableStateFlow(false)
+
+    /**
+     * Whether the repository is currently pulling in a backlog — the replay that
+     * arrives after the phone has been off for a while.
+     *
+     * Deliberately separate from [isInitialLoading]: that one means "I can't show
+     * you a trustworthy list yet" and takes over the whole screen, whereas this
+     * means "the list is real, there's just more coming". The header shows a small
+     * spinner for it so the user isn't left wondering whether a half-restored
+     * conversation list is all they have.
+     *
+     * Repositories that don't ingest in bulk report false forever.
+     */
+    val isCatchingUp: StateFlow<Boolean> =
+        (repository as? SyncActivityAware)?.isCatchingUp ?: MutableStateFlow(false)
 
     /**
      * The id of the most recently opened conversation. When the user returns

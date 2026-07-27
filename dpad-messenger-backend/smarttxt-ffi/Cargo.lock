@@ -2925,6 +2925,7 @@ version = "0.1.0"
 dependencies = [
  "android_logger",
  "base64 0.21.7",
+ "env_logger",
  "jni",
  "keystore",
  "log",
