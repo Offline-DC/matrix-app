@@ -96,4 +96,12 @@ interface FsaChallengeSender {
 
     /** Stop listening for the web code (call when leaving the FSA screen). */
     fun stopWebCode()
+
+    /** Whether a companion smartphone is linked, so the relay path can actually
+     *  work. The security-key relay (both the companion and the web/desktop code
+     *  flow) rides on the flip↔companion pairing, so with nothing linked neither
+     *  [start] nor [requestWebCode] can ever be answered. When false the FSA
+     *  screen should prompt the user to set up their device instead of waiting.
+     *  Defaults to true for hosts that don't implement it. */
+    fun isCompanionLinked(): Boolean = true
 }
