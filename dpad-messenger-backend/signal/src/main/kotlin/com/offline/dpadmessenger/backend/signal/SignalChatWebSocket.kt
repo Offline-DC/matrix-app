@@ -388,6 +388,25 @@ class SignalChatWebSocket(
     }
 
     /**
+     * The body text to store for a DataMessage, with `@mentions` resolved.
+     *
+     * Signal never inlines a mention's name: the body carries a U+FFFC
+     * placeholder and the mentioned ACI travels in `bodyRanges`. Reading
+     * `data.body` alone is what made an incoming "@Avery what's a good day…"
+     * render as "[OBJ] what's a good day…". Every path that pulls a body off
+     * a DataMessage — inbound message, inbound edit, and both flavors of
+     * `SyncMessage.Sent` — must go through here, or that path reintroduces
+     * the bug. See [SignalBodyRanges].
+     */
+    private fun bodyOf(data: SignalServiceProtos.DataMessage): String {
+        val raw = if (data.hasBody()) data.body else ""
+        if (raw.isEmpty()) return raw
+        return SignalBodyRanges.render(raw, data.bodyRangesList) { aci ->
+            repository.knownNameFor(aci)
+        }
+    }
+
+    /**
      * Decode the Content proto and convert any DataMessage into a UI
      * [Message] for the repository. Sync messages, receipts, typing and
      * other Content variants are logged but not yet routed.
@@ -496,7 +515,7 @@ class SignalChatWebSocket(
             }
 
             // Normal text (possibly a reply carrying a Quote) and/or media.
-            val body = if (data.hasBody()) data.body else ""
+            val body = bodyOf(data)
             val envTs = when {
                 env.hasClientTimestamp() -> env.clientTimestamp
                 env.hasServerTimestamp() -> env.serverTimestamp
@@ -551,7 +570,7 @@ class SignalChatWebSocket(
             val edit = content.editMessage
             val roomId = "sig:dm:$sourceServiceId"
             val groupKey = groupMasterKey(edit.dataMessage)
-            val newBody = if (edit.dataMessage.hasBody()) edit.dataMessage.body else ""
+            val newBody = bodyOf(edit.dataMessage)
             val editTs = if (edit.dataMessage.hasTimestamp()) edit.dataMessage.timestamp
                          else System.currentTimeMillis()
             scope.launch {
@@ -668,7 +687,7 @@ class SignalChatWebSocket(
             val edit = sent.editMessage
             val groupKey = groupMasterKey(edit.dataMessage)
             val dest = sent.destinationString()
-            val newBody = if (edit.dataMessage.hasBody()) edit.dataMessage.body else ""
+            val newBody = bodyOf(edit.dataMessage)
             val editTs = if (edit.dataMessage.hasTimestamp()) edit.dataMessage.timestamp
                          else System.currentTimeMillis()
             scope.launch {
@@ -719,7 +738,7 @@ class SignalChatWebSocket(
         }
 
         // Plain outgoing message and/or media we sent from another device.
-        val body = if (data.hasBody()) data.body else ""
+        val body = bodyOf(data)
         val attachment = if (data.attachmentsCount > 0) buildAttachment(data.getAttachments(0)) else null
         val quotedTs = if (data.hasQuote()) data.quote.id else null
         Log.d(

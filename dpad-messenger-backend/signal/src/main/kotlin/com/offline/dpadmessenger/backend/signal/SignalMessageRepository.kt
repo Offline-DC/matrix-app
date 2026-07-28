@@ -678,6 +678,38 @@ class SignalMessageRepository(
         return ensureDmRoom(serviceId, name)
     }
 
+    /**
+     * Best display name we hold for [serviceId] **right now**, or null when
+     * we can't identify them. Synchronous and network-free on purpose: this
+     * is called from the receive path to resolve `@mentions` inline
+     * ([SignalBodyRanges]) while a message is being stored, so it must never
+     * block a bubble on a profile fetch.
+     *
+     * Priority mirrors [resolveDisplayName] minus the network legs: our own
+     * account renders as "@You"; then a synced/persisted contact name; then
+     * whatever the user cache holds (a profile name resolved earlier, or the
+     * peer's phone number — both are better than "@Unknown"). Placeholder
+     * values that would render as noise (the raw service id, [shortName]'s
+     * "Unknown") are rejected so the caller falls back cleanly.
+     *
+     * A mention of someone we've never exchanged messages with — common in a
+     * group — has no name to find, and Signal won't reveal a profile without
+     * that contact's profile key. Those render as "@Unknown"; the name
+     * corrects itself on a later message once contact sync teaches us who
+     * they are.
+     */
+    internal fun knownNameFor(serviceId: String): String? {
+        val id = canonicalId(serviceId)
+        if (isSelfId(id)) return SignalBodyRanges.SELF_MENTION
+
+        contactsByServiceId[id]?.name
+            ?.takeIf { it.isNotBlank() && it != id && it != shortName(id) }
+            ?.let { return it }
+
+        return userCache.value[id]?.displayName
+            ?.takeIf { it.isNotBlank() && it != id && it != shortName(id) }
+    }
+
     /** The contact's Signal profile name, if we hold a profile key for them
      *  (captured from an earlier inbound message). Null when we have no key, or
      *  the fetch is throttled/fails — Signal won't reveal a profile name without
