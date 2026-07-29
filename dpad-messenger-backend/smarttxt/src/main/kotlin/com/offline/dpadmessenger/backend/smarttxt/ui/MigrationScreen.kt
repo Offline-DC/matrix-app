@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -36,8 +35,12 @@ import com.offline.dpadmessenger.backend.smarttxt.R
  *
  * The transfer runs in two phases and has three outcomes:
  *  - **Device identity fails** (couldn't copy/stage the `dumb` + os_config, which
- *    NAC validation needs and there's no relay fallback) → shows a failure with a
- *    "Try again" button. There's no usable path, so we do NOT drop to sign-in.
+ *    NAC validation needs and there's no relay fallback) → calls [onFallbackToSetup].
+ *    There is no "Try again": [OpenBubblesMigrator.migrate] UNINSTALLS OpenBubbles on
+ *    its way out whatever the outcome, so by the time this screen sees a failure there
+ *    is nothing left on the device to transfer from and a retry could only fail the
+ *    same way. The sign-in screen is the only forward path, and it surfaces its own
+ *    error if the device identity is still missing there.
  *  - **Identity OK, but the OpenBubbles login can't be reused** → calls
  *    [onFallbackToSetup] so the user signs in manually; that sign-in still validates
  *    through the NAC server using the staged dumb.
@@ -52,13 +55,9 @@ fun MigrationScreen(
 ) {
     val context = LocalContext.current
     var step by remember { mutableStateOf("This will only take a moment…") }
-    var failure by remember { mutableStateOf<String?>(null) }
-    var attempt by remember { mutableStateOf(0) }
 
-    LaunchedEffect(attempt) {
-        failure = null
-        step = "This will only take a moment…"
-        Log.i("ObMigrator", "MigrationScreen shown → starting transfer (attempt ${attempt + 1})")
+    LaunchedEffect(Unit) {
+        Log.i("ObMigrator", "MigrationScreen shown → starting transfer")
         val result = OpenBubblesMigrator.migrate(context) { step = it }
         when {
             // Full success: migrate() already stamped REGISTERED + flipped status via
@@ -73,11 +72,13 @@ fun MigrationScreen(
                 onFallbackToSetup()
             }
 
-            // Hard failure: the device identity (dumb/os_config) couldn't be staged, so
-            // there's no way to validate. Show a failure the user can retry.
+            // Hard failure: the device identity (dumb/os_config) couldn't be staged.
+            // Retrying is pointless — OpenBubbles has been uninstalled by now — so send
+            // the user to manual sign-in, which reports its own error if the device
+            // identity is still missing at that point.
             else -> {
-                Log.w("ObMigrator", "transfer FAILED (device identity) → failure screen: ${result.error}")
-                failure = result.error ?: "The transfer didn't complete."
+                Log.w("ObMigrator", "transfer FAILED (device identity) → manual sign-in: ${result.error}")
+                onFallbackToSetup()
             }
         }
     }
@@ -96,40 +97,25 @@ fun MigrationScreen(
                 )
                 Spacer(Modifier.height(28.dp))
 
-                val err = failure
-                if (err == null) {
-                    Text(
-                        // Deliberately NEUTRAL: this screen may fall back to a manual
-                        // sign-in if the OpenBubbles login can't be reused, so we never
-                        // promise "your login is carrying over" — that would confuse the
-                        // user about why they're being asked to sign in.
-                        text = "Setting up…",
-                        style = MaterialTheme.typography.titleMedium,
-                        textAlign = TextAlign.Center,
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        text = step,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                    )
-                } else {
-                    Text(
-                        text = "Couldn't transfer from OpenBubbles",
-                        style = MaterialTheme.typography.titleMedium,
-                        textAlign = TextAlign.Center,
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        text = err,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                    )
-                    Spacer(Modifier.height(28.dp))
-                    Button(onClick = { attempt++ }) { Text("Try again") }
-                }
+                // Only ever the progress state now: every outcome either recomposes the
+                // host into the chats or hands off to the sign-in screen, so there is no
+                // terminal state for this screen to render.
+                Text(
+                    // Deliberately NEUTRAL: this screen may fall back to a manual
+                    // sign-in if the OpenBubbles login can't be reused, so we never
+                    // promise "your login is carrying over" — that would confuse the
+                    // user about why they're being asked to sign in.
+                    text = "Setting up…",
+                    style = MaterialTheme.typography.titleMedium,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = step,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
             }
         }
     }

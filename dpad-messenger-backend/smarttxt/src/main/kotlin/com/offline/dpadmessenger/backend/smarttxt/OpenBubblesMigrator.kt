@@ -22,10 +22,18 @@ import java.io.File
  * re-registration — then stamp the account REGISTERED, so the app resumes that iMessage
  * session with no re-login. Validation runs through the NAC server (no relay).
  *
- * Everything is best-effort and reversible: if root is missing, OB isn't logged
- * in, or the import fails, [migrate] returns `ok=false` and the caller falls
- * through to the normal setup screen. The staging dir (which briefly holds
- * private keys) is always wiped in `finally`.
+ * Failure is best-effort: if root is missing, OB isn't logged in, or the import
+ * fails, [migrate] returns `ok=false` and the caller falls through to the normal
+ * setup screen. The staging dir (which briefly holds private keys) is always wiped
+ * in `finally`.
+ *
+ * What is NOT reversible is the last step: on EVERY outcome — success, manual-sign-in
+ * fallback, hard failure, or crash — [migrate] UNINSTALLS OpenBubbles (see
+ * [retireOpenBubbles]) rather than merely disabling it. Two rustpush apps holding one
+ * push identity make Apple thrash both, and a disabled OB is one `pm enable` away from
+ * doing exactly that. Because the uninstall wipes `/data/data/$OB_PKG`, it runs from
+ * `finally` AFTER every read of OB's files, and a failed migration cannot be retried
+ * against OpenBubbles afterwards.
  */
 object OpenBubblesMigrator {
 
@@ -264,12 +272,11 @@ object OpenBubblesMigrator {
             Log.i(TAG, "  account store: isRegistered=${store.isRegistered()} " +
                 "lastRegisteredMs=${store.lastRegisteredMs()} handlesConfigured=${store.handlesConfigured()}")
 
-            // go live + retire OpenBubbles so the two don't fight over one identity.
-            // History is intentionally NOT transferred — new messages arrive as they
-            // come, and the chat list shows a welcome empty-state until then.
+            // go live. History is intentionally NOT transferred — new messages arrive
+            // as they come, and the chat list shows a welcome empty-state until then.
+            // (OpenBubbles is retired below, in `finally`, on every outcome.)
             SmartTxtRepository.markRegisteredExternally(app)
             Log.i(TAG, "  status → REGISTERED, background connection started")
-            retireOpenBubbles()
 
             Log.i(TAG, "════ ✅ MIGRATION OK (${SystemClock.elapsedRealtime() - t0}ms) handles=${handles.size} ════")
             Result(ok = true, registered = true, handles = handles)
@@ -280,6 +287,12 @@ object OpenBubblesMigrator {
         } finally {
             stage.deleteRecursively()   // never leave private keys sitting in cache
             Log.i(TAG, "  wiped staging dir")
+            // Retire OpenBubbles on EVERY outcome — full success, the manual-sign-in
+            // fallback, a hard failure, or a crash. Whatever happened, we have already
+            // taken everything we can from OB, and leaving it installed leaves the same
+            // push identity live in two apps. LAST statement in the method: the uninstall
+            // wipes $OB_FILES, so nothing above it may read from OpenBubbles again.
+            retireOpenBubbles()
         }
     }
 
@@ -449,14 +462,31 @@ object OpenBubblesMigrator {
         return ok
     }
 
-    /** Stop + disable OpenBubbles so it can't reconnect the same push identity
-     *  (which would make Apple thrash both). Best-effort; reversible via `pm enable`. */
+    /** Stop + UNINSTALL OpenBubbles so it can't reconnect the same push identity (which
+     *  would make Apple thrash both). Uninstall, not `pm disable-user`: a disabled OB is
+     *  one `pm enable` — or one factory-reset-adjacent repair flow — away from coming back
+     *  with the identity we just took, and this fleet has no reason to keep it.
+     *
+     *  IRREVERSIBLE, and it deletes `/data/data/$OB_PKG` — every file [migrate] reads. Only
+     *  ever call it once all reads are done (it is the last statement of migrate()'s
+     *  `finally`).
+     *
+     *  Escalating fallbacks, so we never leave OpenBubbles live: full uninstall (the normal
+     *  case — sideloaded APK, so package AND data go), then `--user 0` (removes it for the
+     *  device's only user if it turns out to be baked into the system image), then the old
+     *  `disable-user`. Verified with `pm path`, which is silent once the package is gone. */
     private fun retireOpenBubbles() {
-        runCatching {
-            val p = ProcessBuilder("su", "-c", "am force-stop $OB_PKG && pm disable-user --user 0 $OB_PKG")
-                .redirectErrorStream(true).start()
-            val out = p.inputStream.bufferedReader().use { it.readText() }.trim()
-            Log.i(TAG, "  retire OpenBubbles: exit=${p.waitFor()}${if (out.isNotBlank()) " out='$out'" else ""}")
-        }.onFailure { Log.w(TAG, "  retireOpenBubbles threw: ${it.message}") }
+        // Chain on `pm path`, not on exit codes: some `pm` builds print
+        // "Failure [DELETE_FAILED_...]" and still exit 0, which would swallow the fallbacks.
+        val out = suOutput(
+            "id; am force-stop $OB_PKG; " +
+            "gone() { ! pm path $OB_PKG 2>/dev/null | grep -q package:; }; " +
+            "pm uninstall $OB_PKG; " +
+            "gone || pm uninstall --user 0 $OB_PKG; " +
+            "gone || pm disable-user --user 0 $OB_PKG; " +
+            "echo __OBPATH__; pm path $OB_PKG"
+        )
+        val gone = !out.substringAfter("__OBPATH__", "package:").contains("package:")
+        Log.i(TAG, "  retire OpenBubbles: uninstalled=$gone  out='${out.trim().take(300)}'")
     }
 }

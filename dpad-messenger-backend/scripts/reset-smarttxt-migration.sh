@@ -14,6 +14,14 @@
 # WITHOUT nuking the rest of the launcher (home layout, other settings). It does
 # NOT touch com.openbubbles.messaging, so there's still something to migrate FROM.
 #
+# HEADS UP — this script can no longer put OpenBubbles back. A migration run now
+# UNINSTALLS com.openbubbles.messaging on its way out (every outcome, success or
+# not), so on a device that has already migrated once there is no OpenBubbles data
+# left to migrate FROM: resetting Smart Txt state just lands you on the normal
+# sign-in screen. To re-test the migration end to end you must reinstall
+# OpenBubbles and sign it back in first — the check below tells you which case
+# you're in before anything is deleted.
+#
 # Usage:
 #   ./reset-smarttxt-migration.sh                 # default package, surgical reset
 #   PKG=com.offlineinc.dumbdownlauncher ./reset-smarttxt-migration.sh
@@ -31,6 +39,17 @@ run_su() { adb shell su -c "$1"; }
 # Confirm the device is reachable and rooted before we start deleting.
 adb get-state >/dev/null 2>&1 || { echo "error: no device via adb (USB debugging on?)"; exit 1; }
 run_su 'id' | grep -q 'uid=0' || { echo "error: su did not return root — is this device rooted?"; exit 1; }
+
+# The migration uninstalls OpenBubbles, so warn (don't fail) when it's already gone:
+# the reset still works, it just won't have anything to migrate from.
+if adb shell pm path com.openbubbles.messaging 2>/dev/null | grep -q '^package:'; then
+  echo "==> OpenBubbles is installed — migration has a source to run against"
+else
+  echo "WARNING: com.openbubbles.messaging is NOT installed (a previous migration"
+  echo "         uninstalled it). Resetting Smart Txt will land on manual sign-in,"
+  echo "         not the migration screen. Reinstall + sign into OpenBubbles first"
+  echo "         if you want to re-test the transfer."
+fi
 
 if [ "$NUCLEAR" = "--nuclear" ]; then
   echo "==> pm clear $PKG  (resets the ENTIRE launcher app, not just Smart Txt)"
@@ -60,5 +79,6 @@ run_su "
   echo '   removed account prefs, flags, and staged identity'
 "
 
-echo "Done. Relaunch $PKG — it should re-run the OpenBubbles migration."
+echo "Done. Relaunch $PKG — it re-runs the OpenBubbles migration if (and only if)"
+echo "OpenBubbles is still installed and signed in; otherwise you get manual sign-in."
 echo "Watch it with:  adb logcat -s ObMigrator:V smarttxt_ffi:V"
