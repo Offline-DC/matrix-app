@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -20,6 +21,12 @@ class RoomListViewModel(
 
     val rooms: StateFlow<List<RoomSummary>> = repository
         .observeRoomSummaries()
+        // DIAGNOSTIC (UIFLOW): step 3 of 3. Steps 1+2 firing without this one means the
+        // stateIn boundary conflated it; all three firing while the screen stays stale
+        // means the flow layer is fine and Compose never recomposed - which is the
+        // expected result if the heap is pinned (watch for back-to-back GCs reporting
+        // "0% free" around the same timestamps). Remove all three once diagnosed.
+        .onEach { android.util.Log.i("IMsgUiFlow", "UIFLOW vm: rooms=${it.size}") }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     /**

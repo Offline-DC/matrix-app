@@ -680,6 +680,14 @@ internal class SmartTxtMessageRepository(
         usersById.value = users
         messagesByRoom.value = byRoom
         unreadByRoom.value = unread
+        // DIAGNOSTIC (UIFLOW): step 1 of 3. The catch-up coalescer holds SAVES, not
+        // state assignments - the line above runs on every batch - so if the screen is
+        // stale while these keep printing, the stall is downstream, not here.
+        Log.i(
+            "IMsgUiFlow",
+            "UIFLOW emit[onMessages] batch=${msgs.size} rooms=${byRoom.size} " +
+                "msgs=${byRoom.values.sumOf { it.size }} catchUp=$catchUpActive",
+        )
         requestSave()
         maybeHealContactsLater()
     }
@@ -909,6 +917,11 @@ internal class SmartTxtMessageRepository(
 
     override fun observeRoomSummaries(): Flow<List<RoomSummary>> =
         combine(rooms, messagesByRoom, unreadByRoom, roomActivity) { rs, msgs, unread, activity ->
+            // DIAGNOSTIC (UIFLOW): step 2 of 3. This transform only runs when a
+            // collector is attached AND an upstream StateFlow actually emitted, so
+            // step 1 without step 2 means the emission was conflated away (StateFlow
+            // drops a value that `equals` the previous one) or nothing is collecting.
+            Log.i("IMsgUiFlow", "UIFLOW combine: rooms=${rs.size} msgs=${msgs.values.sumOf { it.size }}")
             rs.map { room ->
                 val last = msgs[room.id]?.lastOrNull { !it.isDeleted } ?: msgs[room.id]?.lastOrNull()
                 val react = activity[room.id]

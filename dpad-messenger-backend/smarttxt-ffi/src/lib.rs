@@ -2097,6 +2097,59 @@ fn spawn_regstate_watcher(client: Arc<IMClient>, my_gen: u64) {
     });
 }
 
+/// Watch the APS (APNs socket) resource state and log every transition.
+///
+/// DIAGNOSTIC ONLY. Unlike `spawn_regstate_watcher` this pushes nothing into
+/// `inbound` and changes no behaviour — it exists purely so an exported log says
+/// what the socket was doing.
+///
+/// WHY: when the APNs socket dies half-open (the AP or a NAT drops the flow with no
+/// FIN/RST, so both ends still believe they are connected) the ONLY evidence in an
+/// exported bundle is a handful of byte-identical "Send timed out, forcing reload!"
+/// lines, and the minutes between the socket dying and the reconnect succeeding are
+/// completely silent. Reconstructing it means diffing message timestamps by hand.
+/// `resource_state` is the same `watch` channel the identity watcher above uses;
+/// APS has one too and nothing was listening to it.
+///
+/// Expect, on a healthy reconnect: Failed(retry_wait=1s) → Generating → Generated.
+/// A long silence after `Generating` with no `Generated` is a hung `open_socket`.
+fn spawn_apsstate_watcher(conn: APSConnection, my_gen: u64) {
+    fn describe(s: &ResourceState) -> String {
+        match s {
+            ResourceState::Generated => "Generated (socket up)".to_string(),
+            ResourceState::Generating => "Generating (opening socket)".to_string(),
+            ResourceState::Closed => "Closed (dead - no further retries)".to_string(),
+            // Display, not Debug, so the underlying error surfaces its human text.
+            ResourceState::Failed(f) => format!(
+                "Failed (retry_wait={} err={})",
+                f.retry_wait.map(|v| format!("{v}s")).unwrap_or_else(|| "none/terminal".to_string()),
+                f.error,
+            ),
+        }
+    }
+    rt().spawn(async move {
+        let mut rx = conn.resource_state.subscribe();
+        // Emit the CURRENT state once: tokio's `watch` marks the value as already seen
+        // at subscribe time, so `changed()` never fires for a resource that is already
+        // Generated (or already Failed).
+        {
+            let now = rx.borrow().clone();
+            log::info!("APSSTATE(initial): {}", describe(&now));
+        }
+        loop {
+            if rx.changed().await.is_err() {
+                break; // sender dropped
+            }
+            if RECV_GEN.load(Ordering::SeqCst) != my_gen {
+                break; // superseded by a newer client
+            }
+            let now = rx.borrow_and_update().clone();
+            log::info!("APSSTATE: {}", describe(&now));
+        }
+        log::info!("APSSTATE: watcher ended (gen {my_gen})");
+    });
+}
+
 /// The live IDS registration state, read straight out of rustpush's own
 /// `ResourceManager` — the mirror of OpenBubbles' `get_regstate`.
 ///
@@ -2358,6 +2411,9 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
     let my_gen = RECV_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     spawn_regstate_watcher(client.clone(), my_gen);
     let connection = st().connection.clone().unwrap();
+    // Log-only; see the fn doc. Same generation guard as the regstate watcher so a
+    // recover's fresh watcher replaces this one instead of doubling up.
+    spawn_apsstate_watcher(connection.clone(), my_gen);
     rt().spawn(async move {
         let mut sub = connection.messages_cont.subscribe();
         loop {

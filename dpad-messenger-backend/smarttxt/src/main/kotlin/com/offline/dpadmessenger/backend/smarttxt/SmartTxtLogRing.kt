@@ -98,6 +98,7 @@ internal object SmartTxtLogRing {
         "IMsgRepo",
         "IMsgRepoHolder",
         "IMsgSession",
+        "IMsgUiFlow",         // DIAGNOSTIC: repo->combine->viewmodel emission trace
         "RustPushBridge",
         "RustPushNative",
         "ObMigrator",
@@ -122,7 +123,16 @@ internal object SmartTxtLogRing {
         // logger level is the only way to get them, at the cost of the mutex flood.
         // For registration health, prefer the REGSTATE lines and rustpush's own
         // info-level "Reregistering in N seconds", both of which are already captured.
-        line.contains("rustpush::util:") || line.contains("rustpush::aps:")
+        (line.contains("rustpush::util:") || line.contains("rustpush::aps:")) &&
+            // ...but NEVER drop their warnings/errors. `rustpush::aps` is held to Warn
+            // at the source (init_logger), so anything at W or E from it is by
+            // definition not flood — it is the APNs socket telling us it died
+            // ("Send timed out (keepalive-pong)", "Failed to write to socket!",
+            // "Broken pipe"). Those lines reached logcat but this filter threw them
+            // away, so an exported bundle could not show a dead-socket stall at all;
+            // it had to be reconstructed from message timestamps. `-v threadtime`
+            // puts the level as a single char before the tag.
+            !(line.contains(" E SmartTxtRust:") || line.contains(" W SmartTxtRust:"))
 
     // ---- volume counters, surfaced in the export bundle's meta.txt ----------
     //
