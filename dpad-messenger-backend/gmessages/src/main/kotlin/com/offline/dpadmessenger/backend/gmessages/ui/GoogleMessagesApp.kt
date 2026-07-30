@@ -97,11 +97,29 @@ fun GoogleMessagesApp(
         val relinkScope = rememberCoroutineScope()
         val relink: () -> Unit = {
             relinkScope.launch {
-                if (!GoogleMessagesRepository.reauth()) {
-                    GoogleMessagesRepository.shutdown(clearMessages = false)
-                    store.clear() // cookies dead → wipe auth → full re-pair
-                    paired = false
+                if (GoogleMessagesRepository.reauth()) return@launch
+                // reauth() failed — but WHY decides whether we're allowed to wipe.
+                // NETWORK means we never reached Google, so the stored cookies are
+                // very probably still good: clearing them here destroys a working
+                // link just because the user tapped Re-link inside a dead zone.
+                // Keep everything and let them try again on signal (the reconnect
+                // screen stays up, so Re-link is still one press away).
+                val reason = GoogleMessagesRepository.lastAuthFailureReason()
+                if (reason == AuthFailureReason.NETWORK) {
+                    android.util.Log.w(
+                        "GMSession",
+                        "re-link: couldn't reach Google — keeping stored credentials, NOT wiping",
+                    )
+                    return@launch
                 }
+                android.util.Log.w(
+                    "GMSession",
+                    "re-link: Google rejected the stored credentials (reason=$reason) " +
+                        "— wiping auth for a full re-pair",
+                )
+                GoogleMessagesRepository.shutdown(clearMessages = false)
+                store.clear() // cookies really are dead → wipe auth → full re-pair
+                paired = false
             }
         }
         // The USER-initiated re-link (Settings + the day-13 warning): ALWAYS a

@@ -30,6 +30,11 @@ class GoogleMessagesAccountStore(context: Context) {
 
     private val ctx = context.applicationContext
 
+    /** Application context, for collaborators that need one but are constructed
+     *  from the store alone (e.g. [GoogleMessagesSessionClient] checking whether
+     *  the device actually has connectivity before blaming a failure on auth). */
+    internal val appContext: Context get() = ctx
+
     private val masterKey by lazy {
         MasterKey.Builder(ctx)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
@@ -99,11 +104,26 @@ class GoogleMessagesAccountStore(context: Context) {
         val encoded = kept.entries.joinToString("\n") { "${it.key}\t${it.value}" }
         prefs.edit().putString(KEY_COOKIES, encoded).apply()
 
-        android.util.Log.i(
-            "GMCookies",
-            "received ${cookies.size} cookies: ${cookies.keys.sorted()} " +
-                "(has __Secure-1PSIDTS=$hadPsidts); stripped $stripped → persisted ${kept.size}",
-        )
+        // Log only when the SET of cookie names changes — not on every save.
+        // Google re-issues the *SIDCC family on almost every response, so this
+        // fired 3-4x per RPC and wrote a ~250-char line each time into the
+        // rolling capture (real flash/battery cost on a device whose diagnostics
+        // were deliberately slimmed down). Value rotation is already reported by
+        // GMSession's "cookies refreshed from Set-Cookie" line; what support
+        // needs from THIS line is the inventory — which changes only at sign-in,
+        // or if Google starts or stops sending one. Cached in the companion
+        // because callers construct a fresh store per save, so comparing against
+        // the stored copy would trade log spam for an EncryptedSharedPreferences
+        // decrypt on every RPC.
+        val names = kept.keys.sorted()
+        if (names != lastLoggedCookieNames) {
+            lastLoggedCookieNames = names
+            android.util.Log.i(
+                "GMCookies",
+                "cookie set changed → ${cookies.size} received ${cookies.keys.sorted()} " +
+                    "(has __Secure-1PSIDTS=$hadPsidts); stripped $stripped → persisted ${kept.size}",
+            )
+        }
     }
 
     fun loadCookies(): Map<String, String> {
@@ -204,6 +224,11 @@ class GoogleMessagesAccountStore(context: Context) {
     private fun decode(s: String) = Base64.decode(s, Base64.NO_WRAP)
 
     companion object {
+        /** Cookie-name set most recently logged by [saveCookies], so a save that
+         *  only rotates values stays silent. Process-scoped on purpose: callers
+         *  build a fresh store instance per save. */
+        @Volatile private var lastLoggedCookieNames: List<String>? = null
+
         private const val SCHEMA_VERSION = 2
         private const val KEY_SCHEMA_VERSION = "schemaVersion"
         private const val KEY_COOKIES = "gaiaCookies"

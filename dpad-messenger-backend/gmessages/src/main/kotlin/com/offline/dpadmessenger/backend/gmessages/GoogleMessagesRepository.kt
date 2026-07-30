@@ -35,10 +35,35 @@ object GoogleMessagesRepository {
         instance?.let { return it }
         val appContext = context.applicationContext
         val store = GoogleMessagesAccountStore(appContext)
-        val account = store.load() ?: return null
+        val account = store.load()
+        if (account == null) {
+            // Either nothing is stored, or the stored account predates the current
+            // schema. Both land the user on the sign-in screen, but they are very
+            // different bugs — and indistinguishable in a capture without this.
+            Log.w(
+                SESSION_TAG,
+                "createIfPaired: NOT paired — no loadable account " +
+                    "(hasCookies=${store.hasCookies()} gaiaMode=${store.isGaiaMode()} " +
+                    "linkAge=${store.daysSinceLink() ?: -1}d). User will see sign-in.",
+            )
+            return null
+        }
+        // Marks a fresh process taking over the session. Frequent repeats here mean
+        // the launcher is being restarted, which resets the in-memory token expiry.
+        Log.i(
+            SESSION_TAG,
+            "createIfPaired: building session for a fresh process " +
+                "(gaiaMode=${store.isGaiaMode()} linkAge=${store.daysSinceLink() ?: -1}d " +
+                "tokenTtl=${account.tokenTtl})",
+        )
         val session = GoogleMessagesSessionClient(store, account)
         return GoogleMessagesMessageRepository(session, appContext).also { instance = it }
     }
+
+    /** Why the last auth attempt failed, so the re-link handler can tell a dead
+     *  cookie from a dead network. Null when there's no live session. */
+    fun lastAuthFailureReason(): AuthFailureReason? =
+        (instance as? GoogleMessagesMessageRepository)?.lastAuthFailureReason
 
     fun create(context: Context): MessageRepository {
         val repo = createIfPaired(context)
@@ -107,4 +132,12 @@ object GoogleMessagesRepository {
     }
 
     private const val TAG = "GMRepo"
+
+    /** Tag for session-lifecycle lines that support needs in a log bundle.
+     *
+     *  These deliberately do NOT use [TAG]. `GMRepo` also carries the conversation
+     *  dump — contact names, phone numbers — so it must stay below the diagnostics
+     *  filterspec's `*:W` floor and out of submitted captures. `GMSession` is
+     *  allow-listed to DEBUG and carries only session/auth state. */
+    private const val SESSION_TAG = "GMSession"
 }

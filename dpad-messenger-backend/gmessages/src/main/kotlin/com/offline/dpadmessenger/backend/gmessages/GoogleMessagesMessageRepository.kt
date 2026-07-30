@@ -240,11 +240,28 @@ internal class GoogleMessagesMessageRepository(
      * messages. Clears the auth-expired flag on success. @return false if the
      * cookies are no longer valid (caller should then do a full re-pair).
      */
-    suspend fun reauth(): Boolean {
+    suspend fun reauth(): Boolean = withContext(Dispatchers.IO) {
+        // Off the main thread: the caller is a Compose `rememberCoroutineScope()`
+        // (Main), and reauth() does an ECDSA key load + sign plus a blocking HTTP
+        // round-trip. Running that on the UI thread is how "Re-link" janks.
         val ok = session.reauth()
-        if (ok) { _authExpired.value = false; _authExpiredReason.value = null }
-        return ok
+        if (ok) {
+            _authExpired.value = false
+            _authExpiredReason.value = null
+        } else {
+            // Refresh the reason so the reconnect screen can explain a failed
+            // re-link. Without this a network-failed re-link looks like a no-op:
+            // we (correctly) don't wipe the account, so nothing on screen changes.
+            _authExpiredReason.value = session.lastFailureReason
+        }
+        // Expression value, not `return` — withContext's block is `noinline`, so a
+        // non-local return here would not compile.
+        ok
     }
+
+    /** Why the last auth attempt failed — read after a failed [reauth] to decide
+     *  whether wiping the stored account is actually justified. */
+    val lastAuthFailureReason: AuthFailureReason get() = session.lastFailureReason
 
     /**
      * Stop the session. [clearCache] = true (an explicit logout) deletes the

@@ -1,5 +1,8 @@
 package com.offline.dpadmessenger.backend.gmessages
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -101,6 +104,8 @@ internal class GoogleMessagesSessionClient(
 
     fun connect() {
         if (longPollJob != null) return
+        sessionStartedMs = System.currentTimeMillis()
+        logSessionStart()
         longPollJob = scope.launch { longPollLoop() }
         ackJob = scope.launch { ackLoop() }
         scope.launch {
@@ -124,6 +129,99 @@ internal class GoogleMessagesSessionClient(
         scope.coroutineContext[Job]?.cancel()
     }
 
+    // =======================================================================
+    // Diagnostics
+    //
+    // Everything here is support-facing. A "why do I keep having to re-link?"
+    // report is only answerable from a capture if we can tell, at the moment the
+    // link is declared dead: how long it had been alive, whether the device even
+    // had connectivity, and whether we were still holding a rotating session
+    // cookie. None of that is recoverable after the fact.
+    // =======================================================================
+
+    /** Wall-clock ms when this session started polling. Distinguishes "the link
+     *  died after 3 hours" from "the launcher restarted 30 seconds ago" — which
+     *  are otherwise the same line in a capture. */
+    @Volatile private var sessionStartedMs: Long = 0L
+
+    /** Why the most recent auth attempt failed. Read by the re-link handler so a
+     *  network failure can't be mistaken for dead credentials. */
+    val lastFailureReason: AuthFailureReason get() = lastAuthFailure
+
+    /** How long this session has been up, in human units. */
+    private fun uptime(): String {
+        if (sessionStartedMs == 0L) return "?"
+        val mins = (System.currentTimeMillis() - sessionStartedMs) / 60_000L
+        return if (mins >= 60) "${mins / 60}h${mins % 60}m" else "${mins}m"
+    }
+
+    /** What we currently hold, and whether the rotating session cookie is among
+     *  it — the single most diagnostic fact about a GAIA session. */
+    private fun cookieSummary(): String =
+        "n=${cookies.size} has1PSIDTS=${cookies.containsKey("__Secure-1PSIDTS")} " +
+            "has3PSIDTS=${cookies.containsKey("__Secure-3PSIDTS")} names=${cookies.keys.sorted()}"
+
+    /** Time left on the token as this process understands it. Note [tokenExpiryMs]
+     *  is in-memory only: a fresh process recomputes it as `now + ttl` on the
+     *  first poll, so this is our BELIEF about expiry, not the token's real age.
+     *  When it reads ~24h right after a restart, that's the belief being wrong. */
+    private fun expirySummary(now: Long = System.currentTimeMillis()): String =
+        if (tokenExpiryMs == 0L) "not-yet-computed" else "${(tokenExpiryMs - now) / 60_000L}min"
+
+    /** Whether the device believes it has a validated internet connection.
+     *  Logged at every failure so a capture can separate "Google rejected us"
+     *  from "we never got off the phone". */
+    private fun connectivity(): String = runCatching {
+        val cm = store.appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val net = cm.activeNetwork ?: return "NONE"
+        val caps = cm.getNetworkCapabilities(net) ?: return "unknown"
+        val transport = when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cell"
+            else -> "other"
+        }
+        "$transport/validated=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}"
+    }.getOrElse { "err:${it.javaClass.simpleName}" }
+
+    /** One line at session start with everything needed to interpret whatever
+     *  goes wrong next. `linkAge` is the closest proxy we persist for the real
+     *  age of the Google session (token issue time is not persisted). */
+    private fun logSessionStart() {
+        Log.i(
+            TAG,
+            "session start: gaia=$gaia linkAge=${store.daysSinceLink() ?: -1}d " +
+                "tokenTtl=${account.tokenTtl}${if (account.tokenTtl > 0) "" else " (0 → assuming 24h)"} " +
+                "destReg=${destRegB64?.take(12)} " +
+                "net=${connectivity()} cookies[${cookieSummary()}]",
+        )
+    }
+
+    /** Mask long base64-ish runs before a response body goes into a log.
+     *
+     *  Error bodies are genuinely diagnostic — they're how we tell a dead cookie
+     *  from a dead token — but a body we failed to parse may still carry an auth
+     *  token, and these particular logs are WARN/ERROR, so they land in every
+     *  support capture regardless of the tag filter. Truncate first, then mask:
+     *  a token clipped at the boundary is still masked as long as a long run
+     *  remains. */
+    private fun redacted(body: String, limit: Int): String =
+        SECRET_RUN.replace(body) { "«redacted:${it.value.length}b»" }.take(limit)
+
+    /** Liveness line while everything is fine, at most every
+     *  [HEARTBEAT_INTERVAL_MS]. Without it a healthy session is invisible in a
+     *  capture and we can't tell how long a link survived before it broke.
+     *  @return the new "last heartbeat" timestamp. */
+    private fun maybeHeartbeat(lastMs: Long): Long {
+        val now = System.currentTimeMillis()
+        if (lastMs != 0L && now - lastMs < HEARTBEAT_INTERVAL_MS) return lastMs
+        Log.i(
+            TAG,
+            "alive: up ${uptime()} linkAge=${store.daysSinceLink() ?: -1}d " +
+                "expiry=${expirySummary(now)} net=${connectivity()} cookies[${cookieSummary()}]",
+        )
+        return now
+    }
+
     /**
      * Force a token refresh from the stored cookies and restart the long-poll —
      * a manual "Re-link" that restores the link WITHOUT re-pairing (no QR scan,
@@ -132,7 +230,23 @@ internal class GoogleMessagesSessionClient(
      * still-alive scope. @return true if the token refreshed and we resumed.
      */
     suspend fun reauth(): Boolean {
-        if (!runCatching { refreshToken() }.getOrDefault(false)) return false
+        Log.i(TAG, "reauth: re-link requested — net=${connectivity()} cookies[${cookieSummary()}]")
+        if (!runCatching { refreshToken() }.getOrDefault(false)) {
+            // This distinction is the whole diagnosis. If the stored cookies were
+            // still good and only the network was down, the credentials are fine
+            // and wiping them would be the bug, not the fix.
+            Log.w(
+                TAG,
+                "reauth FAILED (reason=$lastAuthFailure) — " + when (lastAuthFailure) {
+                    AuthFailureReason.NETWORK ->
+                        "couldn't reach Google; credentials NOT wiped, retry when back online"
+                    else -> "Google rejected the stored credentials; full re-pair needed"
+                },
+            )
+            return false
+        }
+        Log.i(TAG, "reauth OK — link restored from stored cookies WITHOUT re-pairing (no QR/emoji)")
+        sessionStartedMs = System.currentTimeMillis()
         longPollJob?.cancel(); longPollJob = scope.launch { longPollLoop() }
         ackJob?.cancel(); ackJob = scope.launch { ackLoop() }
         scope.launch {
@@ -313,7 +427,7 @@ internal class GoogleMessagesSessionClient(
         Log.i(TAG, "upload start: mime=$mime encSize=$sizeStr")
         val uploadUrl = http.newCall(startReq).execute().use { resp ->
             if (!resp.isSuccessful) {
-                Log.w(TAG, "upload start HTTP ${resp.code}: ${resp.body?.string()?.take(300)}")
+                Log.w(TAG, "upload start HTTP ${resp.code}: ${redacted(resp.body?.string().orEmpty(), 300)}")
                 return null
             }
             resp.header("x-goog-upload-url")
@@ -340,7 +454,7 @@ internal class GoogleMessagesSessionClient(
         Log.i(TAG, "upload finalize: PUT ${encrypted.size}B to $uploadHost")
         return http.newCall(finalizeReq).execute().use { resp ->
             if (!resp.isSuccessful) {
-                Log.w(TAG, "upload finalize HTTP ${resp.code}: ${resp.body?.string()?.take(300)}")
+                Log.w(TAG, "upload finalize HTTP ${resp.code}: ${redacted(resp.body?.string().orEmpty(), 300)}")
                 return null
             }
             val raw = resp.body?.bytes() ?: run { Log.w(TAG, "upload finalize: empty response body"); return null }
@@ -461,7 +575,7 @@ internal class GoogleMessagesSessionClient(
                     .build()
                 http.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) {
-                        Log.w(TAG, "downloadMedia HTTP ${resp.code}: ${resp.body?.string()?.take(300)}")
+                        Log.w(TAG, "downloadMedia HTTP ${resp.code}: ${redacted(resp.body?.string().orEmpty(), 300)}")
                         return@use null
                     }
                     val raw = resp.body?.bytes() ?: run { Log.w(TAG, "downloadMedia: empty body"); return@use null }
@@ -493,7 +607,13 @@ internal class GoogleMessagesSessionClient(
     private suspend fun longPollLoop() {
         var attempt = 0
         var reauthTried = false
-        var consecutiveFailures = 0
+        // SERVER failures (we reached Google and it said no) and TRANSPORT
+        // failures (we never reached Google) are counted separately and treated
+        // completely differently. Conflating them is what turns a tunnel into a
+        // permanent "re-link your phone".
+        var serverFailures = 0
+        var transportFailures = 0
+        var lastHeartbeatMs = 0L
         while (coroutineContext.isActive) {
             attempt++
             runCatching { refreshTokenIfNeeded() }
@@ -507,8 +627,31 @@ internal class GoogleMessagesSessionClient(
                 // Clean open/close — token + registration are healthy.
                 code == 0 -> {
                     reauthTried = false
-                    consecutiveFailures = 0
+                    serverFailures = 0
+                    transportFailures = 0
+                    lastHeartbeatMs = maybeHeartbeat(lastHeartbeatMs)
                     delay(2000)
+                }
+                // We never reached Google at all (DNS, no route, TLS, airplane
+                // mode, dead zone). This says NOTHING about our credentials, so
+                // it must never end the loop: on a flip phone a tunnel or a
+                // Wi-Fi handover is routine, and counting these toward a fatal
+                // threshold turned ~4 minutes of bad signal into a forced
+                // re-pair. Retry indefinitely with capped backoff — the session
+                // resumes by itself when signal returns.
+                code == -1 -> {
+                    transportFailures++
+                    val backoffMs = minOf(2000L shl minOf(transportFailures, 5), 60_000L)
+                    // Log the first, then every 10th, so a long outage leaves a
+                    // readable trace instead of a wall of identical lines.
+                    if (transportFailures == 1 || transportFailures % 10 == 0) {
+                        Log.w(
+                            TAG,
+                            "long-poll transport failure #$transportFailures (net=${connectivity()}) " +
+                                "— retrying in ${backoffMs}ms, link NOT dropped [up ${uptime()}]",
+                        )
+                    }
+                    delay(backoffMs)
                 }
                 // 401/403: the token lapsed. Try one forced refresh + reconnect
                 // before declaring the link dead, so users stay linked across expiry.
@@ -521,23 +664,56 @@ internal class GoogleMessagesSessionClient(
                             continue
                         }
                     }
-                    Log.e(TAG, "long-poll fatal — token dead; re-pair needed (reason=$lastAuthFailure)")
+                    // The refresh couldn't reach Google, so we still don't know
+                    // whether the credentials are bad. Back off and retry rather
+                    // than burning a possibly-healthy link on a network blip.
+                    if (lastAuthFailure == AuthFailureReason.NETWORK) {
+                        transportFailures++
+                        // Re-arm the reactive refresh periodically — not every
+                        // iteration (that would re-run an ECDSA sign + POST every
+                        // cycle for the whole outage) and not never. `reauthTried`
+                        // otherwise resets only on a clean poll, which never comes
+                        // while the token is dead: a single NETWORK verdict would
+                        // then be permanently sticky, the refresh would never be
+                        // retried, and the link would never be declared dead —
+                        // leaving the user with no reconnect screen and a Re-link
+                        // button that silently no-ops.
+                        if (transportFailures % 5 == 0) reauthTried = false
+                        val backoffMs = minOf(2000L shl minOf(transportFailures, 5), 60_000L)
+                        Log.w(
+                            TAG,
+                            "long-poll $code but the refresh couldn't reach Google (net=${connectivity()}) " +
+                                "— retrying in ${backoffMs}ms, link NOT dropped",
+                        )
+                        delay(backoffMs)
+                        continue
+                    }
+                    Log.e(
+                        TAG,
+                        "long-poll fatal HTTP $code after ${uptime()} — declaring link dead " +
+                            "(reason=$lastAuthFailure net=${connectivity()} " +
+                            "expiry=${expirySummary()} cookies[${cookieSummary()}])",
+                    )
                     _events.emit(SessionEvent.AuthExpired(lastAuthFailure))
                     return
                 }
-                // Any other error (e.g. 404 = registration not found / stale). Don't
-                // hammer the endpoint every 2s — back off exponentially. If it keeps
-                // failing the session is genuinely dead, so surface a single reconnect
-                // and stop the loop instead of polling forever.
+                // Any other SERVER error (e.g. 404 = registration not found /
+                // stale). Don't hammer the endpoint every 2s — back off
+                // exponentially. If it keeps failing the session is genuinely
+                // dead, so surface a single reconnect and stop the loop.
                 else -> {
-                    consecutiveFailures++
-                    if (consecutiveFailures >= MAX_LONGPOLL_FAILURES) {
-                        Log.e(TAG, "long-poll persistently failing (HTTP $code ×$consecutiveFailures) — needs re-link")
+                    serverFailures++
+                    if (serverFailures >= MAX_LONGPOLL_FAILURES) {
+                        Log.e(
+                            TAG,
+                            "long-poll persistently failing (HTTP $code ×$serverFailures) after ${uptime()} " +
+                                "— needs re-link (net=${connectivity()} cookies[${cookieSummary()}])",
+                        )
                         _events.emit(SessionEvent.AuthExpired(AuthFailureReason.TOKEN_DEAD))
                         return
                     }
-                    val backoffMs = minOf(2000L shl minOf(consecutiveFailures, 5), 60_000L)
-                    Log.w(TAG, "long-poll HTTP $code — backing off ${backoffMs}ms (failure #$consecutiveFailures)")
+                    val backoffMs = minOf(2000L shl minOf(serverFailures, 5), 60_000L)
+                    Log.w(TAG, "long-poll HTTP $code — backing off ${backoffMs}ms (failure #$serverFailures)")
                     delay(backoffMs)
                 }
             }
@@ -559,7 +735,23 @@ internal class GoogleMessagesSessionClient(
         http.newCall(req).execute().use { resp ->
             updateCookiesFromResponse(resp)
             if (!resp.isSuccessful) {
-                Log.e(TAG, "long-poll #$attempt HTTP ${resp.code}")
+                // The body is the only place that says WHY. SESSION_COOKIE_INVALID
+                // here means the rotating cookie died; anything else points at the
+                // token or the registration. Without it a 401 is unattributable.
+                // Bounded read: this client is built with readTimeout(0) for the
+                // long-poll, so an error body that never closes (captive portal,
+                // middlebox) would block this IO thread forever and wedge the poll.
+                val errBody = runCatching {
+                    resp.body?.source()
+                        ?.apply { timeout().timeout(5, TimeUnit.SECONDS) }
+                        ?.readUtf8().orEmpty()
+                }.getOrDefault("")
+                Log.e(
+                    TAG,
+                    "long-poll #$attempt HTTP ${resp.code} " +
+                        "cookieInvalid=${errBody.contains("SESSION_COOKIE_INVALID")} " +
+                        "body=${redacted(errBody, 300)}",
+                )
                 return resp.code
             }
             val source = resp.body?.source() ?: return 0
@@ -745,6 +937,18 @@ internal class GoogleMessagesSessionClient(
         if (tokenExpiryMs == 0L) {
             val ttlMs = if (account.tokenTtl > 0) account.tokenTtl / 1000 else 24 * 3600_000L
             tokenExpiryMs = now + ttlMs
+            // KNOWN LIMITATION, logged so a capture shows it happening: expiry is
+            // in-memory only, so every process start assumes the token was issued
+            // JUST NOW. A token that is actually 23h old looks brand new here, and
+            // the proactive refresh gets scheduled long after it really died. If
+            // this line appears repeatedly in a capture, the launcher is
+            // restarting often enough that proactive refresh never runs at all.
+            Log.w(
+                TAG,
+                "expiry assumed, not known: no persisted issue time — treating token as " +
+                    "issued now with ttl=${account.tokenTtl}" +
+                    "${if (account.tokenTtl > 0) "" else " (0 → 24h)"}, linkAge=${store.daysSinceLink() ?: -1}d",
+            )
         }
         val minsLeft = (tokenExpiryMs - now) / 60000
         if (now < tokenExpiryMs - 3600_000L) {
@@ -763,6 +967,12 @@ internal class GoogleMessagesSessionClient(
      * it survives process death. @return true if a new token was issued.
      */
     private suspend fun refreshToken(): Boolean {
+        // Clear the sticky reason FIRST. It is read by the long-poll and by the
+        // re-link handler to decide whether the credentials are dead, and a stale
+        // NETWORK left over from an earlier attempt would suppress that decision
+        // forever — the link would never be declared dead, the reconnect screen
+        // would never appear, and the user could not recover.
+        lastAuthFailure = AuthFailureReason.UNKNOWN
         val acct = account
         val requestId = UUID.randomUUID().toString()
         val timestampMicros = System.currentTimeMillis() * 1000
@@ -786,22 +996,67 @@ internal class GoogleMessagesSessionClient(
             "tokenLen=${acct.tachyonAuthToken.size} sigLen=${signature.size} " +
             "browserSrc=${acct.browser.sourceId.take(12)} hasCookies=${cookies.isNotEmpty()} " +
             "has1PSIDTS=${cookies.containsKey("__Secure-1PSIDTS")})")
-        val (code, respBody) = post(GMPairingProto.REGISTER_REFRESH_URL, body)
-        val refreshed = GMSessionProto.parseRegisterRefreshResponse(respBody)
+        // A transport failure here is NOT evidence about the credentials. Convert
+        // it into a classified `false` instead of letting it propagate as a bare
+        // exception that callers can only read as "refresh didn't work" — that
+        // ambiguity is what let a signal drop escalate into an account wipe.
+        val (code, respBody) = try {
+            post(GMPairingProto.REGISTER_REFRESH_URL, body)
+        } catch (c: kotlinx.coroutines.CancellationException) {
+            // Not a network failure — the session is being torn down. Must
+            // propagate, or we'd both swallow the cancellation and poison
+            // lastAuthFailure with NETWORK on the way out.
+            throw c
+        } catch (t: java.io.IOException) {
+            lastAuthFailure = AuthFailureReason.NETWORK
+            Log.w(
+                TAG,
+                "token refresh: couldn't reach Google (${t.javaClass.simpleName}: ${t.message}) " +
+                    "net=${connectivity()} — NOT treating as dead credentials",
+            )
+            return false
+        }
+        // An empty or non-JSON body (transient 5xx, captive portal, a response cut
+        // off mid-stream) throws out of the pblite parser; treat it as a failed
+        // refresh, not a crash. Deliberately does NOT log the body: a truncated
+        // RegisterRefresh response carries the new auth token near the front.
+        val refreshed = runCatching { GMSessionProto.parseRegisterRefreshResponse(respBody) }
+            .getOrElse {
+                Log.w(
+                    TAG,
+                    "token refresh: unparseable HTTP $code (${respBody.length}B, " +
+                        "cookieInvalid=${respBody.contains("SESSION_COOKIE_INVALID")}) — " +
+                        "${it.javaClass.simpleName}: ${it.message}",
+                )
+                null
+            }
         if (refreshed != null) {
             account = acct.copy(tachyonAuthToken = refreshed.tachyonAuthToken, tokenTtl = refreshed.ttl)
             store.updateToken(refreshed.tachyonAuthToken, refreshed.ttl)
             val ttlMs = if (refreshed.ttl > 0) refreshed.ttl / 1000 else 24 * 3600_000L
             tokenExpiryMs = System.currentTimeMillis() + ttlMs
             lastAuthFailure = AuthFailureReason.UNKNOWN
-            Log.i(TAG, "token refresh OK: new token ${refreshed.tachyonAuthToken.size}B ttl=${refreshed.ttl} (HTTP $code)")
+            Log.i(
+                TAG,
+                "token refresh OK: new token ${refreshed.tachyonAuthToken.size}B ttl=${refreshed.ttl}" +
+                    "${if (refreshed.ttl > 0) "" else " (0 → assuming 24h)"} (HTTP $code) " +
+                    "up ${uptime()} cookies[${cookieSummary()}]",
+            )
             return true
         }
         val cookieInvalid = respBody.contains("SESSION_COOKIE_INVALID")
         Log.w(TAG, "token refresh FAILED: no token in HTTP $code response " +
-            "(cookieInvalid=$cookieInvalid) — body=${respBody.take(400)}")
-        lastAuthFailure =
-            if (cookieInvalid) AuthFailureReason.COOKIE_INVALID else AuthFailureReason.TOKEN_DEAD
+            "(cookieInvalid=$cookieInvalid) up ${uptime()} net=${connectivity()} " +
+            "cookies[${cookieSummary()}] — body=${redacted(respBody, 400)}")
+        // Only a response Google actually authored is evidence about our
+        // credentials. A 5xx, or the HTML a captive portal substitutes, means we
+        // never got a verdict — calling that TOKEN_DEAD tells the user to re-pair
+        // over someone else's wifi splash page.
+        lastAuthFailure = when {
+            cookieInvalid -> AuthFailureReason.COOKIE_INVALID
+            code !in 200..499 -> AuthFailureReason.NETWORK
+            else -> AuthFailureReason.TOKEN_DEAD
+        }
         return false
     }
 
@@ -829,7 +1084,7 @@ internal class GoogleMessagesSessionClient(
                 updateCookiesFromResponse(resp)
                 val text = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "POST $url -> HTTP ${resp.code}: ${text.take(200)}")
+                    Log.w(TAG, "POST $url -> HTTP ${resp.code}: ${redacted(text, 200)}")
                 }
                 resp.code to text
             }
@@ -894,8 +1149,18 @@ internal class GoogleMessagesSessionClient(
     companion object {
         private const val TAG = "GMSession"
         /** Consecutive non-auth long-poll failures (e.g. 404) before we stop the
-         *  loop and surface a reconnect instead of polling forever. */
+         *  loop and surface a reconnect instead of polling forever.
+         *
+         *  This counts SERVER failures only. Transport failures (no network) are
+         *  counted separately and never end the loop — see [longPollLoop]. */
         private const val MAX_LONGPOLL_FAILURES = 8
+        /** How often the long-poll logs a liveness line while everything is fine.
+         *  Without it a healthy session is indistinguishable from a dead one in a
+         *  capture, and we can't tell how long a link survived before it broke. */
+        private const val HEARTBEAT_INTERVAL_MS = 5 * 60_000L
+        /** A base64/base64url run long enough to be a credential rather than an
+         *  id. Used by [redacted] to keep tokens out of support captures. */
+        private val SECRET_RUN = Regex("[A-Za-z0-9+/_-]{40,}={0,2}")
     }
 }
 
@@ -910,6 +1175,11 @@ enum class AuthFailureReason {
     /** The tachyon token itself is dead / revoked and RegisterRefresh couldn't
      *  reissue it. */
     TOKEN_DEAD,
+    /** We never reached Google at all — DNS failure, no route, airplane mode,
+     *  dead zone. The credentials are very probably still valid, so this must
+     *  NEVER trigger a `store.clear()`: wiping cookies over a tunnel is how a
+     *  working link gets destroyed by a four-minute signal drop. */
+    NETWORK,
     /** Cause not specifically identified. */
     UNKNOWN,
 }

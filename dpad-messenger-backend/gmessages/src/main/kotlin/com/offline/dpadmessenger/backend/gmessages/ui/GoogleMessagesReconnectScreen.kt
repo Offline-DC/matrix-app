@@ -52,6 +52,12 @@ fun GoogleMessagesReconnectScreen(
                 "in using a private/incognito window and close it right after, so " +
                 "your phone stays the only one holding the login.",
         )
+        AuthFailureReason.NETWORK -> Pair(
+            "No connection",
+            "Couldn't reach Google to restore the link — this phone looks offline. " +
+                "Your login is still saved, so nothing was lost. Move somewhere with " +
+                "signal and press Re-link again.",
+        )
         else -> Pair(
             "Disconnected from your phone",
             "The link to your phone expired. Re-link to keep texting.",

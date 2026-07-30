@@ -231,7 +231,17 @@ class GMGaiaClient(context: Context) {
             return false
         }
         val token = Base64.decode(tokenB64, Base64.DEFAULT)
-        val ttl = tokenData[1].asLongOrNull() ?: 0L
+        val ttlNode = tokenData[1]
+        val ttl = ttlNode.asLongOrNull() ?: 0L
+        if (ttl == 0L) {
+            // Distinguish "Google really sent 0" from "Google sent it as a JSON
+            // string and asLongOrNull() only accepts Num" — the JSPB convention
+            // encodes int64 fields as strings to dodge JS precision loss. The
+            // response body is logged with take(1200) and tokenData is the LAST
+            // element, so this is the only place the raw value is ever visible.
+            // Deliberately logs the node, not the body: the body carries the token.
+            Log.w(TAG, "signInGaia: TTL parsed as 0 — raw node=$ttlNode")
+        }
 
         val deviceData = root[2]
         val deviceNode = deviceData[0][0] // deviceWrapper.device = [userID, sourceID, network]
