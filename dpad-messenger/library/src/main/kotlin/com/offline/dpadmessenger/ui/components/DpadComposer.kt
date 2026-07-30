@@ -755,7 +755,11 @@ private fun StagedAttachmentPreview(
             }
         }
         Text(
-            text = "Photo ready — add a caption or send",
+            // No "Photo ready —" prefix. The thumbnail beside this line already
+            // says a photo is staged, so the words were repeating the picture —
+            // and they lied about a staged VIDEO, which takes the same strip and
+            // was also announced as a photo.
+            text = "add a caption or send",
             style = MaterialTheme.typography.bodyMedium,
             color = colors.mutedText,
             maxLines = 2,

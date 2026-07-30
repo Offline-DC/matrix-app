@@ -66,6 +66,8 @@ import com.offline.dpadmessenger.focus.dpadRow
 import com.offline.dpadmessenger.ui.components.CompactBarButton
 import com.offline.dpadmessenger.ui.components.CompactTopBar
 import com.offline.dpadmessenger.ui.components.InitialsAvatar
+import com.offline.dpadmessenger.ui.navbar.SoftKey
+import com.offline.dpadmessenger.ui.navbar.SoftKeys
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 import kotlinx.coroutines.launch
 
@@ -205,6 +207,26 @@ fun NewConversationScreen(
     }
 
     Scaffold(
+        // Right key only. The left one stays blank: the keypad belongs to the
+        // search field here, so there is nothing for it to do.
+        //
+        // Deliberately routed through the same two steps as hardware Back above
+        // rather than straight to onBack() — in group mode "back" drops the
+        // selection first. A soft key labelled "back" that skipped that step
+        // would leave the label saying one thing and doing another.
+        bottomBar = {
+            SoftKeys(
+                right = SoftKey("back") {
+                    if (groupMode) {
+                        groupMode = false
+                        selectedNumbers.clear()
+                        runCatching { fieldFocus.requestFocus() }
+                    } else {
+                        onBack()
+                    }
+                },
+            )
+        },
         topBar = {
             CompactTopBar(
                 title = if (groupMode) "New group" else "New message",

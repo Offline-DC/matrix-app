@@ -16,11 +16,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountCircle
-import androidx.compose.material.icons.filled.Create
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -43,8 +41,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -53,17 +49,15 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.data.RoomSummary
-import com.offline.dpadmessenger.focus.dpadFocusRing
 import com.offline.dpadmessenger.focus.dpadRow
-import com.offline.dpadmessenger.focus.onDpadAction
 import com.offline.dpadmessenger.ui.components.CompactBarButton
 import com.offline.dpadmessenger.ui.components.CompactTopBar
 import com.offline.dpadmessenger.ui.components.RoomListItem
 import com.offline.dpadmessenger.ui.settings.RELINK_WARN_DAYS
-import com.offline.dpadmessenger.ui.theme.ComposerButtonHighlight
-import com.offline.dpadmessenger.ui.theme.ComposerButtonResting
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 import com.offline.dpadmessenger.ui.theme.SmartTxtAvatarGray
+import com.offline.dpadmessenger.ui.navbar.SoftKey
+import com.offline.dpadmessenger.ui.navbar.SoftKeys
 
 /**
  * Top-level room list. DPAD Up/Down moves between rooms; OK opens the chat.
@@ -71,7 +65,9 @@ import com.offline.dpadmessenger.ui.theme.SmartTxtAvatarGray
  * list. The most recently opened conversation gets the initial focus on
  * return, not the first row, so the user lands where they left off.
  *
- * A floating "new message" compose button sits bottom-right. From any list
+ * "new" on the right soft key opens the new-conversation flow. It replaced a
+ * floating compose button that sat bottom-right and had to be reached with
+ * DPAD-Right — the action is the same, it just isn't in the way any more. From any list
  * row, DPAD-Right focuses it; DPAD-Left returns to the list. OK starts a new
  * conversation.
  */
@@ -83,7 +79,7 @@ fun RoomListScreen(
     onSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
     topBarTitle: String = "Messages",
-    /** Open the new-conversation flow. When null, the compose button is hidden
+    /** Open the new-conversation flow. When null, the "new" soft key is hidden
      *  (repository can't start conversations — e.g. the mock). */
     onNewMessage: (() -> Unit)? = null,
     /** Whole days since the last fresh sign-in. At/after [RELINK_WARN_DAYS] a red
@@ -114,17 +110,27 @@ fun RoomListScreen(
     // When the last-opened IS row 0, both requesters point at the same row.
     val entryRowFocus = remember { FocusRequester() }
     val firstRowFocus = remember { FocusRequester() }
-    val composeButtonFocus = remember { FocusRequester() }
-    // The settings cog's own focus handle, so the compose button can hand focus
-    // back up to it when the list is empty (otherwise the user would be trapped
-    // on the compose button with no row to return to).
-    val settingsFocus = remember { FocusRequester() }
     // Hoisted so the settings-cog Down handler can scroll the top row back into
     // composition before focusing it.
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
 
     Scaffold(
+        // Soft keys: the two hardware buttons under the screen. "settings" is the
+        // profile/cog in the header, "new" is what the floating compose button
+        // used to be — both actions now live in exactly one place. No centre key;
+        // DPAD_CENTER opens the highlighted conversation, which is the list's own.
+        //
+        // In the launcher this publishes to the phone's real bar and lays out
+        // nothing (so calculateBottomPadding() below is 0); elsewhere it draws the
+        // in-app row here, which is why it belongs in bottomBar rather than
+        // floating over the content.
+        bottomBar = {
+            SoftKeys(
+                left = SoftKey("settings") { onSettingsClick() },
+                right = onNewMessage?.let { SoftKey("new", it) },
+            )
+        },
         topBar = {
             CompactTopBar(
                 title = topBarTitle,
@@ -147,23 +153,12 @@ fun RoomListScreen(
                     CompactBarButton(
                         onClick = onSettingsClick,
                         extraModifier = Modifier
-                            .focusRequester(settingsFocus)
                             .onPreviewKeyEvent { event ->
                             if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionDown) {
-                                if (rooms.isEmpty()) {
-                                    // No rows to land on — go straight to the
-                                    // compose button (when present) so Down from
-                                    // the cog still does something useful.
-                                    if (onNewMessage != null) {
-                                        scope.launch {
-                                            repeat(8) {
-                                                withFrameNanos {}
-                                                if (runCatching { composeButtonFocus.requestFocus() }.isSuccess) return@launch
-                                            }
-                                        }
-                                    }
-                                    return@onPreviewKeyEvent true
-                                }
+                                // No rows to land on: swallow it and stay put.
+                                // "new" is on the soft-key bar now, so there's
+                                // nothing below the cog to move to.
+                                if (rooms.isEmpty()) return@onPreviewKeyEvent true
                                 // Move focus into the list. A just-arrived
                                 // message can re-sort the list and re-bind row
                                 // 0's focus requester this frame, so retry a few
@@ -235,8 +230,6 @@ fun RoomListScreen(
                             padding = PaddingValues(bottom = innerPadding.calculateBottomPadding()),
                             entryRowFocus = entryRowFocus,
                             firstRowFocus = firstRowFocus,
-                            // DPAD-Right anywhere in the list jumps to the compose button.
-                            composeButtonFocus = composeButtonFocus.takeIf { onNewMessage != null },
                             savedScroll = viewModel.savedScroll,
                             onScrollChanged = viewModel::saveScroll,
                             listState = listState,
@@ -248,46 +241,6 @@ fun RoomListScreen(
                         )
                     }
                 }
-            }
-
-            if (onNewMessage != null) {
-                ComposeButton(
-                    onClick = onNewMessage,
-                    focusRequester = composeButtonFocus,
-                    // Leaving the compose button: back to the list normally, but
-                    // back up to the settings cog when there are no rows.
-                    onLeft = {
-                        runCatching {
-                            if (rooms.isEmpty()) settingsFocus.requestFocus()
-                            else entryRowFocus.requestFocus()
-                        }
-                    },
-                    // DPAD-Up: return to the chat you were last on (the
-                    // last-opened row) so you can back out of the compose button
-                    // to where you came from without opening "new message".
-                    // Falls back to the top row, or the settings cog when the
-                    // list is empty. Retried across a few frames because the
-                    // target row may not be attached the instant we ask.
-                    onUp = {
-                        scope.launch {
-                            if (rooms.isEmpty()) {
-                                runCatching { settingsFocus.requestFocus() }
-                                return@launch
-                            }
-                            repeat(8) {
-                                withFrameNanos {}
-                                if (runCatching { entryRowFocus.requestFocus() }.isSuccess) return@launch
-                            }
-                            runCatching { firstRowFocus.requestFocus() }
-                        }
-                    },
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(
-                            end = 16.dp,
-                            bottom = innerPadding.calculateBottomPadding() + 16.dp,
-                        ),
-                )
             }
 
             // Press-and-hold context sheet for the selected conversation.
@@ -315,7 +268,6 @@ private fun RoomList(
     padding: PaddingValues,
     entryRowFocus: FocusRequester,
     firstRowFocus: FocusRequester,
-    composeButtonFocus: FocusRequester?,
     savedScroll: Pair<Int, Int>?,
     onScrollChanged: (index: Int, offset: Int) -> Unit,
     listState: androidx.compose.foundation.lazy.LazyListState,
@@ -380,17 +332,7 @@ private fun RoomList(
             .padding(
                 top = padding.calculateTopPadding(),
                 bottom = padding.calculateBottomPadding(),
-            )
-            // DPAD-Right from any focused row jumps to the floating compose
-            // button. Preview so it fires before a row consumes the key.
-            .onPreviewKeyEvent { event ->
-                if (composeButtonFocus != null &&
-                    event.type == KeyEventType.KeyDown && event.key == Key.DirectionRight
-                ) {
-                    runCatching { composeButtonFocus.requestFocus() }
-                    true
-                } else false
-            },
+            ),
     ) {
         items(items = rooms, key = { it.room.id }) { summary ->
             val isEntry = summary.room.id == entryRoomId
@@ -413,56 +355,6 @@ private fun RoomList(
                 showDivider = summary.room.id != rooms.lastOrNull()?.room?.id,
             )
         }
-    }
-}
-
-/** Floating "new message" compose button — DPAD reachable (Right to enter,
- *  Left to leave, OK to start a conversation). */
-@Composable
-private fun ComposeButton(
-    onClick: () -> Unit,
-    focusRequester: FocusRequester,
-    onLeft: () -> Unit,
-    onUp: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    var focused by remember { mutableStateOf(false) }
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = modifier
-            .size(52.dp)
-            .focusRequester(focusRequester)
-            .dpadFocusRing(focused, ComposerButtonHighlight)
-            .clip(CircleShape)
-            // Matches the in-chat composer buttons: soft blue at rest, full
-            // signal blue when highlighted, plus a focus ring on DPAD focus.
-            .background(if (focused) ComposerButtonHighlight else ComposerButtonResting)
-            .onFocusChanged { focused = it.isFocused }
-            .focusable()
-            .onDpadAction { onClick(); true }
-            .onPreviewKeyEvent { event ->
-                when {
-                    event.type == KeyEventType.KeyDown && event.key == Key.DirectionLeft -> {
-                        onLeft()
-                        true
-                    }
-                    // DPAD-Up leaves the compose button back into the list,
-                    // landing on the chat you were last on (see onUp at the call
-                    // site) rather than trapping focus on the button.
-                    event.type == KeyEventType.KeyDown && event.key == Key.DirectionUp -> {
-                        onUp()
-                        true
-                    }
-                    else -> false
-                }
-            },
-    ) {
-        Icon(
-            imageVector = Icons.Filled.Create,
-            contentDescription = "New message",
-            tint = Color.White,
-            modifier = Modifier.size(24.dp),
-        )
     }
 }
 

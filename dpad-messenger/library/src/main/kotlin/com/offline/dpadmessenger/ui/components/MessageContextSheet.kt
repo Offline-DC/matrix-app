@@ -32,6 +32,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import com.offline.dpadmessenger.ui.navbar.SoftKeys
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -100,6 +101,12 @@ fun MessageContextSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
     ) {
+        // A claim with no keys, held while this sheet is up. The sheet is a Dialog
+        // in its own window, so the screen underneath keeps its own claim — its
+        // labels would otherwise still be showing, and its action still reachable,
+        // for a sheet that has nothing to do with them. An empty claim blanks the
+        // bar and leaves both keys inert.
+        SoftKeys()
         Column(
             // Scrollable: on a short screen (e.g. the 240x320 TCL Flip 2) a failed
             // send with a long reason — e.g. the multi-line SMS-forwarding hint —

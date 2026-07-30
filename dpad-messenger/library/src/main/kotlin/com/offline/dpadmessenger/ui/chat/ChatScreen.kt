@@ -58,6 +58,8 @@ import com.offline.dpadmessenger.ui.components.CompactTopBar
 import com.offline.dpadmessenger.ui.components.DateDivider
 import com.offline.dpadmessenger.ui.components.TimestampSeparator
 import com.offline.dpadmessenger.ui.components.DpadComposer
+import com.offline.dpadmessenger.ui.navbar.SoftKey
+import com.offline.dpadmessenger.ui.navbar.SoftKeys
 import com.offline.dpadmessenger.ui.components.InitialsAvatar
 import com.offline.dpadmessenger.ui.components.LoadingOlderRow
 import com.offline.dpadmessenger.ui.components.MessageBubble
@@ -215,6 +217,11 @@ fun ChatScreen(
     val smarttxt = LocalDpadMessengerColors.current.smarttxt
 
     Scaffold(
+        // Right soft key only. Left stays blank — inside a thread the keypad
+        // belongs to the composer, and the one thing you need is out.
+        bottomBar = {
+            SoftKeys(right = SoftKey("back") { onBack() })
+        },
         topBar = {
             CompactTopBar(
                 title = room?.name ?: "",

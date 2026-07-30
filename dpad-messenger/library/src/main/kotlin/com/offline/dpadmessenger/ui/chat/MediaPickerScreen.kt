@@ -50,6 +50,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import com.offline.dpadmessenger.ui.navbar.SoftKey
+import com.offline.dpadmessenger.ui.navbar.SoftKeys
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -128,6 +130,12 @@ fun MediaPickerScreen(
                     onGrant = { permLauncher.launch(permissions) },
                 )
             }
+
+            // The picker is an overlay in the SAME window as the thread beneath
+            // it, so without a claim of its own the thread's "back" stayed live
+            // and the right soft key would have left the conversation entirely
+            // instead of closing the picker.
+            SoftKeys(right = SoftKey("back") { onClose() })
         }
     }
 }

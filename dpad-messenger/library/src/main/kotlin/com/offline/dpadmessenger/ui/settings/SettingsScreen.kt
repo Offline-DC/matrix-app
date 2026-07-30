@@ -35,6 +35,8 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.focus.dpadRow
 import com.offline.dpadmessenger.ui.components.CompactBarButton
+import com.offline.dpadmessenger.ui.navbar.SoftKey
+import com.offline.dpadmessenger.ui.navbar.SoftKeys
 import com.offline.dpadmessenger.ui.components.CompactTopBar
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 
@@ -114,6 +116,11 @@ fun SettingsScreen(
         }
     }
     Scaffold(
+        // Right soft key only. Left stays blank: nothing on this page needs a
+        // second action, and an invented one would just be another way to leave.
+        bottomBar = {
+            SoftKeys(right = SoftKey("back") { onBack() })
+        },
         topBar = {
             CompactTopBar(
                 title = "Settings",
