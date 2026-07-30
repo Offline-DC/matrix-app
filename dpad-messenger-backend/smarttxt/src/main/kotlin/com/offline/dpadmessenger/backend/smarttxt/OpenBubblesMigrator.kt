@@ -484,7 +484,10 @@ object OpenBubblesMigrator {
             "pm uninstall $OB_PKG; " +
             "gone || pm uninstall --user 0 $OB_PKG; " +
             "gone || pm disable-user --user 0 $OB_PKG; " +
-            "echo __OBPATH__; pm path $OB_PKG"
+            // `; true` because `pm path` exits 1 for a package that no longer exists —
+            // i.e. exactly on SUCCESS. Without it every clean uninstall logs a scary
+            // "su -M exit=1" warning from suOutput.
+            "echo __OBPATH__; pm path $OB_PKG; true"
         )
         val gone = !out.substringAfter("__OBPATH__", "package:").contains("package:")
         Log.i(TAG, "  retire OpenBubbles: uninstalled=$gone  out='${out.trim().take(300)}'")
