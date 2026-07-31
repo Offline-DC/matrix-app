@@ -59,6 +59,31 @@ import kotlinx.coroutines.withContext
  * surfaces is wired: initial-sync spinner, new-conversation + group, contacts
  * picker, media download/send, and local retention.
  */
+/**
+ * Per-process salt for [redactForLog]. Random, never persisted: an unsalted
+ * digest of a short message ("ok", "Text test") is trivially brute-forced, and
+ * these logs leave the device in support bundles.
+ *
+ * Correlation therefore works within one process run — enough to answer "is
+ * this the same message being redelivered?" — but not across a restart.
+ */
+private val LOG_SALT: ByteArray =
+    ByteArray(16).also { java.security.SecureRandom().nextBytes(it) }
+
+/**
+ * Render user-authored text as a length plus a salted fingerprint, never the
+ * text itself. Mirrors rustpush's `redact_text` so both halves of the log read
+ * the same way. Support bundles get shared with teammates and outside
+ * engineers; they should not carry customers' messages.
+ */
+private fun redactForLog(text: String): String {
+    val md = java.security.MessageDigest.getInstance("SHA-256")
+    md.update(LOG_SALT)
+    md.update(text.toByteArray(Charsets.UTF_8))
+    val h = md.digest().take(4).joinToString("") { "%02x".format(it) }
+    return "len=${text.length} h=$h"
+}
+
 internal class SmartTxtMessageRepository(
     private val session: SmartTxtSession,
     context: Context,
@@ -883,7 +908,7 @@ internal class SmartTxtMessageRepository(
         }
         val body = mapped.body.ifBlank { if (rm.attachments.isNotEmpty()) "Sent an attachment" else "" }
         if (body.isBlank()) { Log.d(TAG, "notify skip: blank body ${rm.chatGuid}"); return }
-        Log.i(TAG, "notify: room=${rm.chatGuid} screenOn=$screenOn body='${body.take(24)}'")
+        Log.i(TAG, "notify: room=${rm.chatGuid} screenOn=$screenOn body=${redactForLog(body)}")
         notifier.notifyIncoming(
             roomId = rm.chatGuid,
             title = roomNameById[rm.chatGuid] ?: userById(mapped.senderId).displayName,

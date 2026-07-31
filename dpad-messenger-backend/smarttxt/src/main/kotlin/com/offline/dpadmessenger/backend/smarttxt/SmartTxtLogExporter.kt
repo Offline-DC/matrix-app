@@ -185,6 +185,13 @@ internal object SmartTxtLogExporter {
             append("logBytesWritten=").append(bytes).append('\n')
             val total = kept + droppedNoise
             append("logNoisePct=").append(if (total > 0) droppedNoise * 100 / total else 0).append('\n')
+            // Capture continuity. Non-zero means the logcat reader died and was
+            // respawned that many times, and the file has that many holes — see
+            // SmartTxtLogRing.respawns. Read this BEFORE concluding anything
+            // from the absence of a line.
+            val (respawns, gapMs) = SmartTxtLogRing.respawnStats()
+            append("logcatRespawns=").append(respawns).append('\n')
+            append("logcatGapMs=").append(gapMs).append('\n')
         } catch (_: Throwable) {
             append("logVolume=unavailable\n")
         }
@@ -203,6 +210,10 @@ internal object SmartTxtLogExporter {
         append("#   'CATCHUP repo:'       — savesWithheld vs savesWritten while draining\n")
         append("# healthy: dropped=0, peakDepth well under 2000, peakPct well under 100,\n")
         append("#          savesWithheld >> savesWritten, and the log continues past 'done'\n")
+        append("# logcatRespawns  — capture continuity. 0 = the log is complete. Anything\n")
+        append("#   higher means the reader died that many times and the file has that many\n")
+        append("#   holes: absence of a line is NOT evidence it never happened. Grep\n")
+        append("#   '[ring] logcat reader respawned' to see exactly where.\n")
         append("# a bundle that simply STOPS mid-drain is the old failure: the process was\n")
         append("#   low-memory-killed, so check the launcher's system logcat for lowmemorykiller\n")
     }

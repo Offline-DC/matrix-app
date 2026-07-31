@@ -2735,9 +2735,16 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
             let other = counterparts.first().cloned().unwrap_or_else(|| canon(&sender));
             format!("iMessage;-;{other}")
         };
+        // Group display names are user-authored, so they get the same
+        // treatment as message bodies. chat_guid already identifies the
+        // conversation uniquely, so the name adds nothing to diagnosis.
+        let cv_name_redacted = cv_name
+            .as_deref()
+            .map(rustpush::redact_text)
+            .unwrap_or_else(|| "none".to_string());
         log::info!(
             "recv msg: guid={} ts={} sender={sender} is_from_me={is_from_me} \
-             is_group={is_group} counterparts={counterparts:?} cv_name={cv_name:?} \
+             is_group={is_group} counterparts={counterparts:?} cv_name={cv_name_redacted} \
              chat_guid={chat_guid}",
             msg.id, msg.sent_timestamp
         );

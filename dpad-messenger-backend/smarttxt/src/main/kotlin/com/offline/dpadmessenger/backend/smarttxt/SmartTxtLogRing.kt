@@ -2,6 +2,7 @@ package com.offline.dpadmessenger.backend.smarttxt
 
 import android.util.Log
 import java.io.BufferedReader
+import java.io.BufferedWriter
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStreamReader
@@ -77,6 +78,11 @@ internal object SmartTxtLogRing {
     private const val CURRENT_FILENAME = "current.log"
     private const val SEGMENT_PREFIX = "segment"
     private const val BUFFER_BYTES = 32 * 1024
+    /** Flush cadence for the ring writer — see [writeLine] for why this is not
+     *  per-line any more. Whichever comes first. */
+    private const val FLUSH_EVERY_LINES = 64
+    private const val FLUSH_INTERVAL_MS = 2_000L
+
     private const val RESPAWN_INITIAL_MS = 1_000L
     private const val RESPAWN_MAX_MS = 60_000L
 
@@ -123,7 +129,12 @@ internal object SmartTxtLogRing {
         // logger level is the only way to get them, at the cost of the mutex flood.
         // For registration health, prefer the REGSTATE lines and rustpush's own
         // info-level "Reregistering in N seconds", both of which are already captured.
-        (line.contains("rustpush::util:") || line.contains("rustpush::aps:")) &&
+        // logcat prints "--------- beginning of <buffer>" on stdout every time
+        // it attaches. Harmless but pure noise, and with the respawn marker
+        // above we now record the discontinuity ourselves, in one line that
+        // actually says what it means.
+        line.startsWith("--------- beginning of") ||
+        ((line.contains("rustpush::util:") || line.contains("rustpush::aps:")) &&
             // ...but NEVER drop their warnings/errors. `rustpush::aps` is held to Warn
             // at the source (init_logger), so anything at W or E from it is by
             // definition not flood — it is the APNs socket telling us it died
@@ -132,7 +143,7 @@ internal object SmartTxtLogRing {
             // away, so an exported bundle could not show a dead-socket stall at all;
             // it had to be reconstructed from message timestamps. `-v threadtime`
             // puts the level as a single char before the tag.
-            !(line.contains(" E SmartTxtRust:") || line.contains(" W SmartTxtRust:"))
+            !(line.contains(" E SmartTxtRust:") || line.contains(" W SmartTxtRust:")))
 
     // ---- volume counters, surfaced in the export bundle's meta.txt ----------
     //
@@ -160,11 +171,30 @@ internal object SmartTxtLogRing {
     private var thread: Thread? = null
     @Volatile private var process: Process? = null
 
+    /**
+     * How many times the logcat subprocess died and we respawned it, and the
+     * total time we spent with no reader attached.
+     *
+     * Each respawn is a HOLE in the capture: logd keeps producing while nothing
+     * is draining it, and those lines are gone. A 2026-07-31 bundle had 88 of
+     * these across 2h27m and nothing in the file said so — the log looked
+     * continuous, so "we never saw a message from X" read as evidence when it
+     * could just as easily have been one of 88 gaps. Surfaced in meta.txt so
+     * nobody draws that conclusion from a lossy capture again.
+     */
+    @Volatile private var respawns = 0L
+    @Volatile private var gapMs = 0L
+
+    /** Respawn count and total un-attached time — see [respawns]. */
+    fun respawnStats(): Pair<Long, Long> = Pair(respawns, gapMs)
+
     @Volatile private var dir: File? = null
     private var currentFile: File? = null
-    private var currentWriter: OutputStreamWriter? = null
+    private var currentWriter: BufferedWriter? = null
     private var currentBytes: Long = 0L
     private var backoffMs: Long = RESPAWN_INITIAL_MS
+    private var linesSinceFlush = 0
+    private var lastFlushMs = 0L
 
     /** Idempotent: safe to call on every entry to the Smart Txt UI. */
     @Synchronized
@@ -195,7 +225,11 @@ internal object SmartTxtLogRing {
     /** Flush the active writer so [dir] is current before an export reads it. */
     @Synchronized
     fun flush() {
-        try { currentWriter?.flush() } catch (_: Throwable) {}
+        try {
+            currentWriter?.flush()
+            linesSinceFlush = 0
+            lastFlushMs = System.currentTimeMillis()
+        } catch (_: Throwable) {}
     }
 
     /** The ring directory, or null if never started. */
@@ -204,15 +238,33 @@ internal object SmartTxtLogRing {
     // -- Tail loop ----------------------------------------------------------
 
     private fun runTailLoop() {
+        var first = true
+        // The duration actually slept before this attempt. Tracked separately
+        // from backoffMs because backoffMs is doubled after the sleep, so
+        // reading it in the marker below would overstate every gap by 2x.
+        var lastGapMs = 0L
         while (!stopped) {
             try {
                 openCurrentForAppend()
+                if (!first) {
+                    // ONE structured line per respawn, in place of the four
+                    // lines of logcat stderr that used to land here verbatim
+                    // ("Unexpected EOF!" + its three-line explanation). Marks
+                    // the discontinuity explicitly so a reader can see exactly
+                    // where the capture has holes, and grep/count them.
+                    respawns++
+                    writeLine("--- [ring] logcat reader respawned #$respawns after ${lastGapMs}ms — " +
+                        "lines produced during this gap are LOST ---\n")
+                }
+                first = false
                 spawnAndRead()
             } catch (t: Throwable) {
                 Log.w(TAG, "tail subprocess error", t)
             }
             if (stopped) break
-            try { Thread.sleep(backoffMs) } catch (_: InterruptedException) { break }
+            lastGapMs = backoffMs
+            gapMs += lastGapMs
+            try { Thread.sleep(lastGapMs) } catch (_: InterruptedException) { break }
             backoffMs = (backoffMs * 2).coerceAtMost(RESPAWN_MAX_MS)
         }
         flush()
@@ -227,8 +279,23 @@ internal object SmartTxtLogRing {
         cmd.add("logcat"); cmd.add("-v"); cmd.add("threadtime")
         for (t in SMARTTXT_TAGS) cmd.add("$t:V")
         cmd.add("*:S")
-        val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
+        // redirectErrorStream was true, which merged logcat's OWN stderr into
+        // the captured stream — so "logcat: Unexpected EOF!" and its three-line
+        // explanation were written into current.log as if they were log
+        // content, four junk lines per respawn. Keep the streams separate and
+        // drain stderr to Log.w instead, where it belongs.
+        val p = ProcessBuilder(cmd).redirectErrorStream(false).start()
         process = p
+        Thread({
+            try {
+                BufferedReader(InputStreamReader(p.errorStream)).use { err ->
+                    while (true) {
+                        val l = err.readLine() ?: break
+                        if (l.isNotBlank()) Log.w(TAG, "logcat stderr: $l")
+                    }
+                }
+            } catch (_: Throwable) { /* process gone; nothing to report */ }
+        }, "SmartTxtLogRing-stderr").apply { isDaemon = true; start() }
         BufferedReader(InputStreamReader(p.inputStream), BUFFER_BYTES).use { reader ->
             var resetBackoff = true
             while (!stopped) {
@@ -257,16 +324,34 @@ internal object SmartTxtLogRing {
         }
         currentFile = f
         currentBytes = f.length()
-        currentWriter = OutputStreamWriter(FileOutputStream(f, /* append = */ true))
+        linesSinceFlush = 0
+        lastFlushMs = System.currentTimeMillis()
+        currentWriter = BufferedWriter(OutputStreamWriter(FileOutputStream(f, /* append = */ true)), BUFFER_BYTES)
     }
 
     @Synchronized
     private fun writeLine(text: String) {
         val w = currentWriter ?: return
         w.write(text)
-        // Flush each line so the ring is up to date even if the process dies
-        // between reads; logcat is line-buffered upstream so the cost is fine.
-        w.flush()
+        // This used to flush on EVERY line, straight through an unbuffered
+        // OutputStreamWriter — one write syscall per log line. The old comment
+        // said "logcat is line-buffered upstream so the cost is fine"; on a
+        // low-RAM device with slow eMMC it is not. It made this reader slow
+        // enough that logd dropped it ("unable to read log messages as quickly
+        // as they were being produced"), which is what produced 88 respawns —
+        // and therefore 88 holes — in a single 2.5h capture.
+        //
+        // Buffer instead, and flush on a cadence: bounded loss if the process
+        // dies mid-window (at most FLUSH_EVERY_LINES lines or FLUSH_INTERVAL_MS
+        // of writes), against a reader fast enough to keep its logd connection.
+        // export() calls flush() first, so a user-triggered bundle is complete.
+        linesSinceFlush++
+        val now = System.currentTimeMillis()
+        if (linesSinceFlush >= FLUSH_EVERY_LINES || now - lastFlushMs >= FLUSH_INTERVAL_MS) {
+            w.flush()
+            linesSinceFlush = 0
+            lastFlushMs = now
+        }
         currentBytes += text.length
         bytesWritten += text.length
         if (currentBytes >= SEGMENT_BYTES) rotate()
@@ -286,7 +371,9 @@ internal object SmartTxtLogRing {
         val fresh = File(d, CURRENT_FILENAME).apply { createNewFile() }
         currentFile = fresh
         currentBytes = 0L
-        currentWriter = OutputStreamWriter(FileOutputStream(fresh, /* append = */ true))
+        linesSinceFlush = 0
+        lastFlushMs = System.currentTimeMillis()
+        currentWriter = BufferedWriter(OutputStreamWriter(FileOutputStream(fresh, /* append = */ true)), BUFFER_BYTES)
     }
 
     /** Keep the [KEEP_SEGMENTS] newest segments so the ring stays ~[MAX_TOTAL_BYTES]. */
