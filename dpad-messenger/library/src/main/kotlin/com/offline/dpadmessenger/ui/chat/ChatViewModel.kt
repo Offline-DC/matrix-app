@@ -265,14 +265,24 @@ class ChatViewModel(
      *  caption that rides the same message as the media. */
     fun sendAttachment(contentUri: String, caption: String? = null) {
         val sender = repository as? com.offline.dpadmessenger.data.AttachmentSender ?: return
-        viewModelScope.launch { runCatching { sender.sendAttachment(roomId, contentUri, caption?.trim()?.ifBlank { null }) } }
+        viewModelScope.launch {
+            runCatching { sender.sendAttachment(roomId, contentUri, caption?.trim()?.ifBlank { null }) }
+                // Was a bare runCatching {}: any failure in the whole attachment
+                // path vanished here with no trace anywhere.
+                .onFailure { android.util.Log.w("IMsgUiFlow", "sendAttachment failed room=$roomId", it) }
+                .onSuccess { if (!it) android.util.Log.w("IMsgUiFlow", "sendAttachment returned false room=$roomId") }
+        }
     }
 
     /** Send a recorded voice memo (local .m4a file path) as an audio attachment. */
     fun sendVoiceMemo(filePath: String) {
         val sender = repository as? com.offline.dpadmessenger.data.AttachmentSender ?: return
         val uri = android.net.Uri.fromFile(java.io.File(filePath)).toString()
-        viewModelScope.launch { runCatching { sender.sendAttachment(roomId, uri) } }
+        viewModelScope.launch {
+            runCatching { sender.sendAttachment(roomId, uri) }
+                .onFailure { android.util.Log.w("IMsgUiFlow", "sendVoiceMemo failed room=$roomId", it) }
+                .onSuccess { if (!it) android.util.Log.w("IMsgUiFlow", "sendVoiceMemo returned false room=$roomId") }
+        }
     }
 
     fun requestLoadOlder() {

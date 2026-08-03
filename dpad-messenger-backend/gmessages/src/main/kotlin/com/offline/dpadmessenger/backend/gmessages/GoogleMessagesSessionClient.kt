@@ -102,20 +102,34 @@ internal class GoogleMessagesSessionClient(
     private var longPollJob: Job? = null
     private var ackJob: Job? = null
 
+    /** True once Google has been told to route this account's messages to this
+     *  device. Cleared whenever the receive stream breaks, so the next healthy
+     *  long-poll re-registers. See [ensureActiveSession]. */
+    @Volatile private var activeSessionEstablished = false
+
+    /** Guards against piling up registration attempts. The long-poll can reopen
+     *  every couple of seconds if the stream is flapping, and each attempt is two
+     *  POSTs — without these we'd hammer Google exactly when it's already unhappy. */
+    private val activeSessionInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile private var lastActiveSessionAttemptMs = 0L
+
+    /** Consecutive rejected registrations. Widens the retry floor, and at
+     *  [ACTIVE_SESSION_MAX_REJECTS] surfaces the reconnect screen — a device that
+     *  Google keeps refusing to register is not receiving messages, and silently
+     *  retrying forever is the very failure this whole change exists to kill. */
+    private val activeSessionRejects = java.util.concurrent.atomic.AtomicInteger(0)
+
     fun connect() {
         if (longPollJob != null) return
         sessionStartedMs = System.currentTimeMillis()
         logSessionStart()
+        // Registration is driven by the long-poll actually opening (see
+        // [openLongPollOnce]), NOT by a fixed delay after connect(). At boot the
+        // launcher can start before Wi-Fi associates — a timer fires into a dead
+        // network, throws, and nothing retries it.
+        activeSessionEstablished = false
         longPollJob = scope.launch { longPollLoop() }
         ackJob = scope.launch { ackLoop() }
-        scope.launch {
-            // Let the stream open, then ask the phone for current state.
-            delay(1500)
-            runCatching { setActiveSession() }
-                .onFailure { Log.e(TAG, "setActiveSession failed", it) }
-            runCatching { requestConversationList() }
-                .onFailure { Log.e(TAG, "initial conversation list failed", it) }
-        }
     }
 
     fun disconnect() {
@@ -249,11 +263,9 @@ internal class GoogleMessagesSessionClient(
         sessionStartedMs = System.currentTimeMillis()
         longPollJob?.cancel(); longPollJob = scope.launch { longPollLoop() }
         ackJob?.cancel(); ackJob = scope.launch { ackLoop() }
-        scope.launch {
-            delay(1500)
-            runCatching { setActiveSession() }
-            runCatching { requestConversationList() }
-        }
+        // The new token needs a fresh registration; the restarted long-poll does
+        // it as soon as its stream opens.
+        activeSessionEstablished = false
         return true
     }
 
@@ -623,6 +635,10 @@ internal class GoogleMessagesSessionClient(
                     if (!coroutineContext.isActive) return
                     Log.e(TAG, "long-poll #$attempt threw", t); -1
                 }
+            // Any non-clean cycle means the receive stream broke. Google has no
+            // reason to keep routing to a device whose stream is gone, so
+            // re-register on the next healthy open.
+            if (code != 0) activeSessionEstablished = false
             when {
                 // Clean open/close — token + registration are healthy.
                 code == 0 -> {
@@ -758,6 +774,10 @@ internal class GoogleMessagesSessionClient(
             val splitter = PbLite.StreamSplitter()
             val buf = okio.Buffer()
             Log.d(TAG, "session long-poll #$attempt open")
+            // The receive stream is up — register as the active session now, if
+            // we haven't already. Launched on the session scope so it doesn't
+            // hold up the read loop below.
+            if (!activeSessionEstablished) scope.launch { ensureActiveSession() }
             while (coroutineContext.isActive) {
                 val read = source.read(buf, 8192L)
                 if (read == -1L) break
@@ -870,7 +890,80 @@ internal class GoogleMessagesSessionClient(
 
     /** SetActiveSession: rotate sessionID + send a GET_UPDATES nudge so the
      *  phone starts pushing current state to this connection. */
-    private suspend fun setActiveSession() {
+    /**
+     * Tell Google to route this account's messages to this device, then pull the
+     * initial conversation list. Idempotent and safe to call on every healthy
+     * long-poll open — it no-ops once registration has succeeded.
+     *
+     * This MUST NOT be fire-and-forget. It is the call that makes the account's
+     * messages arrive here at all; if it fails and is never retried, the
+     * long-poll stays open, the token keeps refreshing, the heartbeat keeps
+     * reporting "alive", and not one message ever comes in. That exact failure
+     * cost a customer 21 hours of silent breakage: the launcher started ~6s
+     * after a reboot, Wi-Fi wasn't up, the old fixed-delay call threw into a
+     * dead network, and nothing re-ran it. Sending still worked the whole time,
+     * which is what made it so hard to spot.
+     */
+    private suspend fun ensureActiveSession() {
+        if (activeSessionEstablished) return
+        val now = System.currentTimeMillis()
+        // Back off as rejections pile up: 15s, 30s, 1m, 2m, 4m, then 5m forever.
+        val floorMs = minOf(
+            ACTIVE_SESSION_RETRY_MS shl minOf(activeSessionRejects.get(), 5),
+            ACTIVE_SESSION_RETRY_MAX_MS,
+        )
+        if (now - lastActiveSessionAttemptMs < floorMs) return
+        // CAS, not check-then-set: reauth() cancels the long-poll without joining,
+        // and coroutine cancellation can't interrupt a blocking okio read, so two
+        // loops can briefly be inside openLongPollOnce at once.
+        if (!activeSessionInFlight.compareAndSet(false, true)) return
+        lastActiveSessionAttemptMs = now
+        val result = try {
+            runCatching {
+                val accepted = setActiveSession()
+                // Skip the sync if we weren't registered — it can't succeed and
+                // it doubles the traffic on the failing path.
+                if (accepted) requestConversationList()
+                accepted
+            }
+        } finally {
+            activeSessionInFlight.set(false)
+        }
+        // Don't mistake teardown for a failure.
+        result.exceptionOrNull()?.let { if (it is kotlinx.coroutines.CancellationException) throw it }
+        if (result.getOrDefault(false)) {
+            activeSessionEstablished = true
+            activeSessionRejects.set(0)
+            Log.i(TAG, "setActiveSession OK — registered to receive messages [up ${uptime()}]")
+        } else {
+            // Atomic read-modify-write: the reject bookkeeping sits outside the
+            // CAS-protected region, and a lost update would skip the threshold
+            // and suppress the warning to the user entirely.
+            val rejects = activeSessionRejects.incrementAndGet()
+            Log.w(
+                TAG,
+                "setActiveSession FAILED #$rejects (net=${connectivity()}) — " +
+                    "NOT receiving yet, will retry on a later long-poll open",
+                result.exceptionOrNull(),
+            )
+            // Exactly once, at the threshold: tell the user. Retries continue
+            // quietly at the 5-minute floor in case it recovers on its own.
+            if (rejects == ACTIVE_SESSION_MAX_REJECTS) {
+                Log.e(
+                    TAG,
+                    "setActiveSession rejected ×$rejects — this device is NOT " +
+                        "receiving messages; surfacing the reconnect screen",
+                )
+                _events.emit(SessionEvent.AuthExpired(AuthFailureReason.TOKEN_DEAD))
+            }
+        }
+    }
+
+    /** @return true only if Google ACCEPTED the registration. [post] does not
+     *  throw on a non-2xx, so without checking the status a 401/5xx would look
+     *  identical to success — and [ensureActiveSession] would latch and never
+     *  retry, recreating the exact silent-no-receive bug from a different cause. */
+    private suspend fun setActiveSession(): Boolean {
         sessionId = UUID.randomUUID().toString()
         // GET_UPDATES uses the sessionID as its requestID (mautrix SetActiveSession).
         val acct = account
@@ -883,7 +976,9 @@ internal class GoogleMessagesSessionClient(
             tachyonAuthToken = acct.tachyonAuthToken, ttl = 0L, // OmitTTL
             destRegB64 = destRegB64,
         )
-        post(sendUrl, envelope)
+        val (code, _) = post(sendUrl, envelope)
+        if (code !in 200..299) Log.w(TAG, "setActiveSession rejected: HTTP $code")
+        return code in 200..299
     }
 
     private suspend fun ackBrowserPresence() {
@@ -1158,6 +1253,13 @@ internal class GoogleMessagesSessionClient(
          *  Without it a healthy session is indistinguishable from a dead one in a
          *  capture, and we can't tell how long a link survived before it broke. */
         private const val HEARTBEAT_INTERVAL_MS = 5 * 60_000L
+        /** Floor between active-session registration attempts; doubles per
+         *  consecutive rejection up to [ACTIVE_SESSION_RETRY_MAX_MS]. */
+        private const val ACTIVE_SESSION_RETRY_MS = 15_000L
+        private const val ACTIVE_SESSION_RETRY_MAX_MS = 5 * 60_000L
+        /** Consecutive rejections before we stop failing silently and show the
+         *  reconnect screen. */
+        private const val ACTIVE_SESSION_MAX_REJECTS = 5
         /** A base64/base64url run long enough to be a credential rather than an
          *  id. Used by [redacted] to keep tokens out of support captures. */
         private val SECRET_RUN = Regex("[A-Za-z0-9+/_-]{40,}={0,2}")

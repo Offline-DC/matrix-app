@@ -32,6 +32,12 @@ dependencies {
     // and the chat screens — on its classpath without declaring it twice.
     api("com.offline.dpadmessenger:library:0.2.0")
 
+    // :core owns the shared SQLite MessageStore that replaced the encrypted-JSON
+    // blob cache. :smarttxt and :signal already depended on :core; this module was
+    // the odd one out. Adds nothing new transitively — library, security-crypto,
+    // core-ktx and coroutines are all already declared here at the same versions.
+    api(project(":core"))
+
     // EncryptedSharedPreferences for persisting the pairing tokens we get
     // back from the QR pairing flow with the user's primary phone.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")

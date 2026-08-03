@@ -1,5 +1,8 @@
 package com.offline.dpadmessenger.backend.signal
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
 import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
@@ -7,6 +10,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
@@ -28,6 +32,7 @@ import org.whispersystems.signalservice.internal.push.SignalServiceProtos
 import org.whispersystems.signalservice.internal.websocket.WebSocketProtos
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * Authenticated chat WebSocket connection.
@@ -58,6 +63,10 @@ class SignalChatWebSocket(
      *  in production wire it via the convenience constructor below so
      *  contact names update from the primary's address book. */
     private val contactSyncHandler: SignalContactSyncHandler? = null,
+    /** Application context, used only to watch for default-network changes so
+     *  we can reconnect proactively on a Wi-Fi <-> cell handover. Optional so
+     *  existing tests can still construct the socket without one. */
+    private val appContext: Context? = null,
     private val chatUrl: String = "wss://chat.signal.org/v1/websocket/",
 ) {
     /** Convenience: build with Signal-CA-trusting OkHttpClient + protocol store + contact-sync. */
@@ -75,6 +84,7 @@ class SignalChatWebSocket(
             api = SignalApi(SignalTrust.buildOkHttp(context)),
             repository = repository,
         ),
+        appContext = context.applicationContext,
     )
 
     /**
@@ -86,6 +96,34 @@ class SignalChatWebSocket(
     var onSocketConnected: (() -> Unit)? = null
 
     private var socket: WebSocket? = null
+
+    /**
+     * WebSocket-specific client derived from [okHttp].
+     *
+     * `pingInterval` is the whole point. OkHttp disables the read timeout on a
+     * socket once it has been upgraded (`RealConnection.newWebSocketStreams()`
+     * does `socket.soTimeout = 0`), so on an established chat socket the ONLY
+     * transport-level liveness check is the ping/pong task — and that task is
+     * simply never scheduled when `pingIntervalMillis == 0`
+     * (`RealWebSocket.initReaderAndWriter`). Without it a half-open socket —
+     * radio handover, NAT rebind, an interface that went away without an RST —
+     * looks perfectly healthy to us until the kernel finally gives up on TCP
+     * retransmits, which on cellular is many minutes. Everything the server
+     * queued in the meantime then lands in one late burst.
+     *
+     * With it, OkHttp fails the socket with `SocketTimeoutException("sent ping
+     * but didn't receive pong ...")` after at most one interval, which lands in
+     * [WebSocketListener.onFailure] and takes the normal reconnect path.
+     *
+     * `connectTimeout`/`readTimeout` only cover the HTTP upgrade handshake
+     * (see the soTimeout note above). Signal-Android sets both to
+     * `KEEPALIVE_FREQUENCY_SECONDS + 10`; we match.
+     */
+    private val wsClient: OkHttpClient = okHttp.newBuilder()
+        .pingInterval(PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
+        .connectTimeout(HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .readTimeout(HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .build()
 
     /**
      * Dedicated, bounded pool for decrypted-payload processing (repository
@@ -147,8 +185,36 @@ class SignalChatWebSocket(
      *  (creds never self-heal) means the device was unlinked. */
     @Volatile private var authFailures = 0
 
+    /**
+     * Bumped on every [connect]. Each connection's listener and keepalive loop
+     * capture the value they were started with and no-op once it moves on, so a
+     * dying socket can never reconnect on top of its own replacement or ping
+     * the new socket. Without this, the old socket's late `onFailure` and a
+     * forced reconnect race and you end up with two live sockets.
+     */
+    @Volatile private var generation = 0L
+
+    /** Keepalive loop for the CURRENT connection. Cancelled on reconnect —
+     *  [startKeepalive] used to be re-launched per connect and never stopped,
+     *  so every reconnect left another loop running forever. */
+    @Volatile private var keepaliveJob: Job? = null
+
+    /** Wall clock of the last frame the server sent us. Any frame proves the
+     *  socket is alive; the keepalive watchdog compares this against when it
+     *  last sent. */
+    @Volatile private var lastInboundAt = 0L
+
+    /** Rate limit on [forceReconnect] so a burst of network callbacks (or a
+     *  server that is up but refusing) can't spin. */
+    @Volatile private var lastForcedReconnectAt = 0L
+
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    @Synchronized
     fun connect() {
         stopped = false
+        val gen = ++generation
+        keepaliveJob?.cancel()
         val auth = "${account.aci}.${account.deviceId}:${account.password}"
         val authHeader = "Basic " + Base64.encodeToString(auth.toByteArray(), Base64.NO_WRAP)
         // Signal's chat WebSocket accepts auth via either Basic header OR
@@ -163,20 +229,66 @@ class SignalChatWebSocket(
             .url(url)
             .header("Authorization", authHeader)
             .build()
-        socket = okHttp.newWebSocket(request, listener)
-        Log.d(TAG, "connecting as ${account.aci}.${account.deviceId}")
-        startKeepalive()
+        // The listener is built per-connection so it carries `gen`. A single
+        // shared listener can't tell its own socket from a stale one, and
+        // comparing against the `socket` field races: OkHttp can call back
+        // before `socket = ...` below has run.
+        val sock = wsClient.newWebSocket(request, newListener(gen))
+        socket = sock
+        lastInboundAt = System.currentTimeMillis()
+        Log.i(TAG, "chat socket connecting as ${account.aci}.${account.deviceId} (gen=$gen)")
+        keepaliveJob = startKeepalive(gen, sock)
+        registerNetworkCallback()
     }
 
+    @Synchronized
     fun disconnect() {
         stopped = true
+        generation++
+        keepaliveJob?.cancel()
+        keepaliveJob = null
         socket?.close(1000, "shutdown")
         socket = null
+        unregisterNetworkCallback()
     }
 
-    private val listener = object : WebSocketListener() {
+    /**
+     * Tear the current socket down and immediately open a new one.
+     *
+     * This is the path a *silently* dead socket takes — one the OS still
+     * considers open. [WebSocketListener.onFailure] never fires for those, so
+     * the ordinary reconnect-with-backoff path never runs; something has to
+     * notice and force it. Rate-limited to one every
+     * [MIN_FORCED_RECONNECT_GAP_MS] so repeated triggers can't spin.
+     *
+     * @return true if a reconnect actually happened. Callers that tear
+     *   themselves down afterwards MUST check it — a rate-limited `false`
+     *   treated as success would leave the connection with no watchdog at all.
+     */
+    @Synchronized
+    private fun forceReconnect(reason: String): Boolean {
+        if (stopped) return false
+        val now = System.currentTimeMillis()
+        val since = now - lastForcedReconnectAt
+        if (since < MIN_FORCED_RECONNECT_GAP_MS) {
+            Log.w(TAG, "not forcing reconnect ($reason) — last one was ${since}ms ago")
+            return false
+        }
+        lastForcedReconnectAt = now
+        Log.w(TAG, "forcing chat socket reconnect: $reason")
+        generation++          // orphan the old listener + keepalive loop
+        keepaliveJob?.cancel()
+        runCatching { socket?.close(1000, "reconnect") }
+        socket = null
+        connect()
+        return true
+    }
+
+    private fun newListener(gen: Long) = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            Log.d(TAG, "chat socket OPEN (HTTP ${response.code})")
+            if (gen != generation) return
+            Log.i(TAG, "chat socket OPEN (HTTP ${response.code}, gen=$gen)")
+            lastInboundAt = System.currentTimeMillis()
             reconnectAttempts = 0  // healthy connection — reset backoff
             authFailures = 0
             // Notify outside the listener thread so anything heavy (network,
@@ -185,15 +297,16 @@ class SignalChatWebSocket(
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (gen != generation) return
             handleFrame(webSocket, bytes.toByteArray())
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            Log.d(TAG, "chat socket CLOSED $code $reason")
+            Log.i(TAG, "chat socket CLOSED $code $reason (gen=$gen)")
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            if (stopped) return
+            if (stopped || gen != generation) return
             val code = response?.code
 
             // A 401/403 on the upgrade means the server rejected our device
@@ -226,7 +339,7 @@ class SignalChatWebSocket(
             Log.w(TAG, "chat socket dropped (code=$code ${t.message}); reconnecting in ${backoffMs}ms")
             connScope.launch {
                 delay(backoffMs)
-                if (!stopped) connect()
+                if (!stopped && gen == generation) connect()
             }
         }
     }
@@ -246,6 +359,12 @@ class SignalChatWebSocket(
             Log.w(TAG, "could not parse chat-socket envelope", t)
             return
         }
+        // Any frame at all proves the socket is still carrying traffic — that
+        // is what the keepalive watchdog reads. RESPONSE frames in particular
+        // are the keepalive acks: the only outbound REQUESTs we ever make on
+        // this socket are keepalives, and they used to be discarded here, which
+        // is exactly why an unanswered keepalive was invisible.
+        lastInboundAt = System.currentTimeMillis()
         if (envelope.type != WebSocketProtos.WebSocketMessage.Type.REQUEST) return
         val req = envelope.request ?: return
 
@@ -286,6 +405,17 @@ class SignalChatWebSocket(
         }
 
         val sourceServiceId = env.sourceServiceIdString()
+
+        // Non-PII arrival marker, kept at INFO so it survives the diagnostics
+        // filterspec. `lagMs` is the whole diagnosis for "why did this show up
+        // late": the server stamps an envelope when it accepts it, so a large
+        // lag means the message sat in the server-side queue while our socket
+        // was down — not that the sender was slow or that we dropped it.
+        // Anything past a few hundred ms is a delivery gap on our side.
+        val lagMs =
+            if (env.hasServerTimestamp()) System.currentTimeMillis() - env.serverTimestamp else -1L
+        Log.i(TAG, "envelope in: type=${env.type} lagMs=$lagMs")
+
         if (VERBOSE) Log.d(TAG, "ENVELOPE type=${env.type} from=$sourceServiceId deviceId=${env.sourceDeviceId}")
 
         val store = protocolStore ?: run {
@@ -869,14 +999,50 @@ class SignalChatWebSocket(
     /**
      * Signal's chat server expects an empty WebSocketRequest to
      * `/v1/keepalive` every ~30 seconds; idle sockets get torn down.
-     * mautrix-signal sends one every 30s. We match.
+     *
+     * Sending it was never the hard part — noticing that nobody answered is.
+     * Every shipping Signal client treats an unanswered heartbeat as a dead
+     * socket and rebuilds it:
+     *
+     *  - Signal-Android `SignalWebSocketHealthMonitor.KeepAliveSender`:
+     *    `if (hasSentKeepAlive && lastKeepAliveReceived < keepAliveSentTime)
+     *     webSocket?.forceNewWebSocket()`
+     *  - mautrix-signal `signalmeow/web/signalwebsocket.go`: ping every 30s
+     *    with a 20s pong deadline, 5 strikes then
+     *    `ws.Close(..., "Ping timeout")`
+     *
+     * We had the 30s cadence and neither half of the watchdog: the response was
+     * dropped on the floor in [handleFrame], and `send()`'s return value (false
+     * when the socket is closed or the buffer is full) was swallowed by
+     * `runCatching`. So a socket that had stopped carrying traffic kept getting
+     * keepalives written into a dead pipe, and nothing reconnected until the
+     * kernel timed out the TCP retransmits — minutes later, at which point the
+     * whole server-side queue arrives at once.
+     *
+     * [gen] and [sock] are captured rather than read from the fields so a loop
+     * belonging to a superseded connection exits instead of pinging the new
+     * socket.
      */
-    private fun startKeepalive() {
-        connScope.launch {
+    private fun startKeepalive(gen: Long, sock: WebSocket): Job {
+        return connScope.launch {
             var keepaliveId = 1L
+            var lastSentAt = 0L
             while (true) {
-                delay(30_000)
-                val sock = socket ?: return@launch
+                delay(KEEPALIVE_INTERVAL_MS)
+                if (stopped || gen != generation) return@launch
+
+                // Nothing came back since we last sent — the socket is dead
+                // even though the OS still thinks it is open.
+                if (lastSentAt != 0L && lastInboundAt < lastSentAt) {
+                    val reconnected = forceReconnect(
+                        "keepalive unanswered (${System.currentTimeMillis() - lastSentAt}ms since send)",
+                    )
+                    // If the rate limiter declined, keep looping and try again
+                    // next tick — exiting here would leave this connection with
+                    // no watchdog and nothing to bring it back.
+                    if (reconnected) return@launch else continue
+                }
+
                 val req = WebSocketProtos.WebSocketRequestMessage.newBuilder()
                     .setVerb("GET")
                     .setPath("/v1/keepalive")
@@ -886,9 +1052,67 @@ class SignalChatWebSocket(
                     .setType(WebSocketProtos.WebSocketMessage.Type.REQUEST)
                     .setRequest(req)
                     .build()
-                runCatching { sock.send(out.toByteArray().toByteString()) }
+                lastSentAt = System.currentTimeMillis()
+                val accepted = runCatching { sock.send(out.toByteArray().toByteString()) }
+                    .getOrDefault(false)
+                if (!accepted) {
+                    val reconnected =
+                        forceReconnect("keepalive write rejected (socket closed or send buffer full)")
+                    if (reconnected) return@launch else continue
+                }
             }
         }
+    }
+
+    /**
+     * Reconnect when the default network changes.
+     *
+     * This is the other half of the same failure, and it is the root cause
+     * Signal's own maintainers landed on for delayed delivery in websocket mode
+     * (Signal-Android#13640): the socket is bound to an interface that has gone
+     * away, and nothing tells the app. It matters more on this device than on a
+     * normal phone, because the launcher deliberately power-cycles the Wi-Fi
+     * radio when idle (`WifiIdleRadio`) — a transition the socket would
+     * otherwise only discover via TCP timeout.
+     *
+     * The first [ConnectivityManager.NetworkCallback.onAvailable] after
+     * registering describes the network we are already on, so it is recorded
+     * and skipped; only subsequent changes force a reconnect.
+     */
+    @Synchronized
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        val ctx = appContext ?: return
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        if (cm == null) {
+            Log.w(TAG, "no ConnectivityManager — network-change reconnect disabled")
+            return
+        }
+        var sawFirst = false
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (!sawFirst) {
+                    sawFirst = true
+                    return
+                }
+                forceReconnect("default network changed")
+            }
+
+            override fun onLost(network: Network) {
+                Log.w(TAG, "default network lost")
+            }
+        }
+        runCatching { cm.registerDefaultNetworkCallback(cb) }
+            .onSuccess { networkCallback = cb }
+            .onFailure { Log.w(TAG, "could not register network callback", it) }
+    }
+
+    @Synchronized
+    private fun unregisterNetworkCallback() {
+        val cb = networkCallback ?: return
+        val cm = appContext?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        runCatching { cm?.unregisterNetworkCallback(cb) }
+        networkCallback = null
     }
 
     /**
@@ -1016,6 +1240,22 @@ class SignalChatWebSocket(
         private const val VERBOSE = false
         /** Cap on reconnect backoff so a long outage settles at a slow poll. */
         private const val MAX_BACKOFF_MS = 60_000L
+
+        /** Application-level `/v1/keepalive` cadence. Matches Signal-Android's
+         *  `KEEPALIVE_FREQUENCY_SECONDS` and mautrix-signal's ping interval. */
+        private const val KEEPALIVE_INTERVAL_MS = 30_000L
+
+        /** OkHttp WebSocket ping/pong cadence AND its pong deadline — OkHttp
+         *  fails the socket if a pong hasn't arrived by the next tick. */
+        private const val PING_INTERVAL_SECONDS = 30L
+
+        /** Covers the HTTP upgrade only; OkHttp zeroes the socket read timeout
+         *  once the connection is upgraded. Signal-Android uses keepalive+10. */
+        private const val HANDSHAKE_TIMEOUT_SECONDS = 40L
+
+        /** Floor between forced reconnects so overlapping triggers (watchdog +
+         *  network callback) can't turn into a connect loop. */
+        private const val MIN_FORCED_RECONNECT_GAP_MS = 15_000L
         /** Consecutive 401/403s before we conclude the device is unlinked. */
         private const val AUTH_FAILURE_LIMIT = 3
     }

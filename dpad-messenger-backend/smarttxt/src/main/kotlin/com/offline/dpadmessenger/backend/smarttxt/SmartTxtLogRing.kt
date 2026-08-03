@@ -83,6 +83,13 @@ internal object SmartTxtLogRing {
     private const val FLUSH_EVERY_LINES = 64
     private const val FLUSH_INTERVAL_MS = 2_000L
 
+    /** How long a spawn must survive before it counts as healthy enough to
+     *  reset the respawn backoff. See the reset site in [spawnAndRead]. */
+    private const val HEALTHY_SPAWN_MS = 10_000L
+
+    /** Empty anchored spawns tolerated before falling back to no anchor. */
+    private const val ANCHOR_FAIL_LIMIT = 2
+
     private const val RESPAWN_INITIAL_MS = 1_000L
     private const val RESPAWN_MAX_MS = 60_000L
 
@@ -196,6 +203,43 @@ internal object SmartTxtLogRing {
     private var linesSinceFlush = 0
     private var lastFlushMs = 0L
 
+    /**
+     * Timestamp prefix ("MM-DD HH:MM:SS.mmm") of the last line written.
+     *
+     * Plain `logcat` reads logd's buffer from the BEGINNING every time it
+     * attaches. That had two costs, both measured on the 2026-07-31 bundle:
+     * every respawn re-wrote lines this ring already held (51% of the ~10 MB
+     * budget was duplicate replay, and segment-pre-…202255.log was 99%
+     * identical to current.log), and — worse for diagnosis — output from a
+     * PREVIOUS app build reappeared inside the current run's file, which is
+     * exactly how a bundle came to look like it predated an update it
+     * actually contained.
+     *
+     * Passing this back as `-T` makes each spawn resume where the last one
+     * stopped, which also means a respawn no longer loses the lines produced
+     * during the gap (as long as logd hasn't wrapped). `-T` is inclusive, so
+     * the boundary line can repeat once per respawn — cheap next to replaying
+     * the whole buffer.
+     */
+    @Volatile private var lastLineTs: String? = null
+
+    /**
+     * Consecutive spawns that read ZERO lines while using a `-T` anchor.
+     *
+     * Safety net for the anchor itself. If the anchor is ever malformed, or
+     * lands in the future (device clock stepped by an NTP sync, timezone
+     * change), logcat happily starts and then returns nothing — and the
+     * respawn loop would retry forever with the same bad value, leaving the
+     * ring silently dead. Silently dead is the worst possible failure for a
+     * diagnostic: it looks exactly like "the app stopped doing anything".
+     *
+     * So: after [ANCHOR_FAIL_LIMIT] empty spawns, give up on anchoring for the
+     * rest of this process and take the buffer as-is. Replaying some old lines
+     * is a far better failure than capturing none.
+     */
+    @Volatile private var emptySpawns = 0
+    @Volatile private var anchorDisabled = false
+
     /** Idempotent: safe to call on every entry to the Smart Txt UI. */
     @Synchronized
     fun ensureStarted(context: android.content.Context) {
@@ -255,6 +299,14 @@ internal object SmartTxtLogRing {
                     respawns++
                     writeLine("--- [ring] logcat reader respawned #$respawns after ${lastGapMs}ms — " +
                         "lines produced during this gap are LOST ---\n")
+                    // Flush immediately rather than waiting for the cadence.
+                    // FLUSH_INTERVAL_MS is only evaluated inside writeLine, so
+                    // when the app itself goes quiet — which is exactly what a
+                    // frozen or wedged app looks like — nothing further
+                    // arrives to trigger it and the marker never reaches disk.
+                    // The result reads as "the log simply stops", which is the
+                    // single most misleading thing a diagnostic can do.
+                    flush()
                 }
                 first = false
                 spawnAndRead()
@@ -277,6 +329,15 @@ internal object SmartTxtLogRing {
         // verbose, everything else silenced.
         val cmd = ArrayList<String>()
         cmd.add("logcat"); cmd.add("-v"); cmd.add("threadtime")
+        // Resume from the last line we captured rather than replaying logd's
+        // whole buffer — see [lastLineTs]. On the first spawn of a process
+        // there is no last-line anchor yet, so fall back to this process's
+        // start time rather than the buffer head — see [processStartAnchor]
+        // for why taking the buffer as-is is actively harmful.
+        val anchor =
+            if (anchorDisabled) null
+            else lastLineTs ?: runCatching { processStartAnchor() }.getOrNull()
+        anchor?.let { cmd.add("-T"); cmd.add(it) }
         for (t in SMARTTXT_TAGS) cmd.add("$t:V")
         cmd.add("*:S")
         // redirectErrorStream was true, which merged logcat's OWN stderr into
@@ -296,11 +357,28 @@ internal object SmartTxtLogRing {
                 }
             } catch (_: Throwable) { /* process gone; nothing to report */ }
         }, "SmartTxtLogRing-stderr").apply { isDaemon = true; start() }
+        var linesThisSpawn = 0
         BufferedReader(InputStreamReader(p.inputStream), BUFFER_BYTES).use { reader ->
+            val spawnStartMs = System.currentTimeMillis()
             var resetBackoff = true
             while (!stopped) {
                 val line = reader.readLine() ?: break
-                if (resetBackoff) { backoffMs = RESPAWN_INITIAL_MS; resetBackoff = false }
+                linesThisSpawn++
+                // Reset the backoff only once this spawn has proved it can STAY
+                // up, not merely produce one line.
+                //
+                // Resetting on the first line meant a reader that emitted
+                // something and then immediately died pinned the interval at
+                // RESPAWN_INITIAL_MS forever — a 1-second respawn loop, burning
+                // CPU on a low-RAM device. That was survivable while respawns
+                // were invisible; now each one writes and flushes a marker
+                // line, so the same loop would also emit ~86k marker lines a
+                // day and evict the real history from the ring. Verified with a
+                // fake logcat that exits after 3 lines: before this, 9 respawns
+                // in 12s, all reporting "after 1000ms".
+                if (resetBackoff && System.currentTimeMillis() - spawnStartMs >= HEALTHY_SPAWN_MS) {
+                    backoffMs = RESPAWN_INITIAL_MS; resetBackoff = false
+                }
                 if (isNoise(line)) {          // drop the rustpush::util/aps flood before it fills the ring
                     droppedNoiseLines++
                     continue
@@ -308,6 +386,19 @@ internal object SmartTxtLogRing {
                 keptLines++
                 writeLine(line + "\n")
             }
+        }
+        if (anchor != null && linesThisSpawn == 0) {
+            emptySpawns++
+            if (emptySpawns >= ANCHOR_FAIL_LIMIT && !anchorDisabled) {
+                anchorDisabled = true
+                Log.w(TAG, "logcat -T anchor '$anchor' produced no output twice — " +
+                    "falling back to an unanchored reader for this process")
+                writeLine("--- [ring] -T anchor produced no output; reading unanchored " +
+                    "(expect replayed lines) ---\n")
+                flush()
+            }
+        } else if (linesThisSpawn > 0) {
+            emptySpawns = 0
         }
         try { p.destroy() } catch (_: Throwable) {}
         process = null
@@ -318,6 +409,16 @@ internal object SmartTxtLogRing {
     @Synchronized
     private fun openCurrentForAppend() {
         val d = dir ?: return
+        // Flush and close any previous writer FIRST. This is called on every
+        // respawn, and since writeLine became buffered, simply reassigning
+        // currentWriter silently discarded up to FLUSH_EVERY_LINES of pending
+        // output and leaked the stream. The respawn marker itself was the
+        // usual casualty — it is written immediately after this call, so a
+        // ring that died again before the next flush lost the very line that
+        // records the gap. Seen on 2026-07-31: markers #7-8, #10-13 and
+        // #15-18 are absent from a bundle that clearly reached #19.
+        try { currentWriter?.flush(); currentWriter?.close() } catch (_: Throwable) {}
+        currentWriter = null
         val f = File(d, CURRENT_FILENAME).apply {
             parentFile?.mkdirs()
             if (!exists()) createNewFile()
@@ -345,6 +446,12 @@ internal object SmartTxtLogRing {
         // dies mid-window (at most FLUSH_EVERY_LINES lines or FLUSH_INTERVAL_MS
         // of writes), against a reader fast enough to keep its logd connection.
         // export() calls flush() first, so a user-triggered bundle is complete.
+        // "07-31 16:16:23.395 ..." — the -v threadtime prefix is exactly the
+        // shape `-T` wants. Guard on the shape so the ring's own marker lines
+        // ("--- [ring] …") never become the anchor.
+        if (text.length >= 18 && text[2] == '-' && text[5] == ' ' && text[13] == ':') {
+            lastLineTs = text.substring(0, 18)
+        }
         linesSinceFlush++
         val now = System.currentTimeMillis()
         if (linesSinceFlush >= FLUSH_EVERY_LINES || now - lastFlushMs >= FLUSH_INTERVAL_MS) {
@@ -393,6 +500,30 @@ internal object SmartTxtLogRing {
             val sz = file.length()
             if (file.delete()) total -= sz
         }
+    }
+
+    /**
+     * This process's start time, formatted the way `logcat -T` wants
+     * ("MM-DD HH:MM:SS.mmm", device-local — logcat's own timestamps are local,
+     * unlike [timestamp] which is UTC for filenames).
+     *
+     * Used as the anchor on the FIRST spawn of a process. Without it, plain
+     * logcat replays logd's whole buffer, so lines emitted by the PREVIOUS app
+     * process — potentially a previous BUILD — get written into this run's
+     * current.log. That is not hypothetical: a 2026-07-31 bundle carried three
+     * pids in one current.log, and the old-build output in it made the file
+     * look like it predated an update it actually contained.
+     *
+     * Anchoring at process start (minus a 2s margin so nothing emitted during
+     * startup is clipped) keeps everything this process logged and nothing
+     * from the one before it.
+     */
+    private fun processStartAnchor(): String {
+        val startedAgoMs = android.os.SystemClock.elapsedRealtime() -
+            android.os.Process.getStartElapsedRealtime()
+        val wallMs = System.currentTimeMillis() - startedAgoMs - 2_000L
+        val fmt = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+        return fmt.format(Date(wallMs))
     }
 
     private fun timestamp(): String {

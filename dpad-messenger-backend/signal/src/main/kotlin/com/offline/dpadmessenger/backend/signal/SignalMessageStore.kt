@@ -1,28 +1,51 @@
 package com.offline.dpadmessenger.backend.signal
 
 import android.content.Context
+import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import com.offline.dpadmessenger.backend.core.store.MessageStore
 import com.offline.dpadmessenger.data.Message
 import com.offline.dpadmessenger.data.Room
 import com.offline.dpadmessenger.data.User
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
+import kotlinx.serialization.builtins.MapSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 
 /**
  * On-disk persistence for [SignalMessageRepository] so conversations survive
  * process death (otherwise the in-memory state is lost whenever the launcher
- * process is killed). Stored as a single encrypted JSON blob in
- * [EncryptedSharedPreferences] — the message volume is small (especially with
- * 3-day auto-delete on), so a blob is simpler than a SQLite schema.
+ * process is killed).
  *
- * Also holds the auto-delete retention flag (default ON, matching the settings
- * toggle default).
+ * As of the SQLite migration the conversation state lives in the shared
+ * [MessageStore] rather than a single encrypted JSON blob in
+ * [EncryptedSharedPreferences]. The API here is unchanged so
+ * [SignalMessageRepository] did not have to be rewritten.
+ *
+ * Signal had the worst version of the blob problem, and this change only
+ * PARTLY fixes it. Its two writers — the debounced collector and the three
+ * direct `saveSnapshot()` calls in `setMuted` / `deleteRoom` / the recipient
+ * merge — still build a whole snapshot from independently-read StateFlows with
+ * no mutex, and [save] is still a delete-and-reinsert of the whole table. The
+ * database serialises the transactions, so they can no longer interleave, but
+ * the later one still wins with whatever it happened to see. The window
+ * shrank; the lost update did not go away. Closing it properly means either a
+ * mutex around read-state-then-save, or routing those three paths through
+ * `upsertMessages`.
+ *
+ * The auto-delete retention flag deliberately stays in the old
+ * [EncryptedSharedPreferences] — it is a single boolean, not message data, and
+ * moving it would buy nothing.
+ *
+ * Signal-specific state that has no place in a shared schema (the contact
+ * directory, group master keys, disappearing-message timers) is stored as JSON
+ * in the store's `kv` table, encoded here with this module's own serializers.
  */
 class SignalMessageStore(context: Context) {
 
     private val appContext = context.applicationContext
+    private val store = MessageStore.get(appContext, BACKEND_ID)
 
     private val prefs by lazy {
         val masterKey = MasterKey.Builder(appContext)
@@ -62,14 +85,36 @@ class SignalMessageStore(context: Context) {
         val mutedRooms: Set<String> = emptySet(),
     )
 
+    private val contactsSer = MapSerializer(String.serializer(), PersistedContact.serializer())
+    private val timersSer = MapSerializer(String.serializer(), PersistedTimer.serializer())
+    private val stringMapSer = MapSerializer(String.serializer(), String.serializer())
+
+    /**
+     * Set once THIS instance has successfully restored — per-repository, not on
+     * the shared [MessageStore], which is process-wide per backend. See the
+     * guard in [MessageStore.save].
+     */
+    // @Volatile: written on the thread that loads, read on whichever thread
+    // saves — and Signal's saveSnapshot() is called straight from setMuted /
+    // deleteRoom / mergeRecipient, not only from its persist scope.
+    @Volatile
+    private var restored = false
+
+    /**
+     * `SignalMessageRepository` calls this synchronously from `init`, so it runs
+     * on whatever thread built the repository. `SignalApp` now builds it inside a
+     * `LaunchedEffect` on `Dispatchers.IO` rather than during composition, which
+     * is what keeps the one-time migration — decrypt, JSON parse, N-row insert,
+     * read-back — off the main thread on armeabi-v7a. Any other caller of
+     * `SignalRepository.create()` must do the same.
+     */
     fun loadSnapshot(): Snapshot? {
-        val s = prefs.getString(KEY_SNAPSHOT, null) ?: return null
-        return runCatching { json.decodeFromString<Snapshot>(s) }.getOrNull()
+        val ran = store.migrateIfNeeded { readLegacyBlob()?.toStore() }
+        if (ran || store.hasMigrated()) deleteLegacyBlob()
+        return store.load()?.toLocal()?.also { restored = true }
     }
 
-    fun saveSnapshot(snapshot: Snapshot) {
-        runCatching { prefs.edit().putString(KEY_SNAPSHOT, json.encodeToString(snapshot)).apply() }
-    }
+    fun saveSnapshot(snapshot: Snapshot) = store.save(snapshot.toStore(), restored)
 
     /** Auto-delete retention flag (default true). */
     fun isAutoDeleteEnabled(): Boolean = prefs.getBoolean(KEY_AUTO_DELETE, true)
@@ -79,13 +124,78 @@ class SignalMessageStore(context: Context) {
     }
 
     fun clear() {
+        store.clear()
+        restored = false
         runCatching { prefs.edit().clear().apply() }
     }
 
+    // ── mapping ─────────────────────────────────────────────────────────
+
+    private fun Snapshot.toStore() = MessageStore.Snapshot(
+        rooms = rooms.map { it.room },
+        messagesByRoom = messages,
+        usersById = users,
+        unreadByRoom = rooms.associate { it.room.id to it.unreadCount },
+        mutedRooms = mutedRooms,
+        // All three ALWAYS written, empty JSON included. save() does not clear the
+        // kv table (it holds the migration marker), so omitting a key when its map
+        // is empty would mean clearing the contact directory, group keys or expire
+        // timers never sticks — the stale value would be resurrected on every load.
+        kv = mapOf(
+            KV_CONTACTS to json.encodeToString(contactsSer, contacts),
+            KV_GROUP_KEYS to json.encodeToString(stringMapSer, groupMasterKeysB64),
+            KV_TIMERS to json.encodeToString(timersSer, expireTimers),
+        ),
+    )
+
+    private fun MessageStore.Snapshot.toLocal() = Snapshot(
+        rooms = rooms.map { PersistedRoom(it, unreadByRoom[it.id] ?: 0) },
+        messages = messagesByRoom,
+        users = usersById,
+        contacts = kv[KV_CONTACTS]?.let {
+            runCatching { json.decodeFromString(contactsSer, it) }.getOrNull()
+        } ?: emptyMap(),
+        groupMasterKeysB64 = kv[KV_GROUP_KEYS]?.let {
+            runCatching { json.decodeFromString(stringMapSer, it) }.getOrNull()
+        } ?: emptyMap(),
+        expireTimers = kv[KV_TIMERS]?.let {
+            runCatching { json.decodeFromString(timersSer, it) }.getOrNull()
+        } ?: emptyMap(),
+        mutedRooms = mutedRooms,
+    )
+
+    // ── legacy reader (migration only) ──────────────────────────────────
+
+    /**
+     * Deliberately does NOT catch — see [MessageStore.migrateIfNeeded]. A blob
+     * that exists but won't decode must not be mistaken for "nothing to
+     * migrate", or the marker commits and [deleteLegacyBlob] removes the only
+     * copy of the user's history.
+     */
+    private fun readLegacyBlob(): Snapshot? {
+        val s = prefs.getString(KEY_SNAPSHOT, null) ?: return null
+        return json.decodeFromString(Snapshot.serializer(), s)
+    }
+
+    /** Removes only the snapshot key — the auto-delete flag lives in the same file. */
+    private fun deleteLegacyBlob() {
+        if (runCatching { prefs.contains(KEY_SNAPSHOT) }.getOrDefault(false)) {
+            runCatching { prefs.edit().remove(KEY_SNAPSHOT).apply() }
+                .onSuccess { Log.i(TAG, "legacy snapshot blob removed") }
+                .onFailure { Log.w(TAG, "legacy snapshot blob removal failed", it) }
+        }
+    }
+
     companion object {
+        private const val TAG = "SignalMsgStore"
+        private const val BACKEND_ID = "signal"
         private const val FILE_NAME = "dpad_signal_messages"
         private const val KEY_SNAPSHOT = "snapshot_v1"
         private const val KEY_AUTO_DELETE = "auto_delete_enabled"
+
+        private const val KV_CONTACTS = "signal_contacts"
+        private const val KV_GROUP_KEYS = "signal_group_master_keys"
+        private const val KV_TIMERS = "signal_expire_timers"
 
         /** Messages older than this are purged when auto-delete is on. */
         const val RETENTION_MS = 3L * 24 * 60 * 60 * 1000  // 3 days

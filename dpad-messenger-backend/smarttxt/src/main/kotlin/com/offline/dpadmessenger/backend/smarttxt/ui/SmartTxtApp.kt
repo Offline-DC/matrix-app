@@ -16,6 +16,7 @@ import com.offline.dpadmessenger.backend.smarttxt.RustPushNative
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtAccountStore
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtLogExporter
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtLogRing
+import com.offline.dpadmessenger.backend.core.store.MigrationStatus
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtRepository
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtStatus
 import com.offline.dpadmessenger.data.MessageRepository
@@ -87,7 +88,10 @@ fun SmartTxtApp(
                     },
                     modifier = modifier,
                 )
-                repo == null -> DuckLoadingIndicator(modifier = modifier)
+                // The one-time move off the encrypted-JSON blob happens inside
+                // the repository's cache load, which is exactly what this branch is
+                // waiting on. Say so rather than showing a duck that looks stuck.
+                repo == null -> DuckLoadingIndicator(modifier = modifier, label = migrationLabel())
                 else -> SmartTxtChat(
                     repository = repo,
                     modifier = modifier,
@@ -116,7 +120,7 @@ fun SmartTxtApp(
                     else withContext(Dispatchers.IO) { OpenBubblesMigrator.available(context) }
             }
             when (migrate) {
-                null -> DuckLoadingIndicator(modifier = modifier)
+                null -> DuckLoadingIndicator(modifier = modifier, label = migrationLabel())
                 true -> MigrationScreen(modifier = modifier, onFallbackToSetup = { migrate = false })
                 else -> SmartTxtSetupScreen(modifier = modifier, notice = terminalFailure)
             }
@@ -293,3 +297,21 @@ private const val DEBUG_TOGGLE_COUNT = 10
 
 /** Max gap between toggles before the run resets. */
 private const val DEBUG_TOGGLE_WINDOW_MS = 3_000L
+
+/**
+ * "Moving your messages…" while a legacy-blob migration is in flight, null
+ * otherwise (which renders the original bare duck).
+ *
+ * Reads a process-global flow rather than being threaded down from the
+ * repository: the migration runs inside [MessageStore.migrateIfNeeded], several
+ * layers below any composable, and plumbing a callback up through three
+ * repositories to reach three gate screens would be far more invasive.
+ *
+ * Expect this to flash rather than linger — 441 messages import in one
+ * transaction. It is reassurance for the rare large account, not a progress bar.
+ */
+@Composable
+private fun migrationLabel(): String? {
+    val migrating by MigrationStatus.backendId.collectAsState()
+    return if (migrating != null) "Moving your messages\u2026" else null
+}

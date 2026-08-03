@@ -1435,6 +1435,16 @@ internal class SmartTxtMessageRepository(
             val bytes = runCatching { resolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
                 ?: return@withContext false
             val tmpId = "tmp_" + System.nanoTime()
+            // ATTACHMENT TRACE. This whole function had no logging at all, which
+            // is why a 2026-08-01 report of "I sent two voice memos and only one
+            // survived a restart" could be narrowed to "outgoing attachments
+            // never reach the message store" (proved by arithmetic: 46 inbound +
+            // 9 self + 15 texts = 70, the exact store growth, with both
+            // attachments excluded) but NOT to a specific line. Each step below
+            // prints the store size so the next bundle shows exactly where the
+            // message stops existing.
+            Log.i(TAG, "sendAttachment: room=$roomId tmp=$tmpId mime=$mime bytes=${bytes.size} " +
+                "storeBefore=${messagesByRoom.value[roomId]?.size ?: 0}")
             // Copy the outgoing bytes into our media cache and attach them locally,
             // so the SENDER sees their own photo / can play their own voice memo.
             val kind = when {
@@ -1466,12 +1476,21 @@ internal class SmartTxtMessageRepository(
                 messagesByRoom.value = messagesByRoom.value + (roomId to (messagesByRoom.value[roomId].orEmpty() + optimistic))
                 requestSave()
             }
+            Log.i(TAG, "sendAttachment: optimistic inserted tmp=$tmpId " +
+                "storeAfterInsert=${messagesByRoom.value[roomId]?.size ?: 0} localCopy=${localPath != null}")
             val ack = runCatching { session.sendAttachment(roomId, tmpId, bytes, mime, name, cap) }
+                .onFailure { Log.w(TAG, "sendAttachment: transport threw for tmp=$tmpId", it) }
                 .getOrElse { com.offline.dpadmessenger.backend.smarttxt.transport.SendAck(false) }
+            val present = messagesByRoom.value[roomId].orEmpty().any { it.id == tmpId }
             writeLock.withLock {
                 updateMessage(roomId, tmpId) { it.copy(id = ack.guid ?: it.id, status = if (ack.ok) MessageStatus.SENT else MessageStatus.FAILED, errorReason = if (ack.ok) null else ack.error) }
                 requestSave()
             }
+            // `stillPresent=false` here would mean something removed the optimistic
+            // row while the upload was in flight — updateMessage silently no-ops on
+            // a missing id, so that is the one way this can fail without a trace.
+            Log.i(TAG, "sendAttachment: ack ok=${ack.ok} guid=${ack.guid} err=${ack.error} " +
+                "stillPresent=$present storeAfter=${messagesByRoom.value[roomId]?.size ?: 0}")
             ack.ok
         }
 
