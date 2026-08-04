@@ -246,6 +246,11 @@ class NativeRustPushTransport(
                     )
                     if (ev != null) _events.emit(ev)
                 }
+                RelayProtocol.P_PUSH_CERT_REJECTED -> {
+                    val rejected = obj["rejected"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: false
+                    Log.w(TAG, "PUSH CERT rejected=$rejected")
+                    _events.emit(TransportEvent.PushCertRejected(rejected))
+                }
                 RelayProtocol.P_NEW_MESSAGE -> obj["message"]?.let {
                     messages.add(json.decodeFromJsonElement(RelayMessage.serializer(), it))
                 }

@@ -67,6 +67,20 @@ fun SmartTxtApp(
         OpenBubblesMigrator.sweepOnLaunch(context)
     }
     val status by SmartTxtRepository.status.collectAsState()
+    // Apple refusing our APS connect. Checked at the TOP of the tree, above the sign-in
+    // gate and above the chat UI, because the whole point is that every other surface
+    // looks healthy while this is true: sends succeed, receipts come back, and not one
+    // inbound message is ever delivered. Only a full logout can mint a new certificate.
+    val pushCertRejected by SmartTxtRepository.pushCertRejected.collectAsState()
+    if (pushCertRejected && status == SmartTxtStatus.REGISTERED) {
+        PushCertRejectedDialog(
+            onLogout = { SmartTxtRepository.logoutForNewPushCertificate(context) },
+            // Back closes Smart Txt and returns to the launcher rather than dismissing
+            // into an app that silently receives nothing. On a flip phone there is no
+            // app switcher, so a truly trapping dialog reads as a bricked handset.
+            onExit = { context.findHostActivity()?.finish() },
+        )
+    }
     // Post-login handle picker: shown once after registration, before the chats.
     var handlesConfigured by remember { mutableStateOf(SmartTxtAccountStore(context).handlesConfigured()) }
 

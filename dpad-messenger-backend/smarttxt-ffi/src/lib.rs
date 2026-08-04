@@ -54,7 +54,7 @@ use rustpush::{
     APSState, AppleAccount, Attachment, AttachmentType, ConversationData, IDSNGMIdentity, IDSUser, IMClient,
     IndexedMessagePart, LoginDelegate, LoginState, MMCSFile, Message, MessageInst, MessagePart,
     MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType, Reaction,
-    VerifyBody, AuthenticationFSAResponse, MADRID_SERVICE, ResourceState, IDSService
+    VerifyBody, AuthenticationFSAResponse, MADRID_SERVICE, ResourceState, IDSService, PushError
 };
 use rustpush::facetime::{FACETIME_SERVICE, VIDEO_SERVICE};
 use rustpush::findmy::MULTIPLEX_SERVICE;
@@ -3574,8 +3574,108 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     // next poll. See POLL_BATCH_MAX for why draining everything at once was the main
     // cause of the catch-up freeze. The transport loops immediately while batches come
     // back full (see NativeRustPushTransport.startPolling), so this costs no throughput.
+    check_push_cert_rejected();
     let drained: Vec<serde_json::Value> = st().inbound.drain_batch(inbound::POLL_BATCH_MAX);
     out(&mut env, serde_json::to_string(&drained).unwrap_or_else(|_| "[]".into()))
+}
+
+/// How long APS has to stay stuck on a REFUSED connect before we tell the user their
+/// push certificate is dead. Wall-clock, not a retry count, because the retry cadence
+/// is rustpush's business and changes with its backoff. Five minutes is far past any
+/// tunnel, lift, or dead spot.
+const PUSH_CERT_BAD_FOR_MS: u64 = 5 * 60 * 1000;
+
+/// When APS first entered the refused state, 0 = it isn't in it.
+static PUSH_CERT_BAD_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// True once we've raised the modal for the CURRENT episode, so the user is told once
+/// rather than twice a second. Cleared when APS connects, so a device that breaks again
+/// later is told again.
+static PUSH_CERT_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Surface a refused APS connect to the user, the way OpenBubbles does.
+///
+/// ## Where this reads from, and why it isn't a rustpush change
+///
+/// rustpush already publishes exactly this: `ResourceManager::resource_state` is a
+/// public `watch` channel carrying `ResourceState::Failed(ResourceFailure { error, .. })`,
+/// and `error` is the `PushError` — here `APSConnectError(status)`, whose Display text
+/// is the "You need to re-setup your device" message. `ResourceState` and
+/// `ResourceFailure` are both re-exported from rustpush's crate root. That channel is
+/// how OpenBubbles learns about this, and it is why OB can show the error with no
+/// library patch at all. We were already subscribed to it for logging
+/// (`spawn_apsstate_watcher`) and simply never acted on it.
+///
+/// ## Why a state READ rather than the existing watcher
+///
+/// `spawn_apsstate_watcher` consumes transitions. In the 2026-08-04 field bundle its
+/// lines stopped entirely while rejections continued for 1h53m — the capture had 14
+/// holes so that is not conclusive, but a missed edge is unrecoverable and this is the
+/// signal that decides whether a customer is told their phone is broken. Reading the
+/// CURRENT state each poll cannot miss an edge, and `nativePollEvents` is driven by
+/// Kotlin every 500ms.
+///
+/// ## Why wall-clock, and why only APSConnectError
+///
+/// A refused connect is not a bad network — it means Apple accepted the socket and
+/// rejected the credentials. Failures with any other error (DNS, socket, timeout) reset
+/// the clock, so a tunnel never raises this. Only a sustained refusal does.
+fn check_push_cert_rejected() {
+    let Some(conn) = st().connection.clone() else {
+        PUSH_CERT_BAD_SINCE_MS.store(0, Ordering::SeqCst);
+        return;
+    };
+    let state = conn.resource_state.subscribe().borrow().clone();
+    let refused = matches!(
+        &state,
+        ResourceState::Failed(f) if matches!(&*f.error, PushError::APSConnectError(_))
+    );
+
+    if refused {
+        let now = now_ms();
+        let since = PUSH_CERT_BAD_SINCE_MS.load(Ordering::SeqCst);
+        if since == 0 {
+            PUSH_CERT_BAD_SINCE_MS.store(now, Ordering::SeqCst);
+        } else if now.saturating_sub(since) >= PUSH_CERT_BAD_FOR_MS
+            && !PUSH_CERT_ANNOUNCED.swap(true, Ordering::SeqCst)
+        {
+            log::error!(
+                "PUSH CERT REJECTED: Apple has refused this device's APS connect for \
+                 {}s — the socket transmits but subscribed to nothing, so sends look \
+                 fine and NOTHING is delivered. Surfacing the re-setup modal. state={}",
+                now.saturating_sub(since) / 1000,
+                match &state {
+                    ResourceState::Failed(f) => f.error.to_string(),
+                    _ => "?".to_string(),
+                }
+            );
+            st().queue_event(serde_json::json!({ "type": "push_cert_rejected", "rejected": true }));
+        }
+        return;
+    }
+
+    // Anything that is not a refusal clears the clock: Generated (healthy), or a
+    // Failed carrying a network error, which is a bad link and not a dead certificate.
+    // Generating is the gap between retries and must NOT clear it, or a device that
+    // alternates Failed → Generating → Failed never accumulates any elapsed time.
+    if matches!(state, ResourceState::Generating) {
+        return;
+    }
+    PUSH_CERT_BAD_SINCE_MS.store(0, Ordering::SeqCst);
+    if PUSH_CERT_ANNOUNCED.swap(false, Ordering::SeqCst) {
+        // warn!, not info!: the launcher's hourly snapshot filterspec ends in `*:W` and
+        // does not allow-list SmartTxtRust at :I, so an info! here would be missing from
+        // exactly the bundle where "did the logout fix it?" gets answered.
+        log::warn!("PUSH CERT RECOVERED: APS connected — clearing the re-setup modal");
+        st().queue_event(serde_json::json!({ "type": "push_cert_rejected", "rejected": false }));
+    }
 }
 
 /// Tell the native side which message guids the app ALREADY has on disk, so the

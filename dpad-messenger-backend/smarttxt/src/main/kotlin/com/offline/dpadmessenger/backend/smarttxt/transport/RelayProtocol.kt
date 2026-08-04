@@ -51,6 +51,11 @@ object RelayProtocol {
      *  watch channel by the native side (see `spawn_regstate_watcher`). */
     const val P_REGISTRATION_STATE = "registration_state"
 
+    /** Apple has refused this device's APS connect enough times in a row that the push
+     *  certificate has to be considered dead. The socket still transmits, so sends
+     *  appear to work — nothing is ever delivered. Only the user can fix it. */
+    const val P_PUSH_CERT_REJECTED = "push_cert_rejected"
+
     const val T_ACK = "ack"
 
     /** Lenient JSON shared by all transports (forward-compatible with relay

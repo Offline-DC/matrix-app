@@ -432,6 +432,15 @@ internal class SmartTxtMessageRepository(
                 // Only a terminal failure needs us; rustpush retries the rest itself.
                 if (e.needsRelogin) SmartTxtRepository.onTerminalRegistrationFailure(appContext, e.error)
             }
+            is TransportEvent.PushCertRejected -> {
+                // NOT handled like a registration failure: we must not sign the user out
+                // from under themselves. rustpush cannot fix a refused push certificate
+                // and neither can we — only a logout, which discards config.plist and
+                // therefore the certificate, lets the next sign-in mint a fresh one. So
+                // this only raises a flag; the user decides.
+                Log.w(TAG, "push cert rejected=${e.rejected}")
+                SmartTxtRepository.setPushCertRejected(e.rejected)
+            }
         }
     }
 
@@ -761,7 +770,24 @@ internal class SmartTxtMessageRepository(
             // Reconcile the optimistic id → server guid, and only advance status.
             val cur = list[idx]
             val advanced = if (statusRank(status) >= statusRank(cur.status)) status else cur.status
-            list[idx] = cur.copy(id = e.guid.ifBlank { cur.id }, status = advanced, isSms = cur.isSms || e.service == "SMS")
+            // AUTHORITATIVE service. The native side reports how the message ACTUALLY
+            // went out (lib.rs emits "SMS"/"iMessage" from the route it really took),
+            // so the echo REPLACES the optimistic guess rather than OR-ing with it.
+            //
+            // This was `isSms = cur.isSms || e.service == "SMS"` — a one-way latch that
+            // could turn green ON but never OFF. Combined with a new outgoing message
+            // inheriting the newest message's isSms (see sendMessage), one genuine SMS
+            // in a thread painted every LATER message green forever, including messages
+            // that demonstrably went out over iMessage. Confirmed in the field: a send
+            // logged `decide_route on_imessage=true` / `is_sms=false` / madrid cmd 100
+            // still rendered green on the handset while the same message was blue on the
+            // customer's iPhone.
+            val wireIsSms = e.service.equals("SMS", ignoreCase = true)
+            if (wireIsSms != cur.isSms) {
+                Log.i(TAG, "SMSFLAG reconcile room=${e.chatGuid} guid=${e.guid.ifBlank { cur.id }} " +
+                    "guessed=${cur.isSms} wire='${e.service}' → isSms=$wireIsSms")
+            }
+            list[idx] = cur.copy(id = e.guid.ifBlank { cur.id }, status = advanced, isSms = wireIsSms)
             byRoom[e.chatGuid] = list
             changed = true
         }
@@ -1012,6 +1038,12 @@ internal class SmartTxtMessageRepository(
             isSms = messagesByRoom.value[roomId]?.filter { !it.isDeleted }?.maxByOrNull { it.timestampMs }?.isSms
                 ?: (smsThreadCache[roomId] == true),
         )
+        // This is a GUESS, used only so the bubble doesn't flash blue before the ack.
+        // The delivered echo overwrites it with the real service (see onStatus above);
+        // pair this line with the matching "SMSFLAG reconcile" to see guess vs truth.
+        Log.i(TAG, "SMSFLAG send room=$roomId tmp=$tmpId guessed=${optimistic.isSms} " +
+            "(newest=${messagesByRoom.value[roomId]?.filter { !it.isDeleted }?.maxByOrNull { it.timestampMs }?.isSms} " +
+            "probe=${smsThreadCache[roomId]})")
         writeLock.withLock {
             messagesByRoom.value = messagesByRoom.value + (roomId to (messagesByRoom.value[roomId].orEmpty() + optimistic))
             requestSave()

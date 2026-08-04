@@ -199,6 +199,18 @@ sealed class TransportEvent {
      *  backoff, so those arrive here for logging only. */
     data class RegistrationFailed(val needsRelogin: Boolean, val error: String) : TransportEvent()
 
+    /** Apple is refusing this device's APS connect, and has been for long enough that
+     *  the push certificate is dead. [rejected] false withdraws it after a connect
+     *  succeeds.
+     *
+     *  Read from rustpush's own `resource_state` watch channel — the same public signal
+     *  OpenBubbles uses to show this, which is why it needs no rustpush patch.
+     *
+     *  Distinct from [RegistrationFailed] on purpose: IDS registration can be perfectly
+     *  valid while the push certificate behind it is refused, which is exactly the state
+     *  that reads as "my texts send but nobody ever replies". */
+    data class PushCertRejected(val rejected: Boolean) : TransportEvent()
+
     data object AuthExpired : TransportEvent()
 }
 

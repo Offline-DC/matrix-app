@@ -929,6 +929,38 @@ object SmartTxtRepository {
      * `wipe=true`, the encrypted store is left intact, so re-registering reuses
      * the same identity and the chat history survives.
      */
+    /** True while Apple is refusing this device's APS connect. Drives the re-setup
+     *  modal. Not persisted: it is re-derived within one poll tick of any process
+     *  start, and persisting it would strand a user behind the modal if the state
+     *  cleared while the app was closed. */
+    private val _pushCertRejected = MutableStateFlow(false)
+    val pushCertRejected: StateFlow<Boolean> = _pushCertRejected
+
+    internal fun setPushCertRejected(rejected: Boolean) {
+        if (_pushCertRejected.value != rejected) {
+            Log.w(TAG, "pushCertRejected → $rejected")
+        }
+        _pushCertRejected.value = rejected
+    }
+
+    /**
+     * The recovery for a refused push certificate: a FULL logout.
+     *
+     * [shutdown] with `wipe = true` calls `nativeLogout`, which deletes `config.plist`
+     * — and the APS state (push token + certificate keypair) lives in that file. So the
+     * next sign-in has no keypair to resume, `do_connect` runs `activate()`, and Apple
+     * issues a fresh certificate. Anything short of this re-presents the certificate
+     * Apple is already refusing.
+     *
+     * The device identity (`dumb` + `os_config.plist`) is deliberately kept by
+     * `nativeLogout`, so the fresh registration still validates through NAC.
+     */
+    fun logoutForNewPushCertificate(context: Context) {
+        Log.w(TAG, "logoutForNewPushCertificate: full logout so sign-in mints a NEW push cert")
+        setPushCertRejected(false)
+        shutdown(context, wipe = true)
+    }
+
     fun signOutKeepingHistory(context: Context) {
         shutdown(context, wipe = false)
         _status.value = SmartTxtStatus.UNREGISTERED
