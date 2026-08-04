@@ -464,6 +464,15 @@ object SmartTxtRepository {
         Thread {
             val store = SmartTxtAccountStore(appContext)
             if (!store.isRegistered()) return@Thread
+            // Signed in ⇒ OpenBubbles must not be on this device, full stop: it holds the
+            // SAME push identity, so leaving it installed makes Apple thrash both apps.
+            // OpenBubblesMigrator.migrate() already uninstalls it, but only on the one launch
+            // that actually runs a transfer — which misses an OpenBubbles that came back
+            // afterwards (a rollback off the beta build reinstalls it, and returning to Smart
+            // Txt then finds it running in the background). Sweeping from launcher start means
+            // an app UPDATE alone repairs an affected handset; the user never has to open
+            // Smart Txt. Fire-and-forget so the root probe can't delay the push connect below.
+            OpenBubblesMigrator.sweepOnLaunchAsync(appContext)
             restoreStatus(appContext)
             // Build the repo/session once, then make sure the CLIENT is actually up.
             runCatching { connect(appContext) }

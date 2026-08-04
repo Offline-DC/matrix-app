@@ -21,4 +21,13 @@
          require these permissions at targetSdk 34+. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Package-visibility (Android 11+) for the launch-time OpenBubbles sweep,
+         OpenBubblesMigrator.sweepOnLaunch. Without this, getPackageInfo() throws
+         NameNotFoundException for OpenBubbles even when it IS installed, and the sweep
+         silently concludes there is nothing to retire. Visibility only — it grants no
+         access to OpenBubbles' data; the uninstall itself still goes through su. -->
+    <queries>
+        <package android:name="com.openbubbles.messaging" />
+    </queries>
 </manifest>

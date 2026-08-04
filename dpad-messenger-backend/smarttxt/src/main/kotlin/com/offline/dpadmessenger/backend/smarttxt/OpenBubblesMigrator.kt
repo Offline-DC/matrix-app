@@ -1,12 +1,14 @@
 package com.offline.dpadmessenger.backend.smarttxt
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * One-time, on-device migration from OpenBubbles into Smart Txt.
@@ -29,9 +31,15 @@ import java.io.File
  *
  * What is NOT reversible is the last step: on EVERY outcome — success, manual-sign-in
  * fallback, hard failure, or crash — [migrate] UNINSTALLS OpenBubbles (see
- * [retireOpenBubbles]) rather than merely disabling it. Two rustpush apps holding one
- * push identity make Apple thrash both, and a disabled OB is one `pm enable` away from
- * doing exactly that. Because the uninstall wipes `/data/data/$OB_PKG`, it runs from
+ * [retireOpenBubbles]) rather than merely disabling it.
+ *
+ * [migrate] is not the only path to that uninstall, though — it only runs when [available]
+ * says a transfer is on the table. [sweepOnLaunch] closes that gap: it runs on EVERY Smart
+ * Txt launch and retires an OpenBubbles that no transfer is going to consume (already
+ * migrated, already signed in, or reinstalled by a rollback off the beta build).
+ *
+ * Two rustpush apps holding one push identity make Apple thrash both, and a disabled OB is
+ * one `pm enable` away from doing exactly that. Because the uninstall wipes `/data/data/$OB_PKG`, it runs from
  * `finally` AFTER every read of OB's files, and a failed migration cannot be retried
  * against OpenBubbles afterwards.
  */
@@ -140,6 +148,129 @@ object OpenBubblesMigrator {
         return available
     }
 
+    // ---- launch-time sweep --------------------------------------------------
+
+    /** True for the duration of [migrate], so a concurrent [sweepOnLaunch] can't
+     *  uninstall OpenBubbles out from under a transfer that is still reading its files. */
+    @Volatile private var migrationInFlight = false
+
+    /** Guards against two sweeps overlapping — [SmartTxtRepository.startBackgroundSyncIfRegistered]
+     *  fires one at launcher start and the Smart Txt entry composable fires another. Only a
+     *  concurrency guard: it is released after each run, so nothing is ever latched "done".
+     *  An OpenBubbles that comes BACK mid-process (a rollback off the beta build, or the
+     *  updater re-installing it) is caught by the next sweep, not ignored. */
+    private val sweepRunning = AtomicBoolean(false)
+
+    /**
+     * Cheap, root-free "is OpenBubbles on this device at all?". `MATCH_DISABLED_COMPONENTS`
+     * so an OpenBubbles that was only `pm disable-user`-ed still counts — those get escalated
+     * to a real uninstall. Needs the `<package android:name="com.openbubbles.messaging"/>`
+     * entry in `<queries>` to be visible at all on Android 11+.
+     */
+    fun isInstalled(context: Context): Boolean = try {
+        context.packageManager.getPackageInfo(OB_PKG, PackageManager.MATCH_DISABLED_COMPONENTS)
+        true
+    } catch (e: PackageManager.NameNotFoundException) {
+        false
+    } catch (e: Exception) {
+        Log.w(TAG, "isInstalled probe failed: ${e.message}")
+        false
+    }
+
+    /**
+     * **Runs on EVERY Smart Txt launch**, independently of the transfer.
+     *
+     * [migrate] also retires OpenBubbles, but only ever gets to run when [available] says a
+     * transfer is on the table — not already signed in, not already migrated once, root, OB
+     * files present. That left a real hole: a device that has ALREADY migrated (or that was
+     * flashed back from beta to main, which reinstalls OpenBubbles, and then returns to Smart
+     * Txt) has `available() == false`, so nothing ever retired the OpenBubbles sitting right
+     * there — two rustpush apps on one push identity, which is the thing the whole migration
+     * exists to avoid.
+     *
+     * So: if OpenBubbles is installed and the transfer is NOT going to consume it, kill and
+     * uninstall it now. What keeps this from eating a migration that hasn't happened yet —
+     * i.e. from costing somebody their iMessage login:
+     *  0. **The precondition**: retire ONLY when the user is already signed in to Smart Txt,
+     *     or a transfer has already been attempted here ([migrationDone]). Someone with an
+     *     OpenBubbles login and no Smart Txt login keeps their OpenBubbles, full stop.
+     *  1. [migrationInFlight] — a transfer is mid-read right now.
+     *  2. [available] — a transfer is still possible; [migrate] reads OB's files and retires
+     *     it itself, in its own `finally`.
+     *
+     * Best-effort and silent: no root (or a `pm` that refuses) just logs and returns false,
+     * and the next launch tries again. Call it off the main thread — [sweepOnLaunch] is
+     * `suspend` and hops to IO itself; [sweepOnLaunchAsync] is the fire-and-forget version
+     * for non-coroutine hosts.
+     *
+     * @return true when OpenBubbles is gone (or was never there).
+     */
+    suspend fun sweepOnLaunch(context: Context): Boolean =
+        withContext(Dispatchers.IO) { sweepBlocking(context.applicationContext) }
+
+    /** Fire-and-forget [sweepOnLaunch] for callers without a coroutine scope (e.g. an
+     *  Activity's `onCreate`). Returns immediately; the work happens on its own thread. */
+    fun sweepOnLaunchAsync(context: Context) {
+        val app = context.applicationContext
+        Thread({ runCatching { sweepBlocking(app) } }, "ob-launch-sweep").start()
+    }
+
+    private fun sweepBlocking(app: Context): Boolean {
+        // No native engine ⇒ this build can't hold an iMessage identity at all, so there is
+        // no conflict to resolve and nothing to gain by taking the user's OpenBubbles away.
+        // (Debug/mock builds, and any device where libsmarttxt_ffi.so failed to load.)
+        if (!RustPushBridge.NATIVE_AVAILABLE) {
+            Log.i(TAG, "launch sweep: native engine unavailable — leaving OpenBubbles alone")
+            return false
+        }
+        // Cheap and root-free, and deliberately re-run on every entry rather than latched:
+        // the whole bug this closes is OpenBubbles coming BACK after we thought it was gone.
+        if (!isInstalled(app)) return true
+
+        // ══ THE SAFETY PRECONDITION. Retire OpenBubbles ONLY when losing it costs the user
+        // nothing: either Smart Txt is already signed in (they have working iMessage right
+        // now), or a transfer has already been attempted on this device (migrate() reached
+        // PHASE 1, so OpenBubbles has already given up everything it had). If NEITHER holds,
+        // this user has an OpenBubbles login and no Smart Txt login — uninstalling would make
+        // them sign in again from scratch. Stand down and let the transfer happen first;
+        // migrate() retires OpenBubbles itself once it's done reading.
+        //
+        // This is stated POSITIVELY, on two local SharedPreferences reads, deliberately —
+        // NOT inferred from available() being false. available() also returns false for
+        // environmental reasons (su not granted yet, or the SELinux `cat` probe of OB's
+        // files failing on a device where `pm uninstall` would still succeed), and a
+        // never-migrated user must not lose their login to a flaky root probe.
+        val registered = SmartTxtAccountStore(app).isRegistered()
+        val migrated = migrationDone(app)
+        if (!registered && !migrated) {
+            Log.i(TAG, "launch sweep: OpenBubbles present but no transfer has been attempted and " +
+                "Smart Txt is not signed in — LEAVING IT ALONE (the transfer must run first)")
+            return false
+        }
+
+        if (migrationInFlight) {
+            Log.i(TAG, "launch sweep: transfer in flight — leaving the retire to migrate()")
+            return false
+        }
+        if (!sweepRunning.compareAndSet(false, true)) {
+            Log.i(TAG, "launch sweep: another sweep is already running — skipping")
+            return false
+        }
+        try {
+            // A transfer is still possible: migrate() must read OB's files BEFORE anyone
+            // uninstalls it, and it retires OB itself on every outcome. Stand down.
+            if (available(app)) {
+                Log.i(TAG, "launch sweep: OpenBubbles is still migratable — deferring to the transfer")
+                return false
+            }
+            Log.i(TAG, "════ LAUNCH SWEEP: OpenBubbles is installed but NOT migratable " +
+                "(already migrated, already signed in, or reinstalled) — retiring it now ════")
+            return retireOpenBubbles()
+        } finally {
+            sweepRunning.set(false)
+        }
+    }
+
     /** Run the whole migration off the main thread. [onStep] surfaces a short
      *  progress label for the "Transferring…" screen. Every step is logged — the
      *  full story is:  `adb logcat -s ObMigrator:V smarttxt_ffi:V` — ending in a
@@ -147,6 +278,9 @@ object OpenBubblesMigrator {
     suspend fun migrate(context: Context, onStep: (String) -> Unit = {}): Result = withContext(Dispatchers.IO) {
         val app = context.applicationContext
         val t0 = SystemClock.elapsedRealtime()
+        // Hold off the launch sweep until this finishes — it must not uninstall
+        // OpenBubbles while the steps below are still reading out of it.
+        migrationInFlight = true
         Log.i(TAG, "════ MIGRATION START ════ from=$OB_PKG into=${app.filesDir.absolutePath}")
         dumpObSources()
         Log.i(TAG, "Smart Txt filesDir BEFORE migration:\n${listDir(app.filesDir)}")
@@ -293,6 +427,7 @@ object OpenBubblesMigrator {
             // push identity live in two apps. LAST statement in the method: the uninstall
             // wipes $OB_FILES, so nothing above it may read from OpenBubbles again.
             retireOpenBubbles()
+            migrationInFlight = false
         }
     }
 
@@ -469,13 +604,16 @@ object OpenBubblesMigrator {
      *
      *  IRREVERSIBLE, and it deletes `/data/data/$OB_PKG` — every file [migrate] reads. Only
      *  ever call it once all reads are done (it is the last statement of migrate()'s
-     *  `finally`).
+     *  `finally`). The other caller is [sweepBlocking], which only reaches it once
+     *  [available] has confirmed there is nothing left to migrate.
+     *
+     *  Returns true iff OpenBubbles is gone afterwards (verified with `pm path`).
      *
      *  Escalating fallbacks, so we never leave OpenBubbles live: full uninstall (the normal
      *  case — sideloaded APK, so package AND data go), then `--user 0` (removes it for the
      *  device's only user if it turns out to be baked into the system image), then the old
      *  `disable-user`. Verified with `pm path`, which is silent once the package is gone. */
-    private fun retireOpenBubbles() {
+    private fun retireOpenBubbles(): Boolean {
         // Chain on `pm path`, not on exit codes: some `pm` builds print
         // "Failure [DELETE_FAILED_...]" and still exit 0, which would swallow the fallbacks.
         val out = suOutput(
@@ -491,5 +629,6 @@ object OpenBubblesMigrator {
         )
         val gone = !out.substringAfter("__OBPATH__", "package:").contains("package:")
         Log.i(TAG, "  retire OpenBubbles: uninstalled=$gone  out='${out.trim().take(300)}'")
+        return gone
     }
 }

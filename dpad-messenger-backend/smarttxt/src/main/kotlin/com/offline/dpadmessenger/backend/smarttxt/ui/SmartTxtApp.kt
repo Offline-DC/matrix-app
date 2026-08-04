@@ -56,6 +56,16 @@ fun SmartTxtApp(
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) { SmartTxtLogRing.ensureStarted(context.applicationContext) }
     }
+    // Retire any OpenBubbles still on the device, on EVERY launch — not just the one launch
+    // that runs the transfer. The transfer's own uninstall only fires when
+    // OpenBubblesMigrator.available() is true, so a phone that already migrated (or that was
+    // rolled back from beta to main, which reinstalls OpenBubbles, and then came back to
+    // Smart Txt) kept a second rustpush app live on the same push identity. Kept as its own
+    // LaunchedEffect so the sweep's root probe can never delay the log ring above; it hops to
+    // IO itself and stands down whenever a transfer still wants OpenBubbles' files.
+    LaunchedEffect(Unit) {
+        OpenBubblesMigrator.sweepOnLaunch(context)
+    }
     val status by SmartTxtRepository.status.collectAsState()
     // Post-login handle picker: shown once after registration, before the chats.
     var handlesConfigured by remember { mutableStateOf(SmartTxtAccountStore(context).handlesConfigured()) }
