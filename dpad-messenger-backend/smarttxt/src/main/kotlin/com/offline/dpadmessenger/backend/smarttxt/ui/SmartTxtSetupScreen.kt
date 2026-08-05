@@ -1,5 +1,6 @@
 package com.offline.dpadmessenger.backend.smarttxt.ui
 
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -43,11 +44,13 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.offline.dpadmessenger.backend.smarttxt.R
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtRepository
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtStatus
@@ -76,7 +79,7 @@ import kotlinx.coroutines.launch
  */
 
 /** Local UI steps for the sign-in flow. */
-private enum class SignInStep { INTRO, CREDENTIALS, TWO_FACTOR, FSA, REGISTERING, SUCCESS }
+private enum class SignInStep { INTRO, PRIVACY, CREDENTIALS, TWO_FACTOR, FSA, REGISTERING, SUCCESS }
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
@@ -117,6 +120,7 @@ fun SmartTxtSetupScreen(
 
     // DPAD focus handles so the hardware pad moves predictably down the form.
     val getStartedFr = remember { FocusRequester() }
+    val understandFr = remember { FocusRequester() }
     val appleIdFr = remember { FocusRequester() }
     val passwordFr = remember { FocusRequester() }
     val continueFr = remember { FocusRequester() }
@@ -229,9 +233,89 @@ fun SmartTxtSetupScreen(
                     }
                     DpadButton(
                         text = "Get started",
-                        onClick = { error = null; step = SignInStep.CREDENTIALS },
+                        onClick = { error = null; step = SignInStep.PRIVACY },
                         modifier = Modifier.fillMaxWidth(),
                         focusRequester = getStartedFr,
+                    )
+                }
+            }
+
+            // Expectation-setting interstitial between "Get started" and the
+            // credentials form. Apple's own prompt says "a Mac" is signing in
+            // (we register as a Mac against IDS), which reads as an attack if
+            // it's unexplained — and this is the one place to say plainly that
+            // the credentials and message content never touch our servers.
+            //
+            // Small text in a scrollable column so the whole notice is reachable
+            // on the flip's short screen; the "I understand" button is the only
+            // focusable, so DPAD Up/Down scroll the page rather than moving focus.
+            SignInStep.PRIVACY -> {
+                AutoFocus(understandFr)
+                val privacyScroll = rememberScrollState()
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(privacyScroll),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    // Regular weight, unlike the rest of this flow. res/font ships
+                    // only the BLACK cut of Helvetica Now Text, so there is no lighter
+                    // weight to ask for — "not bold" has to mean falling back to the
+                    // system face, which is what the messenger's own screens use by
+                    // design anyway (see DpadMessengerTypography). Swap these two
+                    // families back the moment a regular .ttf lands in res/font.
+                    val regular = MaterialTheme.typography.headlineSmall.copy(
+                        fontFamily = FontFamily.Default,
+                        fontWeight = FontWeight.Normal,
+                    )
+                    // 13.5sp: deliberately off the shared scale (which steps 13 → 15),
+                    // picked for this notice alone — it is the longest prose in the flow
+                    // and the one screen where legibility beats matching the rhythm. At
+                    // this size it runs past the bottom of the flip's screen, which is
+                    // what the scrolling column and the DPAD handler on the button below
+                    // are for.
+                    val regularBody = MaterialTheme.typography.bodyMedium.copy(
+                        fontFamily = FontFamily.Default,
+                        fontWeight = FontWeight.Normal,
+                        fontSize = 13.5.sp,
+                    )
+                    Text("Head's up", style = regular)
+                    Text(
+                        "After signing in, you'll see a prompt that a Mac is trying " +
+                            "to log into your iCloud. We don't store or have access " +
+                            "to your account info or message content. Once setup, " +
+                            "messages will route directly from your phone to Apple's " +
+                            "servers with end-to-end encryption.",
+                        style = regularBody,
+                        // Left-aligned (and full-width, since the column centers its
+                        // children) — ragged-right reads better than centered for
+                        // multi-line prose on a screen this narrow.
+                        textAlign = TextAlign.Start,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    DpadButton(
+                        text = "I understand",
+                        onClick = { error = null; step = SignInStep.CREDENTIALS },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            // Up/Down scroll the notice instead of trying (and
+                            // failing) to move focus off the only focusable node,
+                            // so the button stays reachable and the text readable.
+                            .onPreviewKeyEvent { e ->
+                                if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                                when (e.key) {
+                                    Key.DirectionUp -> {
+                                        scope.launch { privacyScroll.animateScrollBy(-96f) }; true
+                                    }
+                                    Key.DirectionDown -> {
+                                        scope.launch { privacyScroll.animateScrollBy(96f) }; true
+                                    }
+                                    else -> false
+                                }
+                            },
+                        focusRequester = understandFr,
                     )
                 }
             }

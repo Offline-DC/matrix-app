@@ -24,6 +24,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  * re-registration — then stamp the account REGISTERED, so the app resumes that iMessage
  * session with no re-login. Validation runs through the NAC server (no relay).
  *
+ * The MESSAGE HISTORY comes across too, in a separate pass ([ObHistoryImporter]):
+ * because we reuse OpenBubbles' registration rather than registering a new device,
+ * Apple treats this history as already delivered and will not backfill it, so the
+ * ObjectBox store is the only copy — and the uninstall below deletes it. That import
+ * is strictly advisory: it never fails the migration (see PHASE 2.5).
+ *
  * Failure is best-effort: if root is missing, OB isn't logged in, or the import
  * fails, [migrate] returns `ok=false` and the caller falls through to the normal
  * setup screen. The staging dir (which briefly holds private keys) is always wiped
@@ -47,7 +53,8 @@ object OpenBubblesMigrator {
 
     private const val TAG = "ObMigrator"
     const val OB_PKG = "com.openbubbles.messaging"
-    private const val OB_FILES = "/data/data/$OB_PKG/files"
+    private const val OB_DATA = "/data/data/$OB_PKG"
+    private const val OB_FILES = "$OB_DATA/files"
 
     // Two phases. PHASE 1 (identity, HARD): hw_info.plist + dumb → the NAC device
     // identity (os_config.plist + dumb). Without it there's no validation path (no
@@ -381,6 +388,25 @@ object OpenBubblesMigrator {
                 Log.w(TAG, "  login import crashed: ${e.message}")
                 null
             }
+            // ══ PHASE 2.5 — message history (ADVISORY, never fatal).
+            //    Runs on BOTH PHASE 2 outcomes and BEFORE anything below, because:
+            //      - the reused registration means Apple will NOT backfill these
+            //        messages (it already delivered them to OpenBubbles), and
+            //        retireOpenBubbles() deletes the only remaining copy in `finally`;
+            //      - it must land in SQLite before markRegisteredExternally() builds the
+            //        repository, or that repository restores an EMPTY store and its first
+            //        debounced save writes that emptiness back over the import;
+            //      - even on the manual-sign-in fallback the history is still this user's,
+            //        it is still about to be deleted, and the repository merges it in
+            //        whenever the sign-in completes — so there is nothing to gain by
+            //        holding it back.
+            //    OpenBubbles is stopped first: ObjectBox is LMDB, and copying a file that
+            //    a live writer is committing into can yield a mix of old and new pages.
+            runCatching {
+                suOutput("id; am force-stop $OB_PKG")
+                ObHistoryImporter.importInto(app, stage, OB_DATA) { src, dst -> suCopy(src, dst) }
+            }.onFailure { Log.w(TAG, "  history import threw (migration continues): ${it.message}") }
+
             if (login == null) {
                 Log.w(TAG, "════ ⚠️ MIGRATION → SIGN-IN: device ready, but the OpenBubbles login " +
                     "couldn't be reused — routing to manual sign-in (${SystemClock.elapsedRealtime() - t0}ms) ════")
@@ -406,8 +432,8 @@ object OpenBubblesMigrator {
             Log.i(TAG, "  account store: isRegistered=${store.isRegistered()} " +
                 "lastRegisteredMs=${store.lastRegisteredMs()} handlesConfigured=${store.handlesConfigured()}")
 
-            // go live. History is intentionally NOT transferred — new messages arrive
-            // as they come, and the chat list shows a welcome empty-state until then.
+            // go live. Recent history has already been imported in PHASE 2.5, so the
+            // chat list opens on real conversations rather than an empty state.
             // (OpenBubbles is retired below, in `finally`, on every outcome.)
             SmartTxtRepository.markRegisteredExternally(app)
             Log.i(TAG, "  status → REGISTERED, background connection started")
