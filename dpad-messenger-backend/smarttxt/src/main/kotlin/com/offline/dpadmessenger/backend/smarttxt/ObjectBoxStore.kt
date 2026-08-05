@@ -72,9 +72,63 @@ internal class ObjectBoxStore private constructor(
 
     /** Forward pairs of a standalone relation (e.g. `Chat.handles` → chatId to handleId).
      *  Empty when [entity] has no relation called [name]. */
-    fun relationPairs(entity: ObEntity, name: String): List<Pair<Long, Long>> {
-        val relId = entity.relations[name] ?: return emptyList()
-        val prefix = beInt(RELATION_NS or (4 * relId))
+    fun relationPairs(entity: ObEntity, name: String, targetEntityId: Int = 0): List<Pair<Long, Long>> {
+        // Prefer the declared name, but fall back to "whatever relation on this entity
+        // points at that target" — a rename upstream should not silently cost us the
+        // participant list, which is the one thing every room id is built from.
+        // Target first when we know it: the name is the part that goes missing
+        // across OpenBubbles versions, the target entity is not.
+        val rel = entity.relations.firstOrNull { targetEntityId != 0 && it.targetEntityId == targetEntityId }
+            ?: entity.relations.firstOrNull { it.name.isNotEmpty() && it.name == name }
+            ?: run {
+                Log.w(TAG, "relation '$name' not declared on ${entity.name}; " +
+                    "it has ${entity.relations.size}: ${entity.relations.joinToString { it.name }}")
+                return emptyList()
+            }
+        // Forward pairs live at `4 * relationId`; the same relation indexed backwards
+        // lives 2 slots up. Which side ObjectBox fills is not something to assume, so
+        // read forward and, only if it is empty, read the backlink and swap.
+        val forward = pairsAt(RELATION_NS or (4 * rel.id), swap = false)
+        if (forward.isNotEmpty()) {
+            Log.i(TAG, "relation ${entity.name}.${rel.name.ifEmpty { "(unnamed)" }}#${rel.id}" +
+                "→e${rel.targetEntityId}: ${forward.size} pair(s) (forward)")
+            return forward
+        }
+        val reverse = pairsAt(RELATION_NS or (4 * rel.id + 2), swap = true)
+        Log.i(TAG, "relation ${entity.name}.${rel.name}#${rel.id}: forward empty, " +
+            "backlink has ${reverse.size} pair(s)")
+        if (reverse.isEmpty()) probeRelationNamespaces(rel.id)
+        return reverse
+    }
+
+    /**
+     * Both sides of a relation came back empty. That has two very different causes and
+     * the fix differs, so say which: either this OpenBubbles genuinely never wrote the
+     * relation (nothing found anywhere → recover membership some other way), or it
+     * wrote it under a slot our `4 * relationId` mapping didn't predict (something
+     * found → the mapping is what needs fixing, and this line names the right slot).
+     *
+     * Cheap: an empty prefix scan is a couple of page reads, and this only runs on the
+     * failure path.
+     */
+    private fun probeRelationNamespaces(expectedId: Int) {
+        val found = (0 until 64)
+            .mapNotNull { slot ->
+                val n = pairsAt(RELATION_NS or slot, swap = false).size
+                if (n > 0) "slot$slot(=rel${slot / 4}${if (slot % 4 == 2) " backlink" else ""})=$n" else null
+            }
+        if (found.isEmpty()) {
+            Log.w(TAG, "relation probe: NO relation rows anywhere in this store — " +
+                "OpenBubbles never wrote them; membership must come from elsewhere")
+        } else {
+            Log.w(TAG, "relation probe: expected relation #$expectedId at slot ${4 * expectedId}, " +
+                "but rows live at: ${found.joinToString()} — the id→slot mapping is wrong")
+        }
+    }
+
+    /** All (from, to) pairs stored under one relation key namespace. */
+    private fun pairsAt(ns: Int, swap: Boolean): List<Pair<Long, Long>> {
+        val prefix = beInt(ns)
         val out = ArrayList<Pair<Long, Long>>()
         scan(prefix) { key, _ ->
             // key = prefix + fromId + toId, split evenly (ObjectBox writes both ids
@@ -82,7 +136,9 @@ internal class ObjectBoxStore private constructor(
             val idBytes = key.size - prefix.size
             if (idBytes >= 2 && idBytes % 2 == 0) {
                 val half = idBytes / 2
-                out += beLong(key, prefix.size, half) to beLong(key, prefix.size + half, half)
+                val a = beLong(key, prefix.size, half)
+                val b = beLong(key, prefix.size + half, half)
+                out += if (swap) b to a else a to b
             }
         }
         return out
@@ -119,15 +175,30 @@ internal class ObjectBoxStore private constructor(
                     if (slot < 0) null
                     else ObProperty(pname, type = typeWord and 0xFFFF, slot = slot)
                 }
+                // Relation record: `0` = id, `1` = uid, `2` = source entity,
+                // `3` = TARGET entity, `4` = name — and the NAME IS OPTIONAL.
+                //
+                // OpenBubbles 1.15.0 writes this record with four fields and no name
+                // at all (1.9-era stores carry "handles"). Requiring the name is what
+                // cost a real device its whole history on 2026-08-05: the Chat→Handle
+                // relation was dropped from the model, every chat came out with no
+                // participants, no room could be keyed, and all 20 messages fell out
+                // as `noRoom`. The id and the target are always present and are the
+                // only parts we need — so a nameless relation is a normal relation,
+                // and callers match on the target entity instead.
                 val rels = t.tables(10).mapNotNull { r ->
-                    val rname = r.string(4) ?: return@mapNotNull null
                     val rid = r.int(0) ?: return@mapNotNull null
-                    rname to rid
-                }.toMap()
+                    ObRelation(rid, r.string(4).orEmpty(), r.int(3) ?: 0)
+                }
                 if (props.isNotEmpty()) out[name] = ObEntity(id, name, props, rels)
             }
         }
-        Log.i(TAG, "model: " + out.values.joinToString { "${it.name}#${it.id}(${it.properties.size}p)" })
+        Log.i(TAG, "model: " + out.values.joinToString {
+            "${it.name}#${it.id}(${it.properties.size}p" +
+                (if (it.relations.isEmpty()) "" else ", rel " + it.relations.joinToString("/") { r ->
+                    "${r.name.ifEmpty { "(unnamed)" }}#${r.id}→e${r.targetEntityId}"
+                }) + ")"
+        })
         return out
     }
 
@@ -374,12 +445,15 @@ internal class ObProperty(val name: String, val type: Int, val slot: Int) {
 }
 
 /** One entity type from the store's meta model. [relations] are standalone
- *  (many-to-many) relations by name → relation id. */
+ *  (many-to-many) relations. */
+/** A standalone (many-to-many) relation declared on an entity. */
+internal class ObRelation(val id: Int, val name: String, val targetEntityId: Int)
+
 internal class ObEntity(
     val id: Int,
     val name: String,
     val properties: List<ObProperty>,
-    val relations: Map<String, Int>,
+    val relations: List<ObRelation>,
 ) {
     private val byName: Map<String, ObProperty> = properties.associateBy { it.name }
     fun property(name: String): ObProperty? = byName[name]

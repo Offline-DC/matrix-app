@@ -141,8 +141,16 @@ internal object ObHistoryImporter {
             val store = ObjectBoxStore.open(db) ?: return fail("ObjectBox store unreadable")
             val imported = store.use { read(it) } ?: return fail("no Message entity in the store")
             val res = merge(app, imported)
-            Log.i(TAG, "════ ✅ HISTORY IMPORTED: ${res.rooms} room(s), ${res.messages} message(s) " +
-                "(${SystemClock.elapsedRealtime() - t0}ms) ════")
+            // A run that imported NOTHING is not a success, even though nothing threw:
+            // on 2026-08-05 a device logged "✅ HISTORY IMPORTED: 0 room(s)" and the ✅
+            // is exactly the wrong thing to see when every thread was dropped. Say so.
+            if (res.messages == 0) {
+                Log.w(TAG, "════ ⚠️ HISTORY IMPORT FOUND NOTHING (${SystemClock.elapsedRealtime() - t0}ms) — " +
+                    "see the source/rooms/messages lines above for which rule dropped it ════")
+            } else {
+                Log.i(TAG, "════ ✅ HISTORY IMPORTED: ${res.rooms} room(s), ${res.messages} message(s) " +
+                    "(${SystemClock.elapsedRealtime() - t0}ms) ════")
+            }
             res
         } catch (e: Exception) {
             fail("history import crashed: ${e.message}")
@@ -195,24 +203,57 @@ internal object ObHistoryImporter {
         val participantsByChat = HashMap<Long, MutableList<String>>()
         var relationPairs = 0
         if (chatEntity != null && handleEntity != null) {
-            for ((chatId, handleId) in store.relationPairs(chatEntity, "handles")) {
+            for ((chatId, handleId) in store.relationPairs(chatEntity, "handles", handleEntity.id)) {
                 relationPairs++
                 val addr = addressById[handleId] ?: continue
                 if (addr.isBlank() || addr in mine) continue
                 participantsByChat.getOrPut(chatId) { ArrayList() }.add(addr)
             }
         }
-        // The first thing to check when NOTHING imports: an empty relation means every
-        // chat loses its participants, and a chat with no participants has no guid we
-        // can build, so all of them get dropped a few lines below.
+
+        // FALLBACK — who has actually spoken in each chat.
+        //
+        // The Chat↔Handle relation is the authority on membership, but it is not always
+        // populated: a device on 2026-08-05 imported nothing because its store had two
+        // chats, four handles and ZERO relation pairs, so every chat came out with no
+        // participants, no guid could be built, and all 20 messages fell out as
+        // `noRoom`. Sender handles are on the messages themselves, so recover the
+        // membership from those instead of losing the thread.
+        //
+        // Only used when the relation gave a chat nothing. It is strictly weaker: it
+        // sees a group's SILENT members not at all, so a group recovered this way can
+        // get a member-set guid narrower than the real conversation — which costs a
+        // possible duplicate room later, against certain loss now.
+        val observedByChat = HashMap<Long, MutableSet<String>>()
+        store.forEachRow(messageEntity) { _, row ->
+            if (row.bool("isFromMe")) return@forEachRow
+            val chatId = row.long("chatId")
+            if (chatId == 0L || participantsByChat.containsKey(chatId)) return@forEachRow
+            val h = row.long("handleId").takeIf { it != 0L } ?: row.long("handleRelationId")
+            val addr = addressById[h] ?: return@forEachRow
+            if (addr.isBlank() || addr in mine) return@forEachRow
+            observedByChat.getOrPut(chatId) { LinkedHashSet() }.add(addr)
+        }
+
+        // The first thing to check when nothing imports: 0 pairs AND 0 recovered means
+        // no chat can be keyed, and every message below will land in `noRoom`.
         Log.i(TAG, "  history source: ${chatRows.size} chat(s), ${addressById.size} handle(s), " +
-            "$relationPairs chat↔handle pair(s), ${mine.size} handle(s) of my own")
+            "$relationPairs chat↔handle pair(s), ${mine.size} handle(s) of my own, " +
+            "${observedByChat.size} chat(s) recovered from message senders")
 
         val rooms = HashMap<Long, Room>()
         val muted = HashSet<String>()
         var chatsWithoutParticipants = 0
+        var fromRelation = 0
+        var fromMessages = 0
         for ((chatId, row) in chatRows) {
-            val members = participantsByChat[chatId]?.distinct()?.sorted().orEmpty()
+            val declared = participantsByChat[chatId]?.distinct()?.sorted().orEmpty()
+            val members = if (declared.isNotEmpty()) {
+                fromRelation++
+                declared
+            } else {
+                observedByChat[chatId]?.sorted().orEmpty().also { if (it.isNotEmpty()) fromMessages++ }
+            }
             // No known counterpart ⇒ no way to build a Smart Txt guid for this thread,
             // and a room the transport can never match is worse than no room at all.
             if (members.isEmpty()) { chatsWithoutParticipants++; continue }
@@ -232,7 +273,8 @@ internal object ObHistoryImporter {
             if (row.string("muteType") == "mute") muted += id
         }
         Log.i(TAG, "  history rooms: built ${rooms.values.distinctBy { it.id }.size} " +
-            "(${rooms.values.count { !it.isGroup }} 1:1, ${rooms.values.count { it.isGroup }} group), " +
+            "(${rooms.values.count { !it.isGroup }} 1:1, ${rooms.values.count { it.isGroup }} group) — " +
+            "$fromRelation from the handle relation, $fromMessages recovered from senders; " +
             "dropped $chatsWithoutParticipants chat(s) with no known participant")
 
         // One pass over the messages, inside the retention window. Reaction rows are
