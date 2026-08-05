@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.util.Log
+import com.offline.dpadmessenger.backend.smarttxt.transport.Handles
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -77,6 +78,10 @@ object OpenBubblesMigrator {
     // Persistent "we already migrated from OpenBubbles" flag, so a later logout leads to a
     // fresh MANUAL sign-in rather than another auto-migration. Survives logout; reset only
     // by wiping the app's data.
+    /** OpenBubbles' "Start Chats Using" preference key (Flutter prefixes it
+     *  `flutter.` in the XML shape; [ObFlutterPrefs] handles that). */
+    private const val KEY_DEFAULT_HANDLE = "defaultHandle"
+
     private const val PREFS = "smarttxt_flags"
     private const val KEY_MIGRATED = "ob_migration_done"
     private fun migrationDone(context: Context): Boolean =
@@ -300,7 +305,7 @@ object OpenBubblesMigrator {
             //    and hw_info.plist only matters for REUSING the OpenBubbles login. A device
             //    that has nothing but a dumb is a perfectly valid device: it just signs in
             //    manually instead of inheriting the session. Neither is worth failing on.
-            onStep("This will only take a moment…")
+            onStep("updating smart txt…")
 
             // 1a. The dumb (HARD). PREFER Smart Txt's own — the launcher may already have
             //     provisioned it (filesDir/dumb) even when OpenBubbles was never installed —
@@ -378,7 +383,7 @@ object OpenBubblesMigrator {
             // ══ PHASE 2 — reuse the OpenBubbles login → config.plist (the keystore is NOT
             //    migrated). SOFT: if it fails we KEEP the staged identity and send the user
             //    to the normal sign-in screen, which still validates through the NAC server.
-            onStep("This will only take a moment…")
+            onStep("this will only take a moment…")
             val login = if (!haveHwInfo) {
                 Log.w(TAG, "  no hw_info.plist — nothing to import a login FROM; manual sign-in")
                 null
@@ -424,10 +429,7 @@ object OpenBubblesMigrator {
             ))
             store.markRegistered()
             if (handles.isNotEmpty()) {
-                store.saveHandleSelection(
-                    enabled = handles,
-                    default = handles.firstOrNull { it.startsWith("tel:") } ?: handles.first(),
-                )
+                store.saveHandleSelection(enabled = handles, default = sendFromHandle(stage, handles))
             }
             Log.i(TAG, "  account store: isRegistered=${store.isRegistered()} " +
                 "lastRegisteredMs=${store.lastRegisteredMs()} handlesConfigured=${store.handlesConfigured()}")
@@ -455,6 +457,50 @@ object OpenBubblesMigrator {
             retireOpenBubbles()
             migrationInFlight = false
         }
+    }
+
+    /**
+     * The address new messages should be sent from — OpenBubbles' "Start Chats Using"
+     * setting, carried over rather than guessed.
+     *
+     * This matters more than it looks. Marking the handle selection configured is what
+     * SKIPS the post-login picker and drops a migrating user straight into their
+     * conversations — so whatever we choose here is a choice they never get asked
+     * about. The old rule ("first tel:, else whatever's first") quietly got it wrong
+     * for anyone whose vetted aliases are all email: a real device on 2026-08-05 had
+     * `[mailto:swagthug4lyfe@icloud.com, mailto:27jackstreet@gmail.com]` and had chosen
+     * the second, and the old rule would have started them sending from the first.
+     *
+     * Falls back to the old rule whenever the setting is missing or names an address
+     * that didn't come across — never fails the migration.
+     */
+    private fun sendFromHandle(stage: File, handles: List<String>): String {
+        val fallback = handles.firstOrNull { it.startsWith("tel:") } ?: handles.first()
+        // Two shapes, because Flutter changed its backing store mid-life and shipped
+        // OpenBubbles builds straddle it: 1.9-era stores the DataStore protobuf,
+        // 1.15.0 the older XML (its .preferences_pb is a 125-byte stub). Read both.
+        val pb = File(stage, "flutter_prefs.pb")
+        val xml = File(stage, "flutter_prefs.xml")
+        suCopy("$OB_FILES/datastore/FlutterSharedPreferences.preferences_pb", pb)
+        suCopy("$OB_DATA/shared_prefs/FlutterSharedPreferences.xml", xml)
+        val raw = ObFlutterPrefs.string(pb, KEY_DEFAULT_HANDLE)?.takeIf { it.isNotBlank() }
+            ?: ObFlutterPrefs.string(xml, KEY_DEFAULT_HANDLE)?.takeIf { it.isNotBlank() }
+        if (raw == null) {
+            Log.w(TAG, "  send-from: no defaultHandle in OpenBubbles' settings " +
+                "(pb=${pb.length()}B xml=${xml.length()}B) — using $fallback")
+            return fallback
+        }
+        // Exact first; then compare canonically, so a difference in how the address is
+        // written ("tel:+1 404…" vs "tel:+1404…") still resolves to the same handle.
+        val match = handles.firstOrNull { it.equals(raw, ignoreCase = true) }
+            ?: handles.firstOrNull { Handles.canon(it) == Handles.canon(raw) }
+        if (match == null) {
+            Log.w(TAG, "  send-from: OpenBubbles used '$raw', which is not among the " +
+                "migrated handles $handles — using $fallback")
+            return fallback
+        }
+        Log.i(TAG, "  send-from: carried OpenBubbles' '$raw' → $match (post-login picker skipped)")
+        return match
     }
 
     /** PHASE 2: reuse OpenBubbles' existing registration → config.plist (the keystore is

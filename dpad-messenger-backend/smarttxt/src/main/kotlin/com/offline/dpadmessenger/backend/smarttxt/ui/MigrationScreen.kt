@@ -54,7 +54,10 @@ fun MigrationScreen(
     onFallbackToSetup: () -> Unit,
 ) {
     val context = LocalContext.current
-    var step by remember { mutableStateOf("This will only take a moment…") }
+    // The first line the user sees, before migrate() reports a step of its own.
+    // It then reads: "updating smart txt…" (PHASE 1) → "this will only take a
+    // moment…" (PHASE 2, the slow half — keystore decrypt, IDS import, history).
+    var step by remember { mutableStateOf("updating smart txt…") }
 
     LaunchedEffect(Unit) {
         Log.i("ObMigrator", "MigrationScreen shown → starting transfer")
@@ -105,7 +108,10 @@ fun MigrationScreen(
                     // sign-in if the OpenBubbles login can't be reused, so we never
                     // promise "your login is carrying over" — that would confuse the
                     // user about why they're being asked to sign in.
-                    text = "Setting up…",
+                    // Lower-case on purpose: this screen and the step line under
+                    // it read as one quiet sentence beside the duck, not as two
+                    // headings. Keep any new copy here lower-case to match.
+                    text = "setting up…",
                     style = MaterialTheme.typography.titleMedium,
                     textAlign = TextAlign.Center,
                 )
