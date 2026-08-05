@@ -3579,78 +3579,114 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     out(&mut env, serde_json::to_string(&drained).unwrap_or_else(|_| "[]".into()))
 }
 
-/// How long APS has to stay stuck on a REFUSED connect before we tell the user their
-/// push certificate is dead. Wall-clock, not a retry count, because the retry cadence
-/// is rustpush's business and changes with its backoff. Five minutes is far past any
-/// tunnel, lift, or dead spot.
-const PUSH_CERT_BAD_FOR_MS: u64 = 5 * 60 * 1000;
-
-/// When APS first entered the refused state, 0 = it isn't in it.
-static PUSH_CERT_BAD_SINCE_MS: AtomicU64 = AtomicU64::new(0);
-
-/// True once we've raised the modal for the CURRENT episode, so the user is told once
-/// rather than twice a second. Cleared when APS connects, so a device that breaks again
-/// later is told again.
+/// True once we've raised the alert for the CURRENT episode. Cleared when APS connects.
+///
+/// This is OpenBubbles' `notifiedFailed` bool, same semantics: raise on the first
+/// failure, once, and reset when the state goes healthy again
+/// (`rustpush_service.dart:3361` — `if (state is RegisterState_Failed && !notifiedFailed)`,
+/// reset under `RegisterState_Registered`). There is deliberately NO time threshold and
+/// no failure count, because OB has neither.
 static PUSH_CERT_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+/// Whether we have reported a HEALTHY connect at least once in this process.
+///
+/// Closes a stale-notification hole. The alert is `setOngoing`, so it survives the
+/// process — but [`PUSH_CERT_ANNOUNCED`] does not. Without this, a handset that is
+/// alerted, then killed (which this hardware does constantly — see the lowmemorykiller
+/// findings), then comes back healthy would take the `swap(false) == false` branch,
+/// emit nothing, and leave the user staring at a "not receiving messages" notification
+/// forever while messages arrive perfectly well behind it.
+static PUSH_CERT_HEALTHY_REPORTED: AtomicBool = AtomicBool::new(false);
 
-/// Surface a refused APS connect to the user, the way OpenBubbles does.
+/// Surface a refused APS connect to the user.
 ///
-/// ## Where this reads from, and why it isn't a rustpush change
+/// ## Where this reads from
 ///
-/// rustpush already publishes exactly this: `ResourceManager::resource_state` is a
-/// public `watch` channel carrying `ResourceState::Failed(ResourceFailure { error, .. })`,
-/// and `error` is the `PushError` — here `APSConnectError(status)`, whose Display text
-/// is the "You need to re-setup your device" message. `ResourceState` and
-/// `ResourceFailure` are both re-exported from rustpush's crate root. That channel is
-/// how OpenBubbles learns about this, and it is why OB can show the error with no
-/// library patch at all. We were already subscribed to it for logging
-/// (`spawn_apsstate_watcher`) and simply never acted on it.
+/// rustpush already publishes it: `ResourceManager::resource_state` is a public `watch`
+/// channel carrying `ResourceState::Failed(ResourceFailure { error, .. })`, and `error`
+/// is the `PushError` — here `APSConnectError(status)`. `ResourceState` and
+/// `ResourceFailure` are re-exported from rustpush's crate root, so this needs no
+/// library patch. We were already subscribed for logging (`spawn_apsstate_watcher`) and
+/// simply never acted on it.
+///
+/// ## Why this exists at all — OpenBubbles does NOT do this
+///
+/// Worth being explicit, because it is the one place we knowingly go beyond OB: their
+/// Dart never watches the APS connection. `conn` appears only as an argument passed into
+/// API calls. What OB watches is IDS *registration* — and a refused APS connect does not
+/// fail registration. On the 2026-08-04 field handset, registration stayed healthy
+/// ("Reregistering in 3739908 seconds") through 20 hours of receiving nothing, so OB's
+/// alert would never have fired either. The mechanism below is copied from OB; the fact
+/// that it is wired to APS instead of registration is ours.
 ///
 /// ## Why a state READ rather than the existing watcher
 ///
-/// `spawn_apsstate_watcher` consumes transitions. In the 2026-08-04 field bundle its
-/// lines stopped entirely while rejections continued for 1h53m — the capture had 14
-/// holes so that is not conclusive, but a missed edge is unrecoverable and this is the
-/// signal that decides whether a customer is told their phone is broken. Reading the
-/// CURRENT state each poll cannot miss an edge, and `nativePollEvents` is driven by
-/// Kotlin every 500ms.
-///
-/// ## Why wall-clock, and why only APSConnectError
-///
-/// A refused connect is not a bad network — it means Apple accepted the socket and
-/// rejected the credentials. Failures with any other error (DNS, socket, timeout) reset
-/// the clock, so a tunnel never raises this. Only a sustained refusal does.
+/// `spawn_apsstate_watcher` consumes transitions. In the field bundle its lines stopped
+/// entirely while rejections continued for 1h53m — inconclusive (that capture had 14
+/// holes) but a missed edge is unrecoverable for the signal that decides whether a
+/// customer is told their phone is broken. Reading the CURRENT state each poll cannot
+/// miss an edge, and `nativePollEvents` is driven by Kotlin every 500ms.
+/// Last APS state this poll path OBSERVED, so transitions can be logged once each.
+static APS_LAST_OBSERVED: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+
+/// One-line signature of an APS state, including the error VARIANT when failed.
+fn aps_state_signature(state: &ResourceState) -> String {
+    match state {
+        ResourceState::Generated => "Generated".to_string(),
+        ResourceState::Generating => "Generating".to_string(),
+        ResourceState::Closed => "Closed".to_string(),
+        ResourceState::Failed(f) => {
+            // chars(), NOT a byte slice: `&e[..90]` panics if byte 90 lands mid-UTF-8,
+            // and these strings carry em-dashes. A panic here would be inside the JNI
+            // poll path, taking the receive loop with it — an unacceptable price for a
+            // diagnostic line.
+            let e: String = f.error.to_string().chars().take(90).collect();
+            format!("Failed({e})")
+        }
+    }
+}
+
 fn check_push_cert_rejected() {
-    let Some(conn) = st().connection.clone() else {
-        PUSH_CERT_BAD_SINCE_MS.store(0, Ordering::SeqCst);
-        return;
-    };
+    let Some(conn) = st().connection.clone() else { return };
     let state = conn.resource_state.subscribe().borrow().clone();
-    let refused = matches!(
+
+    // ── DIAGNOSTIC: does Failed(APSConnectError) ever actually reach this channel? ──
+    //
+    // It has to, for the detection below to work — and we cannot yet show that it does.
+    // Across 41 hours and 914 refusals on the 2026-08-04 handset, every `APSSTATE:
+    // Failed` line logged by `spawn_apsstate_watcher` carried an IO error and not one
+    // carried an APSConnectError. That is not proof of absence (the watcher consumes
+    // transitions and tokio's `watch` coalesces, so it can miss a state that is
+    // overwritten before it wakes) but it means the trigger is unverified.
+    //
+    // This logs from the POLL path instead, which reads the CURRENT value every 500ms
+    // and cannot miss an edge the same way. One line per transition, at warn! so it
+    // survives the launcher snapshot's trailing `*:W`. Grep APSPOLL: if
+    // `Failed(Aps connection failed…)` appears, the detection below is sound; if only
+    // IO errors ever appear, the trigger has to move to elapsed-time-since-Generated.
+    {
+        let sig = aps_state_signature(&state);
+        let cell = APS_LAST_OBSERVED.get_or_init(|| std::sync::Mutex::new(String::new()));
+        if let Ok(mut last) = cell.lock() {
+            if *last != sig {
+                log::warn!("APSPOLL: {sig}");
+                *last = sig;
+            }
+        }
+    }
+
+    // Only a REFUSAL counts: Apple took the socket and rejected the credentials. A
+    // Failed carrying a network error (DNS, socket, timeout) is a bad link, not a dead
+    // certificate, and must never raise this — that is what a tunnel looks like.
+    if matches!(
         &state,
         ResourceState::Failed(f) if matches!(&*f.error, PushError::APSConnectError(_))
-    );
-
-    if refused {
-        let now = now_ms();
-        let since = PUSH_CERT_BAD_SINCE_MS.load(Ordering::SeqCst);
-        if since == 0 {
-            PUSH_CERT_BAD_SINCE_MS.store(now, Ordering::SeqCst);
-        } else if now.saturating_sub(since) >= PUSH_CERT_BAD_FOR_MS
-            && !PUSH_CERT_ANNOUNCED.swap(true, Ordering::SeqCst)
-        {
+    ) {
+        if !PUSH_CERT_ANNOUNCED.swap(true, Ordering::SeqCst) {
             log::error!(
-                "PUSH CERT REJECTED: Apple has refused this device's APS connect for \
-                 {}s — the socket transmits but subscribed to nothing, so sends look \
-                 fine and NOTHING is delivered. Surfacing the re-setup modal. state={}",
-                now.saturating_sub(since) / 1000,
+                "PUSH CERT REJECTED: Apple refused this device's APS connect — the socket \
+                 transmits but subscribed to nothing, so sends look fine and NOTHING is \
+                 delivered. Alerting the user. state={}",
                 match &state {
                     ResourceState::Failed(f) => f.error.to_string(),
                     _ => "?".to_string(),
@@ -3661,19 +3697,18 @@ fn check_push_cert_rejected() {
         return;
     }
 
-    // Anything that is not a refusal clears the clock: Generated (healthy), or a
-    // Failed carrying a network error, which is a bad link and not a dead certificate.
-    // Generating is the gap between retries and must NOT clear it, or a device that
-    // alternates Failed → Generating → Failed never accumulates any elapsed time.
-    if matches!(state, ResourceState::Generating) {
-        return;
-    }
-    PUSH_CERT_BAD_SINCE_MS.store(0, Ordering::SeqCst);
-    if PUSH_CERT_ANNOUNCED.swap(false, Ordering::SeqCst) {
+    // Healthy. OB withdraws its notification the same way (`clearRegisterFailed`).
+    // Reported when we are recovering from an alert we raised, AND once unconditionally
+    // on the first healthy connect of the process — that second case is what clears an
+    // alert left behind by a previous process (see PUSH_CERT_HEALTHY_REPORTED).
+    if matches!(state, ResourceState::Generated) {
+        let was_announced = PUSH_CERT_ANNOUNCED.swap(false, Ordering::SeqCst);
+        let first_healthy = !PUSH_CERT_HEALTHY_REPORTED.swap(true, Ordering::SeqCst);
+        if !(was_announced || first_healthy) { return }
         // warn!, not info!: the launcher's hourly snapshot filterspec ends in `*:W` and
         // does not allow-list SmartTxtRust at :I, so an info! here would be missing from
-        // exactly the bundle where "did the logout fix it?" gets answered.
-        log::warn!("PUSH CERT RECOVERED: APS connected — clearing the re-setup modal");
+        // exactly the bundle where "did it recover?" gets answered.
+        log::warn!("PUSH CERT RECOVERED: APS connected — withdrawing the alert");
         st().queue_event(serde_json::json!({ "type": "push_cert_rejected", "rejected": false }));
     }
 }

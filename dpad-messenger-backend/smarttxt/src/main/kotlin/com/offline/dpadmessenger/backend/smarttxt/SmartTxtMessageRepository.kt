@@ -439,7 +439,7 @@ internal class SmartTxtMessageRepository(
                 // therefore the certificate, lets the next sign-in mint a fresh one. So
                 // this only raises a flag; the user decides.
                 Log.w(TAG, "push cert rejected=${e.rejected}")
-                SmartTxtRepository.setPushCertRejected(e.rejected)
+                SmartTxtRepository.setPushCertRejected(appContext, e.rejected)
             }
         }
     }

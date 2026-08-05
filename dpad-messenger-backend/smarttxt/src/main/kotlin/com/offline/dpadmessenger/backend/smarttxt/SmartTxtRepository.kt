@@ -936,29 +936,18 @@ object SmartTxtRepository {
     private val _pushCertRejected = MutableStateFlow(false)
     val pushCertRejected: StateFlow<Boolean> = _pushCertRejected
 
-    internal fun setPushCertRejected(rejected: Boolean) {
-        if (_pushCertRejected.value != rejected) {
-            Log.w(TAG, "pushCertRejected → $rejected")
-        }
+    internal fun setPushCertRejected(context: Context, rejected: Boolean) {
+        if (_pushCertRejected.value == rejected) return
+        Log.w(TAG, "pushCertRejected → $rejected")
         _pushCertRejected.value = rejected
-    }
-
-    /**
-     * The recovery for a refused push certificate: a FULL logout.
-     *
-     * [shutdown] with `wipe = true` calls `nativeLogout`, which deletes `config.plist`
-     * — and the APS state (push token + certificate keypair) lives in that file. So the
-     * next sign-in has no keypair to resume, `do_connect` runs `activate()`, and Apple
-     * issues a fresh certificate. Anything short of this re-presents the certificate
-     * Apple is already refusing.
-     *
-     * The device identity (`dumb` + `os_config.plist`) is deliberately kept by
-     * `nativeLogout`, so the fresh registration still validates through NAC.
-     */
-    fun logoutForNewPushCertificate(context: Context) {
-        Log.w(TAG, "logoutForNewPushCertificate: full logout so sign-in mints a NEW push cert")
-        setPushCertRejected(false)
-        shutdown(context, wipe = true)
+        // The notification is the PRIMARY surface, not the dialog: this failure happens
+        // while the app is closed (the push connection lives in the launcher process),
+        // so a dialog alone waits for a visit that may never come. Mirrors OB's
+        // createRegisterFailed / clearRegisterFailed pair.
+        val notifier = SmartTxtNotifier(context.applicationContext)
+        runCatching {
+            if (rejected) notifier.notifyPushCertRejected() else notifier.clearPushCertRejected()
+        }.onFailure { Log.w(TAG, "push-cert notification failed: ${it.message}") }
     }
 
     fun signOutKeepingHistory(context: Context) {
