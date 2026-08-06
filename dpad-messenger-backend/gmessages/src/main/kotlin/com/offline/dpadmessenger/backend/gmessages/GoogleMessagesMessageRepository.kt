@@ -185,6 +185,30 @@ internal class GoogleMessagesMessageRepository(
     private val loggedMediaParseFailures =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
+    /** What a still-unreconciled outgoing media send looked like on the wire,
+     *  keyed by its tmpID. A media echo arrives with an EMPTY body — the local
+     *  bubble carries a "[voice message]"-style placeholder instead — so the
+     *  body+time fallback is structurally unable to match one, and every media
+     *  send doubles. Mime + exact plaintext size can match it.
+     *
+     *  In memory only, deliberately: after a process restart there is no send in
+     *  flight, and a tmp_ row that outlived its own process cannot be reconciled
+     *  by any key, so persisting this would buy nothing. */
+    private class PendingMedia(
+        val mime: String,
+        val sizeBytes: Long,
+        /** Pixel dimensions for images, 0 for everything else. Needed because
+         *  Google TRANSCODES images: a 662209-byte JPEG echoes back claiming
+         *  162243 bytes, so size can never reconcile a photo. Dimensions come
+         *  back unchanged. Audio is echoed byte-for-byte and matches on size. */
+        val width: Int,
+        val height: Int,
+        val atMs: Long,
+    )
+
+    private val pendingMediaByTmpId =
+        java.util.concurrent.ConcurrentHashMap<String, PendingMedia>()
+
     /** Message ids we've already logged a contentless-ghost dump for (once each). */
     private val loggedEmptyMessages =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
@@ -206,6 +230,11 @@ internal class GoogleMessagesMessageRepository(
                         Log.w(TAG, "auth expired — re-pair needed (reason=${evt.reason})")
                         _authExpiredReason.value = evt.reason
                         _authExpired.value = true
+                    }
+                    SessionEvent.AuthRestored -> {
+                        Log.i(TAG, "auth restored — dismissing the reconnect screen")
+                        _authExpired.value = false
+                        _authExpiredReason.value = null
                     }
                 }
             }
@@ -264,6 +293,25 @@ internal class GoogleMessagesMessageRepository(
     val lastAuthFailureReason: AuthFailureReason get() = session.lastFailureReason
 
     /**
+     * Tell Google to forget this pairing. Must run BEFORE [shutdown] and before
+     * the stored account is wiped — it needs the live session and the
+     * credentials.
+     *
+     * Best-effort: the caller is a user pressing Log out or Re-link, and a
+     * failure only costs one leftover entry in the phone's device list, which
+     * is where every user is today.
+     *
+     * The time bound lives in the session client's OkHttp `callTimeout`, NOT
+     * here. A `withTimeoutOrNull` around this would be theatre: the call
+     * underneath is a blocking `execute()`, coroutine cancellation cannot
+     * interrupt it, so the wrapper could not return early — it could only
+     * mislabel a slow SUCCESS as a timeout.
+     */
+    suspend fun unpairRemote(): Boolean = withContext(Dispatchers.IO) {
+        session.unpairGaia()
+    }
+
+    /**
      * Stop the session. [clearCache] = true (an explicit logout) deletes the
      * persisted message history; false (a re-link / re-pair after the token
      * expired) keeps it, so signing back in restores past conversations instead
@@ -271,8 +319,19 @@ internal class GoogleMessagesMessageRepository(
      */
     fun shutdown(clearCache: Boolean = true) {
         session.shutdown()
-        if (clearCache) cache.clear()
+        // Cancel BEFORE clearing. The debounced save loop lives in this scope
+        // (CONFLATED channel, ~1.5s collapse), so a save already queued would
+        // otherwise land AFTER MessageStore's DELETE and re-persist the snapshot
+        // we just wiped — bringing the old messages, and any stale tmp_ rows,
+        // straight back after a logout.
+        //
+        // This narrows the window; it does not close it. Cancellation is
+        // cooperative and cannot interrupt a SQLite write already in flight, so
+        // a save that has entered `cache.save()` still lands after the DELETE.
+        // Closing it properly needs a fence on the cache, the way
+        // GoogleMessagesSessionClient.storeWritable fences the account store.
         scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+        if (clearCache) cache.clear()
     }
 
     private suspend fun restoreFromCache() {
@@ -287,8 +346,47 @@ internal class GoogleMessagesMessageRepository(
                 if (autoDeleteOldMessages) System.currentTimeMillis() - AUTO_DELETE_AGE_MS else 0L
             usersById.value = snap.usersById + (ME to currentUser)
             rooms.value = snap.rooms
-            messagesByRoom.value = snap.messagesByRoom
+            // Sweep leftover optimistic rows, but do NOT treat them all alike —
+            // a "tmp_…" id at restore means two very different things now.
+            //
+            //  - A server copy of the same text is sitting right next to it: the
+            //    echo did land, it just failed to reconcile (the old double-bubble
+            //    bug). The row is a pure duplicate → drop it. Google still has the
+            //    real copy, so nothing is lost.
+            //  - No server copy anywhere in the thread: the message never made it
+            //    off the phone. Dropping it would silently eat the user's text on
+            //    the next app start — so mark it FAILED instead, which shows
+            //    "Not Delivered" and can be resent from the message menu.
+            //
+            // FAILED rows are left alone either way: those never reached Google.
+            val aged = snap.messagesByRoom
                 .mapValues { (_, list) -> list.filter { it.timestampMs >= cutoff } }
+            var dropped = 0
+            var stranded = 0
+            messagesByRoom.value = aged.mapValues { (_, list) ->
+                val serverCopies = list.filter { !it.id.startsWith(TMP_ID_PREFIX) && it.isOutgoing }
+                list.mapNotNull { m ->
+                    if (!m.id.startsWith(TMP_ID_PREFIX) || m.status == MessageStatus.FAILED) return@mapNotNull m
+                    val echoed = serverCopies.any {
+                        it.body == m.body &&
+                            kotlin.math.abs(it.timestampMs - m.timestampMs) <= TMP_RECONCILE_WINDOW_MS
+                    }
+                    if (echoed) {
+                        dropped++
+                        null
+                    } else {
+                        stranded++
+                        m.copy(status = MessageStatus.FAILED)
+                    }
+                }
+            }
+            if (dropped > 0 || stranded > 0) {
+                Log.w(
+                    TAG,
+                    "restore: swept $dropped duplicate optimistic row(s); " +
+                        "marked $stranded never-echoed row(s) FAILED",
+                )
+            }
             unreadByRoom.value = snap.unreadByRoom
             mutedRooms.value = snap.mutedRooms
             outgoingIdByRoom.putAll(snap.outgoingIdByRoom)
@@ -319,7 +417,13 @@ internal class GoogleMessagesMessageRepository(
         val unread = unreadByRoom.value.toMutableMap()
         val users = usersById.value.toMutableMap()
         for (c in convs) {
-            outgoingIdByRoom[c.conversationId] = c.defaultOutgoingId
+            // Field 11 (defaultOutgoingID) is optional on the wire and decodes
+            // to "" when absent (GMSessionProto: `var outgoingId = ""`). Writing
+            // that over a known-good id makes the next send go out with a blank
+            // self-participant, which is one route to an echo with no tmpID.
+            if (c.defaultOutgoingId.isNotEmpty()) {
+                outgoingIdByRoom[c.conversationId] = c.defaultOutgoingId
+            }
             for (p in c.participants) {
                 if (!p.isMe && p.participantId.isNotEmpty()) {
                     users[p.participantId] = User(
@@ -409,8 +513,148 @@ internal class GoogleMessagesMessageRepository(
             val list = byRoom[gm.conversationId].orEmpty().toMutableList()
             // De-dup: replace an optimistic local copy (matched by tmpID) or an
             // earlier copy of the same server id.
-            val idx = list.indexOfFirst {
+            var idx = list.indexOfFirst {
                 it.id == mapped.id || (gm.tmpId.isNotEmpty() && it.id == gm.tmpId)
+            }
+            val matchedById = idx >= 0
+            // Fallback for an echo that came back WITHOUT the tmpID it was sent
+            // with — observed on three customers after a re-link. With no tmpID
+            // on the echo, the id check above can never match a "tmp_…" row, so
+            // the optimistic bubble survives beside the server copy and the user
+            // sees their own message twice. Permanently: the two rows have
+            // distinct ids, so every later sync, restart and re-link keeps both.
+            //
+            // Match the orphan on (outgoing, exact body, close in time) instead.
+            //
+            // NON-EMPTY BODIES ONLY, deliberately. Media sends carry an empty
+            // body, so two photos to one thread inside the window would match
+            // each other — and the `preserved` block below then copies the FIRST
+            // row's localPath onto the second, showing the wrong image. A
+            // duplicate bubble is a much better bug than the wrong picture. The
+            // dedup-miss line will say whether media echoes lose their tmpID at
+            // all; if they do, that wants a fix keyed on the attachment, not the
+            // body.
+            //
+            // FAILED rows are excluded — no echo is coming for those and the
+            // user may still want to resend them.
+            if (idx < 0 && gm.isOutgoing && mapped.body.isNotEmpty()) {
+                fun candidate(m: Message) =
+                    m.id.startsWith(TMP_ID_PREFIX) &&
+                        m.isOutgoing &&
+                        m.body == mapped.body &&
+                        kotlin.math.abs(m.timestampMs - mapped.timestampMs) <=
+                        TMP_RECONCILE_WINDOW_MS
+                // Live rows first, oldest first: two identical sends in flight
+                // reconcile tmp_A then tmp_B, in order.
+                idx = list.indexOfFirst { candidate(it) && it.status != MessageStatus.FAILED }
+                // Then, only if nothing live matched, reclaim a row the echo
+                // watchdog already gave up on. FAILED used to be excluded outright
+                // because it meant "the send never reached Google, no echo is
+                // coming" — but it now ALSO means "we waited
+                // SEND_ECHO_TIMEOUT_MS and stopped waiting", and for those an echo
+                // genuinely can still arrive. Without this the late echo matches
+                // nothing and lands as a second bubble beside the failed one.
+                // Checked second, never first, so a live send is always preferred
+                // over a dead one.
+                if (idx < 0) idx = list.indexOfFirst { candidate(it) }
+                // Both branches log at W so they survive the rolling filterspec —
+                // GMRepo is deliberately NOT allow-listed (it carries contact
+                // names), but the trailing *:W catches everything at W and above.
+                // Ids only, never a message body.
+                Log.w(
+                    TAG,
+                    if (idx >= 0) {
+                        "dedup-fallback: echo had no tmpID, reconciled by body+time " +
+                            "msg=${gm.messageId} conv=${gm.conversationId} " +
+                            "sentAs='${outgoingIdByRoom[gm.conversationId].orEmpty()}'"
+                    } else {
+                        "dedup-miss: outgoing echo matched nothing " +
+                            "msg=${gm.messageId} conv=${gm.conversationId} " +
+                            "tmpId='${gm.tmpId}' " +
+                            "sentAs='${outgoingIdByRoom[gm.conversationId].orEmpty()}' " +
+                            "tmpRows=${list.count { it.id.startsWith(TMP_ID_PREFIX) }}"
+                    },
+                )
+            }
+            // Media fallback. A media echo carries no body — the local bubble
+            // shows a "[photo]"/"[voice message]" placeholder — so the body+time
+            // match above can never see one, and every media send doubles. Match
+            // on what the echo DOES carry: MediaContent field 5 (plaintext byte
+            // size) and field 14 (mime), against what we actually uploaded. Size
+            // is exact to the byte, so unlike a body match this cannot confuse
+            // two photos sent to one thread: each pending send is held under its
+            // own tmpID and removed the moment it reconciles.
+            //
+            // Fires on the FIRST echo, the pre-download placeholder (status 5, no
+            // mediaId yet) — that is the delivery that appends the duplicate. The
+            // later full copy carries the real id and matches by id above.
+            var matchedByMedia = false
+            val wireMedia = gm.media
+            if (idx < 0 && gm.isOutgoing && mapped.body.isEmpty() &&
+                wireMedia != null && (wireMedia.sizeBytes > 0L || wireMedia.width > 0)
+            ) {
+                idx = list.indexOfFirst { row ->
+                    val pending = pendingMediaByTmpId[row.id]
+                    row.id.startsWith(TMP_ID_PREFIX) &&
+                        row.isOutgoing &&
+                        row.status != MessageStatus.FAILED &&
+                        pending != null &&
+                        pending.mime == wireMedia.mimeType &&
+                        // Either discriminator is enough, and which one fires
+                        // depends on whether Google re-encoded: audio keeps its
+                        // byte count, images keep their pixels.
+                        (
+                            (pending.sizeBytes > 0L && pending.sizeBytes == wireMedia.sizeBytes) ||
+                            (
+                                pending.width > 0 && pending.height > 0 &&
+                                    pending.width == wireMedia.width &&
+                                    pending.height == wireMedia.height
+                            )
+                        ) &&
+                        kotlin.math.abs(row.timestampMs - mapped.timestampMs) <=
+                        TMP_RECONCILE_WINDOW_MS
+                }
+                if (idx >= 0) {
+                    matchedByMedia = true
+                    pendingMediaByTmpId.remove(list[idx].id)
+                }
+                val pendingSummary = pendingMediaByTmpId.values.joinToString(";") { p ->
+                    p.mime + "/" + p.sizeBytes + "/" + p.width + "x" + p.height
+                }
+                Log.w(
+                    TAG,
+                    if (matchedByMedia) {
+                        "dedup-media: media echo had no tmpID, reconciled by mime+size/dims " +
+                            "msg=${gm.messageId} conv=${gm.conversationId} " +
+                            "mime='${wireMedia.mimeType}' size=${wireMedia.sizeBytes} " +
+                            "dims=${wireMedia.width}x${wireMedia.height}"
+                    } else {
+                        "dedup-media-miss: media echo matched nothing " +
+                            "msg=${gm.messageId} conv=${gm.conversationId} " +
+                            "mime='${wireMedia.mimeType}' size=${wireMedia.sizeBytes} " +
+                            "dims=${wireMedia.width}x${wireMedia.height} " +
+                            "pending=[$pendingSummary] " +
+                            "tmpRows=${list.count { it.id.startsWith(TMP_ID_PREFIX) }}"
+                    },
+                )
+            }
+            // Pre-ship verification: one line per outgoing echo, so a quiet log is
+            // still evidence. Ids only, never a body. `tmpId=''` here is the whole
+            // bug in one field — if every echo carries one, it cannot fire.
+            if (gm.isOutgoing) {
+                val how = when {
+                    matchedById -> "byId"
+                    matchedByMedia -> "byMedia"
+                    idx >= 0 -> "byBody"
+                    else -> "none"
+                }
+                Log.w(
+                    TAG,
+                    "echo: msg=${gm.messageId} conv=${gm.conversationId} " +
+                        "tmpId='${gm.tmpId}' matched=$how " +
+                        "status=${gm.statusCode}->${mapped.status} " +
+                        "tmpRows=${list.count { it.id.startsWith(TMP_ID_PREFIX) }}",
+                )
             }
             val isNew = idx < 0
             // Preserve an already-downloaded media file across re-delivery
@@ -420,9 +664,18 @@ internal class GoogleMessagesMessageRepository(
                 // Local val so the null check smart-casts (attachment is a
                 // cross-module public property — no direct smart cast).
                 val mappedAtt = mapped.attachment
-                if (prev?.localPath != null && mappedAtt != null) {
-                    mapped.copy(attachment = mappedAtt.copy(localPath = prev.localPath))
-                } else mapped
+                when {
+                    prev?.localPath != null && mappedAtt != null ->
+                        mapped.copy(attachment = mappedAtt.copy(localPath = prev.localPath))
+                    // The echo carried media we could not parse into an Attachment
+                    // (no id, no format, no mime, no name). Before outgoing sends
+                    // kept a local copy there was nothing to lose here; now there
+                    // is — falling through to `mapped` would drop the sender's own
+                    // photo out of their own bubble. Keep the local one.
+                    prev?.localPath != null && mappedAtt == null ->
+                        mapped.copy(attachment = prev)
+                    else -> mapped
+                }
             } else mapped
             if (idx >= 0) list[idx] = preserved else list.add(preserved)
             list.sortBy { it.timestampMs }
@@ -532,7 +785,7 @@ internal class GoogleMessagesMessageRepository(
         // The optimistic message's id IS the tmpID we hand to Google. The
         // phone echoes that tmpID on the delivered message, so onMessages can
         // replace this copy in place instead of showing the text twice.
-        val tmpId = "tmp_" + System.nanoTime()
+        val tmpId = TMP_ID_PREFIX + System.nanoTime()
         val optimistic = Message(
             id = tmpId,
             roomId = roomId,
@@ -556,11 +809,20 @@ internal class GoogleMessagesMessageRepository(
             writeLock.withLock {
                 // Only flip status if the optimistic copy is still here — if the
                 // phone's echo already replaced it (by tmpID), leave that alone.
+                // A successful SendMessage RPC means GOOGLE'S WEB TIER took the
+                // message — NOT that the paired handset put it on the network.
+                // Unlink the phone and this RPC still returns success, forever;
+                // the only thing that ever tells the truth is the phone's own
+                // echo (MessageStatusType 5 SENDING → 1 COMPLETE), which simply
+                // never arrives. Painting SENT here is what drew a checkmark on
+                // messages that were never sent. So: leave the bubble on
+                // SENDING and let the echo promote it. No echo, no checkmark.
                 updateMessage(roomId, tmpId) {
-                    it.copy(status = if (ok) MessageStatus.SENT else MessageStatus.FAILED)
+                    if (ok) it else it.copy(status = MessageStatus.FAILED)
                 }
                 requestSave()
             }
+            if (ok) awaitEcho(roomId, tmpId)
         }
         return optimistic
     }
@@ -799,11 +1061,37 @@ internal class GoogleMessagesMessageRepository(
         val isAudio = mime.startsWith("audio/")
         val name = queryDisplayName(uri) ?: if (isAudio) "voice.m4a" else "attachment"
         val isVideo = mime.startsWith("video/")
-        val tmpId = "tmp_" + System.nanoTime()
+        val tmpId = TMP_ID_PREFIX + System.nanoTime()
 
-        // Optimistic local bubble. The real media (with a downloadable id) arrives
-        // via the phone's echo; until then show a generic placeholder — unless the
-        // user typed a caption, which rides the same message and shows right away.
+        // Optimistic local bubble. Keep a copy of the outgoing bytes and attach
+        // it, so the SENDER sees their own photo / can play their own voice memo
+        // the instant they hit send — the way Smart Txt and iMessage do it.
+        //
+        // Without a localPath, MediaBlock classes the row as a pre-download
+        // placeholder (`loadedPath == null && downloadToken.isBlank()`) and shows
+        // "Receiving photo…" — on a message the user just sent — and then, once the
+        // full echo lands with a real mediaId, downloads their own picture back
+        // off Google. The reconciliation below carries this localPath onto the
+        // server copy, and downloadMedia short-circuits on an existing local
+        // file, so that round trip never happens.
+        //
+        // cacheDir, so eviction is possible; if the file is gone the bubble falls
+        // back to the downloadToken exactly as before. Degrades, never breaks.
+        val kind = when {
+            isAudio -> AttachmentKind.AUDIO
+            isVideo -> AttachmentKind.VIDEO
+            mime.startsWith("image/") -> AttachmentKind.IMAGE
+            else -> AttachmentKind.OTHER
+        }
+        val ext = mime.substringAfterLast('/', "bin").substringBefore(';').ifBlank { "bin" }
+        val localCopy = java.io.File(mediaDir, "${tmpId.filter { it.isLetterOrDigit() }}.$ext")
+        val localPath = runCatching { localCopy.writeBytes(bytes); localCopy.absolutePath }
+            .onFailure { Log.w(TAG, "sendAttachment: could not keep a local copy", it) }
+            .getOrNull()
+
+        // The caption rides the SAME message as the media (one bubble). It is the
+        // body when present; the "[photo]"-style placeholder is now only a
+        // fallback for when we could not keep a local copy to render.
         val cap = caption?.trim().orEmpty()
         val placeholder = when {
             isAudio -> "[voice message]"
@@ -814,7 +1102,17 @@ internal class GoogleMessagesMessageRepository(
             id = tmpId,
             roomId = roomId,
             senderId = currentUser.id,
-            body = cap.ifEmpty { placeholder },
+            body = when {
+                cap.isNotEmpty() -> cap
+                localPath != null -> ""
+                else -> placeholder
+            },
+            attachment = Attachment(
+                kind = kind,
+                mimeType = mime,
+                name = name,
+                localPath = localPath,
+            ),
             timestampMs = System.currentTimeMillis(),
             status = MessageStatus.SENDING,
             isOutgoing = true,
@@ -825,16 +1123,40 @@ internal class GoogleMessagesMessageRepository(
             requestSave()
         }
 
+        // Remember the wire shape so a tmpID-less echo can still be reconciled.
+        // Pruned opportunistically: an entry older than twice the reconcile
+        // window belongs to a send whose echo is never coming.
+        val nowMs = System.currentTimeMillis()
+        // inJustDecodeBounds reads the JPEG/PNG header only — no bitmap is
+        // allocated, which matters on a 938MB handset.
+        var outW = 0
+        var outH = 0
+        if (mime.startsWith("image/")) {
+            val opts = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            runCatching { android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) }
+            outW = opts.outWidth.coerceAtLeast(0)
+            outH = opts.outHeight.coerceAtLeast(0)
+        }
+        pendingMediaByTmpId.values.removeAll { nowMs - it.atMs > 2L * TMP_RECONCILE_WINDOW_MS }
+        pendingMediaByTmpId[tmpId] = PendingMedia(mime, bytes.size.toLong(), outW, outH, nowMs)
+        Log.i(TAG, "sendAttachment: pending tmp=$tmpId mime=$mime size=${bytes.size} dims=${outW}x$outH")
+
         val participantId = outgoingIdByRoom[roomId].orEmpty()
         val ok = runCatching {
             session.sendMedia(roomId, participantId, tmpId, bytes, mime, name, cap)
         }.getOrElse { Log.e(TAG, "sendAttachment failed", it); false }
         writeLock.withLock {
+            // Same as the text path: an accepted RPC is not a sent message.
+            // Hold at SENDING until the phone echoes the media back.
             updateMessage(roomId, tmpId) {
-                it.copy(status = if (ok) MessageStatus.SENT else MessageStatus.FAILED)
+                if (ok) it else it.copy(status = MessageStatus.FAILED)
             }
             requestSave()
         }
+        if (!ok) pendingMediaByTmpId.remove(tmpId)
+        // Not awaited: sendAttachment's caller wants the upload result now, not
+        // a minute from now.
+        if (ok) scope.launch { awaitEcho(roomId, tmpId) }
         return ok
     }
 
@@ -856,6 +1178,42 @@ internal class GoogleMessagesMessageRepository(
         }
 
     // ---- helpers -----------------------------------------------------------
+
+    /**
+     * MessageStatusType (<100 = outgoing) → the bubble receipt.
+     *
+     * This used to be a flat `MessageStatus.SENT`, which is why an unlinked or
+     * offline phone still drew a checkmark: Google's web tier happily accepts the
+     * SendMessage RPC and echoes the message back with a real server id, because
+     * "accepted into the conversation" and "the handset actually put it on the
+     * network" are two different things. The echo carries which one happened in
+     * this field, and we were throwing it away — so a send that Google itself
+     * knows failed ("Not sent. File is too large.") rendered identically to one
+     * that went through.
+     *
+     * Codes are MessageStatusType from Google Messages' conversations.proto
+     * (cross-checked against mautrix-gmessages' copy of the enum).
+     */
+    private fun outgoingStatus(code: Int): MessageStatus = when (code) {
+        // 2 OUTGOING_DELIVERED — the carrier/RCS stack confirmed handoff.
+        2 -> MessageStatus.DELIVERED
+        // 11 OUTGOING_DISPLAYED — RCS read receipt.
+        11 -> MessageStatus.READ
+        // Still in flight on the phone. 3 DRAFT, 4 YET_TO_SEND, 5 SENDING,
+        // 6 RESENDING, 7 AWAITING_RETRY, 10 SEND_AFTER_PROCESSING,
+        // 14 NOT_DELIVERED_YET, 16 SCHEDULED, 20 VALIDATING. An unlinked phone
+        // is expected to park here forever rather than ever reaching 1 — which
+        // is exactly the state the old code painted as a checkmark.
+        3, 4, 5, 6, 7, 10, 14, 16, 20 -> MessageStatus.SENDING
+        // Terminal failures. 8 GENERIC, 9 EMERGENCY_NUMBER, 12 CANCELED,
+        // 13 TOO_LARGE, 17 RECIPIENT_LOST_RCS, 18 NO_RETRY_NO_FALLBACK,
+        // 19/22 RECIPIENT_DID_NOT_DECRYPT, 21 RECIPIENT_LOST_ENCRYPTION.
+        8, 9, 12, 13, 17, 18, 19, 21, 22 -> MessageStatus.FAILED
+        // 1 OUTGOING_COMPLETE, 15 REVOCATION_PENDING, 0/unknown. Unknown stays
+        // SENT rather than FAILED on purpose: a status Google adds later must not
+        // start marking working sends as failures in the field.
+        else -> MessageStatus.SENT
+    }
 
     private fun GMSessionProto.GMMessage.toDomain(): Message {
         // Diagnostic for "says sent but not delivered / no preview": log every
@@ -927,7 +1285,7 @@ internal class GoogleMessagesMessageRepository(
                 else -> ""
             },
             timestampMs = timestampMicros / 1000,
-            status = if (isOutgoing) MessageStatus.SENT else MessageStatus.DELIVERED,
+            status = if (isOutgoing) outgoingStatus(statusCode) else MessageStatus.DELIVERED,
             isOutgoing = isOutgoing,
             replyToId = replyToMessageId,
             reactions = mapReactions(this),
@@ -985,6 +1343,48 @@ internal class GoogleMessagesMessageRepository(
         }
     }
 
+    /**
+     * Give the phone [SEND_ECHO_TIMEOUT_MS] to echo an accepted send back, then
+     * stop pretending.
+     *
+     * The SendMessage RPC only proves Google's web tier took the message. When
+     * the paired handset is gone — unlinked, uninstalled, factory reset — that
+     * RPC keeps returning success forever and the echo simply never comes, so
+     * without this the bubble sits on "Sending…" for good and the user has no
+     * idea their text is never going to arrive.
+     *
+     * Only ever touches a row that is STILL the optimistic one and STILL
+     * SENDING: once the echo reconciles, the tmp id is gone and [updateMessage]
+     * finds nothing, so this is a no-op on the happy path.
+     */
+    private suspend fun awaitEcho(roomId: String, tmpId: String) {
+        kotlinx.coroutines.delay(SEND_ECHO_TIMEOUT_MS)
+        writeLock.withLock {
+            var timedOut = false
+            updateMessage(roomId, tmpId) { m ->
+                if (m.status == MessageStatus.SENDING) {
+                    timedOut = true
+                    m.copy(status = MessageStatus.FAILED)
+                } else {
+                    m
+                }
+            }
+            if (timedOut) {
+                // Ids only. This is THE line that says "the phone is not
+                // answering" — one per stranded send, so a support log shows
+                // immediately whether a customer's link is dead.
+                Log.w(
+                    TAG,
+                    "send-timeout: no echo for tmp=$tmpId conv=$roomId after " +
+                        "${SEND_ECHO_TIMEOUT_MS / 1000}s — marking Not Delivered " +
+                        "(phone unlinked or unreachable?)",
+                )
+                pendingMediaByTmpId.remove(tmpId)
+                requestSave()
+            }
+        }
+    }
+
     private fun updateMessage(roomId: String, messageId: String, transform: (Message) -> Message) {
         val list = messagesByRoom.value[roomId].orEmpty().toMutableList()
         val idx = list.indexOfFirst { it.id == messageId }
@@ -1002,6 +1402,37 @@ internal class GoogleMessagesMessageRepository(
         private const val KEY_AUTO_DELETE = "autoDeleteOldMessages"
         private const val KEY_READ_RECEIPTS = "sendReadReceipts"
         private const val AUTO_DELETE_AGE_MS = 3L * 24 * 60 * 60 * 1000 // 3 days
+
+        /** Prefix for optimistic local rows, replaced when the phone echoes the
+         *  id back. */
+        private const val TMP_ID_PREFIX = "tmp_"
+
+        /** How far apart an optimistic row and its echo may be and still
+         *  reconcile by body, when the echo came back without the tmpID.
+         *  Generous on purpose: the two timestamps come from different clocks
+         *  (this handset vs. the paired phone), so a tight window would miss
+         *  real matches. The (tmp_ id + outgoing + non-empty exact body) triple
+         *  is already doing the discriminating work. */
+        private const val TMP_RECONCILE_WINDOW_MS = 5L * 60 * 1000
+
+        /**
+         * How long an accepted send may sit with no echo from the phone before we
+         * call it failed.
+         *
+         * A linked phone echoes in well under a second (status 5 → 1, ~0.5s in
+         * every capture we have). This is not tuned to that — it's tuned to the
+         * phone being briefly asleep, in a tunnel, or on a bad cell, where the
+         * message is genuinely queued and will go. Nothing is lost if a late echo
+         * arrives after we've given up: the reconcile below reclaims a
+         * timed-out row and the bubble corrects itself to sent.
+         *
+         * Must stay well under TMP_RECONCILE_WINDOW_MS, or a late echo would fall
+         * outside the match window and land as a second bubble.
+         */
+        private const val SEND_ECHO_TIMEOUT_MS = 60L * 1000
+        // The logout-time unpair's ceiling is UNPAIR_CALL_TIMEOUT_MS in
+        // GoogleMessagesSessionClient — the OkHttp client is the only layer that
+        // can actually enforce one over a blocking call.
 
         // Google fallback: '<emoji> to "Hi"' — prefix must be symbols only
         // (no letters/digits), so real sentences like 'Going to "town"' pass.

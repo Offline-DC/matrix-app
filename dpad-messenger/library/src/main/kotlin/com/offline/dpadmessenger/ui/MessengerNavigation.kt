@@ -62,16 +62,16 @@ fun DpadMessengerApp(
      *  this instead of the built-in stub login navigation, so the host can
      *  clear the real pairing and return to its own link screen. */
     onLogout: (() -> Unit)? = null,
-    /** Host-provided re-link. When set (launcher), a failed message offers a
-     *  "Re-link phone" action that calls this — re-pairing the phone while
-     *  KEEPING message history, so the user doesn't have to log out. This is the
-     *  ADAPTIVE recovery path (token-refresh first, full re-pair only if needed),
-     *  used for reactive recovery (a failed send / the auth-expired screen). */
+    /** Host-provided re-link: the ADAPTIVE recovery path — token-refresh from the
+     *  stored cookies first, full re-pair only if Google rejects them. Keeps
+     *  message history. Used where a silent recovery is the right answer: the
+     *  auth-expired reconnect screen. NOT the failed-message action, which is
+     *  user-initiated and uses [onFreshRelink] (see the chat route below). */
     onRelink: (() -> Unit)? = null,
-    /** User-initiated re-link from Settings (and the day-13 banner that routes
-     *  there): ALWAYS a full re-sign-in for a brand-new ~2-week session, since
-     *  token refresh can't extend the Google session ceiling. Keeps history.
-     *  Falls back to [onRelink] when null. */
+    /** User-initiated re-link — Settings, the day-13 banner that routes there, and
+     *  "Re-link phone" on a failed message: ALWAYS a full re-sign-in for a
+     *  brand-new ~2-week session, since token refresh can't extend the Google
+     *  session ceiling. Keeps history. Falls back to [onRelink] when null. */
     onFreshRelink: (() -> Unit)? = null,
     /** Whole days since the last fresh sign-in. Drives the Settings "last linked"
      *  row and the day-13 "re-link soon" banner on the room list. Null hides both. */
@@ -199,7 +199,25 @@ fun DpadMessengerApp(
                     ChatViewModelFactory(repository, roomId)
                 }
                 val vm: ChatViewModel = viewModel(factory = chatFactory)
-                ChatScreen(viewModel = vm, onBack = { nav.popBackStack() }, onRelink = onRelink)
+                // "Re-link phone" on a failed message is a USER-INITIATED repair,
+                // so it gets the same full re-sign-in Settings does.
+                //
+                // It used to call the adaptive [onRelink], which tries a token
+                // refresh from the stored cookies first. That refresh SUCCEEDS
+                // against a phone that has been unlinked on the Google Messages
+                // side — you get "reauth OK — link restored ... WITHOUT
+                // re-pairing", the pairing is still gone, the message still can't
+                // send, and the user sees absolutely nothing happen. Pressing a
+                // button labelled "Re-link phone" and getting a silent no-op is
+                // worse than the failed send itself.
+                //
+                // The adaptive path still owns the REACTIVE case (the auth-expired
+                // reconnect screen), where a silent refresh is exactly right.
+                ChatScreen(
+                    viewModel = vm,
+                    onBack = { nav.popBackStack() },
+                    onRelink = onFreshRelink ?: onRelink,
+                )
             }
             composable(Routes.SETTINGS) {
                 SettingsScreen(

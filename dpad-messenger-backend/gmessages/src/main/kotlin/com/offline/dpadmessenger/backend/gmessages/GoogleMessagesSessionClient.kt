@@ -61,10 +61,50 @@ internal class GoogleMessagesSessionClient(
     /** Session id for GET_UPDATES; rotated on each SetActiveSession call. */
     @Volatile private var sessionId: String = UUID.randomUUID().toString()
 
+    /** The LONG-POLL client only. `readTimeout(0)` is required — the receive
+     *  stream is supposed to stay open — and `callTimeout` is therefore also
+     *  unset, so a request on this client can block forever. */
     private val http = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS) // long-poll: no read timeout
         .build()
+
+    /**
+     * Everything that is NOT the long-poll: SendMessage, AckMessages,
+     * RegisterRefresh, SetActiveSession, the unpair.
+     *
+     * These MUST be bounded. Sharing the long-poll's client gave them
+     * `readTimeout(0)` and no `callTimeout`, so a middlebox or captive portal
+     * that completes the TLS handshake and then never answers wedges the
+     * calling coroutine forever. Two ways that bites, both of which shipped
+     * before this client existed:
+     *
+     *  - `ensureActiveSession` holds [activeSessionInFlight] across the POST.
+     *    One hung request latches it permanently, every later registration
+     *    attempt returns at the CAS, and the device silently stops receiving —
+     *    the very bug this file has been fixed for twice.
+     *  - `withTimeoutOrNull` around a blocking `execute()` cannot interrupt it,
+     *    so the unpair's "2.5 second ceiling" was not a ceiling and Log out
+     *    could hang with no spinner and no error.
+     *
+     * `callTimeout` bounds the WHOLE call — DNS, connect, write, read,
+     * redirects — which is the only knob that actually guarantees return.
+     * [GMGaiaPairing] already keeps a second client for exactly this reason.
+     */
+    private val httpRpc = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
+        .callTimeout(RPC_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .build()
+
+    /** The unpair only. Shares [httpRpc]'s connection pool and dispatcher, but
+     *  with a much tighter ceiling: a user has pressed Log out and is watching
+     *  a button that has not done anything yet. A leftover pairing entry is a
+     *  far better outcome than a Log out that looks broken. */
+    private val httpUnpair by lazy {
+        httpRpc.newBuilder().callTimeout(UNPAIR_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS).build()
+    }
 
     // Google-account (GAIA / cookie) mode: messaging runs on the clients6 host
     // with network "GDitto", destRegistrationIDs=[primary phone], and cookies +
@@ -119,6 +159,54 @@ internal class GoogleMessagesSessionClient(
      *  retrying forever is the very failure this whole change exists to kill. */
     private val activeSessionRejects = java.util.concurrent.atomic.AtomicInteger(0)
 
+    /** ANY consecutive failed registration attempt, transport included. Widens
+     *  the retry floor only — it must never drive the escalation, or four
+     *  minutes in a tunnel becomes a forced re-pair. Same separation
+     *  [longPollLoop] already makes between server and transport failures. */
+    private val activeSessionFailures = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Set once the reconnect screen has been surfaced for registration
+     *  failures, so the escalation fires exactly once per healthy streak
+     *  instead of on every attempt. Cleared on any success and by [reauth]. */
+    @Volatile private var activeSessionGaveUp = false
+
+    /** A displacement alert asked for an immediate re-assert. Sticky: if the
+     *  attempt is swallowed by the retry floor, the request survives to the
+     *  next long-poll tick instead of being silently dropped. */
+    @Volatile private var reassertRequested = false
+
+    /** At most one assert tick in flight. The long-poll read loop checks after
+     *  every read batch, which is thousands of times an hour on a busy device. */
+    private val assertTickPending = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Cleared by [shutdown]. Cancelling the OkHttp dispatchers closes the
+     *  sockets, but it cannot stop a call that has ALREADY received its response
+     *  and is inside the `use { }` body — and that body writes rotated cookies
+     *  and refreshed tokens back to the store. Without this fence, a response
+     *  arriving in the microseconds after Log out re-persisted the user's live
+     *  Google session cookies over the account we had just wiped. */
+    @Volatile private var storeWritable = true
+
+    /** Wall-clock ms of the last active-session assertion we let through —
+     *  success OR failure. Drives the periodic re-assert. */
+    @Volatile private var lastActiveSessionAssertMs = 0L
+
+    /** Wall-clock ms of the last update the phone PUSHED here. Excludes our own
+     *  request/response round-trips (those return early on the waiter path),
+     *  heartbeats, and replayed backlog — so it means "messages are genuinely
+     *  reaching this device", which is the thing a 200 from SetActiveSession
+     *  does not tell us. */
+    @Volatile private var lastInboundMs = 0L
+
+    /** DataEvents still to come on THIS stream that are replayed backlog rather
+     *  than live traffic. Set from the stream's opening ack count. */
+    @Volatile private var staleReplayRemaining = 0
+
+    /** Displacement alerts and when the last one landed, so two devices paired
+     *  to one account can't evict each other forever. See [onUserAlert]. */
+    private val displacements = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var lastDisplacementMs = 0L
+
     fun connect() {
         if (longPollJob != null) return
         sessionStartedMs = System.currentTimeMillis()
@@ -128,6 +216,12 @@ internal class GoogleMessagesSessionClient(
         // launcher can start before Wi-Fi associates — a timer fires into a dead
         // network, throws, and nothing retries it.
         activeSessionEstablished = false
+        lastActiveSessionAssertMs = 0L
+        lastInboundMs = 0L
+        displacements.set(0)
+        activeSessionFailures.set(0)
+        activeSessionGaveUp = false
+        reassertRequested = false
         longPollJob = scope.launch { longPollLoop() }
         ackJob = scope.launch { ackLoop() }
     }
@@ -139,8 +233,19 @@ internal class GoogleMessagesSessionClient(
 
     /** Permanently tear down the session (logout) — cancels the whole scope. */
     fun shutdown() {
+        storeWritable = false
         disconnect()
         scope.coroutineContext[Job]?.cancel()
+        // Coroutine cancellation cannot interrupt a blocking okio read, so an
+        // ack or token refresh already inside execute() would otherwise finish
+        // AFTER the caller wiped the account — and both write to the store on
+        // the way out (updateCookiesFromResponse / updateToken). That put the
+        // user's live Google cookies back on disk immediately after Log out.
+        // Cancelling the dispatchers closes those sockets for real.
+        runCatching {
+            http.dispatcher.cancelAll()
+            httpRpc.dispatcher.cancelAll()
+        }
     }
 
     // =======================================================================
@@ -266,6 +371,15 @@ internal class GoogleMessagesSessionClient(
         // The new token needs a fresh registration; the restarted long-poll does
         // it as soon as its stream opens.
         activeSessionEstablished = false
+        // Clear the registration bookkeeping too. The user has just asked for a
+        // fresh start; carrying a threshold-height reject count into it means
+        // the escalation has already been spent, so the NEXT real failure walks
+        // past it in silence and the reconnect screen never comes back.
+        activeSessionRejects.set(0)
+        activeSessionFailures.set(0)
+        activeSessionGaveUp = false
+        reassertRequested = false
+        displacements.set(0)
         return true
     }
 
@@ -773,11 +887,15 @@ internal class GoogleMessagesSessionClient(
             val source = resp.body?.source() ?: return 0
             val splitter = PbLite.StreamSplitter()
             val buf = okio.Buffer()
+            // Each stream announces its own replay backlog. Reset before the
+            // first element, or a previous stream's leftover count would
+            // silently discard live events on this one.
+            staleReplayRemaining = 0
             Log.d(TAG, "session long-poll #$attempt open")
-            // The receive stream is up — register as the active session now, if
-            // we haven't already. Launched on the session scope so it doesn't
-            // hold up the read loop below.
-            if (!activeSessionEstablished) scope.launch { ensureActiveSession() }
+            // The receive stream is up — register as the active session if we
+            // aren't yet, or re-assert if the registration is stale. Launched on
+            // the session scope so it doesn't hold up the read loop below.
+            scheduleAssertTick()
             while (coroutineContext.isActive) {
                 val read = source.read(buf, 8192L)
                 if (read == -1L) break
@@ -786,6 +904,12 @@ internal class GoogleMessagesSessionClient(
                     runCatching { handleElement(element) }
                         .onFailure { Log.w(TAG, "element handling failed", it) }
                 }
+                // A stream that stays open past the re-assert interval would
+                // otherwise never reach the check above. Cheap enough to run per
+                // read batch: two volatile reads and a clock call, and
+                // scheduleAssertTick returns at its CAS if a tick is already
+                // pending.
+                if (!activeSessionEstablished || reassertDue()) scheduleAssertTick()
             }
             return 0
         }
@@ -794,8 +918,14 @@ internal class GoogleMessagesSessionClient(
     private suspend fun handleElement(element: String) {
         when (val evt = GMSessionProto.parseLongPollElement(element)) {
             is GMSessionProto.LongPollEvent.Data -> handleRpc(evt.rpc)
-            is GMSessionProto.LongPollEvent.AckCount ->
+            is GMSessionProto.LongPollEvent.AckCount -> {
+                // The stream opens by declaring how many buffered events it is
+                // about to re-deliver. Those are history: acting on a REPLAYED
+                // BROWSER_INACTIVE would make every single reconnect look like a
+                // fresh displacement and spin the client in a re-assert loop.
+                staleReplayRemaining = evt.count
                 Log.d(TAG, "startup ack count=${evt.count}")
+            }
             GMSessionProto.LongPollEvent.Heartbeat -> {}
             null -> Log.v(TAG, "unparsed element: ${element.take(120)}")
         }
@@ -805,6 +935,11 @@ internal class GoogleMessagesSessionClient(
         // Always ack what we received, or the phone re-delivers it forever.
         if (rpc.responseId.isNotEmpty()) queueAck(rpc.responseId)
         if (rpc.bugleRoute != GMSessionProto.ROUTE_DATA_EVENT) return
+        // Consume one slot of this stream's replay backlog. Counted for EVERY
+        // DataEvent, including ones dropped below, so the tally stays aligned
+        // with what the server actually re-delivered.
+        val stale = staleReplayRemaining > 0
+        if (stale) staleReplayRemaining--
         val data = rpc.messageData ?: return
         val msg = GMSessionProto.parseRpcMessageData(data)
 
@@ -817,12 +952,84 @@ internal class GoogleMessagesSessionClient(
         // Otherwise it's a pushed update (GET_UPDATES).
         val plain = msg.encryptedData?.let(::decrypt) ?: return
         val updates = runCatching { GMSessionProto.parseUpdateEvents(plain) }.getOrNull() ?: return
+        updates.userAlert?.let { onUserAlert(it, stale) }
         if (updates.isBrowserPresenceCheck) { runCatching { ackBrowserPresence() }; return }
+        if (updates.conversations.isNotEmpty() || updates.messages.isNotEmpty()) {
+            // Proof that traffic is genuinely reaching this device, which is the
+            // one thing an HTTP 200 from SetActiveSession does not establish.
+            if (!stale) lastInboundMs = System.currentTimeMillis()
+        }
         if (updates.conversations.isNotEmpty()) {
             _events.emit(SessionEvent.ConversationsUpdated(updates.conversations))
         }
         if (updates.messages.isNotEmpty()) {
             _events.emit(SessionEvent.MessagesUpdated(updates.messages))
+        }
+    }
+
+    /**
+     * React to a UserAlertEvent. The BROWSER_INACTIVE family is the only thing
+     * Google ever sends to say "you are not the receive target any more" — and
+     * until now it was parsed and thrown away, which is why a displaced device
+     * was indistinguishable from a quiet one in a support capture.
+     *
+     * [stale] events are replayed backlog from the stream opening and are
+     * logged but never acted on.
+     */
+    private fun onUserAlert(alert: Int, stale: Boolean) {
+        val name = GMSessionProto.alertName(alert)
+        if (stale) {
+            Log.d(TAG, "user alert $name — replayed backlog, not acting on it")
+            return
+        }
+        when {
+            GMSessionProto.isBrowserInactiveAlert(alert) -> {
+                val now = System.currentTimeMillis()
+                // Two displacements more than a re-assert interval apart are
+                // unrelated incidents, not a fight — decay the counter.
+                if (now - lastDisplacementMs > ACTIVE_SESSION_REASSERT_MS) displacements.set(0)
+                lastDisplacementMs = now
+                val n = displacements.incrementAndGet()
+                if (n <= MAX_AUTO_RECLAIMS) {
+                    Log.w(
+                        TAG,
+                        "user alert $name (#$n) — Google says another session took the " +
+                            "receive slot; reclaiming it now [up ${uptime()}]",
+                    )
+                    // A REASSERT, deliberately, NOT a REGISTER — even though we
+                    // now know we are not the receive target. Two reasons.
+                    // First, REGISTER escalates: five failed reclaims would put
+                    // a "re-link your phone" screen in front of a user whose
+                    // real problem is too many pairings, and re-linking makes
+                    // exactly one more. Second, clearing
+                    // activeSessionEstablished here would make reassertDue()
+                    // false, so the periodic backstop below would stop running
+                    // for the one device that has just proved it needs it.
+                    reassertRequested = true
+                    scheduleAssertTick()
+                } else {
+                    // Two LIVE devices paired to one account will evict each
+                    // other forever if both keep reclaiming, and the user gets a
+                    // pair of phones that each receive half their texts. Stop
+                    // racing. The 30-minute backstop genuinely does still run —
+                    // activeSessionEstablished is left alone on this path, which
+                    // is exactly what reassertDue() needs — but the real remedy
+                    // is removing one of the pairings.
+                    Log.e(
+                        TAG,
+                        "user alert $name (#$n) — something keeps taking the receive slot " +
+                            "back. Not reclaiming again: this account probably has another " +
+                            "LIVE paired device, and racing it would leave both half-working. " +
+                            "Falling back to the periodic re-assert [up ${uptime()}]",
+                    )
+                }
+            }
+            alert == GMSessionProto.ALERT_BROWSER_ACTIVE -> {
+                // Confirmation we hold the slot — the positive half of the
+                // signal, and the line that proves a reclaim worked.
+                Log.i(TAG, "user alert BROWSER_ACTIVE — this device is the receive target [up ${uptime()}]")
+            }
+            else -> Log.d(TAG, "user alert $name")
         }
     }
 
@@ -840,6 +1047,16 @@ internal class GoogleMessagesSessionClient(
         plaintextPayload: ByteArray?,
         messageType: Int = GMSessionProto.MSGTYPE_BUGLE_MESSAGE,
         awaitResponse: Boolean,
+        /** Invoked with the final HTTP status of the send (after the one 401
+         *  retry, if any). [post] does not throw on a non-2xx, so a caller that
+         *  needs to know whether Google ACCEPTED the RPC — rather than merely
+         *  that we managed to send one — has no other way to find out. */
+        onStatus: ((Int) -> Unit)? = null,
+        client: OkHttpClient = httpRpc,
+        /** The 401 path costs a RegisterRefresh plus a second send. Worth it for
+         *  a message the user typed; not for a best-effort revoke on the way out
+         *  of a session whose credentials Google has already rejected. */
+        retryOn401: Boolean = true,
     ): GMSessionProto.RpcMessageData? {
         val acct = account
         val requestId = UUID.randomUUID().toString()
@@ -863,8 +1080,8 @@ internal class GoogleMessagesSessionClient(
             }
         } else null
 
-        val (code, _) = post(sendUrl, envelope)
-        if (code == 401) {
+        var (code, _) = post(sendUrl, envelope, client)
+        if (code == 401 && retryOn401) {
             // The tachyon token lapsed at send time. Refresh from the stored
             // cookies and retry ONCE so the message isn't silently dropped — the
             // long-poll's self-heal doesn't cover one-off RPCs like SendMessage.
@@ -876,11 +1093,12 @@ internal class GoogleMessagesSessionClient(
                     messageType = messageType, tachyonAuthToken = acct2.tachyonAuthToken,
                     ttl = acct2.tokenTtl, destRegB64 = destRegB64,
                 )
-                post(sendUrl, envelope2)
+                code = post(sendUrl, envelope2, client).first
             } else {
                 Log.e(TAG, "send RPC 401 and token refresh failed — message not sent")
             }
         }
+        onStatus?.invoke(code)
 
         if (deferred == null) return null
         return withTimeoutOrNull(10_000) { deferred.await() }.also {
@@ -904,12 +1122,12 @@ internal class GoogleMessagesSessionClient(
      * dead network, and nothing re-ran it. Sending still worked the whole time,
      * which is what made it so hard to spot.
      */
-    private suspend fun ensureActiveSession() {
-        if (activeSessionEstablished) return
+    private suspend fun ensureActiveSession(trigger: ActiveSessionTrigger) {
+        if (trigger == ActiveSessionTrigger.REGISTER && activeSessionEstablished) return
         val now = System.currentTimeMillis()
         // Back off as rejections pile up: 15s, 30s, 1m, 2m, 4m, then 5m forever.
         val floorMs = minOf(
-            ACTIVE_SESSION_RETRY_MS shl minOf(activeSessionRejects.get(), 5),
+            ACTIVE_SESSION_RETRY_MS shl minOf(activeSessionFailures.get(), 5),
             ACTIVE_SESSION_RETRY_MAX_MS,
         )
         if (now - lastActiveSessionAttemptMs < floorMs) return
@@ -918,12 +1136,49 @@ internal class GoogleMessagesSessionClient(
         // loops can briefly be inside openLongPollOnce at once.
         if (!activeSessionInFlight.compareAndSet(false, true)) return
         lastActiveSessionAttemptMs = now
+        // Stamp the re-assert clock on the ATTEMPT, not on success. A re-assert
+        // that fails must then wait the full interval like any other: we are
+        // still registered as far as anyone knows, so there is nothing urgent to
+        // recover, and retrying on every long-poll open would turn one bad hour
+        // at Google into a POST every few seconds from every device we ship.
+        lastActiveSessionAssertMs = now
+        // Do we have POSITIVE evidence this device is not the receive target?
+        // Two sources, and only two: we know we are unregistered (REGISTER), or
+        // Google told us another session took the slot ([onUserAlert] sets the
+        // sticky request, cleared only on success). A ROUTINE periodic
+        // re-assert has neither — it runs on a device that is registered and,
+        // as far as anything here knows, receiving. Its failure is evidence
+        // about Google, not about us, and must never reach the user.
+        val displacedEvidence = trigger == ActiveSessionTrigger.REGISTER || reassertRequested
+        val quiet = lastInboundMs == 0L || now - lastInboundMs >= ACTIVE_SESSION_REASSERT_MS
+        if (trigger == ActiveSessionTrigger.REASSERT) {
+            Log.i(
+                TAG,
+                "re-asserting active session [up ${uptime()}, ${inboundGap(now)}] — " +
+                    "unconditional by design: a silently displaced device and a device " +
+                    "nobody has texted look identical from here",
+            )
+        }
         val result = try {
             runCatching {
                 val accepted = setActiveSession()
-                // Skip the sync if we weren't registered — it can't succeed and
-                // it doubles the traffic on the failing path.
-                if (accepted) requestConversationList()
+                // Only re-sync when we might have MISSED something: a first
+                // registration, or a re-assert on a device that has had nothing
+                // pushed to it all interval (the displaced case). On a device
+                // that is actively receiving, a periodic list sync would be a
+                // whole-store rewrite every 30 minutes for no new data.
+                //
+                // Its own runCatching: the sync is a courtesy, and folding its
+                // failure into `accepted` would report a registration Google
+                // ACCEPTED as rejected — five of those and a working device gets
+                // a "re-link your phone" screen it does not need.
+                if (accepted && (trigger == ActiveSessionTrigger.REGISTER || quiet)) {
+                    runCatching { requestConversationList() }
+                        .onFailure {
+                            if (it is kotlinx.coroutines.CancellationException) throw it
+                            Log.w(TAG, "post-registration conversation sync failed (registration is fine)", it)
+                        }
+                }
                 accepted
             }
         } finally {
@@ -934,28 +1189,250 @@ internal class GoogleMessagesSessionClient(
         if (result.getOrDefault(false)) {
             activeSessionEstablished = true
             activeSessionRejects.set(0)
-            Log.i(TAG, "setActiveSession OK — registered to receive messages [up ${uptime()}]")
+            activeSessionFailures.set(0)
+            // Cleared only on SUCCESS. Clearing it on the attempt cost a
+            // displaced device a full backstop interval every time a reclaim
+            // lost a cell handover: the alert comes once, so the request has to
+            // outlive a failed attempt or it is simply gone.
+            reassertRequested = false
+            if (activeSessionGaveUp) {
+                // We had told the user to re-link. We were wrong, or it fixed
+                // itself. Say so, or the reconnect screen stays up over a device
+                // that is receiving and notifying perfectly well behind it.
+                Log.i(
+                    TAG,
+                    "setActiveSession recovered after the reconnect screen was surfaced — " +
+                        "this device IS receiving again; clearing it",
+                )
+                _events.emit(SessionEvent.AuthRestored)
+            }
+            activeSessionGaveUp = false
+            if (trigger == ActiveSessionTrigger.REASSERT) {
+                Log.i(TAG, "setActiveSession re-asserted OK [up ${uptime()}]")
+            } else {
+                Log.i(TAG, "setActiveSession OK — registered to receive messages [up ${uptime()}]")
+            }
         } else {
-            // Atomic read-modify-write: the reject bookkeeping sits outside the
+            // WHAT FAILED decides what happens, not WHO ASKED.
+            //
+            // An earlier cut of this branched on the trigger and made every
+            // re-assert failure silent. That was wrong in both directions at
+            // once: a re-assert is the ONLY thing that ever runs on a displaced
+            // device whose long-poll is healthy, so suppressing it meant such a
+            // device could never tell the user anything — the exact 18-hour
+            // silent outage this change exists to end — while a REGISTER
+            // rejection on a device that was merely holding a rotated cookie
+            // still escalated. The right axis is Google's answer.
+            //
+            // Neither trigger clears activeSessionEstablished here. A failure
+            // proves nothing about a registration Google may still be honouring,
+            // and clearing it would also switch off the periodic backstop.
+            // Atomic read-modify-write: this bookkeeping sits outside the
             // CAS-protected region, and a lost update would skip the threshold
             // and suppress the warning to the user entirely.
+            val failures = activeSessionFailures.incrementAndGet()
+            val what = if (trigger == ActiveSessionTrigger.REASSERT) "re-assert" else "registration"
+            // A thrown exception means we never reached Google (DNS, no route,
+            // TLS, airplane mode, the call timeout). A `false` means Google
+            // answered and said no. Only the second is evidence about this
+            // device's registration; the first is evidence about the tunnel it
+            // is standing in. [longPollLoop] has drawn that line since the
+            // four-minute-dead-zone incident and this path must draw it too —
+            // conflating them is how a phone in a lift gets a re-link screen.
+            val thrown = result.exceptionOrNull()
+            if (thrown is java.io.IOException) {
+                // Transport: DNS, no route, TLS, airplane mode, or our own
+                // callTimeout firing as InterruptedIOException. None of these
+                // say anything about this device's registration, and none of
+                // them are fixed by re-linking — so log and retry, never
+                // escalate. Same line [longPollLoop] has drawn since the
+                // four-minute-dead-zone incident.
+                Log.w(
+                    TAG,
+                    "setActiveSession $what could not reach Google (attempt #$failures, " +
+                        "net=${connectivity()}) — NOT a rejection, link NOT dropped",
+                    thrown,
+                )
+                return
+            }
+            if (thrown != null) {
+                // Not a network failure and not a Google answer: this is our own
+                // bug — payload encryption, key load, a proto writer. Re-linking
+                // cannot fix it, so it must not escalate either. But it must be
+                // LOUD, because the alternative is a device that quietly never
+                // registers and looks exactly like the outage this file has
+                // twice been fixed for.
+                Log.e(
+                    TAG,
+                    "setActiveSession $what threw a non-network error (attempt #$failures) — " +
+                        "this is a CLIENT bug, not a Google rejection; the device is NOT " +
+                        "receiving and re-linking will not help",
+                    thrown,
+                )
+                return
+            }
+            if (!displacedEvidence) {
+                // Google answered "no" to a routine re-assert on a device whose
+                // long-poll is clean and whose messages are still arriving. A
+                // Google-side incident, or a config version drifting out of
+                // support, would otherwise walk five of these into a "re-link
+                // your phone" screen over roughly two hours — on a phone that is
+                // working, and where re-linking fixes nothing and adds another
+                // stale pairing. Count it for the backoff floor, say so, stop.
+                Log.w(
+                    TAG,
+                    "setActiveSession re-assert REJECTED by Google (attempt #$failures, " +
+                        "${inboundGap(now)}) — NOT escalating: nothing says this device has " +
+                        "actually lost the receive slot",
+                )
+                return
+            }
             val rejects = activeSessionRejects.incrementAndGet()
             Log.w(
                 TAG,
-                "setActiveSession FAILED #$rejects (net=${connectivity()}) — " +
-                    "NOT receiving yet, will retry on a later long-poll open",
-                result.exceptionOrNull(),
+                "setActiveSession $what REJECTED by Google #$rejects (net=${connectivity()}) — " +
+                    "this device is NOT the receive target, will retry",
             )
-            // Exactly once, at the threshold: tell the user. Retries continue
-            // quietly at the 5-minute floor in case it recovers on its own.
-            if (rejects == ACTIVE_SESSION_MAX_REJECTS) {
+            // Once per healthy streak, at or past the threshold: tell the user.
+            // `>=` plus the latch, not `==`: [reauth] used to leave the counter
+            // sitting at the threshold, so a later failure walked straight past
+            // it and the reconnect screen never came back — a silently
+            // non-receiving phone whose owner had already tried the remedy.
+            if (rejects >= ACTIVE_SESSION_MAX_REJECTS && !activeSessionGaveUp) {
+                activeSessionGaveUp = true
                 Log.e(
                     TAG,
                     "setActiveSession rejected ×$rejects — this device is NOT " +
                         "receiving messages; surfacing the reconnect screen",
                 )
-                _events.emit(SessionEvent.AuthExpired(AuthFailureReason.TOKEN_DEAD))
+                // Prefer whatever the refresh actually learned. The common
+                // cause of five real rejections is COOKIE_INVALID — another
+                // browser on this Google account rotating the session cookie —
+                // and that screen's copy tells the user what to DO. Falling back
+                // to TOKEN_DEAD shows the generic "the link expired" instead.
+                val reason =
+                    if (lastAuthFailure != AuthFailureReason.UNKNOWN) lastAuthFailure
+                    else AuthFailureReason.TOKEN_DEAD
+                _events.emit(SessionEvent.AuthExpired(reason))
             }
+        }
+    }
+
+    /** True when a registered session should re-assert: either a displacement
+     *  alert asked for it, or the periodic interval has elapsed. */
+    private fun reassertDue(): Boolean =
+        activeSessionEstablished &&
+            (reassertRequested ||
+                System.currentTimeMillis() - lastActiveSessionAssertMs >= ACTIVE_SESSION_REASSERT_MS)
+
+    /** Queue an assert tick, at most one at a time. The long-poll read loop
+     *  calls this after every read batch; without the guard a device that is
+     *  merely throttled by the retry floor would spawn a coroutine per batch
+     *  for the whole floor. */
+    private fun scheduleAssertTick() {
+        if (!assertTickPending.compareAndSet(false, true)) return
+        val job = scope.launch {
+            // No CoroutineExceptionHandler on this scope, and this is now the
+            // single entry point for ALL registration — an escaping throwable
+            // would reach Android's uncaught handler and take the launcher down.
+            try {
+                maybeAssertActiveSession()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Log.e(TAG, "assert tick threw", t)
+            }
+        }
+        // invokeOnCompletion, not a finally inside the block: a launch on an
+        // already-cancelled scope never runs its body at all, so a finally would
+        // never fire and this guard would latch true forever — silently
+        // disabling the re-assert AND the initial registration, which is a worse
+        // failure than the one the guard exists to prevent.
+        job.invokeOnCompletion { assertTickPending.set(false) }
+    }
+
+    /**
+     * The single entry point for "make sure we are the receive target". Picks
+     * between a first registration and a periodic re-assert, which fail very
+     * differently — see [ensureActiveSession].
+     */
+    private suspend fun maybeAssertActiveSession() {
+        if (!activeSessionEstablished) {
+            ensureActiveSession(ActiveSessionTrigger.REGISTER)
+        } else if (reassertDue()) {
+            ensureActiveSession(ActiveSessionTrigger.REASSERT)
+        }
+    }
+
+    /** How long since anything was pushed to this device, for the re-assert log
+     *  line. This is the number that makes a displacement legible after the
+     *  fact: "re-asserting … last inbound 247m ago" followed by messages
+     *  arriving is the whole diagnosis. */
+    private fun inboundGap(now: Long): String =
+        if (lastInboundMs == 0L) "nothing pushed since this session started"
+        else "last inbound ${(now - lastInboundMs) / 60_000}m ago"
+
+    /**
+     * Ask Google to revoke THIS pairing, so it stops appearing in the phone's
+     * Google Messages device list. Called on logout and on a deliberate
+     * re-link, BEFORE the session is torn down and the credentials wiped —
+     * both of which it needs.
+     *
+     * Best-effort by design. The user has already decided to leave and the
+     * session is going away regardless, so a failure here must never block or
+     * fail the teardown; the cost is one stale entry the user can delete by
+     * hand.
+     *
+     * @return true if a revoke was sent. False means nothing was sent — not a
+     * Google-account pairing, or a pairing made before the attempt id was
+     * persisted, which cannot be revoked remotely at all.
+     */
+    suspend fun unpairGaia(): Boolean {
+        if (!gaia) {
+            Log.i(TAG, "unpair: not a Google-account pairing — nothing to revoke")
+            return false
+        }
+        val attemptId = store.loadGaiaPairingAttemptId()
+        if (attemptId.isNullOrBlank()) {
+            Log.w(
+                TAG,
+                "unpair: no stored pairing-attempt id — this device paired before we kept " +
+                    "one, so Google cannot be told to forget it. The entry will stay in the " +
+                    "phone's device list until the user removes it by hand.",
+            )
+            return false
+        }
+        var status = -1
+        return runCatching {
+            sendDataRequest(
+                GMSessionProto.ACTION_UNPAIR_GAIA_PAIRING,
+                GMSessionProto.revokeGaiaPairingRequest(attemptId),
+                awaitResponse = false,
+                onStatus = { status = it },
+                client = httpUnpair,
+                retryOn401 = false,
+            )
+            // Checking the status is the whole point. [post] does not throw on a
+            // non-2xx, so without this a 401 — the NORMAL outcome on the
+            // credentials-are-dead re-link path — would log "revoke sent" and
+            // report success, and the next person debugging "why does this
+            // account still have six ghost devices" would rule this out wrongly.
+            val ok = status in 200..299
+            if (ok) {
+                Log.i(TAG, "unpair: revoked pairing ${attemptId.take(8)}… (HTTP $status) [up ${uptime()}]")
+            } else {
+                Log.w(
+                    TAG,
+                    "unpair: Google REJECTED the revoke (HTTP $status) for pairing " +
+                        "${attemptId.take(8)}… — the entry stays in the phone's device list " +
+                        "and has to be removed by hand",
+                )
+            }
+            ok
+        }.getOrElse {
+            if (it is kotlinx.coroutines.CancellationException) throw it
+            Log.w(TAG, "unpair: revoke failed to send — the entry stays in the device list", it)
+            false
         }
     }
 
@@ -976,7 +1453,28 @@ internal class GoogleMessagesSessionClient(
             tachyonAuthToken = acct.tachyonAuthToken, ttl = 0L, // OmitTTL
             destRegB64 = destRegB64,
         )
-        val (code, _) = post(sendUrl, envelope)
+        var (code, _) = post(sendUrl, envelope)
+        if (code == 401) {
+            // This is the ONE RPC that does not go through sendDataRequest, so it
+            // never had the 401 self-heal the others do — and that gap escalates.
+            // Google rotates the session cookie roughly every 30 minutes; the
+            // long-poll stream was authenticated when it opened and keeps
+            // delivering messages, so nothing else notices. Registration
+            // attempts then 401 on a device that is still receiving perfectly
+            // well, and five of those is a "re-link your phone" screen the user
+            // does not need — which would create another stale pairing.
+            Log.w(TAG, "setActiveSession HTTP 401 — refreshing token and retrying once")
+            if (runCatching { refreshToken() }.getOrDefault(false)) {
+                val acct2 = account
+                val envelope2 = GMSessionProto.outgoingRpcMessage(
+                    mobile = acct2.mobile, requestId = sessionId, messageData = rpcData,
+                    messageType = GMSessionProto.MSGTYPE_BUGLE_MESSAGE,
+                    tachyonAuthToken = acct2.tachyonAuthToken, ttl = 0L,
+                    destRegB64 = destRegB64,
+                )
+                code = post(sendUrl, envelope2).first
+            }
+        }
         if (code !in 200..299) Log.w(TAG, "setActiveSession rejected: HTTP $code")
         return code in 200..299
     }
@@ -998,6 +1496,23 @@ internal class GoogleMessagesSessionClient(
     private suspend fun ackLoop() {
         while (coroutineContext.isActive) {
             delay(5000)
+            // The only TIMER in the session. Every other assert tick is driven
+            // by long-poll I/O, so on a stream that stays open and silent — the
+            // exact shape of a displaced device — both the sticky reclaim and
+            // the 30-minute backstop would stall waiting for traffic that is
+            // never coming.
+            //
+            // Gated on the long-poll still running. longPollLoop RETURNS on its
+            // fatal paths without cancelling this loop, and it clears
+            // activeSessionEstablished on the way out — so without the gate a
+            // permanently dead session would POST SetActiveSession with
+            // known-dead credentials every five minutes, forever, on a phone
+            // whose owner has already been shown the reconnect screen.
+            if (longPollJob?.isActive == true &&
+                (!activeSessionEstablished || reassertDue())
+            ) {
+                scheduleAssertTick()
+            }
             val ids = ackLock.withLock {
                 if (pendingAcks.isEmpty()) emptyList()
                 else pendingAcks.toList().also { pendingAcks.clear() }
@@ -1127,7 +1642,7 @@ internal class GoogleMessagesSessionClient(
             }
         if (refreshed != null) {
             account = acct.copy(tachyonAuthToken = refreshed.tachyonAuthToken, tokenTtl = refreshed.ttl)
-            store.updateToken(refreshed.tachyonAuthToken, refreshed.ttl)
+            if (storeWritable) store.updateToken(refreshed.tachyonAuthToken, refreshed.ttl)
             val ttlMs = if (refreshed.ttl > 0) refreshed.ttl / 1000 else 24 * 3600_000L
             tokenExpiryMs = System.currentTimeMillis() + ttlMs
             lastAuthFailure = AuthFailureReason.UNKNOWN
@@ -1168,14 +1683,21 @@ internal class GoogleMessagesSessionClient(
      *  conversation), and okhttp's blocking execute() would otherwise throw
      *  NetworkOnMainThreadException. */
     /** @return (httpStatusCode, responseBody). */
-    private suspend fun post(url: String, pbliteBody: String): Pair<Int, String> =
+    private suspend fun post(
+        url: String,
+        pbliteBody: String,
+        client: OkHttpClient = httpRpc,
+    ): Pair<Int, String> =
         withContext(Dispatchers.IO) {
             val req = Request.Builder()
                 .url(url)
                 .post(pbliteBody.toRequestBody(GMPairingProto.CONTENT_TYPE_PBLITE.toMediaType()))
                 .applyRelayHeaders()
                 .build()
-            http.newCall(req).execute().use { resp ->
+            // NOT [http]: every caller of post() is a one-shot RPC that must
+            // return, and [http] deliberately has no read or call timeout. The
+            // long-poll builds its own call against [http].
+            client.newCall(req).execute().use { resp ->
                 updateCookiesFromResponse(resp)
                 val text = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
@@ -1209,13 +1731,28 @@ internal class GoogleMessagesSessionClient(
             val name = nameValue.substring(0, eq).trim()
             val value = nameValue.substring(eq + 1).trim()
             if (name.isEmpty() || value.isEmpty() || value.equals("EXPIRED", ignoreCase = true)) continue
+            // OkHttp's Request.Builder.header THROWS on a value containing a
+            // control or non-ASCII character, and applyRelayHeaders joins these
+            // straight into the Cookie header. Persisting one bad value would
+            // wedge every request in this session — and, since it is written to
+            // disk, every request after a reboot too. Skip it instead: dropping
+            // one rotated cookie costs at worst a re-auth, which self-heals.
+            if (!isHeaderSafe(name) || !isHeaderSafe(value)) {
+                Log.w(TAG, "ignoring Set-Cookie '$name' — value is not header-safe")
+                continue
+            }
             if (cookies[name] != value) { cookies[name] = value; changed = true }
         }
-        if (changed) {
+        if (changed && storeWritable) {
             runCatching { store.saveCookies(cookies) }
             Log.d(TAG, "cookies refreshed from Set-Cookie (${setCookies.size} header(s))")
         }
     }
+
+    /** True if every character is one OkHttp will accept in a header value
+     *  (printable US-ASCII, plus tab). Mirrors okhttp3.Headers' own check. */
+    private fun isHeaderSafe(v: String): Boolean =
+        v.all { it == '\t' || (it.code in 0x20..0x7e) }
 
     private fun Request.Builder.applyRelayHeaders(): Request.Builder {
         this.header("sec-ch-ua", GMPairingProto.SEC_UA)
@@ -1260,10 +1797,58 @@ internal class GoogleMessagesSessionClient(
         /** Consecutive rejections before we stop failing silently and show the
          *  reconnect screen. */
         private const val ACTIVE_SESSION_MAX_REJECTS = 5
+        /**
+         * How often a registered session re-asserts itself.
+         *
+         * SetActiveSession returning 200 means "request accepted", not "you are
+         * the receive target". Once [activeSessionEstablished] latches, nothing
+         * clears it but a transport failure or a process restart — so a device
+         * whose slot was taken by another session keeps long-polling, keeps
+         * refreshing its token, keeps reporting healthy, and never receives
+         * another message. That failure cost a customer 18+ hours and is
+         * invisible in a capture: 202 clean long-polls, zero inbound.
+         *
+         * The BROWSER_INACTIVE alert ([onUserAlert]) catches this precisely when
+         * Google sends one. This is the backstop for when it doesn't. mautrix's
+         * equivalent watchdog waits 2h55m; 30 minutes here because on a
+         * dumbphone a missed text is the product failing, and the cost is one
+         * POST — plus a conversation-list sync only if nothing arrived all
+         * interval.
+         */
+        private const val ACTIVE_SESSION_REASSERT_MS = 30 * 60_000L
+        /** How many displacement alerts, arriving within one re-assert interval
+         *  of each other, we will reclaim the slot from before giving up. Two
+         *  LIVE devices paired to one account would otherwise evict each other
+         *  indefinitely, leaving both half-working. */
+        private const val MAX_AUTO_RECLAIMS = 3
+        /** Whole-call ceiling for one-shot RPCs (send, ack, refresh, register).
+         *  Generous, because a text the user typed is worth waiting for on a bad
+         *  cell connection — but FINITE, which is the only property that
+         *  matters here. An unbounded call latched [activeSessionInFlight] and
+         *  silently stopped the device receiving. */
+        private const val RPC_CALL_TIMEOUT_MS = 25_000L
+        /** Whole-call ceiling for the logout-time revoke. Much tighter: a user
+         *  is watching a button they just pressed. */
+        private const val UNPAIR_CALL_TIMEOUT_MS = 3_000L
         /** A base64/base64url run long enough to be a credential rather than an
          *  id. Used by [redacted] to keep tokens out of support captures. */
         private val SECRET_RUN = Regex("[A-Za-z0-9+/_-]{40,}={0,2}")
     }
+}
+
+/**
+ * Why we are (re)asserting the active session. The two cases fail very
+ * differently and must not share a failure path.
+ */
+private enum class ActiveSessionTrigger {
+    /** We believe we are NOT registered. A failure here is a real problem:
+     *  it counts toward the reject threshold and can surface the reconnect
+     *  screen, because a device that cannot register receives nothing. */
+    REGISTER,
+
+    /** We believe we ARE registered and are refreshing the claim. A failure
+     *  here proves nothing and must stay silent — see [GoogleMessagesSessionClient]. */
+    REASSERT,
 }
 
 /** Why a session's auth failed — drives the re-link screen's explanation.
@@ -1293,4 +1878,12 @@ internal sealed class SessionEvent {
     /** Token/cookies dead — the user must re-link. [reason] explains why so the
      *  UI can show the right fix. */
     data class AuthExpired(val reason: AuthFailureReason) : SessionEvent()
+
+    /** A previously-surfaced [AuthExpired] turned out to be recoverable and the
+     *  device is registered again. Without this the reconnect screen is a latch:
+     *  it only ever cleared on a successful manual re-link, so a transient
+     *  rejection left a "re-link your phone" prompt sitting over a session that
+     *  had already healed itself — and following that prompt is what creates the
+     *  duplicate pairings. */
+    data object AuthRestored : SessionEvent()
 }

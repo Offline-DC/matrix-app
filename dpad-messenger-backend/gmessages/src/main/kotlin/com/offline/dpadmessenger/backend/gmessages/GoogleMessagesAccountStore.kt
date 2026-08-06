@@ -156,11 +156,21 @@ class GoogleMessagesAccountStore(context: Context) {
     // SAPISIDHASH on every RPC. Persist the marker + the dest registration id.
 
     /** Mark the account as GAIA-paired and store the primary phone's dest
-     *  registration id (base64 of the UUID string, as sent on the wire). */
-    fun saveGaiaSession(destRegB64: String) {
+     *  registration id (base64 of the UUID string, as sent on the wire), plus
+     *  the pairing-attempt id.
+     *
+     *  [pairingAttemptId] is the UUID minted for the UKey2 handshake. It is not
+     *  needed to RUN the session, which is why it was previously thrown away —
+     *  but it is the only thing that identifies this pairing to Google, and
+     *  RevokeGaiaPairing takes nothing else. Without it we cannot tell the
+     *  account "forget this device" on logout, so every re-link leaves another
+     *  identically-named entry behind in the phone's Device-pairing list, and
+     *  those stale entries compete for the receive slot. */
+    fun saveGaiaSession(destRegB64: String, pairingAttemptId: String) {
         prefs.edit()
             .putBoolean(KEY_GAIA_MODE, true)
             .putString(KEY_GAIA_DEST_REG, destRegB64)
+            .putString(KEY_GAIA_PAIRING_ATTEMPT, pairingAttemptId)
             // Stamp the moment of a FRESH sign-in. This is what "days since
             // re-link" counts from, and what the day-13 warning watches. Only a
             // full re-pair (new cookies + emoji) sets it — token refresh does
@@ -174,6 +184,15 @@ class GoogleMessagesAccountStore(context: Context) {
 
     /** The primary phone's dest registration id (base64), or null if not GAIA. */
     fun loadGaiaDestReg(): String? = prefs.getString(KEY_GAIA_DEST_REG, null)
+
+    /** The pairing-attempt id for this device's GAIA pairing, or null.
+     *
+     *  Null for every pairing made before this key existed — those sessions
+     *  simply cannot be revoked remotely and must be removed by hand on the
+     *  phone. Callers must treat null as "skip the unpair", never as an error,
+     *  and never send the all-zeros UUID in its place: that is a valid-looking
+     *  request that revokes nothing. */
+    fun loadGaiaPairingAttemptId(): String? = prefs.getString(KEY_GAIA_PAIRING_ATTEMPT, null)
 
     /** Epoch millis of the last fresh sign-in (full re-pair), or 0 if unknown.
      *  Set in [saveGaiaSession]; survives token refreshes; wiped by [clear]. */
@@ -216,6 +235,18 @@ class GoogleMessagesAccountStore(context: Context) {
     /** True only if a *loadable* (current-schema) account exists. */
     fun isPaired(): Boolean = load() != null
 
+    /**
+     * Wipe the stored pairing, [KEY_DEVICE_SESSION_ID] included.
+     *
+     * Carrying that id across a wipe was considered, since reusing it would let
+     * repeated sign-ins share one web registration. Rejected: neither re-link
+     * path constrains the user to the same Google account — both drop to a full
+     * sign-in with an account picker — so a preserved id can end up registered
+     * under two accounts, which is exactly the cross-account correlator a Log
+     * out is supposed to remove. The upside was small anyway:
+     * [getOrCreateDeviceSessionId] is only consulted when Google's own config
+     * response carries no device UUID.
+     */
     fun clear() {
         prefs.edit().clear().apply()
     }
@@ -245,6 +276,7 @@ class GoogleMessagesAccountStore(context: Context) {
         private const val KEY_HMAC = "hmacKey"
         private const val KEY_GAIA_MODE = "gaiaMode"
         private const val KEY_GAIA_DEST_REG = "gaiaDestReg"
+        private const val KEY_GAIA_PAIRING_ATTEMPT = "gaiaPairingAttemptId"
         private const val KEY_LINK_TS = "linkTimestampMs"
         private const val KEY_DEVICE_SESSION_ID = "deviceSessionId"
     }

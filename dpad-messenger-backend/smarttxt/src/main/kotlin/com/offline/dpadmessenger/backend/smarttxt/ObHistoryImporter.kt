@@ -331,6 +331,9 @@ internal object ObHistoryImporter {
                 val out = row.bool("isFromMe")
                 val read = row.long("dateRead").takeIf { it > 0L }
                 val delivered = row.long("dateDelivered").takeIf { it > 0L }
+                // OpenBubbles' own send-failure flag. Non-zero is an iMessage error
+                // code (1 = generic, 22 = not iMessage, …); 0 is "no error recorded".
+                val failed = row.long("error") != 0L
                 byRoom.getOrPut(room.id) { ArrayList() } += Message(
                     id = guid,
                     roomId = room.id,
@@ -341,9 +344,28 @@ internal object ObHistoryImporter {
                     // dateRead (when WE read it) must not become a "Read" status.
                     status = when {
                         !out -> MessageStatus.SENT
+                        failed -> MessageStatus.FAILED
                         read != null -> MessageStatus.READ
                         delivered != null -> MessageStatus.DELIVERED
-                        else -> MessageStatus.SENT
+                        // Imported history is finished business: OpenBubbles is
+                        // uninstalled at the end of this migration, so nothing here is
+                        // in flight and no receipt will ever arrive for these rows.
+                        //
+                        // OpenBubbles only writes dateDelivered/isDelivered when it
+                        // happened to observe the receipt live, and it usually did not:
+                        // in a real 2026-08-05 device store, 19 of 20 outgoing rows
+                        // carried NEITHER dateDelivered NOR dateRead (isDelivered
+                        // tracked dateDelivered exactly, so it is not a second source).
+                        // Falling through to SENT therefore labelled essentially every
+                        // imported thread "Sending…" forever — statusGlyph() renders
+                        // SENT as "Sending…" on purpose, because in live SmartTxt it is
+                        // a sub-second hop on the way to DELIVERED.
+                        //
+                        // A message OpenBubbles kept, with no error recorded, did leave
+                        // the device. DELIVERED is both the honest reading and the one
+                        // that stops the thread looking stuck. Anything that actually
+                        // failed is caught by `failed` above.
+                        else -> MessageStatus.DELIVERED
                     },
                     readAtMs = if (out) read else null,
                     isOutgoing = out,
@@ -409,6 +431,7 @@ internal object ObHistoryImporter {
      */
     private fun merge(app: Context, imported: Imported): Result {
         val store = SmartTxtStore(app)
+        claimDemoCachePurge(app, store)
         val existing = store.load()
         val existingRoomIds = existing?.rooms?.map { it.id }?.toSet().orEmpty()
 
@@ -454,6 +477,36 @@ internal object ObHistoryImporter {
             rooms = imported.rooms.size,
             messages = imported.messagesByRoom.values.sumOf { it.size },
         )
+    }
+
+    /**
+     * Run [SmartTxtRepository]'s one-time demo-cache purge HERE, before the import
+     * writes anything, and mark it done.
+     *
+     * `SmartTxtRepository.create()` clears the store once per install, to drop chats
+     * that older MOCK builds persisted. On a migrating device that first `create()`
+     * is triggered by `markRegisteredExternally()` — which the migration calls
+     * immediately AFTER this import. On 2026-08-05 that ordering wiped a verified
+     * 4-room / 22-message import 1.1 seconds after it landed:
+     *
+     *     history verify: SQLite reads back 4 room(s), 22 message(s) ✓
+     *     purged leftover demo chat cache (first native run)
+     *     cache restore: 0 room(s), 0 message(s)
+     *
+     * Doing the purge here keeps its intent — any genuine demo leftovers are still
+     * cleared, and cleared BEFORE we write — while making it impossible for the
+     * later `create()` to eat real history. A no-op on a device that has already
+     * done its purge.
+     */
+    private fun claimDemoCachePurge(app: Context, store: SmartTxtStore) {
+        val flags = app.getSharedPreferences(
+            SmartTxtRepository.DEMO_PURGE_PREFS, Context.MODE_PRIVATE,
+        )
+        if (flags.getBoolean(SmartTxtRepository.DEMO_PURGE_KEY, false)) return
+        store.clear()
+        flags.edit().putBoolean(SmartTxtRepository.DEMO_PURGE_KEY, true).apply()
+        Log.i(TAG, "  history: ran the one-time demo-cache purge before writing, so the " +
+            "first SmartTxtRepository.create() can't run it after and wipe the import")
     }
 
     // ── pure helpers (unit-tested) ──────────────────────────────────────

@@ -233,7 +233,7 @@ class GMGaiaPairing(
         store.save(account)
         // GAIA-mode extras the session client needs in Phase 4 (clients6 host,
         // GDitto network, destRegistrationIDs, cookies+SAPISIDHASH on every RPC).
-        store.saveGaiaSession(destRegB64)
+        store.saveGaiaSession(destRegB64, pairingAttemptId)
     }
 
     // ---- networking: send a pairing RPC + await its response ---------------

@@ -4,7 +4,12 @@ import android.content.Context
 import android.util.Log
 import com.offline.dpadmessenger.data.InMemoryMessageRepository
 import com.offline.dpadmessenger.data.MessageRepository
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 
 /**
  * Factory + process-scoped holder for the [MessageRepository] backing the
@@ -91,6 +96,70 @@ object GoogleMessagesRepository {
         (instance as? GoogleMessagesMessageRepository)?.shutdown(clearCache = clearMessages)
         instance = null
     }
+
+    /**
+     * Revoke the pairing with Google, tear the session down, and wipe the
+     * stored account — in that order, which is the only order that works: the
+     * revoke needs both the live session and the credentials the wipe removes.
+     *
+     * This owns the ORDER on purpose, rather than leaving three statements at
+     * each UI call site. It is also why it runs on [teardownScope] under
+     * [NonCancellable]:
+     *
+     * The callers are Compose `rememberCoroutineScope()` lambdas, so their job
+     * dies with the composition — and the composition dies the moment the user
+     * presses Back on a screen that is sitting on a network call. Cut partway
+     * through, the old code could revoke the pairing and cancel the session but
+     * never clear the store (the app comes back believing it is still paired,
+     * over a session whose scope is cancelled — sends stick on SENDING forever,
+     * nothing arrives, and no reconnect screen ever appears), or clear the store
+     * against a composition that has already re-read `isPaired()` as true. That
+     * is the same "silently not receiving" failure this whole change exists to
+     * remove, reached by a new route.
+     *
+     * Best-effort about the revoke, never about the teardown: a revoke that
+     * fails costs one leftover entry in the phone's device list, and the local
+     * teardown must happen regardless.
+     *
+     * @return true only if Google accepted the revoke.
+     */
+    suspend fun unpairAndTearDown(
+        store: GoogleMessagesAccountStore,
+        clearMessages: Boolean,
+    ): Boolean = withContext(Dispatchers.IO + NonCancellable) {
+        val revoked = runCatching {
+            (instance as? GoogleMessagesMessageRepository)?.unpairRemote() ?: false
+        }.getOrElse {
+            Log.w(SESSION_TAG, "unpair failed — continuing with teardown", it)
+            false
+        }
+        shutdown(clearMessages = clearMessages)
+        store.clear()
+        _teardowns.value += 1
+        revoked
+    }
+
+    private val _teardowns = MutableStateFlow(0)
+
+    /**
+     * Bumped by every completed [unpairAndTearDown]. The messenger UI collects
+     * this to decide when to drop back to the sign-in screen.
+     *
+     * A flow, not a plain counter the UI samples on resume: teardown is
+     * uninterruptible and outlives the composition that started it, so the
+     * increment can land while a NEW composition is already showing the chat
+     * list — and a sampled counter would miss it until the next resume, leaving
+     * the user typing into a wiped store with sends stuck on SENDING.
+     *
+     * It exists so the UI never has to ask the STORE whether it is still paired
+     * in order to sign a user OUT. `isPaired()` is `load() != null`, and
+     * `load()` returns null for ANY unreadable field, a transient Keystore/Tink
+     * hiccup included. Driving sign-out off that would eject a perfectly good
+     * session to the sign-in screen on a bad read — and signing back in is what
+     * mints the duplicate pairings this change exists to stop.
+     */
+    val teardowns: StateFlow<Int> = _teardowns.asStateFlow()
+
 
     /** Re-link WITHOUT re-pairing: refresh the token from stored cookies and
      *  resume, keeping the pairing + messages. Returns false if the cookies are

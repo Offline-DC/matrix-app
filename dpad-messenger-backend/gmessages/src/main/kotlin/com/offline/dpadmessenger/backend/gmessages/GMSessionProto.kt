@@ -32,10 +32,54 @@ internal object GMSessionProto {
     const val ACTION_ACK_BROWSER_PRESENCE = 17
     const val ACTION_NOTIFY_DITTO_ACTIVITY = 22
     const val ACTION_SEND_REACTION = 38
+    /** UNPAIR_GAIA_PAIRING — revokes THIS web pairing from the Google account so
+     *  it stops appearing in the phone's Device-pairing list. Sent as a normal
+     *  encrypted session RPC (BUGLE_MESSAGE / DataEvent), payload
+     *  [revokeGaiaPairingRequest]. */
+    const val ACTION_UNPAIR_GAIA_PAIRING = 46
 
     // SendReactionRequest.Action
     const val REACTION_ADD = 1
     const val REACTION_REMOVE = 2
+
+    // AlertType (events.proto) — carried by UserAlertEvent inside a GET_UPDATES
+    // push. Only the four below are acted on; the rest (battery, RCS, database
+    // sync, push throttling, …) are logged and ignored.
+    //
+    // The BROWSER_INACTIVE family is the ONLY signal Google gives that this
+    // device has stopped being the receive target. Without it a displaced
+    // device is byte-for-byte identical to a quiet one: the long-poll stays
+    // open, the token keeps refreshing, and no message ever arrives.
+    /** Another session took the receive slot. */
+    const val ALERT_BROWSER_INACTIVE = 1
+    /** This session (re)acquired the receive slot. */
+    const val ALERT_BROWSER_ACTIVE = 2
+    const val ALERT_BROWSER_INACTIVE_FROM_TIMEOUT = 7
+    const val ALERT_BROWSER_INACTIVE_FROM_INACTIVITY = 8
+
+    /** True for every alert meaning "you are no longer the receive target". */
+    fun isBrowserInactiveAlert(alert: Int): Boolean =
+        alert == ALERT_BROWSER_INACTIVE ||
+            alert == ALERT_BROWSER_INACTIVE_FROM_TIMEOUT ||
+            alert == ALERT_BROWSER_INACTIVE_FROM_INACTIVITY
+
+    /** Human-readable alert name for logs. Unknown types print their number so a
+     *  capture stays useful against a newer server. */
+    fun alertName(alert: Int): String = when (alert) {
+        ALERT_BROWSER_INACTIVE -> "BROWSER_INACTIVE"
+        ALERT_BROWSER_ACTIVE -> "BROWSER_ACTIVE"
+        3 -> "MOBILE_DATA_CONNECTION"
+        4 -> "MOBILE_WIFI_CONNECTION"
+        5 -> "MOBILE_BATTERY_LOW"
+        6 -> "MOBILE_BATTERY_RESTORED"
+        ALERT_BROWSER_INACTIVE_FROM_TIMEOUT -> "BROWSER_INACTIVE_FROM_TIMEOUT"
+        ALERT_BROWSER_INACTIVE_FROM_INACTIVITY -> "BROWSER_INACTIVE_FROM_INACTIVITY"
+        9 -> "RCS_CONNECTION"
+        11 -> "MOBILE_DATABASE_SYNCING"
+        12 -> "MOBILE_DATABASE_SYNC_COMPLETE"
+        13 -> "MOBILE_DATABASE_SYNC_STARTED"
+        else -> "alert#" + alert
+    }
 
     // BugleRoute (rpc.proto)
     const val ROUTE_DATA_EVENT = 19
@@ -167,6 +211,18 @@ internal object GMSessionProto {
         val format: Int,
         /** Per-attachment AES-256-GCM key needed to decrypt the download. */
         val decryptionKey: ByteArray?,
+        /** MediaContent field 5 — the byte size Google reports for its own stored
+         *  copy. For AUDIO that equals what we uploaded, so it reconciles an echo
+         *  that came back without its tmpID. For IMAGES it does NOT: Google
+         *  transcodes, and a 662209-byte JPEG echoes back as 162243. Use
+         *  [width]/[height] for those. 0 when the field is absent. */
+        val sizeBytes: Long = 0L,
+        /** MediaContent field 6 = { width=1, height=2 }, in pixels. Survives the
+         *  image transcode (only the compression changes), so it is the key that
+         *  reconciles a photo echo with no tmpID. 0 for audio, which has no
+         *  field 6 at all. */
+        val width: Int = 0,
+        val height: Int = 0,
     ) {
         val isImage: Boolean get() = format in 1..7 || mimeType.startsWith("image/")
         val isVideo: Boolean get() = format in 8..13 || mimeType.startsWith("video/")
@@ -205,19 +261,24 @@ internal object GMSessionProto {
      * UpdateEvents (events.proto) — what GET_UPDATES pushes decrypt to:
      *   conversationEvent=2 { data=2: repeated Conversation }
      *   messageEvent=3      { data=2: repeated Message }
-     * (typing=4, settings=5, userAlert=6, browserPresenceCheck=7 ignored —
-     *  except presence, which the caller must ack.)
+     *   userAlertEvent=6    { alertType=2: AlertType }
+     *   browserPresenceCheckEvent=7
+     * (typing=4, settings=5, accountChange=15 still ignored.)
      */
     data class UpdateEvents(
         val conversations: List<GMConversation>,
         val messages: List<GMMessage>,
         val isBrowserPresenceCheck: Boolean,
+        /** AlertType from a UserAlertEvent, or null if this push carried none.
+         *  See [ALERT_BROWSER_INACTIVE] for why this matters. */
+        val userAlert: Int? = null,
     )
 
     fun parseUpdateEvents(bytes: ByteArray): UpdateEvents {
         val conversations = ArrayList<GMConversation>()
         val messages = ArrayList<GMMessage>()
         var presence = false
+        var alert: Int? = null
         forEachField(bytes) { f ->
             when (f.number) {
                 2 -> f.bytes?.let { ce -> // ConversationEvent
@@ -230,11 +291,25 @@ internal object GMSessionProto {
                         if (inner.number == 2) inner.bytes?.let { messages.add(parseMessage(it)) }
                     }
                 }
+                // UserAlertEvent { alertType = 2 }. The alert type is field TWO
+                // of the inner message — there is no field 1. Reading field 1
+                // here would silently yield null forever.
+                6 -> f.bytes?.let { ua ->
+                    forEachField(ua) { inner ->
+                        if (inner.number == 2) alert = inner.value.toInt()
+                    }
+                }
                 7 -> presence = true
             }
         }
-        return UpdateEvents(conversations, messages, presence)
+        return UpdateEvents(conversations, messages, presence, alert)
     }
+
+    /** RevokeGaiaPairingRequest (authentication.proto) — the payload of an
+     *  [ACTION_UNPAIR_GAIA_PAIRING] RPC. One field: the pairing-attempt id
+     *  minted when this device paired, which is why it has to be persisted. */
+    fun revokeGaiaPairingRequest(pairingAttemptId: String): ByteArray =
+        ProtoWriter().string(1, pairingAttemptId).toByteArray()
 
     fun parseConversation(bytes: ByteArray): GMConversation {
         var id = ""; var name = ""; var latest = ""; var ts = 0L
@@ -382,6 +457,10 @@ internal object GMSessionProto {
         val format = (f[1]?.value ?: 0L).toInt()
         val mime = f[14]?.bytes?.toString(Charsets.UTF_8) ?: ""
         val name = f[4]?.bytes?.toString(Charsets.UTF_8) ?: ""
+        val size = f[5]?.value ?: 0L
+        val dims = f[6]?.bytes?.let { ProtoReader.fields(it) }
+        val width = (dims?.get(1)?.value ?: 0L).toInt()
+        val height = (dims?.get(2)?.value ?: 0L).toInt()
         // Nothing identifiable as media (no id, no format, no mime, no name) →
         // genuinely not a media part.
         if (mediaId == null && format == 0 && mime.isBlank() && name.isBlank()) return null
@@ -392,6 +471,9 @@ internal object GMSessionProto {
             name = name,
             format = format,
             decryptionKey = key,
+            sizeBytes = size,
+            width = width,
+            height = height,
         )
     }
 

@@ -69,6 +69,20 @@ fun SmartTxtApp(
     val status by SmartTxtRepository.status.collectAsState()
     // Post-login handle picker: shown once after registration, before the chats.
     var handlesConfigured by remember { mutableStateOf(SmartTxtAccountStore(context).handlesConfigured()) }
+    // ...and re-read whenever the status changes, because the value above is captured
+    // at FIRST composition — which, on an OpenBubbles migration, is while the transfer
+    // is still running (this composable is what renders MigrationScreen). It is false
+    // at that instant. The migration then answers the picker on the user's behalf, by
+    // carrying OpenBubbles' "Start Chats Using" address into the account store; without
+    // this re-read the stale `false` survives and the gate shows them the picker anyway
+    // — the "u r signed in!!!" screen a migrated user should never reach.
+    LaunchedEffect(status) {
+        if (status == SmartTxtStatus.REGISTERED && !handlesConfigured) {
+            handlesConfigured = withContext(Dispatchers.IO) {
+                SmartTxtAccountStore(context).handlesConfigured()
+            }
+        }
+    }
 
     when {
         status == SmartTxtStatus.REGISTERED && !handlesConfigured ->

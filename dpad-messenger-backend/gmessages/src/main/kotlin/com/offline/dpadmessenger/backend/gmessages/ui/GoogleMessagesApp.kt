@@ -54,6 +54,40 @@ fun GoogleMessagesApp(
     // Snapshot pairing status once. Flips to true when pairing completes.
     var paired by remember { mutableStateOf(store.isPaired()) }
 
+    // A teardown is uninterruptible and outlives the composition that launched
+    // it (see GoogleMessagesRepository.unpairAndTearDown), so one can complete
+    // while a NEW composition is already showing the chat list — over a wiped
+    // store and a cancelled session, where sends stick on SENDING forever and
+    // nothing ever arrives. Collecting the counter catches that the moment it
+    // happens rather than at the next resume.
+    //
+    // Deliberately NOT driven by `store.isPaired()`: that is `load() != null`,
+    // which returns null for ANY unreadable field, a transient Keystore/Tink
+    // hiccup included. Signing a working session out on a bad read would send
+    // the user to re-link — and re-linking is what creates the duplicate
+    // pairings this whole change exists to stop.
+    val teardowns by GoogleMessagesRepository.teardowns.collectAsState()
+    // The baseline is "the teardown count when we last became paired", NOT
+    // composition start.
+    //
+    // With the old `remember { teardowns }`, logging out and re-pairing without
+    // leaving the screen was unwinnable: Log out bumps the counter, so for the
+    // whole remaining life of that composition `teardowns != teardownsAtStart`
+    // stayed true — and the instant pairing set `paired = true`, the very next
+    // line set it straight back to false. Pressing Done did fire onPaired(); the
+    // gate just ate it, silently, every time. Backing out and reopening
+    // "worked" only because it re-remembered a fresh baseline.
+    //
+    // Re-baselining on each transition to paired keeps what this guard is for —
+    // a teardown completing under a live chat UI — without vetoing a pairing
+    // that happened *after* the teardown it's guarding against.
+    var teardownsWhenPaired by remember { mutableStateOf(teardowns) }
+    fun becomePaired() {
+        teardownsWhenPaired = teardowns
+        paired = true
+    }
+    if (paired && teardowns != teardownsWhenPaired) paired = false
+
     // Pairing finishes in a separate activity (the companion cookie/UKey2 flow).
     // Re-check on resume so we flip straight to the chats once it succeeds,
     // instead of leaving the user on the "waiting" screen until a relaunch.
@@ -61,7 +95,7 @@ fun GoogleMessagesApp(
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME && !paired && store.isPaired()) {
-                paired = true
+                becomePaired()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -117,8 +151,13 @@ fun GoogleMessagesApp(
                     "re-link: Google rejected the stored credentials (reason=$reason) " +
                         "— wiping auth for a full re-pair",
                 )
-                GoogleMessagesRepository.shutdown(clearMessages = false)
-                store.clear() // cookies really are dead → wipe auth → full re-pair
+                // Revoke, tear down, wipe — in that order, and uninterruptibly.
+                // Google has just rejected these credentials so the revoke will
+                // usually fail, but not always: a TOKEN_DEAD verdict can come
+                // from repeated setActiveSession rejections while the cookies
+                // are still fine, and that is exactly the case where a leftover
+                // pairing is the actual problem.
+                GoogleMessagesRepository.unpairAndTearDown(store, clearMessages = false)
                 paired = false
             }
         }
@@ -128,9 +167,17 @@ fun GoogleMessagesApp(
         // proactive re-link must re-pair. Messages are kept (clearMessages=false);
         // wiping auth flips us to the companion sign-in screen.
         val freshRelink: () -> Unit = {
-            GoogleMessagesRepository.shutdown(clearMessages = false)
-            store.clear()
-            paired = false
+            relinkScope.launch {
+                // This is the path that accumulates junk. Every re-link mints a
+                // new pairing, and until now the old one was simply abandoned:
+                // the phone's Google Messages device list fills up with
+                // identically-named entries, and those entries still compete for
+                // the receive slot. A user who has re-linked six times has five
+                // ghosts, any of which can silently take over receiving and
+                // leave the real phone long-polling into nothing.
+                GoogleMessagesRepository.unpairAndTearDown(store, clearMessages = false)
+                paired = false
+            }
         }
         // Age of the current Google session, for the Settings "last linked" row
         // and the day-13 re-link banner. Plain (not remembered) so it advances
@@ -163,17 +210,25 @@ fun GoogleMessagesApp(
             onFreshRelink = freshRelink,
             linkAgeDays = linkAgeDays,
             onLogout = {
-                // Real logout: tear the session down and wipe the stored pairing
-                // + cookies AND delete the cached message history (clearMessages =
-                // true). Signing back in gets fresh cookies from a new scan and
-                // starts from an empty inbox.
-                GoogleMessagesRepository.shutdown(clearMessages = true)
-                store.clear()
-                android.util.Log.i(
-                    "GMGaia",
-                    "logout: cleared gmessages account + cookies (hasCookies=${store.hasCookies()}, isPaired=${store.isPaired()})",
-                )
-                paired = false
+                relinkScope.launch {
+                    // Real logout: revoke the pairing with Google, tear the
+                    // session down, and wipe the stored pairing + cookies AND
+                    // the cached message history (clearMessages = true). Signing
+                    // back in gets fresh cookies and starts from an empty inbox.
+                    //
+                    // The revoke is bounded to ~3s inside the session client, so
+                    // Log out cannot appear to hang because Google is slow — a
+                    // leftover entry is much the better outcome. The teardown
+                    // itself is uninterruptible; see unpairAndTearDown.
+                    val revoked =
+                        GoogleMessagesRepository.unpairAndTearDown(store, clearMessages = true)
+                    android.util.Log.i(
+                        "GMGaia",
+                        "logout: cleared gmessages account + cookies (revokedRemotePairing=$revoked " +
+                            "hasCookies=${store.hasCookies()}, isPaired=${store.isPaired()})",
+                    )
+                    paired = false
+                }
             },
             autoDeleteEnabled = autoDelete,
             onAutoDeleteChange = { enabled ->
@@ -197,7 +252,7 @@ fun GoogleMessagesApp(
     // (not a separate Activity + a passive prompt — that showed two near-identical
     // "waiting for your phone" screens). It flips us to the chats via onPaired.
     if (companionSignIn != null) {
-        companionSignIn { paired = true }
+        companionSignIn { becomePaired() }
         return
     }
 

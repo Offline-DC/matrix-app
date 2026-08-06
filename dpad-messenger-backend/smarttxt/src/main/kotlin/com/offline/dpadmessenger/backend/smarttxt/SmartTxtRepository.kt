@@ -283,10 +283,10 @@ object SmartTxtRepository {
         // the on-disk cache, so the real (native) path starts blank. Guarded by a
         // flag so real message history isn't wiped on later launches.
         if (RustPushBridge.NATIVE_AVAILABLE) {
-            val flags = appContext.getSharedPreferences("smarttxt_flags", Context.MODE_PRIVATE)
-            if (!flags.getBoolean("purged_demo_cache_v2", false)) {
+            val flags = appContext.getSharedPreferences(DEMO_PURGE_PREFS, Context.MODE_PRIVATE)
+            if (!flags.getBoolean(DEMO_PURGE_KEY, false)) {
                 SmartTxtStore(appContext).clear()
-                flags.edit().putBoolean("purged_demo_cache_v2", true).apply()
+                flags.edit().putBoolean(DEMO_PURGE_KEY, true).apply()
                 Log.i(TAG, "purged leftover demo chat cache (first native run)")
             }
         }
@@ -954,6 +954,18 @@ object SmartTxtRepository {
         shutdown(context, wipe = false)
         _status.value = SmartTxtStatus.UNREGISTERED
     }
+
+    /**
+     * The one-time demo-cache purge above. Exposed (rather than inlined) because
+     * [ObHistoryImporter] has to CLAIM it: `create()` runs the purge on the first
+     * native launch, and on a migrating device that launch happens AFTER the
+     * OpenBubbles history has been written — on 2026-08-05 it wiped a verified
+     * import of 4 rooms / 22 messages microseconds after it landed. The importer
+     * therefore performs this purge itself, before writing, and sets the flag.
+     * Keep both sides on these constants so they can't drift apart.
+     */
+    internal const val DEMO_PURGE_PREFS = "smarttxt_flags"
+    internal const val DEMO_PURGE_KEY = "purged_demo_cache_v2"
 
     private const val TAG = "IMsgRepoHolder"
 
