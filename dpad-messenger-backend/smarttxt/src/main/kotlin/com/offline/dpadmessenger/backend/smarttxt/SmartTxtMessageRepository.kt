@@ -306,20 +306,41 @@ internal class SmartTxtMessageRepository(
             // nothing at all, with the bubble stuck on "Sending…" waiting for a receipt
             // that cannot come (captured 2026-08-07 11:58).
             //
-            // RECEIVED messages only. An outgoing bubble's colour is itself a guess
+            // PREFER a received message. An outgoing bubble's colour can be a guess
             // (see sendMessage's `SMSFLAG send … guessed=`), and in that same capture a
             // wrongly-blue send had already become the newest message in the room —
             // seeding from it would launder the guess into a fact and pin the thread
-            // to the wrong transport.
-            session.seedGroupServices(
-                messagesByRoom.value.mapNotNull { (roomId, msgs) ->
-                    if (!ChatGuid.isGroup(roomId)) return@mapNotNull null
-                    val newestInbound = msgs
-                        .filter { !it.isOutgoing && !it.isDeleted }
-                        .maxByOrNull { it.timestampMs } ?: return@mapNotNull null
-                    roomId to newestInbound.isSms
-                }.toMap()
-            )
+            // to the wrong transport. That room had inbound history, so it still reads
+            // its inbound message and is unaffected by the fallback below.
+            //
+            // FALL BACK to the newest message of any direction when the room has NO
+            // inbound message at all, because the alternative is saying nothing and
+            // silently defaulting the thread to blue. Observed 2026-08-07 16:49 on a
+            // real migration: of three imported groups only one had ever received
+            // anything, so `backfilled 1 group(s)` — and the all-Android group
+            // +12025039452,+18048336200 then failed NoValidTargets on every send while
+            // the app itself knew better (`guessed=true (newest=true)` one line above
+            // `is_sms=false`).
+            //
+            // Nothing is laundered in the fallback case. After a migration an imported
+            // message's isSms comes from the chat-level flag OpenBubbles routed by
+            // (`guid.startsWith("SMS") || isRpSms`), not from a guess of ours; and in a
+            // long-running install an unseeded group always sent blue, so an
+            // outgoing-only group already reads false and seeding false is a no-op.
+            val groupServices = messagesByRoom.value.mapNotNull { (roomId, msgs) ->
+                if (!ChatGuid.isGroup(roomId)) return@mapNotNull null
+                val live = msgs.filter { !it.isDeleted }
+                val inbound = live.filter { !it.isOutgoing }.maxByOrNull { it.timestampMs }
+                val witness = inbound
+                    ?: live.maxByOrNull { it.timestampMs }
+                    ?: return@mapNotNull null
+                if (inbound == null) {
+                    Log.i(TAG, "seed: room=$roomId has no inbound message — taking its " +
+                        "service from the newest outgoing one (isSms=${witness.isSms})")
+                }
+                roomId to witness.isSms
+            }.toMap()
+            session.seedGroupServices(groupServices)
             session.connect()
         }
     }

@@ -243,6 +243,11 @@ internal object ObHistoryImporter {
 
         val rooms = HashMap<Long, Room>()
         val muted = HashSet<String>()
+        // OB chat row ids whose conversation runs over text rather than iMessage. Kept
+        // by CHAT id, not room id, because two OB chats can collapse onto one Smart Txt
+        // room (see the de-dup of `used` below) and one of them may be a routing stub —
+        // each message is tagged from its own chat instead of a merged room-level guess.
+        val smsChats = HashSet<Long>()
         var chatsWithoutParticipants = 0
         var fromRelation = 0
         var fromMessages = 0
@@ -257,6 +262,24 @@ internal object ObHistoryImporter {
             // No known counterpart ⇒ no way to build a Smart Txt guid for this thread,
             // and a room the transport can never match is worse than no room at all.
             if (members.isEmpty()) { chatsWithoutParticipants++; continue }
+            // Which transport this conversation runs on — the one thing the rest of the
+            // import cannot infer later. A GROUP's service is never looked up at send
+            // time (`group_sends_sms` reads stored meta only, and unknown means blue),
+            // so without this a migrated Android group replies as iMessage: an
+            // all-Android one fails NoValidTargets, and a MIXED one silently reaches
+            // only its iPhone members. It self-heals on the group's first inbound
+            // message, but that can be days away in a thread the user usually starts.
+            //
+            // Same predicate as OpenBubbles' own `Chat.isTextForwarding`
+            // (`guid.startsWith("SMS") || isRpSms`, io/chat.dart:1670) — the flag OB
+            // routes by, so this is its answer rather than a guess of ours. `ObRow.bool`
+            // yields false when the column is absent, so an older OpenBubbles build
+            // simply behaves as it does today.
+            if (row.bool("isRpSms") ||
+                row.string("guid").orEmpty().startsWith("SMS", ignoreCase = true)
+            ) {
+                smsChats += chatId
+            }
             val title = row.string("displayName")?.trim().orEmpty()
             // Same rule the FFI uses to pick a guid: >1 counterpart, or a named
             // conversation, is a group.
@@ -275,6 +298,7 @@ internal object ObHistoryImporter {
         Log.i(TAG, "  history rooms: built ${rooms.values.distinctBy { it.id }.size} " +
             "(${rooms.values.count { !it.isGroup }} 1:1, ${rooms.values.count { it.isGroup }} group) — " +
             "$fromRelation from the handle relation, $fromMessages recovered from senders; " +
+            "${smsChats.size} on text rather than iMessage; " +
             "dropped $chatsWithoutParticipants chat(s) with no known participant")
 
         // One pass over the messages, inside the retention window. Reaction rows are
@@ -289,7 +313,8 @@ internal object ObHistoryImporter {
             runCatching {
                 val at = row.long("dateCreated")
                 if (at <= 0L || at < cutoff) { tally.outOfWindow++; return@runCatching }
-                val room = rooms[row.long("chatId").takeIf { it != 0L } ?: -1L]
+                val chatId = row.long("chatId").takeIf { it != 0L } ?: -1L
+                val room = rooms[chatId]
                 if (room == null) { tally.noRoom++; return@runCatching }
                 val sender = if (row.bool("isFromMe")) ME else {
                     val h = row.long("handleId").takeIf { it != 0L } ?: row.long("handleRelationId")
@@ -371,6 +396,11 @@ internal object ObHistoryImporter {
                     isOutgoing = out,
                     replyToId = row.string("threadOriginatorGuid")?.takeIf { it.isNotBlank() },
                     editedAtMs = row.long("dateEdited").takeIf { it > 0L },
+                    // Green history stays green, and — the part that actually matters —
+                    // `seedGroupServices` reads the newest INBOUND message of each group
+                    // at startup, so this is what tells the native side that a migrated
+                    // group replies over MMS before it has received anything.
+                    isSms = chatId in smsChats,
                 )
             }
         }
