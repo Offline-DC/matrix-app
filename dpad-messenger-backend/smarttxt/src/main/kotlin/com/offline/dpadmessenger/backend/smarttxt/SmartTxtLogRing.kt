@@ -195,6 +195,65 @@ internal object SmartTxtLogRing {
     /** Respawn count and total un-attached time — see [respawns]. */
     fun respawnStats(): Pair<Long, Long> = Pair(respawns, gapMs)
 
+    /**
+     * Provenance for every line this process writes: build, PID, and how long ago the
+     * device booted. Composed in [ensureStarted] (the only place with a Context) and
+     * written as the FIRST line of `current.log` by [runTailLoop].
+     *
+     * WHY THIS IS NOT A `Log.i` CALL. It would have to survive the same race it exists to
+     * document: the ring's logcat reader attaches a beat after the process starts, so
+     * anything logged at startup lands in the gap and never reaches the file. (That is
+     * exactly why `reconcile:` and `REGSTATE` have never appeared in ANY captured bundle.)
+     * Writing straight into `current.log` — the same mechanism as the respawn marker —
+     * bypasses logcat entirely, so it cannot be lost to a respawn and is guaranteed to be
+     * line 1. It also means it does not depend on [TAGS] allow-listing this class's tag,
+     * which it does not.
+     *
+     * WHY IT MATTERS. `meta.txt` records `appVersion` at EXPORT time, i.e. the LAST build.
+     * A bundle that spans an app update therefore mislabels every line written before the
+     * update, silently. In the 2026-08-05 capture the app updated mid-bundle and the only
+     * way to detect it was noticing that a log line present in one PID was absent from an
+     * earlier one — an inference that happened to work. `updated=` makes it a read, and
+     * `pid=` + `uptimeMs=` together distinguish a device reboot from a process restart
+     * without having to reason about whether the PID went up or down.
+     */
+    @Volatile private var sessionLine: String? = null
+
+    /** Build the session line. Fully defensive: this runs on the boot path of the HOME
+     *  app, so nothing here may throw. Any field we can't read degrades to `?`.
+     *
+     *  DEPRECATION is suppressed for `PackageInfo.versionCode`: the replacement,
+     *  `longVersionCode`, is API 28 and this module's minSdk is 24. */
+    @Suppress("DEPRECATION")
+    private fun buildSessionLine(context: android.content.Context): String {
+        fun iso(ms: Long): String = try {
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+                .apply { timeZone = TimeZone.getTimeZone("UTC") }
+                .format(Date(ms))
+        } catch (_: Throwable) { "?" }
+
+        var version = "?"
+        var code = "?"
+        var installed = "?"
+        var updated = "?"
+        try {
+            val pi = context.packageManager.getPackageInfo(context.packageName, 0)
+            version = pi.versionName ?: "?"
+            // versionCode, not longVersionCode: the latter is API 28 and minSdk here is 24.
+            code = pi.versionCode.toString()
+            installed = iso(pi.firstInstallTime)
+            updated = iso(pi.lastUpdateTime)
+        } catch (t: Throwable) {
+            Log.w(TAG, "session line: package info unavailable", t)
+        }
+        val pid = try { android.os.Process.myPid().toString() } catch (_: Throwable) { "?" }
+        val uptimeMs = try { android.os.SystemClock.elapsedRealtime() } catch (_: Throwable) { -1L }
+
+        return "--- [ring] SESSION pid=$pid app=$version code=$code " +
+            "installed=$installed updated=$updated uptimeMs=$uptimeMs " +
+            "ringStart=${iso(System.currentTimeMillis())} ---\n"
+    }
+
     @Volatile private var dir: File? = null
     private var currentFile: File? = null
     private var currentWriter: BufferedWriter? = null
@@ -257,6 +316,27 @@ internal object SmartTxtLogRing {
         } catch (t: Throwable) {
             Log.w(TAG, "prior current.log rename failed", t)
         }
+        // Composed here because this is the only place with a Context; written to disk by
+        // runTailLoop once the writer is open. Never allowed to fail the ring start.
+        sessionLine = try { buildSessionLine(context) } catch (t: Throwable) {
+            Log.w(TAG, "session line build failed", t); null
+        }
+        // ALSO emit it to logcat, so the line exists in BOTH capture paths:
+        //
+        //   export-logs bundle  ← the direct file write in runTailLoop
+        //   adb / rolling logcat ← this call
+        //
+        // Neither path subsumes the other. The file write is invisible to `adb logcat`
+        // (it never goes through logd), and a logcat line is invisible to the bundle here
+        // because [SMARTTXT_TAGS] deliberately does not allow-list this class's own tag —
+        // which also means this cannot double-print into current.log.
+        //
+        // The launcher's continuous rolling capture runs at `*:W` with an explicit tag
+        // allow-list (RebootLoggingConfig.ROLLING_LOGCAT_FILTERSPEC), and `IMsgLogRing:I`
+        // is on it, so INFO is captured there. A plain `adb logcat -b main` is unfiltered
+        // and captures it regardless. If that filterspec ever drops IMsgLogRing, this line
+        // must move to Log.w to survive the `*:W` floor.
+        sessionLine?.let { Log.i(TAG, it.trim()) }
         stopped = false
         started = true
         thread = Thread({ runTailLoop() }, "SmartTxtLogRing").apply {
@@ -290,6 +370,15 @@ internal object SmartTxtLogRing {
         while (!stopped) {
             try {
                 openCurrentForAppend()
+                if (first) {
+                    // First line of this process's capture, before any logcat output. See
+                    // [sessionLine] for why this is written directly rather than logged.
+                    // Flushed immediately for the same reason the respawn marker is: if
+                    // the app then wedges, nothing further arrives to trigger the cadence
+                    // and the line never reaches disk — which is precisely the bundle
+                    // where you most need to know which build produced it.
+                    sessionLine?.let { writeLine(it); flush() }
+                }
                 if (!first) {
                     // ONE structured line per respawn, in place of the four
                     // lines of logcat stderr that used to land here verbatim

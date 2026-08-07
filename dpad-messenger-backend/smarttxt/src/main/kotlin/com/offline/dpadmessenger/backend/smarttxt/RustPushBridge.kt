@@ -41,23 +41,87 @@ class RustPushBridge(
 
     // ---- lifecycle ----------------------------------------------------------
 
-    fun connectApns() {
-        if (NATIVE_AVAILABLE) {
-            apnsConnected = RustPushNative.nativeConnect()
-            Log.i(TAG, "native APNs connect = $apnsConnected")
-            return
+    /**
+     * **THE ONLY CALLER OF [RustPushNative.nativeConnect] IN THE CODEBASE.** Keep it
+     * that way — `grep -rn nativeConnect --include=*.kt` must return exactly one hit
+     * outside [RustPushNative]'s own declaration.
+     *
+     * Opening a SECOND APNs connection on one push token makes Apple evict both, which
+     * is the `early eof` → `Send timed out, forcing reload!` storm that left handsets
+     * unable to send or receive until a restart. The native side has its own lock, but
+     * a lock is a property of the *implementation*; a single call site is a property of
+     * the *shape*, and it is the shape OpenBubbles gets for free by only ever calling
+     * `setup_push` from `SharedPushState::restore`.
+     *
+     * Smart Txt cannot literally have one caller — it has a boot retry ladder, a
+     * network-recovery callback and a launch health check that OpenBubbles has no
+     * equivalent of, each of which exists for a field failure. What it can have is one
+     * *funnel*: those callers ask for a connection, they do not perform one.
+     *
+     * [rebuild] is for the failure a plain retry cannot fix — socket up, `IMClient`
+     * never built. `nativeConnect` short-circuits on `connected && connection.is_some()`
+     * and returns true without rebuilding, so the connection has to be dropped first to
+     * force the full path. Dropping and reconnecting happen under the same lock, so no
+     * other caller can slip a connect in between.
+     */
+    fun connectApns(rebuild: Boolean = false): Boolean = synchronized(CONNECT_LOCK) {
+        when {
+            !NATIVE_AVAILABLE -> {
+                apnsConnected = true
+                Log.i(TAG, "STUB APNs 'connected' (no real socket — Phase B not built)")
+                true
+            }
+            // Re-checked INSIDE the lock, which is the whole point of the funnel: a
+            // caller that queued behind an in-flight connect must ADOPT its result.
+            // Without this a rebuild request would demolish the connection the winner
+            // had just finished building.
+            hasClient() -> {
+                apnsConnected = true
+                Log.i(TAG, "native APNs connect: client already up — reusing")
+                true
+            }
+            else -> {
+                if (rebuild) {
+                    Log.i(TAG, "native APNs connect: client down — tearing down first")
+                    runCatching { RustPushNative.nativeDisconnect() }
+                }
+                apnsConnected = runCatching { RustPushNative.nativeConnect() }.getOrElse {
+                    Log.w(TAG, "native APNs connect threw: ${it.message}")
+                    false
+                }
+                Log.i(TAG, "native APNs connect = $apnsConnected (rebuild=$rebuild)")
+                apnsConnected
+            }
         }
-        apnsConnected = true
-        Log.i(TAG, "STUB APNs 'connected' (no real socket — Phase B not built)")
     }
 
-    fun disconnectApns() {
-        if (NATIVE_AVAILABLE) { RustPushNative.nativeDisconnect(); apnsConnected = false; return }
+    /** Under [CONNECT_LOCK] too, so a teardown can never land between another caller's
+     *  readiness check and its connect. */
+    fun disconnectApns() = synchronized(CONNECT_LOCK) {
+        if (NATIVE_AVAILABLE) RustPushNative.nativeDisconnect()
         apnsConnected = false
     }
 
     fun isApnsConnected(): Boolean =
         if (NATIVE_AVAILABLE) RustPushNative.nativeIsConnected() else apnsConnected
+
+    /**
+     * True when the iMessage CLIENT is built, not merely when a socket is open.
+     *
+     * Falls back to [RustPushNative.nativeIsConnected] if the bundled `.so` predates
+     * `nativeHasClient` — the JNI call throws UnsatisfiedLinkError on version skew, and
+     * degrading to the old, weaker signal beats crashing or looping forever.
+     *
+     * `SmartTxtRepository.nativeClientReady` is the same check plus the rule that the
+     * stub path is never "ready"; keep the two in step.
+     */
+    fun hasClient(): Boolean {
+        if (!NATIVE_AVAILABLE) return apnsConnected
+        return runCatching { RustPushNative.nativeHasClient() }.getOrElse {
+            Log.w(TAG, "nativeHasClient unavailable (old .so?) — falling back to nativeIsConnected")
+            runCatching { RustPushNative.nativeIsConnected() }.getOrDefault(false)
+        }
+    }
 
     /** Hand rustpush the guids we already have stored, so the backlog Apple replays
      *  on connect is dropped instead of re-delivered. Must run BEFORE [connectApns].
@@ -125,7 +189,9 @@ class RustPushBridge(
             if (!RustPushNative.nativeIsConnected()) {
                 RustPushNative.runCatchingNativeLogout()
             }
-            if (!RustPushNative.nativeIsConnected() && !RustPushNative.nativeConnect()) {
+            // Through the funnel, not straight to the FFI — sign-in can overlap the
+            // background-sync connect on a handset that was already registered.
+            if (!RustPushNative.nativeIsConnected() && !connectApns()) {
                 Log.w(TAG, "sign-in: nativeConnect failed (APNs)")
                 return RegistrationResult.Failure(
                     "Couldn't connect to Apple's servers. Check your internet connection and try again.")
@@ -399,6 +465,12 @@ class RustPushBridge(
 
     companion object {
         private const val TAG = "RustPushBridge"
+
+        /** Guards [connectApns]/[disconnectApns]. On the companion, not the instance,
+         *  because what it protects is a PROCESS-global native resource — one APNs
+         *  socket on one push token — and that must hold even if a second bridge is
+         *  ever constructed. */
+        private val CONNECT_LOCK = Any()
 
         /** True once `libsmarttxt_ffi.so` is bundled and loads. Auto-detected —
          *  no manual flag to flip. */

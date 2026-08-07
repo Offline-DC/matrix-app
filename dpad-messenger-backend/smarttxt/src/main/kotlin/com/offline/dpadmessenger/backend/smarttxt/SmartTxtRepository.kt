@@ -528,9 +528,11 @@ object SmartTxtRepository {
             appendConnectLog(appContext, "ensureClientUp: nativeInit FAILED")
             return false
         }
-        runCatching { RustPushNative.nativeDisconnect() }
-        val connected = runCatching { RustPushNative.nativeConnect() }.getOrElse {
-            Log.w(TAG, "ensureClientUp: nativeConnect threw: ${it.message}")
+        // Through RustPushBridge.connectApns — the one funnel — never straight to the
+        // FFI. It owns the teardown too, so the drop and the reconnect happen under one
+        // lock and the session's own connect cannot slip in between them.
+        val connected = runCatching { bridge().connectApns(rebuild = true) }.getOrElse {
+            Log.w(TAG, "ensureClientUp: connectApns threw: ${it.message}")
             false
         }
         val ready = nativeClientReady()
@@ -546,15 +548,12 @@ object SmartTxtRepository {
      * for 24h+ after a power-off, unable to send OR receive, until a force-stop.
      */
     private fun connectWithRetry(appContext: Context) {
-        // The session's OWN connect is already in flight from connect() above, and it
-        // reaches nativeConnect by a different path than ensureClientUp — so the lock
-        // can't serialise it. Poll first and let it finish. Without this, both raced
-        // into the FFI's 4-attempt APNs ladder at once and the log showed two fully
-        // interleaved connect sequences.
-        repeat(BOOT_CONNECT_GRACE_POLLS) {
-            if (nativeClientReady()) return
-            runCatching { Thread.sleep(BOOT_CONNECT_GRACE_MS) }
-        }
+        // There used to be a 12 s poll here, waiting out the session's own connect
+        // because it reached nativeConnect by a path healLock couldn't cover. That is
+        // gone: both now go through RustPushBridge.connectApns, so this simply blocks
+        // on the funnel and then observes the winner's result. A timing guess is not a
+        // substitute for a single call site, and this one was losing — the 2026-08-06
+        // capture has the two connects 225 ms apart, well inside the grace window.
         for (attempt in 1..BOOT_CONNECT_ATTEMPTS) {
             if (ensureClientUp(appContext)) {
                 if (attempt > 1) Log.i(TAG, "boot connect recovered on attempt $attempt")
@@ -1013,11 +1012,6 @@ object SmartTxtRepository {
      *  a brief race. 4 attempts with linear backoff ≈ 18s, all on a background thread. */
     private const val BOOT_CONNECT_ATTEMPTS = 4
     private const val BOOT_CONNECT_BACKOFF_MS = 3_000L
-
-    /** Wait out the session's own in-flight connect before forcing our own. The FFI's
-     *  internal APNs ladder takes ~7s to exhaust, so ~12s covers it either way. */
-    private const val BOOT_CONNECT_GRACE_POLLS = 12
-    private const val BOOT_CONNECT_GRACE_MS = 1_000L
 
     /** One network callback per process. */
     private val networkRecoveryRegistered = java.util.concurrent.atomic.AtomicBoolean(false)

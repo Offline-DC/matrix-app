@@ -109,6 +109,80 @@ static RECV_GEN: AtomicU64 = AtomicU64::new(0);
 /// (received as `Message::EnableSmsActivation`). Gates green (SMS) sends; persisted
 /// to `<dir>/sms_active` so it survives restarts (the iPhone won't re-announce it).
 static SMS_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Serialises `nativeConnect` end to end, so two callers can never each build an APNs
+/// connection on the same push token. See the comment at the top of `nativeConnect` for
+/// the failure this prevents (two live APS resources reconnecting over each other).
+///
+/// Deliberately NOT the `AppState` mutex: this is held across a blocking network call,
+/// and `st()` is taken by everything.
+///
+/// AS OF THE FUNNEL REFACTOR THIS IS A BACKSTOP, NOT THE MECHANISM. Kotlin now routes
+/// every connect through `RustPushBridge.connectApns`, the single call site, so two
+/// callers should never reach here concurrently in the first place. This stays because
+/// the funnel is a convention a future caller can break by adding one more
+/// `RustPushNative.nativeConnect()`, whereas the lock is enforced — and because the cost
+/// when uncontended is an uncontended mutex acquire. If it ever *does* contend, that is
+/// a bug upstream in Kotlin, and the `already connected — reusing` line below is how you
+/// would see it.
+static CONNECT_LOCK: Mutex<()> = Mutex::new(());
+/// Serialises the two JNI entry points that run a full IDS registration —
+/// `nativeRegister` (sign-in) and `nativeReregister` (Settings ▸ Re-register now).
+///
+/// The 2026-08-06 storm's twin `Reregistering now!` lines came from rustpush
+/// (`ids/identity_manager.rs:363`), which means two `IdentityResource`s were live —
+/// i.e. two `IMClient`s, the downstream effect of the `nativeConnect` race that
+/// [`CONNECT_LOCK`] now closes. So this lock is not the fix for that storm; it closes
+/// the remaining, independent hole: `nativeRegister` and `nativeReregister` are separate
+/// JNI functions reachable from the sign-in flow, the renewal worker and the Settings
+/// screen, and nothing on the Kotlin side stops two of them overlapping. Two concurrent
+/// registrations mean two NAC validation flows and two IDS registrations racing to
+/// decide which identity Apple stores — after which the identity we sign with locally
+/// may not be the one peers fetch, and every recipient reports a decrypt failure.
+///
+/// This matches OpenBubbles by construction, which drives registration from a single
+/// GetX-held `SharedPushState` rather than from several call sites.
+static REGISTER_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take one of the module locks, recovering from poisoning rather than propagating it.
+///
+/// A panic inside a previous connect/register must not wedge connecting or registering
+/// for the life of the process — the data these guard is the *sequencing*, not a shared
+/// invariant that a panic could have left half-written.
+fn lock_recovering(lock: &'static Mutex<()>, what: &str) -> MutexGuard<'static, ()> {
+    match lock.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            log::warn!("{what}: lock was poisoned by an earlier panic — recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+/// What [`reconcile_handles`] decided at client-build time, verbatim, so
+/// [`spawn_startup_summary`] can re-emit it once the log ring is definitely attached.
+///
+/// WHY THIS EXISTS. `build_client_and_receive` runs in the sub-second window before
+/// SmartTxtLogRing's logcat reader attaches, so on every bundle captured so far the
+/// reconcile verdict and the initial REGSTATE line fell outside the capture entirely —
+/// 51 hours of logs across a reboot and an app update could prove no re-registration
+/// ran, but could not show what reconcile decided at startup. Stashing the verdict and
+/// re-logging it later closes that hole without raising the log level.
+static RECONCILE_VERDICT: std::sync::OnceLock<std::sync::Mutex<String>> =
+    std::sync::OnceLock::new();
+
+fn set_reconcile_verdict(v: String) {
+    let cell = RECONCILE_VERDICT.get_or_init(|| std::sync::Mutex::new(String::new()));
+    if let Ok(mut g) = cell.lock() {
+        *g = v;
+    }
+}
+
+fn get_reconcile_verdict() -> String {
+    RECONCILE_VERDICT
+        .get()
+        .and_then(|m| m.lock().ok().map(|g| g.clone()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(reconcile did not run)".to_string())
+}
 
 // Group-chat identity (gid-keying) lives in a dependency-free module so it can be
 // unit-tested on the host (see group_identity.rs + identity-tests/). `canon` moved
@@ -121,8 +195,17 @@ use attachment_stash::{
 
 mod group_identity;
 use group_identity::{
-    canon, effective_send_guid, members_csv, resolve_group_guid, send_identity, updated_meta,
-    GroupMeta,
+    canon, effective_send_guid, group_sends_sms, members_csv, resolve_group_guid, send_identity,
+    updated_meta, GroupMeta,
+};
+
+// Send routing + handle reconciliation POLICY. Same reason as the two modules above:
+// dependency-free so both decisions can be proved on the host (see policy-tests/) rather
+// than by trying to provoke an IDS failure on a handset at the exact moment of a send.
+mod send_policy;
+use send_policy::{
+    delivered_action, error_action, rate_limited_message, reconcile_action, route_for,
+    sms_confirm_action, BlockReason, LookupOutcome, ReceiptAction, ReconcileAction, RouteKind,
 };
 
 #[derive(Default)]
@@ -210,7 +293,66 @@ struct AppState {
     /// suppress a message Kotlin has proven it holds. If that cache is ever lost,
     /// nothing is seeded, nothing is suppressed, and the replay repopulates it.
     seen_guids: std::collections::HashSet<String>,
+
+    /// Messages WE sent, keyed by guid, so a later delivery receipt (IDS 101) or
+    /// decrypt-failure report (IDS 120) can be attributed to a chat.
+    ///
+    /// Both of those arrive as a `MessageInst` with `conversation: None` — rustpush
+    /// builds them with `to_message(None, …)` (aps_client.rs:240 / :283), because
+    /// Apple's receipt payload carries only the sender, the target and the guid.
+    /// The read path gets away with it by falling back to `vec![sender]`, which
+    /// names a 1:1 correctly; that trick FAILS for exactly the case that matters
+    /// here — a 120 from one of MY OWN devices, where the sender is me and the
+    /// counterpart list comes out empty. So the mapping is recorded at send time,
+    /// where the chat is known exactly, for groups as well as 1:1s.
+    ///
+    /// Recorded BEFORE `client.send()` is awaited, not after: in the field a 120 has
+    /// arrived 1.5 s after the transmit while `send()` was still retrying (it did not
+    /// return for three minutes), so a post-send insert would race the receipt it
+    /// exists to explain.
+    sent_chats: std::collections::HashMap<String, SentRecord>,
+    /// Insertion order of `sent_chats`, so it can be FIFO-capped at
+    /// [`SENT_TRACK_CAP`] rather than growing for the life of the process.
+    sent_order: VecDeque<String>,
 }
+
+/// What we remember about a message we sent, for receipt attribution.
+#[derive(Clone, Debug)]
+struct SentRecord {
+    /// The chat_guid the message went to.
+    chat: String,
+    /// The app's optimistic row id (Kotlin's `tmp_…`), echoed back on every status
+    /// event for this message.
+    ///
+    /// WHY THIS IS LOAD-BEARING. Kotlin adopts the server guid only when
+    /// `nativeSendText` RETURNS, and `client.send()` does not return until rustpush's
+    /// delivery-confirmation loop finishes with every target — which on a 9-target
+    /// fan-out with an offline device of the user's own takes minutes (observed:
+    /// `Sending retry 1` still running 66 s after the transmit, `Sending done!` three
+    /// minutes after). The peer's IDS 101 arrives in the meantime — 480 ms after the
+    /// transmit in the 2026-08-06 16:43 capture — so a receipt keyed only by the server
+    /// guid finds a row still called `tmp_…`, matches nothing, and is dropped. The
+    /// message was delivered and the bubble said "Sending…" indefinitely.
+    ///
+    /// OpenBubbles never hits this: it creates its Message row with the final guid
+    /// before sending, so a receipt always matches. Carrying the temp id is the same
+    /// property without restructuring the send path.
+    temp: String,
+    /// How it ACTUALLY went out. Kotlin treats the `service` on a status event as
+    /// authoritative and will repaint the bubble from it, so a receipt must echo the
+    /// route the send really took rather than guessing.
+    is_sms: bool,
+    /// Set once a genuine peer delivery receipt lands. This is the OpenBubbles
+    /// `mistakeFor.isDelivered` guard: after it flips, a 120 for this guid is a
+    /// straggler device complaining about a message that demonstrably arrived, and
+    /// must not turn the bubble red.
+    delivered: bool,
+}
+
+/// How many recently-sent guids to keep for receipt attribution. Receipts land within
+/// seconds-to-minutes of a send, so this only has to outlive the in-flight window;
+/// 256 entries is roughly 20 KB, which matters on a 128 MB-heap handset.
+const SENT_TRACK_CAP: usize = 256;
 
 impl AppState {
     /// Queue a relay-wire event for `nativePollEvents`, enforcing [`inbound::INBOUND_CAP`].
@@ -508,6 +650,57 @@ fn ordered_attachments(s: &AppState) -> Vec<StashedAttachment> {
         .collect()
 }
 
+/// Remember that we sent `guid` to `chat`, so a later IDS 101/120 can be attributed.
+/// Called BEFORE the send is awaited — see [`AppState::sent_chats`] for why.
+///
+/// Memory-only and deliberately not persisted: a receipt for a message sent before the
+/// process died is unattributable, and the correct behaviour there is to ignore it
+/// rather than to resurrect a bubble from a previous run.
+fn remember_sent(guid: &str, chat: &str, is_sms: bool, temp: &str) {
+    if guid.is_empty() || chat.is_empty() {
+        return;
+    }
+    let key = guid.to_uppercase();
+    let mut s = st();
+    if s.sent_chats.contains_key(&key) {
+        return; // already tracked (a resend reuses nothing, but be idempotent)
+    }
+    s.sent_chats.insert(
+        key.clone(),
+        SentRecord {
+            chat: chat.to_string(),
+            temp: temp.to_string(),
+            is_sms,
+            delivered: false,
+        },
+    );
+    s.sent_order.push_back(key);
+    while s.sent_order.len() > SENT_TRACK_CAP {
+        if let Some(old) = s.sent_order.pop_front() {
+            s.sent_chats.remove(&old);
+        }
+    }
+}
+
+/// Look up a guid we sent. `None` = we have no record (sent by another of my devices,
+/// sent before this process started, or aged out of the cap) — the caller must then do
+/// nothing, because it cannot name the chat and must not guess.
+fn sent_record(guid: &str) -> Option<SentRecord> {
+    st().sent_chats.get(&guid.to_uppercase()).cloned()
+}
+
+/// Flip a tracked guid to delivered. Returns the record as it was BEFORE the flip, so
+/// the caller can tell a first receipt from a duplicate (Apple replays receipts on every
+/// APS reconnect, and one message fans out to every device the recipient owns).
+fn mark_sent_delivered(guid: &str) -> Option<SentRecord> {
+    let key = guid.to_uppercase();
+    let mut s = st();
+    let rec = s.sent_chats.get_mut(&key)?;
+    let before = rec.clone();
+    rec.delivered = true;
+    Some(before)
+}
+
 /// Record/refresh a group's identity for `chat_guid` (the pure decision lives in
 /// [group_identity::updated_meta]). Persists only on a real change, mirroring
 /// [remember_thread_handle].
@@ -526,6 +719,45 @@ fn remember_group_meta(chat_guid: &str, members: &[String], cv_name: &Option<Str
         if !key.is_empty() {
             s.group_by_members.insert(key, chat_guid.to_string());
         }
+        (s.files_dir.clone(), s.group_meta.clone())
+    };
+    save_group_meta(&dir, &snapshot);
+}
+
+/// Record which service a GROUP conversation actually runs on, learned from an inbound
+/// message: MMS/SMS relayed by the paired iPhone, or iMessage.
+///
+/// This is the only writer of [GroupMeta::is_sms], and the reason it exists is that a
+/// group chat guid says nothing about its service. Every group we key is
+/// "iMessage;+;<id>" — that prefix is our own naming, not a claim about transport — so
+/// before this, `nativeSendText` had no way to tell an MMS group from an iMessage one
+/// and assumed blue for both.
+///
+/// Last observation wins, which is a deliberate (small) departure from OpenBubbles: OB
+/// fixes `isRpSms` when the chat row is created and never revisits it, because a OB user
+/// who ends up with a mis-serviced chat can delete and recreate it. Our users cannot, and
+/// every group already on disk predates this field, so the first inbound message after
+/// the update is what corrects them.
+fn remember_group_service(chat_guid: &str, is_sms: bool) {
+    if chat_guid.is_empty() || !chat_guid.contains(";+;") {
+        return;
+    }
+    let (dir, snapshot) = {
+        let mut s = st();
+        let mut meta = s.group_meta.get(chat_guid).cloned().unwrap_or_default();
+        if meta.is_sms == Some(is_sms) {
+            return; // unchanged — skip the disk write
+        }
+        let was = meta.is_sms;
+        meta.is_sms = Some(is_sms);
+        s.group_meta.insert(chat_guid.to_string(), meta);
+        // Grep this when a group replies in the wrong colour: it names the exact moment
+        // the conversation's service was decided, and what it was before.
+        log::info!(
+            "group service learned: chat={chat_guid} is_sms={is_sms} (was {was:?}) — \
+             replies go out as {}",
+            if is_sms { "MMS/SMS (green)" } else { "iMessage (blue)" }
+        );
         (s.files_dir.clone(), s.group_meta.clone())
     };
     save_group_meta(&dir, &snapshot);
@@ -1447,10 +1679,33 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     _env: JNIEnv,
     _class: JClass,
 ) -> jboolean {
-    // Idempotent: opening a SECOND APNs connection with the same push token makes
-    // Apple drop both sockets — the "early eof → Send timed out, forcing reload!"
-    // loop. The sign-in path connects, then the REGISTERED screen builds the repo
-    // and would connect again; guard against that by reusing the live connection.
+    // SERIALISED, not merely idempotent. Opening a SECOND APNs connection with the
+    // same push token makes Apple drop both sockets — the "early eof → Send timed
+    // out, forcing reload!" loop.
+    //
+    // The old guard was a bare check of `s.connected`, which is a check-then-act race
+    // with roughly a ONE SECOND window: `APSConnectionResource::new` below blocks on
+    // the network before anything sets `connected = true`. Two callers entering that
+    // window both build a full connection, the second overwrites `s.connection`, and
+    // the FIRST resource is never shut down — so two live APSConnectionResources sit
+    // there reconnecting over each other forever.
+    //
+    // This is not hypothetical: a 2026-08-06 capture has `nativeConnect: resume state`
+    // twice, 225 ms apart on threads 4412 and 4410, followed by two `OB_PARITY`
+    // client builds, two `Reregistering now!`, two NAC validation flows, and then a
+    // continuous APSSTATE Generating/Generated storm every ~300 ms for the rest of the
+    // capture. The two racing callers are Kotlin's `connect()` (from
+    // startBackgroundSyncIfRegistered) and `ensureClientUp` (from the network-recovery
+    // callback) — they take different locks on the Kotlin side, so nothing there
+    // separated them.
+    //
+    // A dedicated lock, NOT `st()`: the state mutex cannot be held across the
+    // `block_on` below without deadlocking every other `st()` caller. Poisoning is
+    // recovered rather than propagated — a panic in a previous connect must not wedge
+    // connecting forever.
+    let _connect_guard = lock_recovering(&CONNECT_LOCK, "nativeConnect");
+    // Re-checked AFTER acquiring, which is the whole point: a caller that queued
+    // behind an in-flight connect must observe its result, not start a second one.
     if {
         let s = st();
         s.connected && s.connection.is_some()
@@ -1880,6 +2135,9 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     _class: JClass<'l>,
     _apple_id: JString<'l>,
 ) -> jstring {
+    // Serialised against nativeReregister — see REGISTER_LOCK. Taken before `st()` is
+    // touched so a queued caller doesn't hold the state mutex while it waits.
+    let _register_guard = lock_recovering(&REGISTER_LOCK, "nativeRegister");
     let (os_config, connection, account, dir) = {
         let mut s = st();
         (s.os_config.clone(), s.connection.clone(), s.account.take(), s.files_dir.clone())
@@ -2007,6 +2265,10 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
 ) -> jstring {
+    // Serialised against nativeRegister — see REGISTER_LOCK. A user tapping "Re-register
+    // now" while the renewal worker is mid-register is the realistic way two of these
+    // overlap, and it is exactly the case that must not run two NAC flows at once.
+    let _register_guard = lock_recovering(&REGISTER_LOCK, "nativeReregister");
     let client = st().client.clone();
     let Some(client) = client else {
         return out(&mut env, err_json("iMessage isn't connected right now. Open Smart Txt Settings and tap Re-register now to reconnect, then restart your phone."));
@@ -2094,6 +2356,50 @@ fn spawn_regstate_watcher(client: Arc<IMClient>, my_gen: u64) {
             }));
         }
         log::info!("regstate watcher ended (gen {my_gen})");
+    });
+}
+
+/// Re-emit the startup facts on a delay, so they survive the log ring's attach gap.
+///
+/// THE PROBLEM THIS SOLVES. `build_client_and_receive` — and therefore
+/// [`reconcile_handles`] and `spawn_regstate_watcher`'s initial emit — run in the
+/// sub-second window before SmartTxtLogRing's logcat reader attaches. On every bundle
+/// captured so far, both fell outside the file: 51 hours of logs across a reboot and an
+/// app update could prove (via the pinned rereg deadline and a REGSTATE watcher that
+/// never fired) that no re-registration ran, but could NOT show what reconcile decided
+/// at startup. That gap is exactly the window an engineer asks about first.
+///
+/// Two emissions, at 30s and 5min. The observed capture loses ~62s spread over 37
+/// reader respawns, so a single delayed line could still land in a hole; two, an order
+/// of magnitude apart, effectively cannot. Both are one line, once per client build.
+///
+/// Grep `STARTUP:` to get the whole startup posture from any bundle.
+fn spawn_startup_summary(client: &Arc<IMClient>, my_gen: u64) {
+    // Weak, not Arc, and borrowed rather than cloned. This task sleeps for up to 5
+    // minutes; holding a strong reference would pin a REPLACED IMClient (and its key
+    // cache) alive for that whole window on a 128 MB-heap device that is already being
+    // low-memory-killed. Nothing here needs to keep the client alive — if it has been
+    // dropped, there is nothing left to report.
+    let weak = Arc::downgrade(client);
+    rt().spawn(async move {
+        for (i, delay_s) in [30u64, 300u64].into_iter().enumerate() {
+            tokio::time::sleep(std::time::Duration::from_secs(delay_s)).await;
+            if RECV_GEN.load(Ordering::SeqCst) != my_gen {
+                return; // superseded by a newer client; its own summary will fire
+            }
+            let Some(client) = weak.upgrade() else {
+                return; // client already dropped — nothing to summarise
+            };
+            let handles = client.identity.get_handles().await;
+            let regstate = regstate_payload(&client).await;
+            log::info!(
+                "STARTUP: (emit {}/2, +{delay_s}s) reconcile={} | handles={handles:?} | \
+                 regstate={regstate} | sms_active={} | gen={my_gen}",
+                i + 1,
+                get_reconcile_verdict(),
+                SMS_ACTIVE.load(Ordering::SeqCst),
+            );
+        }
     });
 }
 
@@ -2385,6 +2691,7 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
          will send the same list OpenBubbles sends",
         IDS_SERVICES.len()
     );
+
     let client = IMClient::new(
         connection.clone(),
         users,
@@ -2414,6 +2721,10 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
     // Log-only; see the fn doc. Same generation guard as the regstate watcher so a
     // recover's fresh watcher replaces this one instead of doubling up.
     spawn_apsstate_watcher(connection.clone(), my_gen);
+    // Log-only. Re-states what reconcile decided above plus the live registration
+    // posture, on a delay, because everything logged in THIS function lands before the
+    // log ring attaches and has never once appeared in a captured bundle.
+    spawn_startup_summary(&client, my_gen);
     rt().spawn(async move {
         let mut sub = connection.messages_cont.subscribe();
         loop {
@@ -2509,6 +2820,152 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
         let dir = st().files_dir.clone();
         save_sms_active(&dir, *enabled);
         st().queue_event(serde_json::json!({ "type": "sms_activation", "enabled": *enabled }));
+        return;
+    }
+    // ---- Outbound receipts: did the message we sent actually arrive? ----------
+    //
+    // Both of these used to fall through every `if let` below and be dropped in silence,
+    // which is what made a message nobody could decrypt look exactly like a delivered
+    // one: the bubble's "delivered" was emitted optimistically at send time and nothing
+    // could ever correct it in either direction. Ported from OpenBubbles'
+    // `rustpush_service.dart` (the `Message_Delivered`/`Message_Read` arm and the
+    // `Message_Error` arm), with the same guards; the decisions themselves live in
+    // send_policy.rs so they are unit-tested rather than reasoned about.
+    //
+    // Neither receipt carries a conversation — rustpush builds them with
+    // `to_message(None, …)` — so the chat comes from the send-time record.
+    let receipt_sender = msg.sender.clone().unwrap_or_default();
+    let from_self = !receipt_sender.is_empty()
+        && my_handles.iter().any(|h| canon(h) == canon(&receipt_sender));
+    // A GREEN message's delivery confirmation. It arrives as IDS 146 (sent) / 149
+    // (failed) on topic com.apple.private.alloy.sms, from the paired iPhone — never as a
+    // 101, because the recipient has no Apple device to send one. Handled before the
+    // Delivered arm so the two can never be confused: they carry opposite `from_self`
+    // rules (see `sms_confirm_action`).
+    if let Message::SmsConfirmSent(sent_ok) = &msg.message {
+        let sent_ok = *sent_ok;
+        let guid = msg.id.to_uppercase();
+        // Flip the record first, on success only, so a duplicate replay sees
+        // `delivered = true` and a late 149 cannot un-deliver a confirmed message.
+        let before = if sent_ok { mark_sent_delivered(&guid) } else { sent_record(&guid) };
+        let action = sms_confirm_action(
+            before.is_some(),
+            before.as_ref().is_some_and(|r| r.delivered),
+            from_self,
+            sent_ok,
+        );
+        match action {
+            ReceiptAction::MarkDelivered => {
+                let rec = before.expect("tracked");
+                log::info!(
+                    "recv sms-confirm: guid={guid} from={receipt_sender} chat={} temp={} \
+                     — the paired iPhone transmitted it (IDS 146)",
+                    rec.chat,
+                    rec.temp
+                );
+                st().queue_event(serde_json::json!({
+                    "type": "message_status",
+                    "chatGuid": rec.chat,
+                    "guid": guid,
+                    "tempGuid": rec.temp,
+                    "status": "delivered",
+                    "service": "SMS",
+                }));
+            }
+            ReceiptAction::MarkFailed => {
+                let rec = before.expect("tracked");
+                log::warn!(
+                    "recv sms-confirm: guid={guid} from={receipt_sender} chat={} temp={} \
+                     — the paired iPhone could NOT send it (IDS 149)",
+                    rec.chat,
+                    rec.temp
+                );
+                st().queue_event(serde_json::json!({
+                    "type": "message_status",
+                    "chatGuid": rec.chat,
+                    "guid": guid,
+                    "tempGuid": rec.temp,
+                    "status": "failed",
+                    "service": "SMS",
+                    "detail": format!("Your iPhone couldn't send this text. {SMS_FORWARDING_REMEDY}"),
+                }));
+            }
+            ReceiptAction::Ignore(why) => log::info!(
+                "recv sms-confirm: guid={guid} from={receipt_sender} sent_ok={sent_ok} \
+                 — ignored ({why})"
+            ),
+        }
+        return;
+    }
+    if matches!(&msg.message, Message::Delivered) {
+        let guid = msg.id.to_uppercase();
+        // Flip the record first so a 120 racing this receipt sees `delivered = true`.
+        let before = if from_self { sent_record(&guid) } else { mark_sent_delivered(&guid) };
+        match delivered_action(before.is_some(), from_self) {
+            ReceiptAction::MarkDelivered => {
+                let rec = before.expect("tracked");
+                if rec.delivered {
+                    return; // duplicate: Apple replays receipts on every APS reconnect
+                }
+                log::info!(
+                    "recv delivered: guid={guid} from={receipt_sender} chat={} temp={} (IDS 101)",
+                    rec.chat,
+                    rec.temp
+                );
+                st().queue_event(serde_json::json!({
+                    "type": "message_status",
+                    "chatGuid": rec.chat,
+                    "guid": guid,
+                    "tempGuid": rec.temp,
+                    "status": "delivered",
+                    "service": if rec.is_sms { "SMS" } else { "iMessage" },
+                }));
+            }
+            ReceiptAction::Ignore(why) => {
+                log::info!("recv delivered: guid={guid} from={receipt_sender} — ignored ({why})")
+            }
+            ReceiptAction::MarkFailed => unreachable!("delivered_action never fails a message"),
+        }
+        return;
+    }
+    if let Message::Error(err) = &msg.message {
+        let guid = err.for_uuid.to_uppercase();
+        let rec = sent_record(&guid);
+        let action = error_action(
+            rec.is_some(),
+            rec.as_ref().is_some_and(|r| r.delivered),
+            from_self,
+        );
+        match action {
+            ReceiptAction::MarkFailed => {
+                let rec = rec.expect("tracked");
+                log::warn!(
+                    "recv send-failure: guid={guid} chat={} reported by MY OWN handle \
+                     {receipt_sender} status={} str={} — failing the bubble (IDS 120)",
+                    rec.chat,
+                    err.status,
+                    err.status_str
+                );
+                st().queue_event(serde_json::json!({
+                    "type": "message_status",
+                    "chatGuid": rec.chat,
+                    "guid": guid,
+                    "tempGuid": rec.temp,
+                    "status": "failed",
+                    "service": if rec.is_sms { "SMS" } else { "iMessage" },
+                    // Shown on the failed bubble (Models.kt `errorReason`) so the user
+                    // gets a reason and a resend, not a silent red mark.
+                    "detail": format!("Couldn't be delivered ({}).", err.status_str),
+                }));
+            }
+            ReceiptAction::Ignore(why) => log::info!(
+                "recv send-failure: guid={guid} from={receipt_sender} str={} — ignored ({why})",
+                err.status_str
+            ),
+            ReceiptAction::MarkDelivered => {
+                unreachable!("error_action never delivers a message")
+            }
+        }
         return;
     }
     // Cross-device read sync: Apple tells THIS device that I read a chat on another
@@ -2756,6 +3213,30 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
         let mut stash: Vec<(String, Attachment)> = Vec::new();
         for (idx, part) in normal.parts.0.iter().enumerate() {
             if let MessagePart::Attachment(att) = &part.part {
+                // Two attachment parts are plumbing, not content, and neither can be
+                // opened — shipping them gave every received MMS a phantom
+                // "Tap to view file" the user could only fail to open:
+                //
+                //  - `application/smil` is the MMS layout document. rustpush's
+                //    `MessageParts::parse_sms` makes an Attachment out of EVERY part
+                //    whose mime isn't exactly "text/plain", and every MMS carries a
+                //    smil, so every inbound MMS gained one of these.
+                //  - `iris` is the silent video half of a Live Photo; the still image
+                //    is a separate part and is the thing to show.
+                //
+                // OpenBubbles inherits the identical rustpush behaviour and drops both
+                // at exactly this point (`rustpush_service.dart`: "who needs display
+                // info amirite?"), which is why it never showed the phantom. Filtering
+                // here rather than in rustpush keeps rustpush byte-identical to
+                // upstream. `idx` still enumerates ALL parts, so the attachment guids
+                // and download indices are unchanged.
+                if att.iris || att.mime.eq_ignore_ascii_case("application/smil") {
+                    log::debug!(
+                        "recv msg: dropping non-content part idx={idx} mime={} iris={}",
+                        att.mime, att.iris
+                    );
+                    continue;
+                }
                 let guid = format!("{}:{}", msg.id, idx);
                 // A voice memo (the message's `voice` flag) is an audio attachment
                 // whose mime often ISN'T "audio/*" — iMessage sends CAF as
@@ -2791,6 +3272,13 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
 
         // Green (SMS, forwarded by the iPhone) vs blue (iMessage).
         let service = if matches!(normal.service, MessageType::SMS { .. }) { "SMS" } else { "iMessage" };
+
+        // A GROUP's service is a property of the conversation, and this message is the
+        // only place we ever get told what it is. Record it so a reply goes out on the
+        // same transport the thread already runs on — see `remember_group_service`.
+        if is_group {
+            remember_group_service(&chat_guid, service == "SMS");
+        }
 
         // Self-heal SMS forwarding state: RECEIVING a forwarded green text is proof
         // the paired iPhone's Text Message Forwarding is live right now. Trust that
@@ -2930,11 +3418,15 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     _class: JClass<'l>,
     chat_guid: JString<'l>,
     text: JString<'l>,
-    _temp_guid: JString<'l>,
+    temp_guid: JString<'l>,
     reply_to: JString<'l>,
 ) -> jstring {
     let chat = jstr(&mut env, &chat_guid);
     let body = jstr(&mut env, &text);
+    // The app's optimistic row id. Echoed back on every status event for this message
+    // so a receipt can find the bubble before the server guid has been adopted — see
+    // `SentRecord::temp` for why that window is minutes wide, not milliseconds.
+    let temp_guid = jstr(&mut env, &temp_guid);
     let reply_to = jstr(&mut env, &reply_to);
     let client = st().client.clone();
     let Some(client) = client else {
@@ -2949,11 +3441,45 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         let Some(handle) = thread_send_handle(&chat, &handles).or_else(|| pick_send_handle(&handles)) else {
             return "ERR:No sending number or email is set up for this account (no registered handles).".to_string();
         };
-        // A group ("iMessage;+;a,b,c") always goes over iMessage to every member;
-        // only a 1:1 gets per-number SMS-forwarding routing.
+        // A group is NOT automatically an iMessage group. A thread carried over the
+        // paired iPhone's Text Message Forwarding is an MMS group, and its members may
+        // not be on iMessage at all — this used to hardcode iMessage for every group,
+        // which either half-landed (only the members who happen to have iMessage got it,
+        // while the bubble said "Delivered") or failed outright with NoValidTargets.
+        // `remember_group_service` learns the service from inbound traffic; here we obey
+        // it. A group nothing has ever arrived on stays blue, as before.
         let is_group = chat.contains(";+;");
+        let group_is_sms = if is_group {
+            // Two statements, not one expression: `st()` is a mutex guard and nesting
+            // two live guards in one expression self-deadlocks.
+            let key = { let s = st(); effective_send_guid(&chat, &s.group_meta) };
+            let s = st();
+            group_sends_sms(s.group_meta.get(&key))
+        } else {
+            false
+        };
         let service = if is_group {
-            MessageType::IMessage
+            if group_is_sms {
+                // Same block reason a 1:1 green send gets, for the same cause: without
+                // forwarding live the iPhone will not relay it, and "NoValidTargets"
+                // tells the user nothing they can act on.
+                if !SMS_ACTIVE.load(Ordering::SeqCst) {
+                    return format!(
+                        "ERR:Text messages aren't set up for this phone yet. {SMS_FORWARDING_REMEDY}"
+                    );
+                }
+                match sms_route(&handles) {
+                    Route::Block(reason) => return format!("ERR:{reason}"),
+                    Route::Sms { using_number } => MessageType::SMS {
+                        is_phone: false,
+                        using_number,
+                        from_handle: None,
+                    },
+                    Route::IMessage => MessageType::IMessage,
+                }
+            } else {
+                MessageType::IMessage
+            }
         } else {
             let recipient = recipient_from_chat_guid(&chat);
             match decide_route(&client, &handle, &recipient).await {
@@ -2994,6 +3520,10 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             &handle,
             Message::Message(msg),
         );
+        // Track BEFORE awaiting the send: `MessageInst::new` has already minted the
+        // guid, and a delivery receipt or a decrypt-failure report routinely beats
+        // `send()`'s return by minutes.
+        remember_sent(&inst.id, &chat, is_sms, &temp_guid);
         match client.send(&mut inst).await {
             Ok(_) => {
                 // Pin this thread to the handle we just sent from, so every later
@@ -3001,23 +3531,56 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
                 // first message fixes its self-handle here.
                 remember_thread_handle(&chat, &handle);
                 let guid = inst.id.clone(); // VERIFY: server guid field name on MessageInst
-                // Optimistic "delivered" so the bubble shows a receipt. Apple's real
-                // delivery receipt arrives later over APNs (via the receive loop).
+                // "sent", NOT "delivered". `send()` returning Ok means Apple accepted
+                // our ciphertext for transmission — it says nothing about whether any
+                // recipient could decrypt it. This used to emit "delivered" here, which
+                // made a receipt-bearing success and a message every device rejected
+                // render identically, and left the bubble permanently unable to be
+                // corrected (nothing downstream ever consumed the real receipt).
+                // "delivered" is now emitted only on a genuine IDS 101 from the peer;
+                // see the Message::Delivered arm in push_relay_event.
                 st().queue_event(serde_json::json!({
                     "type": "message_status",
                     "chatGuid": chat,
                     "guid": guid,
-                    "status": "delivered",
+                    "tempGuid": temp_guid,
+                    "status": "sent",
                     "service": if is_sms { "SMS" } else { "iMessage" },
                 }));
                 guid
             }
             Err(e) => {
-                log::error!("nativeSendText: send failed: {e:?}");
+                log::error!("nativeSendText: send failed: {e:?} (is_sms={is_sms})");
                 // Surface the real reason to the UI (via the ERR: channel) instead of a
                 // generic "couldn't send". Display is the human-readable thiserror message;
                 // the full Debug is in logcat above.
-                format!("ERR:Send failed: {e}")
+                //
+                // For a GREEN send, lead with the remedy instead of the error. The
+                // underlying text here is a transport-level message ("NoValidTargets",
+                // a timeout) that tells the user nothing they can act on, whereas the
+                // forwarding toggle is a fix that has worked in the field. The raw error
+                // is kept in parentheses so support still has it.
+                let fallback = if is_sms {
+                    // The raw `{e}` used to be appended here "so support still has it".
+                    // In practice it is rustpush's own text, and for an Apple rate-limit
+                    // that is ~450 characters of Apple Support boilerplate — a Customer
+                    // Code, an apple.co link, and advice about what not to tell Apple —
+                    // which overflowed a 240x272 screen with nothing to scroll. It is
+                    // still in logcat one line above (`send failed: …`), which is where
+                    // support reads it from anyway.
+                    format!("ERR:Couldn't send as a text message. {SMS_FORWARDING_REMEDY}")
+                } else {
+                    format!("ERR:Send failed: {e}")
+                };
+                // Checked FIRST and for both colours. A rate limit is not a forwarding
+                // problem and not a per-message problem: nothing the user does to this
+                // send will help, and the two messages below would send them to iPhone
+                // settings (green) or paste Apple's ~450-character support text into a
+                // 240x272 bubble (blue). Neither is true or useful.
+                match rate_limited_message(rate_limit_wait_s(&e)) {
+                    Some(msg) => format!("ERR:{msg}"),
+                    None => fallback,
+                }
             }
         }
     });
@@ -3034,13 +3597,14 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
     chat_guid: JString<'l>,
-    _temp_guid: JString<'l>,
+    temp_guid: JString<'l>,
     data: JByteArray<'l>,
     mime: JString<'l>,
     name: JString<'l>,
     caption: JString<'l>,
 ) -> jstring {
     let chat = jstr(&mut env, &chat_guid);
+    let temp_guid = jstr(&mut env, &temp_guid); // see nativeSendText
     let mime_s = jstr(&mut env, &mime);
     let name_s = jstr(&mut env, &name);
     let caption_s = jstr(&mut env, &caption);
@@ -3062,11 +3626,46 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         let Some(handle) = thread_send_handle(&chat, &handles).or_else(|| pick_send_handle(&handles)) else {
             return "ERR:No sending number or email is set up for this account (no registered handles).".to_string();
         };
-        // Group attachments go over iMessage to every member; only a 1:1 gets
-        // per-number SMS-forwarding routing.
+        // Same rule as nativeSendText: an MMS group's attachment has to go out as MMS.
+        // A thread carried over the
+        // paired iPhone's Text Message Forwarding is an MMS group, and its members may
+        // not be on iMessage at all — this used to hardcode iMessage for every group,
+        // which either half-landed (only the members who happen to have iMessage got it,
+        // while the bubble said "Delivered") or failed outright with NoValidTargets.
+        // `remember_group_service` learns the service from inbound traffic; here we obey
+        // it. A group nothing has ever arrived on stays blue, as before.
         let is_group = chat.contains(";+;");
+        let group_is_sms = if is_group {
+            // Two statements, not one expression: `st()` is a mutex guard and nesting
+            // two live guards in one expression self-deadlocks.
+            let key = { let s = st(); effective_send_guid(&chat, &s.group_meta) };
+            let s = st();
+            group_sends_sms(s.group_meta.get(&key))
+        } else {
+            false
+        };
         let service = if is_group {
-            MessageType::IMessage
+            if group_is_sms {
+                // Same block reason a 1:1 green send gets, for the same cause: without
+                // forwarding live the iPhone will not relay it, and "NoValidTargets"
+                // tells the user nothing they can act on.
+                if !SMS_ACTIVE.load(Ordering::SeqCst) {
+                    return format!(
+                        "ERR:Text messages aren't set up for this phone yet. {SMS_FORWARDING_REMEDY}"
+                    );
+                }
+                match sms_route(&handles) {
+                    Route::Block(reason) => return format!("ERR:{reason}"),
+                    Route::Sms { using_number } => MessageType::SMS {
+                        is_phone: false,
+                        using_number,
+                        from_handle: None,
+                    },
+                    Route::IMessage => MessageType::IMessage,
+                }
+            } else {
+                MessageType::IMessage
+            }
         } else {
             let recipient = recipient_from_chat_guid(&chat);
             match decide_route(&client, &handle, &recipient).await {
@@ -3138,6 +3737,8 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             &handle,
             Message::Message(normal),
         );
+        // See nativeSendText: track before the await, and report "sent" not "delivered".
+        remember_sent(&inst.id, &chat, is_sms, &temp_guid);
         match client.send(&mut inst).await {
             Ok(_) => {
                 remember_thread_handle(&chat, &handle);
@@ -3146,14 +3747,37 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
                     "type": "message_status",
                     "chatGuid": chat,
                     "guid": guid,
-                    "status": "delivered",
+                    "tempGuid": temp_guid,
+                    "status": "sent",
                     "service": if is_sms { "SMS" } else { "iMessage" },
                 }));
                 guid
             }
             Err(e) => {
-                log::error!("nativeSendAttachment: send failed: {e:?}");
-                format!("ERR:Send failed: {e}")
+                log::error!("nativeSendAttachment: send failed: {e:?} (is_sms={is_sms})");
+                // Same split as nativeSendText — a green attachment fails for the same
+                // reason and has the same fix.
+                let fallback = if is_sms {
+                    // The raw `{e}` used to be appended here "so support still has it".
+                    // In practice it is rustpush's own text, and for an Apple rate-limit
+                    // that is ~450 characters of Apple Support boilerplate — a Customer
+                    // Code, an apple.co link, and advice about what not to tell Apple —
+                    // which overflowed a 240x272 screen with nothing to scroll. It is
+                    // still in logcat one line above (`send failed: …`), which is where
+                    // support reads it from anyway.
+                    format!("ERR:Couldn't send as a text message. {SMS_FORWARDING_REMEDY}")
+                } else {
+                    format!("ERR:Send failed: {e}")
+                };
+                // Checked FIRST and for both colours. A rate limit is not a forwarding
+                // problem and not a per-message problem: nothing the user does to this
+                // send will help, and the two messages below would send them to iPhone
+                // settings (green) or paste Apple's ~450-character support text into a
+                // 240x272 bubble (blue). Neither is true or useful.
+                match rate_limited_message(rate_limit_wait_s(&e)) {
+                    Some(msg) => format!("ERR:{msg}"),
+                    None => fallback,
+                }
             }
         }
     });
@@ -3216,31 +3840,156 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     }
 }
 
-/// OpenBubbles-style handle reconciliation. rustpush only compares IDS-vended handles
-/// against registered ones REACTIVELY (on an IDS command-66 push; see identity_manager).
-/// This is the PROACTIVE form: if `get_possible_handles()` (what Apple says this account
-/// can use) differs from `get_handles()` (what we've actually registered), force a
-/// reregister to adopt the delta. Run on login and on the app's reconnect/foreground/
-/// renewal triggers so a handle Apple vends without a push (e.g. a phone number missing
-/// from the first id-get-handles) is still picked up. Handles are then read live from
-/// rustpush (get_handles) wherever needed — nothing is cached. Mirrors OB's
-/// `if real_handles != my_handles { refresh }`.
+/// Backstop handle reconciliation, deliberately narrow.
+///
+/// WHAT rustpush ALREADY DOES, AND WHY WE MOSTLY DEFER TO IT. rustpush compares
+/// IDS-vended handles against registered ones in `identity_manager.rs` — but only when
+/// Apple pushes IDS command 66 ("handles changed"), and it drives that with `refresh()`.
+/// The gating is the safety property: Apple sends 66 when something actually changed, so
+/// a persistent mismatch can never spin. OpenBubbles adds no automatic trigger at all —
+/// its only reregister path is three UI buttons.
+///
+/// WHY THIS STILL EXISTS. A command-66 push can be missed (the socket was down, the
+/// process was dead, the notification was dropped), and nothing re-delivers it. This is
+/// the one case rustpush's reactive path structurally cannot cover, so we keep a
+/// backstop — but scoped to that case only.
+///
+/// WHAT CHANGED, AND WHY EACH PART MATTERS. The previous version fired on set
+/// INEQUALITY, on every client build, via `refresh_now()`. All three were wrong:
+///
+///  1. **Direction.** Inequality fires in both directions, but only ONE direction is
+///     actionable. `possible − registered` (IDS vends a handle we never registered) is
+///     fixable: reregistering adopts it. `registered − possible` (we hold a handle IDS
+///     no longer vends) is NOT: `register()` stores back exactly the URIs Apple echoes
+///     (rustpush `user.rs:1156-1174`) and only ever INSERTS into `user.registration`
+///     (`:1180`), never clears — so a stale entry survives the reregister and the sets
+///     mismatch again on the next connect, forever. Inequality therefore had an
+///     unbounded-loop state with no exit. A subset test does not.
+///  2. **Cadence.** Fired on every `build_client_and_receive` — every connect, cold
+///     start and network flap. Now at most once per [`RECONCILE_COOLDOWN_S`], persisted
+///     to `<dir>/reconcile_last` so a reboot loop can't turn into a register loop.
+///  3. **Backoff.** `refresh_now()` lands on the `retry_now_recv` arm of the
+///     ResourceManager's backoff select (rustpush `util.rs:1026-1032`), CANCELLING the
+///     5min→24h ladder; `refresh()` does not wake that arm. On an account Apple is
+///     already throttling, `refresh_now()` converts a backoff into an immediate retry —
+///     precisely the wrong response. We now use `refresh()`, exactly as rustpush's own
+///     command-66 handler does.
+///
+/// Returns the live handles either way; the verdict is stashed for the startup summary.
 async fn reconcile_handles(client: &Arc<IMClient>) -> Vec<String> {
-    let my: std::collections::HashSet<String> =
+    let dir = st().files_dir.clone();
+    // BTreeSet, not HashSet: the sets go straight into log lines, and a stable ordering
+    // is what lets two bundles from the same handset be diffed.
+    let registered: std::collections::BTreeSet<String> =
         client.identity.get_handles().await.into_iter().collect();
-    match client.identity.get_possible_handles().await {
-        Ok(possible) if possible != my => {
+
+    let possible: std::collections::BTreeSet<String> =
+        match client.identity.get_possible_handles().await {
+            Ok(p) => p.into_iter().collect(),
+            Err(e) => {
+                // Fail CLOSED. An id-get-handles failure is not evidence of anything and
+                // must never itself become a reason to touch Apple again.
+                let v = format!("get_possible_handles failed ({e}) — keeping current handles");
+                log::warn!("reconcile: {v}");
+                set_reconcile_verdict(v);
+                return client.identity.get_handles().await;
+            }
+        };
+
+    let action = reconcile_action(
+        &possible,
+        &registered,
+        reconcile_age_s(&dir),
+        RECONCILE_COOLDOWN_S,
+    );
+
+    let verdict = match action {
+        ReconcileAction::UpToDate { stale } if stale.is_empty() => {
+            "registered handles match IDS".to_string()
+        }
+        ReconcileAction::UpToDate { stale } => format!(
+            "registered handles cover IDS; {} stale entry/entries held locally ({stale:?}) \
+             — NOT reregistering (a reregister cannot clear these)",
+            stale.len()
+        ),
+        ReconcileAction::Deferred { missing, age_s, cooldown_s, .. } => format!(
+            "IDS vends {} unregistered handle(s) ({missing:?}) but the last attempt was {age_s}s \
+             ago (< {cooldown_s}s cooldown) — deferring to rustpush's command-66 path",
+            missing.len()
+        ),
+        ReconcileAction::Reregister { missing, stale } => {
+            // Stamp BEFORE the attempt, so a crash or a hang inside refresh() still
+            // consumes the window. Otherwise a handset that dies mid-register retries on
+            // every boot — the exact loop the cooldown exists to prevent.
+            save_reconcile_now(&dir);
             log::info!(
-                "reconcile: IDS vends handles we haven't registered (possible={possible:?} registered={my:?}) — reregistering"
+                "reconcile: IDS vends {} handle(s) we haven't registered ({missing:?}; \
+                 registered={registered:?}; stale={stale:?}) — requesting reregister via \
+                 refresh() (backoff-preserving)",
+                missing.len()
             );
-            if let Err(e) = client.identity.refresh_now().await {
-                log::warn!("reconcile: reregister failed: {e}");
+            // refresh(), NOT refresh_now(): see point 3 in the doc comment.
+            match client.identity.refresh().await {
+                Ok(()) => {
+                    let after: std::collections::BTreeSet<String> =
+                        client.identity.get_handles().await.into_iter().collect();
+                    let still: Vec<String> =
+                        missing.iter().filter(|h| !after.contains(*h)).cloned().collect();
+                    if still.is_empty() {
+                        format!("adopted {} previously-unregistered handle(s) {missing:?}", missing.len())
+                    } else {
+                        // The permanent-mismatch signature. If this line ever appears,
+                        // Apple's register response is omitting a URI that id-get-handles
+                        // vends, and the cooldown above is the only thing between us and a
+                        // register loop. Worth an alert, not a silent retry next boot.
+                        format!(
+                            "reregistered but {} handle(s) STILL unregistered {still:?} — Apple's \
+                             register response omits a URI id-get-handles vends; not retrying \
+                             before cooldown",
+                            still.len()
+                        )
+                    }
+                }
+                Err(e) => {
+                    format!("reregister request failed ({e}) — leaving it to rustpush's retry ladder")
+                }
             }
         }
-        Ok(_) => log::info!("reconcile: registered handles already match IDS"),
-        Err(e) => log::warn!("reconcile: get_possible_handles failed ({e}) — keeping current handles"),
-    }
+    };
+
+    log::info!("reconcile: {verdict}");
+    set_reconcile_verdict(verdict);
     client.identity.get_handles().await
+}
+
+/// Minimum spacing between two automatic reconcile-driven reregisters, persisted across
+/// process death. 6 h matches the Kotlin self-heal cooldown (`SmartTxtRepository`
+/// `HEAL_COOLDOWN_MS`) so the two app-side Apple-facing paths can't compound.
+const RECONCILE_COOLDOWN_S: u64 = 6 * 60 * 60;
+
+fn reconcile_stamp_path(dir: &str) -> std::path::PathBuf {
+    Path::new(dir).join("reconcile_last")
+}
+
+/// Seconds since the last reconcile-driven reregister, or `None` if there has never been
+/// one (or the stamp is unreadable/corrupt — both mean "no evidence of a recent attempt",
+/// and the cooldown is a rate limit, not a correctness gate).
+fn reconcile_age_s(dir: &str) -> Option<u64> {
+    let raw = std::fs::read_to_string(reconcile_stamp_path(dir)).ok()?;
+    let then: u64 = raw.trim().parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    // A clock that moved backwards (NTP step, user change) reads as "no recent attempt"
+    // rather than as a huge age — the conservative direction is to keep the cooldown.
+    Some(now.saturating_sub(then))
+}
+
+fn save_reconcile_now(dir: &str) {
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        let _ = std::fs::write(reconcile_stamp_path(dir), now.as_secs().to_string());
+    }
 }
 
 /// The user's chosen send-from handle if it's still one of their registered
@@ -3298,6 +4047,54 @@ enum Route {
     Block(String),
 }
 
+/// The remedy that actually works when a green (SMS) send fails: toggle Text Message
+/// Forwarding OFF and then back ON, for ALL devices, on the paired iPhone.
+///
+/// WHY THIS WORDING, AND NOT "MAKE SURE IT'S ON". The failure mode in the field is that
+/// the iPhone still SHOWS the switch as on while the relay behind it is dead — the send
+/// is accepted and never lands. Telling someone to check a switch that is visibly already
+/// on reads as advice that doesn't apply, so they stop reading. The OFF→ON cycle is what
+/// re-establishes the relay, and it let a stuck send go through immediately on the next
+/// try. It is also safe advice when forwarding genuinely IS off: "turn it off" is then a
+/// no-op and "turn it back on" is the fix.
+///
+/// ALL devices, not just this one: that is what was actually done on the handset this
+/// came from, and it is the instruction we know worked. Naming one device would also make
+/// the user hunt for which row is theirs on a list of similar-looking names.
+///
+/// One constant so the SMS-forwarding block message and both send-failure paths cannot
+/// drift into telling the user three different things.
+/// How long Apple says to wait before trying again, if this failure is a rate limit.
+///
+/// rustpush wraps the real cause: a rate-limited send arrives as
+/// `DoNotRetry(ResourceFailure(ResourceFailure { retry_wait: Some(300), error: … }))`,
+/// and `DoNotRetry` can nest, so this unwraps rather than matching one fixed shape. The
+/// inner `error` is checked too, because a `ResourceFailure` whose own `retry_wait` is
+/// empty may still wrap one that has it.
+///
+/// Matching on rustpush's public error type, NOT on its Debug string: the Display text
+/// is Apple's and changes with Apple's mood, whereas these variants are part of the
+/// library's API.
+/// Returns `(seconds_to_wait, is_connectivity)`. The bool is why the INNER error is
+/// inspected rather than just the wait: booting with no signal produces the identical
+/// `ResourceFailure { retry_wait: Some(300) }` wrapper that an Apple rate limit does
+/// (captured 2026-08-07 10:39, Wi-Fi off at power-on), and only the cause underneath
+/// distinguishes them. `RequestError` is reqwest's — DNS, TLS, connection refused.
+fn rate_limit_wait_s(e: &PushError) -> Option<(u64, bool)> {
+    match e {
+        PushError::DoNotRetry(inner) => rate_limit_wait_s(inner),
+        PushError::ResourceFailure(f) => f
+            .retry_wait
+            .map(|w| (w, matches!(&*f.error, PushError::RequestError(_))))
+            .or_else(|| rate_limit_wait_s(&f.error)),
+        _ => None,
+    }
+}
+
+const SMS_FORWARDING_REMEDY: &str = "On your iPhone (same Apple ID): Settings ▸ Messages ▸ \
+     Text Message Forwarding ▸ toggle all devices OFF, then back ON. Then send again. \
+     If that doesn't work, email support@dumb.co.";
+
 /// Build the green-SMS route from my own account's phone handle, or a user-facing
 /// reason we can't. Shared by `decide_route`'s "confirmed not on iMessage" and
 /// "couldn't check" paths.
@@ -3313,46 +4110,84 @@ async fn decide_route(client: &IMClient, handle: &str, recipient: &str) -> Route
     let is_phone = recipient.starts_with("tel:");
     let sms_active = SMS_ACTIVE.load(Ordering::SeqCst);
     let targets = vec![recipient.to_string()];
-    let valid = match client
+    // Collapse rustpush's Result<Vec<String>> into the three states that actually matter.
+    // `validate_targets` returns the caller's own strings filtered by cache membership,
+    // so an exact match against `recipient` is sound — no normalisation gap.
+    let (outcome, detail) = match client
         .identity
         .validate_targets(&targets, "com.apple.madrid", handle)
         .await
     {
-        Ok(v) => v,
+        Ok(valid) => {
+            let on = valid.iter().any(|t| t == recipient);
+            (
+                if on { LookupOutcome::OnIMessage } else { LookupOutcome::NotOnIMessage },
+                format!("status-0 answer, valid={valid:?}"),
+            )
+        }
         Err(e) => {
-            // Couldn't check iMessage availability (network/IDS hiccup). For a phone
-            // number whose SMS forwarding we KNOW is live, a green send WILL land —
-            // so try SMS rather than a doomed iMessage encrypt that fails
-            // NoValidTargets and surfaces as "Not Delivered". For an email, or with
-            // forwarding off, keep the old "assume iMessage" default so a transient
-            // blip doesn't misroute a real iMessage contact to a text.
-            if is_phone && sms_active {
-                log::warn!("decide_route[{recipient}]: validate failed ({e:?}) — forwarding on, routing SMS");
-                return sms_route(&client.identity.get_handles().await);
-            }
-            log::warn!("decide_route[{recipient}]: validate failed ({e:?}); defaulting to iMessage");
-            return Route::IMessage;
+            // FAIL BLUE, ALWAYS. This branch used to route phone numbers to green SMS
+            // whenever SMS forwarding was live, on the theory that a green send WILL
+            // land while a doomed iMessage encrypt surfaces as "Not Delivered".
+            //
+            // That trade is wrong, and it was the ONE path in this stack that could go
+            // green without Apple ever answering. Everything lands here: a 15s APS
+            // timeout doubled by rustpush's single retry (~30s), a `LookupFailed` for
+            // ANY non-zero IDS status — including 6004 "Please try again" and 6009
+            // "temporarily disabled" — a WebTunnelError, a plist parse failure, and
+            // `ResourceState::Failed` from `ensure_ready`, which is exactly the state
+            // the identity resource is in DURING a re-registration. So a transient blip,
+            // or our own reregister, silently downgraded a real iMessage contact to a
+            // text: the recipient sees green, the thread stays green, and nothing in the
+            // UI ever said the lookup failed.
+            //
+            // Three reasons blue is the right default:
+            //   - Apple's own contract. rustpush only reports "not on iMessage" from a
+            //     status-0 `id-query` (`user.rs:993`); an error is the absence of an
+            //     answer, not a negative one, and must not be promoted to a verdict.
+            //   - Internal consistency. `nativeIsIMessage` — the composer-colour probe —
+            //     already fails blue on the identical error. The two disagreed precisely
+            //     when it mattered, so the UI showed a blue composer while the send went
+            //     out green, which is why this never reproduced in testing.
+            //   - Failure quality. "Not Delivered" is a visible, retryable failure the
+            //     user can act on. A wrong green is silent, irreversible (it really was
+            //     an SMS), and mis-attributes the fault to the recipient's phone.
+            //
+            // Neither rustpush nor OpenBubbles has this behaviour; OB decides a chat's
+            // service once at creation and never re-derives it at send time.
+            log::warn!(
+                "decide_route[{recipient}]: validate failed ({e:?}) — no answer from IDS, \
+                 routing iMessage (is_phone={is_phone} sms_active={sms_active}). \
+                 NOT falling back to SMS: an error is not a negative lookup."
+            );
+            (LookupOutcome::NoAnswer, format!("no answer ({e:?})"))
         }
     };
-    let on_imessage = valid.iter().any(|t| t == recipient);
+
+    let kind = route_for(outcome, is_phone, sms_active);
+    // One line carrying the full decision: what Apple said, and what we did with it.
+    // `outcome` is the field to grep when a green bubble is reported — `NotOnIMessage`
+    // means Apple answered and said no; `NoAnswer` can no longer produce a green send.
+    //
+    // `on_imessage=` and `valid=[…]` (inside `detail`) are kept verbatim even though
+    // `outcome=` supersedes both: the smarttxt-log-diagnosis skill greps for them, and
+    // every bundle captured to date is indexed on that shape. Adding a field is free;
+    // renaming one silently breaks the diagnosis of every historical capture.
     log::info!(
-        "decide_route[{recipient}]: on_imessage={on_imessage} is_phone={is_phone} \
-         sms_active={sms_active} valid={valid:?}"
+        "decide_route[{recipient}]: outcome={outcome:?} route={kind:?} \
+         on_imessage={} is_phone={is_phone} sms_active={sms_active} ({detail})",
+        outcome == LookupOutcome::OnIMessage
     );
-    if on_imessage {
-        return Route::IMessage;
+    match kind {
+        RouteKind::IMessage => Route::IMessage,
+        RouteKind::Sms => sms_route(&client.identity.get_handles().await),
+        RouteKind::Block(BlockReason::EmailNotOnIMessage) => Route::Block(
+            "This address isn't on iMessage, and only phone numbers can receive a text.".to_string(),
+        ),
+        RouteKind::Block(BlockReason::SmsForwardingOff) => Route::Block(format!(
+            "Text messages aren't set up for this phone yet. {SMS_FORWARDING_REMEDY}"
+        )),
     }
-    // Not on iMessage. Only phone numbers can fall back to SMS.
-    if !is_phone {
-        return Route::Block("This address isn't on iMessage, and only phone numbers can receive a text.".to_string());
-    }
-    if !sms_active {
-        return Route::Block(
-            "SMS forwarding isn't on. On your iPhone (same Apple ID): Settings ▸ Messages ▸ Text Message Forwarding ▸ turn on all devices ▸ restart iPhone."
-                .to_string(),
-        );
-    }
-    sms_route(&client.identity.get_handles().await)
 }
 
 /// Set the handle outgoing messages are sent FROM (the Settings "default send"

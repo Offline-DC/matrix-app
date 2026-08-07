@@ -204,6 +204,12 @@ internal object SmartTxtLogExporter {
      */
     private fun StringBuilder.appendReadingGuide() {
         append("\n# reading this bundle\n")
+        append("# grep '[ring] SESSION'   — START HERE. One per process, first line of that\n")
+        append("#   process's capture: pid / app version+code / install+update time / device\n")
+        append("#   uptime at ring start. appVersion above is EXPORT-time only, so on a bundle\n")
+        append("#   that spans an app update it mislabels every line written before it — the\n")
+        append("#   SESSION lines are what tell you which build wrote what. Small uptimeMs\n")
+        append("#   means that process started right after a DEVICE BOOT.\n")
         append("# grep CATCHUP            — one backlog drain, start to finish\n")
         append("#   'CATCHUP native:'     — Rust queue: delivered / peakDepth / dropped\n")
         append("#   'CATCHUP start|done'  — transport: events, duration, heap peak vs limit\n")

@@ -1,0 +1,25 @@
+# Host-only test harness for the send-routing + handle-reconciliation policy. It
+# compiles the SAME file the FFI crate ships (../src/send_policy.rs) and runs its
+# #[cfg(test)] suite on the host — no Android NDK / rustpush needed.
+# Run: `cargo test` from this directory.
+#
+# Same shape as ../identity-tests and ../inbound-tests. `send_policy.rs` is deliberately
+# dependency-free (std only) precisely so these two decisions can be verified here:
+#
+#   * "an IDS lookup that ERRORED must never route a message as green SMS" — reproducing
+#     that on a handset means inducing an IDS failure at the exact instant of a send.
+#   * "a registration that is a SUPERSET of what IDS vends is up to date" — the old
+#     set-inequality test re-fired on every connect forever in that state, because
+#     rustpush's register() only ever inserts into user.registration, never clears.
+#
+# Isolated workspace ([workspace] below) so it is never pulled into the Android build of
+# the parent smarttxt-ffi crate (which build-rustpush-so.sh compiles on its own).
+[package]
+name = "policy-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]

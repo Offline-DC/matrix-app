@@ -767,9 +767,25 @@ internal class SmartTxtMessageRepository(
                 }
                 continue
             }
-            // Reconcile the optimistic id → server guid, and only advance status.
+            // Reconcile the optimistic id → server guid, and only advance status —
+            // EXCEPT for FAILED, which is a deliberate downgrade.
+            //
+            // statusRank(FAILED) is -1, below every other state, so a plain rank test
+            // discards every "failed" that arrives after the bubble has reached SENT.
+            // That silently threw away the only signal we get that a message could not
+            // be decrypted (native emits it from an IDS 120; see push_relay_event), and
+            // it is the reason a doomed send and a good one rendered identically.
+            //
+            // Not symmetric with READ above, which must NOT clobber a FAILED bubble: a
+            // read receipt for a thread is about other messages too, whereas a failure
+            // names this exact guid. A later genuine DELIVERED still wins over FAILED by
+            // rank, which is correct — one device's complaint loses to proof of arrival.
             val cur = list[idx]
-            val advanced = if (statusRank(status) >= statusRank(cur.status)) status else cur.status
+            val advanced = when {
+                status == MessageStatus.FAILED -> MessageStatus.FAILED
+                statusRank(status) >= statusRank(cur.status) -> status
+                else -> cur.status
+            }
             // AUTHORITATIVE service. The native side reports how the message ACTUALLY
             // went out (lib.rs emits "SMS"/"iMessage" from the route it really took),
             // so the echo REPLACES the optimistic guess rather than OR-ing with it.
@@ -787,7 +803,22 @@ internal class SmartTxtMessageRepository(
                 Log.i(TAG, "SMSFLAG reconcile room=${e.chatGuid} guid=${e.guid.ifBlank { cur.id }} " +
                     "guessed=${cur.isSms} wire='${e.service}' → isSms=$wireIsSms")
             }
-            list[idx] = cur.copy(id = e.guid.ifBlank { cur.id }, status = advanced, isSms = wireIsSms)
+            if (advanced == MessageStatus.FAILED && cur.status != MessageStatus.FAILED) {
+                Log.w(TAG, "send FAILED (late) room=${e.chatGuid} guid=${e.guid.ifBlank { cur.id }} " +
+                    "was=${cur.status} detail='${e.detail}'")
+            }
+            list[idx] = cur.copy(
+                id = e.guid.ifBlank { cur.id },
+                status = advanced,
+                isSms = wireIsSms,
+                // Carry the reason onto the bubble (MessageContextSheet shows it via
+                // FailedNotice) and clear it again if the message later recovers.
+                errorReason = when {
+                    advanced == MessageStatus.FAILED -> e.detail.ifBlank { cur.errorReason }
+                    advanced == MessageStatus.DELIVERED || advanced == MessageStatus.READ -> null
+                    else -> cur.errorReason
+                },
+            )
             byRoom[e.chatGuid] = list
             changed = true
         }
@@ -895,6 +926,43 @@ internal class SmartTxtMessageRepository(
         val snippet = targetBody.ifBlank { "your message" }
             .let { if (it.length > 30) it.take(30).trim() + "…" else it }
         return "$reactor ${tapbackVerb(emoji)} “$snippet”"
+    }
+
+    /**
+     * The text an MMS/SMS peer receives in place of a tapback: `Liked “their message”`.
+     *
+     * Every character here is protocol. Clients turn this sentence back into a reaction
+     * by matching it (OpenBubbles: `Message.inferReactionMap`), so:
+     *  - the quotes are CURLY (U+201C/U+201D), not straight;
+     *  - [targetBody] is quoted in FULL — the peer finds the original message by its
+     *    text, so the 30-character truncation used by [tapbackSentence] (a UI preview,
+     *    where shortening is right) would break the match;
+     *  - the removal wording is Apple's, not a generic "Removed a like" — see
+     *    [tapbackWireVerb].
+     *
+     * Ported from OpenBubbles' `RustPushBackend.sendTapback`, including its
+     * capitalise-the-first-letter step.
+     */
+    private fun tapbackWireText(emoji: String, targetBody: String, remove: Boolean): String =
+        "${tapbackWireVerb(emoji, remove)} “$targetBody”"
+
+    /**
+     * Apple's exact phrasing for each tapback, capitalised as it appears on the wire.
+     * The removal forms are NOT symmetric with the additions ("liked" → "removed a like
+     * from", "emphasized" → "removed an exclamation from") — that asymmetry is Apple's,
+     * and the peer's parser depends on it.
+     *
+     * An emoji reaction has no verb of its own and takes the generic form, which is what
+     * OpenBubbles falls through to when its verb map misses.
+     */
+    private fun tapbackWireVerb(emoji: String, remove: Boolean): String = when (emoji) {
+        "❤️", "♥️" -> if (remove) "Removed a heart from" else "Loved"
+        "👍" -> if (remove) "Removed a like from" else "Liked"
+        "👎" -> if (remove) "Removed a dislike from" else "Disliked"
+        "😂", "😆" -> if (remove) "Removed a laugh from" else "Laughed at"
+        "‼️", "❗", "❗️" -> if (remove) "Removed an exclamation from" else "Emphasized"
+        "❓", "❔" -> if (remove) "Removed a question mark from" else "Questioned"
+        else -> if (remove) "Removed $emoji from" else "Reacted $emoji to"
     }
 
     /** English verb for a tapback emoji (matches the FFI's reaction_emoji set). */
@@ -1173,10 +1241,14 @@ internal class SmartTxtMessageRepository(
     override suspend fun toggleReaction(roomId: String, messageId: String, emoji: String) {
         var adding = false
         var targetBody = ""
+        // Which transport the message being reacted to actually arrived on. A tapback
+        // is only a real protocol message on iMessage; see the green branch below.
+        var targetIsSms = false
         writeLock.withLock {
             updateMessage(roomId, messageId) { m ->
                 adding = ME !in m.reactions[emoji].orEmpty()
                 targetBody = m.body
+                targetIsSms = m.isSms
                 m.copy(reactions = applyTapback(m.reactions, ME, emoji, remove = !adding))
             }
             // Treat MY reaction like iMessage: ADDING a tapback bumps the chat to the
@@ -1193,7 +1265,28 @@ internal class SmartTxtMessageRepository(
             requestSave()
         }
         scope.launch {
-            val ok = runCatching { session.sendTapback(roomId, messageId, emoji, remove = !adding) }.getOrDefault(false)
+            val ok = if (targetIsSms) {
+                // MMS has no tapback. Sending one resolved zero IDS keys for every
+                // participant and came back NoValidTargets, so the reaction silently
+                // did nothing. Apple's own clients send a plain text instead, and that
+                // is what OpenBubbles does here too (RustPushBackend.sendTapback:
+                // `if (!chat.isIMessage) { … "$text “${selected.text}”" … }`).
+                //
+                // Sent through session.sendText rather than sendMessage so no second
+                // bubble appears: the user sees the reaction they tapped, exactly as on
+                // an iPhone, while the peer receives the sentence. The temp guid is
+                // deliberately owned by nothing — onStatuses skips an id it can't match
+                // (`if (idx < 0) continue`), so the send's status echo lands nowhere.
+                val body = tapbackWireText(emoji, targetBody, remove = !adding)
+                Log.i(TAG, "tapback in an SMS thread room=$roomId → sending text fallback")
+                runCatching {
+                    session.sendText(roomId, body, "tmp_" + System.nanoTime(), null).ok
+                }.getOrDefault(false)
+            } else {
+                runCatching { session.sendTapback(roomId, messageId, emoji, remove = !adding) }.getOrDefault(false)
+            }
+            // As before, a rejection is logged rather than rolled back: the pushed
+            // tapback is the source of truth and reconciles either way.
             if (!ok) Log.w(TAG, "tapback rejected")
         }
     }

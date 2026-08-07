@@ -139,6 +139,10 @@ sealed class TransportEvent {
         /** "SMS" (green) or "iMessage" (blue); lets an optimistic bubble adopt its
          *  real color once the native side reports how it actually sent. */
         val service: String = "iMessage",
+        /** Human-readable reason, set only on [status] == "failed" (an IDS 120 saying a
+         *  recipient couldn't decrypt). Surfaced as the message's `errorReason` so a
+         *  failed bubble explains itself instead of just turning red. */
+        val detail: String = "",
     ) : TransportEvent()
 
     /** A tapback was added/removed on a message. */

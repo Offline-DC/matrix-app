@@ -22,6 +22,30 @@ pub struct GroupMeta {
     pub participants: Vec<String>,
     /// The group's display name (iMessage cv_name), if it has one.
     pub cv_name: Option<String>,
+    /// Which service this conversation actually runs on, learned from inbound traffic.
+    /// `Some(true)` = MMS/SMS relayed by the paired iPhone, `Some(false)` = iMessage,
+    /// `None` = never observed (nothing has arrived here yet).
+    ///
+    /// A group is NOT automatically an iMessage group. A group thread carried over Text
+    /// Message Forwarding arrives as IDS cmd 140 on topic `com.apple.private.alloy.sms`
+    /// and its members may not be on iMessage at all — replying to it over iMessage
+    /// reaches only the members who happen to have it, and the rest get silence.
+    ///
+    /// This is OpenBubbles' `Chat.isRpSms` (`lib/database/io/chat.dart`), which it sets
+    /// at chat creation from the inbound service and reads back in
+    /// `RustPushService.getService`. `Option` rather than `bool` so an existing
+    /// group_meta.json — written before this field existed — reads back as "unknown"
+    /// and gets corrected by the next inbound message, instead of silently claiming
+    /// every pre-existing group is iMessage.
+    #[serde(default)]
+    pub is_sms: Option<bool>,
+}
+
+/// Does a reply into this group have to go out as MMS/SMS? Only a conversation OBSERVED
+/// to be SMS says yes: unknown means iMessage, which is both the old behaviour and the
+/// right default for a group the user creates from the composer.
+pub fn group_sends_sms(meta: Option<&GroupMeta>) -> bool {
+    matches!(meta.and_then(|m| m.is_sms), Some(true))
 }
 
 /// The gid decision + members for a send, computed without touching global state.
@@ -124,6 +148,10 @@ pub fn updated_meta(prev: Option<&GroupMeta>, members: &[String], cv_name: &Opti
             participants
         },
         cv_name: cv_name.clone().or_else(|| prev.and_then(|e| e.cv_name.clone())),
+        // Carried, never derived here: the service is learned from the inbound
+        // message's own type, which this function does not see. `lib.rs`'s
+        // `remember_group_service` is the only writer.
+        is_sms: prev.and_then(|e| e.is_sms),
     }
 }
 
@@ -275,11 +303,42 @@ mod tests {
     }
 
     #[test]
+    fn an_unobserved_group_still_sends_imessage() {
+        // The default has to stay blue: a group the user just created from the composer
+        // has no inbound history, and must not be downgraded to a text.
+        assert!(!group_sends_sms(None));
+        assert!(!group_sends_sms(Some(&GroupMeta::default())));
+    }
+
+    #[test]
+    fn a_group_observed_as_sms_replies_as_sms() {
+        // The bug: this group's members are not on iMessage, so a blue reply reaches
+        // nobody. Only an explicit Some(true) flips it.
+        let mms = GroupMeta { is_sms: Some(true), ..Default::default() };
+        assert!(group_sends_sms(Some(&mms)));
+        let blue = GroupMeta { is_sms: Some(false), ..Default::default() };
+        assert!(!group_sends_sms(Some(&blue)));
+    }
+
+    #[test]
+    fn learning_a_name_or_members_never_forgets_the_service() {
+        // updated_meta runs on every inbound message. If it dropped is_sms, the group
+        // would revert to blue the moment anyone renamed it or a member list arrived.
+        let learned = GroupMeta { is_sms: Some(true), ..Default::default() };
+        let after = updated_meta(Some(&learned), &sibs(), &Some("sibs & sav".into()));
+        assert_eq!(after.is_sms, Some(true));
+        assert_eq!(after.cv_name.as_deref(), Some("sibs & sav"));
+        // …and a group that has never been observed stays unknown, not false.
+        let fresh = updated_meta(None, &sibs(), &None);
+        assert_eq!(fresh.is_sms, None);
+    }
+
+    #[test]
     fn send_identity_replays_real_gid_and_name() {
         // THE FIX: sending to the gid-keyed "sibs & sav" replays the real gid + name +
         // members — NOT cv_name:None + a fresh random gid (the bug that forked the thread).
         let guid = "iMessage;+;c71a3485-5e0d-4974-8b3d-c55bf2edea8a";
-        let meta = GroupMeta { participants: sibs(), cv_name: Some("sibs & sav".into()) };
+        let meta = GroupMeta { participants: sibs(), cv_name: Some("sibs & sav".into()), ..Default::default() };
         let id = send_identity(guid, Some(&meta));
         assert_eq!(id.gid.as_deref(), Some("c71a3485-5e0d-4974-8b3d-c55bf2edea8a"));
         assert_eq!(id.cv_name.as_deref(), Some("sibs & sav"));
@@ -310,7 +369,7 @@ mod tests {
         // A reply typed in an old member-keyed room redirects to the one known gid.
         let mut groups: HashMap<String, GroupMeta> = HashMap::new();
         let gid = "iMessage;+;c71a3485-5e0d-4974-8b3d-c55bf2edea8a";
-        groups.insert(gid.to_string(), GroupMeta { participants: sibs(), cv_name: Some("sibs & sav".into()) });
+        groups.insert(gid.to_string(), GroupMeta { participants: sibs(), cv_name: Some("sibs & sav".into()), ..Default::default() });
         let legacy = format!("iMessage;+;{}", members_csv(&sibs()));
         assert_eq!(effective_send_guid(&legacy, &groups), gid);
     }
@@ -327,8 +386,8 @@ mod tests {
     fn effective_send_guid_no_guess_when_ambiguous() {
         // Two groups with the SAME members → never guess; keep the legacy guid.
         let mut groups: HashMap<String, GroupMeta> = HashMap::new();
-        groups.insert("iMessage;+;gid-aaaa".into(), GroupMeta { participants: sibs(), cv_name: Some("sibs & sav".into()) });
-        groups.insert("iMessage;+;gid-bbbb".into(), GroupMeta { participants: sibs(), cv_name: None });
+        groups.insert("iMessage;+;gid-aaaa".into(), GroupMeta { participants: sibs(), cv_name: Some("sibs & sav".into()), ..Default::default() });
+        groups.insert("iMessage;+;gid-bbbb".into(), GroupMeta { participants: sibs(), cv_name: None, ..Default::default() });
         let legacy = format!("iMessage;+;{}", members_csv(&sibs()));
         assert_eq!(effective_send_guid(&legacy, &groups), legacy);
     }
@@ -336,7 +395,7 @@ mod tests {
     #[test]
     fn effective_send_guid_passes_through_gid_and_dm() {
         let mut groups: HashMap<String, GroupMeta> = HashMap::new();
-        groups.insert("iMessage;+;c71a3485".into(), GroupMeta { participants: sibs(), cv_name: None });
+        groups.insert("iMessage;+;c71a3485".into(), GroupMeta { participants: sibs(), cv_name: None, ..Default::default() });
         assert_eq!(effective_send_guid("iMessage;+;c71a3485", &groups), "iMessage;+;c71a3485"); // already gid
         assert_eq!(effective_send_guid("iMessage;-;+18048334449", &groups), "iMessage;-;+18048334449"); // 1:1
     }

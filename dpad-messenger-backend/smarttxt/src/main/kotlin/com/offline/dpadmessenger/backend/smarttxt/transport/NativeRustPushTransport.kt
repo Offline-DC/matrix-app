@@ -261,6 +261,7 @@ class NativeRustPushTransport(
                         tempGuid = obj["tempGuid"]?.jsonPrimitive?.content,
                         status = obj["status"]?.jsonPrimitive?.content ?: "delivered",
                         service = obj["service"]?.jsonPrimitive?.content ?: "iMessage",
+                        detail = obj["detail"]?.jsonPrimitive?.content.orEmpty(),
                     ),
                 )
                 RelayProtocol.P_TAPBACK -> tapbacks.add(
