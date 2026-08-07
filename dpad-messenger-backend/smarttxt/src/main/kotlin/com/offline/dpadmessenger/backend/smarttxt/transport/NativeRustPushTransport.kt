@@ -154,6 +154,8 @@ class NativeRustPushTransport(
 
     override fun seedSeen(guids: Collection<String>) = bridge.seedSeenGuids(guids)
 
+    override fun seedGroupServices(services: Map<String, Boolean>) = bridge.seedGroupServices(services)
+
     override fun shutdown() {
         pollJob?.cancel()
         bridge.disconnectApns()

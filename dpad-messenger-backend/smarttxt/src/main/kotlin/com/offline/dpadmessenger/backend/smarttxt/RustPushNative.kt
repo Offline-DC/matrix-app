@@ -233,6 +233,19 @@ object RustPushNative {
         if (loaded) runCatching { nativeSeedSeen(guidsJson) }
     }
 
+    /** Tell the native side which service each GROUP conversation runs on, as a JSON
+     *  object of chat guid → true (MMS/SMS, green) / false (iMessage, blue). The native
+     *  side otherwise learns this only from inbound traffic, so a group that hasn't
+     *  received anything since the app updated would reply on the wrong transport.
+     *  Backfill only — a group it has already observed keeps its observation.
+     *  Call BEFORE [nativeConnect]. */
+    external fun nativeSeedGroupServices(servicesJson: String)
+
+    /** Null-safe seed: no-op when the `.so` isn't loaded. */
+    fun runCatchingNativeSeedGroupServices(servicesJson: String) {
+        if (loaded) runCatching { nativeSeedGroupServices(servicesJson) }
+    }
+
     /** Null-safe tapback send: no-op (false) when the `.so` isn't loaded, so
      *  callers never risk an UnsatisfiedLinkError. */
     fun runCatchingNativeTapback(chatGuid: String, targetGuid: String, associatedMessageType: Int): Boolean =

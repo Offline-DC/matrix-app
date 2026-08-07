@@ -623,20 +623,75 @@ fn save_thread_handles(dir: &str, map: &std::collections::HashMap<String, String
 fn group_meta_path(dir: &str) -> PathBuf {
     Path::new(dir).join("group_meta.json")
 }
+/// Load the group index, saying out loud when it isn't there.
+///
+/// This file is the ONLY place a gid-keyed group's membership lives. Without it,
+/// `conv_data_for` falls through to `participants_from_chat_guid`, which parses
+/// "iMessage;+;<gid>" and hands IDS the gid as if it were a phone number — every send
+/// then fails `NoValidTargets` until that group receives a message and
+/// `remember_group_meta` rebuilds it (observed 2026-08-07: `IDS returned zero keys for
+/// participant tel:2586df0c-…`).
+///
+/// It used to collapse "no file" and "corrupt file" into an empty map with no log line,
+/// so that failure was invisible in a returned bundle. Missing is normal on a fresh
+/// install; unparseable is not, and it is the one worth grepping for.
 fn load_group_meta(dir: &str) -> std::collections::HashMap<String, GroupMeta> {
-    std::fs::read(group_meta_path(dir))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
-}
-fn save_group_meta(dir: &str, map: &std::collections::HashMap<String, GroupMeta>) {
-    match serde_json::to_vec(map) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(group_meta_path(dir), json) {
-                log::warn!("persist group_meta failed: {e}");
-            }
+    let path = group_meta_path(dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log::info!(
+                "group_meta: none on disk — every group will re-learn its members from \
+                 the first message it receives"
+            );
+            return Default::default();
         }
-        Err(e) => log::warn!("serialize group_meta failed: {e}"),
+        Err(e) => {
+            log::warn!("group_meta: unreadable ({e}) — group sends will fail until each \
+                        group receives a message");
+            return Default::default();
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(map) => map,
+        Err(e) => {
+            log::warn!(
+                "group_meta: CORRUPT ({e}) in {} bytes — group membership is lost; every \
+                 group send will fail with NoValidTargets until that group receives a \
+                 message",
+                bytes.len()
+            );
+            Default::default()
+        }
+    }
+}
+
+/// Persist the group index atomically: temp file, then rename.
+///
+/// A plain `fs::write` truncates in place, so a low-memory kill partway through leaves a
+/// half-written file — and on the next launch that parses as nothing, which is the
+/// membership-loss failure described on [`load_group_meta`]. These handsets are 128 MB
+/// and already show `logcatRespawns`, so that is a real window, not a theoretical one.
+/// `rename` within the same directory is atomic on Android's filesystems: readers see
+/// either the old file or the new one, never a partial.
+fn save_group_meta(dir: &str, map: &std::collections::HashMap<String, GroupMeta>) {
+    let json = match serde_json::to_vec(map) {
+        Ok(json) => json,
+        Err(e) => {
+            log::warn!("serialize group_meta failed: {e}");
+            return;
+        }
+    };
+    let path = group_meta_path(dir);
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, json) {
+        log::warn!("persist group_meta failed (temp write): {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        log::warn!("persist group_meta failed (rename): {e}");
+        // Leave no partial temp behind to be mistaken for anything later.
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -3273,10 +3328,23 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
         // Green (SMS, forwarded by the iPhone) vs blue (iMessage).
         let service = if matches!(normal.service, MessageType::SMS { .. }) { "SMS" } else { "iMessage" };
 
-        // A GROUP's service is a property of the conversation, and this message is the
-        // only place we ever get told what it is. Record it so a reply goes out on the
-        // same transport the thread already runs on — see `remember_group_service`.
-        if is_group {
+        // A GROUP's service is a property of the conversation, and an inbound message
+        // is the only place we are ever told what it is. Record it so a reply goes out
+        // on the same transport the thread already runs on — see
+        // `remember_group_service`.
+        //
+        // FROM OTHER PEOPLE ONLY. A message with `is_from_me` is one of OUR OWN, mirrored
+        // back by the paired iPhone, and it carries that iPhone's choice for that single
+        // message — which since RCS varies message to message. On 2026-08-07 15:00:12 a
+        // single RCS forward (cmd 143, from our own handle) flipped group b040fef9 from
+        // `Some(false)` to SMS, 33 minutes after a real participant had sent iMessage
+        // (cmd 100, madrid) in the same thread — and the next message typed on the flip
+        // phone then went out green into a blue group.
+        //
+        // Same rule the startup seed uses (`seedGroupServices` reads the newest RECEIVED
+        // message per room): an outgoing message's service is a choice, not an
+        // observation, so it teaches us nothing about the conversation.
+        if is_group && !is_from_me {
             remember_group_service(&chat_guid, service == "SMS");
         }
 
@@ -4570,6 +4638,66 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         }
     }
     log::info!("nativeSeedSeen: {} guid(s) already stored by the app", s.seen_guids.len());
+}
+
+/// Backfill the service of GROUP conversations from the APP's stored history.
+///
+/// `services_json` is a JSON object of chat guid → true (MMS/SMS) / false (iMessage).
+/// Kotlin computes it from the newest RECEIVED message in each group room and calls
+/// this from its cache restore, BEFORE connecting.
+///
+/// This exists because [`remember_group_service`] — the only other writer of
+/// [`GroupMeta::is_sms`] — learns from inbound traffic alone, so a group whose last
+/// message predates this feature has no service on record and replies to it go out as
+/// iMessage. For an MMS group that means the members who aren't on iMessage silently
+/// receive nothing (captured 2026-08-07 11:58: `IDS returned zero keys for participant
+/// tel:+12405754507`, sent anyway as command 100).
+///
+/// BACKFILL ONLY: a group the native side has already observed keeps its observation.
+/// The seed is derived from a cache and can be stale; live traffic cannot be, so it
+/// must never be overwritten here.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeSeedGroupServices(
+    mut env: JNIEnv,
+    _class: JClass,
+    services_json: JString,
+) {
+    let raw = jstr(&mut env, &services_json);
+    let services: std::collections::HashMap<String, bool> =
+        serde_json::from_str(&raw).unwrap_or_default();
+    let (dir, snapshot, seeded, kept) = {
+        let mut s = st();
+        let (mut seeded, mut kept) = (0usize, 0usize);
+        for (chat, is_sms) in &services {
+            if chat.is_empty() || !chat.contains(";+;") {
+                continue;
+            }
+            let mut meta = s.group_meta.get(chat).cloned().unwrap_or_default();
+            if meta.is_sms.is_some() {
+                kept += 1;
+                continue;
+            }
+            meta.is_sms = Some(*is_sms);
+            s.group_meta.insert(chat.clone(), meta);
+            seeded += 1;
+            log::debug!("group service seeded from app history: chat={chat} is_sms={is_sms}");
+        }
+        if seeded == 0 {
+            log::info!(
+                "nativeSeedGroupServices: nothing to backfill \
+                 ({kept} group(s) already observed, {} offered)",
+                services.len()
+            );
+            return;
+        }
+        (s.files_dir.clone(), s.group_meta.clone(), seeded, kept)
+    };
+    // One write for the whole batch — this runs on the launch path.
+    save_group_meta(&dir, &snapshot);
+    log::info!(
+        "nativeSeedGroupServices: backfilled {seeded} group(s) from the app's history \
+         ({kept} already observed) — replies now go out on the thread's own transport"
+    );
 }
 
 /// `iMessage;-;<addr>` (or a bare/scheme'd address) → a rustpush handle.

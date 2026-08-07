@@ -135,6 +135,19 @@ class RustPushBridge(
         Log.i(TAG, "seeded ${guids.size} already-stored guid(s) — replay will be dropped")
     }
 
+    /** Hand rustpush the service (green MMS vs blue iMessage) of every GROUP we hold
+     *  history for, so a reply into a thread that hasn't received anything since the
+     *  app updated still goes out on the transport the thread actually runs on. Must
+     *  run BEFORE [connectApns]. No-op on the stub path (it does not route). */
+    fun seedGroupServices(services: Map<String, Boolean>) {
+        if (!NATIVE_AVAILABLE || services.isEmpty()) return
+        val payload = kotlinx.serialization.json.JsonObject(
+            services.mapValues { kotlinx.serialization.json.JsonPrimitive(it.value) },
+        ).toString()
+        RustPushNative.runCatchingNativeSeedGroupServices(payload)
+        Log.i(TAG, "seeded the service of ${services.size} group(s) from stored history")
+    }
+
     // ---- registration (§2.2) -----------------------------------------------
 
     suspend fun register(config: MacOSConfig, appleId: String): RegistrationResult {

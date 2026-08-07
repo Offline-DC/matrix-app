@@ -113,6 +113,12 @@ interface SmartTxtTransport {
      *  transports no-op. */
     fun seedSeen(guids: Collection<String>) {}
 
+    /** Tell the transport which service each GROUP conversation runs on — true for
+     *  MMS/SMS, false for iMessage — learned from the history we already hold. Call
+     *  BEFORE [connect]. Only the native transport routes on it; the relay transports
+     *  no-op. */
+    fun seedGroupServices(services: Map<String, Boolean>) {}
+
     /** Tear down the connection and any background work. */
     fun shutdown()
 }

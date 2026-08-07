@@ -121,6 +121,17 @@ internal class SmartTxtMessageRepository(
         java.util.Collections.synchronizedMap(object : LinkedHashMap<String, String>(64, 0.75f, false) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 4000
         })
+    // Temp guids of tapback sentences WE sent into an SMS thread (toggleReaction's
+    // green branch). Apple mirrors every outgoing text back to us as an ordinary
+    // message (IDS cmd 143, is_from_me=true), so without this the sentence lands in
+    // the thread as a second bubble underneath the reaction the user already sees —
+    // the reported `Loved “loon”` bubble. Bounded + synchronized, same idiom as
+    // reactionRoomByGuid: written from toggleReaction's coroutine, read on the
+    // transport thread.
+    private val sentSmsTapbackTemps: MutableMap<String, Boolean> =
+        java.util.Collections.synchronizedMap(object : LinkedHashMap<String, Boolean>(64, 0.75f, false) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>?): Boolean = size > 256
+        })
     private val roomNameById = HashMap<String, String>()
     private val writeLock = Mutex()
 
@@ -288,6 +299,27 @@ internal class SmartTxtMessageRepository(
             // raw-handle names restored from a cache written during an earlier cold start.
             warmContacts()
             session.seedSeen(messagesByRoom.value.values.flatten().map { it.id })
+            // Which transport each GROUP thread runs on. The native side learns this
+            // from inbound traffic only, so a group that hasn't received anything since
+            // the app updated has no service on record and its replies go out blue —
+            // and for an MMS group that means the members who aren't on iMessage get
+            // nothing at all, with the bubble stuck on "Sending…" waiting for a receipt
+            // that cannot come (captured 2026-08-07 11:58).
+            //
+            // RECEIVED messages only. An outgoing bubble's colour is itself a guess
+            // (see sendMessage's `SMSFLAG send … guessed=`), and in that same capture a
+            // wrongly-blue send had already become the newest message in the room —
+            // seeding from it would launder the guess into a fact and pin the thread
+            // to the wrong transport.
+            session.seedGroupServices(
+                messagesByRoom.value.mapNotNull { (roomId, msgs) ->
+                    if (!ChatGuid.isGroup(roomId)) return@mapNotNull null
+                    val newestInbound = msgs
+                        .filter { !it.isOutgoing && !it.isDeleted }
+                        .maxByOrNull { it.timestampMs } ?: return@mapNotNull null
+                    roomId to newestInbound.isSms
+                }.toMap()
+            )
             session.connect()
         }
     }
@@ -561,7 +593,135 @@ internal class SmartTxtMessageRepository(
         if (msgMap != null || unreadMap != null || roomList != null) requestSave()
     }
 
-    private suspend fun onMessages(msgs: List<RelayMessage>) = writeLock.withLock {
+    /**
+     * Entry point for every inbound batch. MMS has no tapback protocol, so a reaction
+     * in a green thread IS a sentence on the wire — `Loved “loon”`. Showing that
+     * sentence as a message shows the plumbing, so two kinds of it are pulled out of
+     * the batch before the normal path ever sees them:
+     *
+     *  1. the echo of a tapback WE just sent — dropped; the reaction is already on the
+     *     target bubble from the optimistic update in [toggleReaction];
+     *  2. a tapback sentence from the other side (or our own, after a restart, or one
+     *     sent from the user's iPhone) — folded into its target's reactions.
+     *
+     * This is where OpenBubbles does it too: `Message.inferReaction`, called for every
+     * `MessageType_SMS` message in `rustpush_service.dart`.
+     */
+    private suspend fun onMessages(msgs: List<RelayMessage>) {
+        if (msgs.isEmpty()) return
+        val plain = ArrayList<RelayMessage>(msgs.size)
+        val sentences = ArrayList<Pair<RelayMessage, InferredTapback>>()
+        for (rm in msgs) {
+            if (rm.tempGuid.isNotEmpty() && sentSmsTapbackTemps.remove(rm.tempGuid) != null) {
+                Log.i(TAG, "recv: dropped the echo of our own SMS tapback (temp=${rm.tempGuid})")
+                continue
+            }
+            // Only green threads, and never something already associated by the relay
+            // (a real tapback, handled below by the associatedMessageType branch).
+            val inferred = if (rm.service == "SMS" && rm.associatedMessageType == 0) {
+                inferSmsTapback(rm.text)
+            } else {
+                null
+            }
+            if (inferred != null) sentences.add(rm to inferred) else plain.add(rm)
+        }
+        if (plain.isNotEmpty()) onMessagesLocked(plain)
+        if (sentences.isEmpty()) return
+        // Resolved only AFTER the plain messages have landed: a reaction can arrive in
+        // the same batch as the message it reacts to (a backlog replay always does).
+        val events = ArrayList<TransportEvent.TapbackUpdated>(sentences.size)
+        val unmatched = ArrayList<RelayMessage>()
+        for ((rm, inf) in sentences) {
+            // Newest message with exactly that text — the same lookup OpenBubbles does
+            // (`dateCreated` descending, limit 1). Room lists are kept sorted ascending,
+            // so that is the LAST match.
+            val target = messagesByRoom.value[rm.chatGuid].orEmpty()
+                .lastOrNull { it.body == inf.targetText }
+            if (target == null) {
+                // Reacting to something older than this room's message cap, or to an
+                // attachment (no text to match). Keep the sentence as a message rather
+                // than losing it — a stray line beats a reaction that vanished.
+                Log.i(TAG, "recv: SMS tapback with no target here — kept as text")
+                unmatched.add(rm)
+                continue
+            }
+            events.add(
+                TransportEvent.TapbackUpdated(
+                    chatGuid = rm.chatGuid,
+                    targetGuid = target.id,
+                    emoji = inf.emoji,
+                    senderAddress = rm.senderAddress,
+                    isFromMe = rm.isFromMe,
+                    remove = inf.remove,
+                    timestampMs = rm.timestampMs,
+                    guid = rm.guid,
+                )
+            )
+        }
+        if (unmatched.isNotEmpty()) onMessagesLocked(unmatched)
+        // Reuse the ordinary reaction path: same fold, same chat bump, same unread dot,
+        // same notification, same redelivery dedup a blue tapback already gets.
+        if (events.isNotEmpty()) onTapbacks(events)
+    }
+
+    /** One recognised tapback sentence: which reaction, and the text it points at. */
+    private data class InferredTapback(val emoji: String, val remove: Boolean, val targetText: String)
+
+    /**
+     * Apple's named tapback sentences → the emoji this app stores reactions under.
+     *
+     * Ported from OpenBubbles' `Message.inferReactionMap` (lib/database/io/message.dart),
+     * pattern for pattern. The emoji column is deliberately the CANONICAL one from the
+     * FFI's `reaction_emoji` — an alias like ♥️ sends "Loved", so it has to come back as
+     * ❤️ or the folded reaction would land in a different bucket from the optimistic one
+     * and the user would see two.
+     *
+     * `.` does not match a newline here, exactly as in OpenBubbles: a reaction to a
+     * multi-line message stays a plain message rather than risking a false positive on
+     * someone genuinely writing one of these sentences.
+     */
+    private val smsTapbackPatterns: List<Triple<Regex, String, Boolean>> = listOf(
+        Triple(Regex("^\\s*Liked \u201C(.*)\u201D\\s*$"), "\uD83D\uDC4D", false),
+        Triple(Regex("^\\s*Removed a like from \u201C(.*)\u201D\\s*$"), "\uD83D\uDC4D", true),
+        Triple(Regex("^\\s*Loved \u201C(.*)\u201D\\s*$"), "\u2764\uFE0F", false),
+        Triple(Regex("^\\s*Removed a heart from \u201C(.*)\u201D\\s*$"), "\u2764\uFE0F", true),
+        Triple(Regex("^\\s*Disliked \u201C(.*)\u201D\\s*$"), "\uD83D\uDC4E", false),
+        Triple(Regex("^\\s*Removed a dislike from \u201C(.*)\u201D\\s*$"), "\uD83D\uDC4E", true),
+        Triple(Regex("^\\s*Laughed at \u201C(.*)\u201D\\s*$"), "\uD83D\uDE02", false),
+        Triple(Regex("^\\s*Removed a laugh from \u201C(.*)\u201D\\s*$"), "\uD83D\uDE02", true),
+        Triple(Regex("^\\s*Emphasized \u201C(.*)\u201D\\s*$"), "\u203C\uFE0F", false),
+        Triple(Regex("^\\s*Removed an exclamation from \u201C(.*)\u201D\\s*$"), "\u203C\uFE0F", true),
+        Triple(Regex("^\\s*Questioned \u201C(.*)\u201D\\s*$"), "\u2753", false),
+        Triple(Regex("^\\s*Removed a question mark from \u201C(.*)\u201D\\s*$"), "\u2753", true),
+    )
+
+    /**
+     * The two generic forms, where the emoji is IN the sentence. Checked AFTER the named
+     * ones and in this order — "Removed a like from “x”" must not be read as removing an
+     * emoji called "a".
+     */
+    private val smsTapbackEmojiPatterns: List<Pair<Regex, Boolean>> = listOf(
+        Regex("^\\s*Reacted (\\S+) to \u201C(.*)\u201D\\s*$") to false,
+        Regex("^\\s*Removed (\\S+) from \u201C(.*)\u201D\\s*$") to true,
+    )
+
+    /** `Loved “loon”` → ❤️ on the message that says "loon". Null for ordinary text. */
+    private fun inferSmsTapback(text: String): InferredTapback? {
+        // The curly quote is the cheap reject: it is in every one of these sentences and
+        // in almost no typed message.
+        if ('\u201C' !in text) return null
+        for ((re, emoji, remove) in smsTapbackPatterns) {
+            val m = re.find(text) ?: continue
+            return InferredTapback(emoji, remove, m.groupValues[1])
+        }
+        for ((re, remove) in smsTapbackEmojiPatterns) {
+            val m = re.find(text) ?: continue
+            return InferredTapback(m.groupValues[1], remove, m.groupValues[2])
+        }
+        return null
+    }
+
+    private suspend fun onMessagesLocked(msgs: List<RelayMessage>) = writeLock.withLock {
         if (msgs.isEmpty()) return@withLock
         // Upgrade fold: pull any pre-gid (member-keyed) group room into its gid room
         // BEFORE we build the working maps below, so the merge is picked up here.
@@ -1272,15 +1432,20 @@ internal class SmartTxtMessageRepository(
                 // is what OpenBubbles does here too (RustPushBackend.sendTapback:
                 // `if (!chat.isIMessage) { … "$text “${selected.text}”" … }`).
                 //
-                // Sent through session.sendText rather than sendMessage so no second
-                // bubble appears: the user sees the reaction they tapped, exactly as on
-                // an iPhone, while the peer receives the sentence. The temp guid is
-                // deliberately owned by nothing — onStatuses skips an id it can't match
-                // (`if (idx < 0) continue`), so the send's status echo lands nowhere.
+                // Sent through session.sendText rather than sendMessage so nothing is
+                // inserted locally: the user sees the reaction they tapped, exactly as
+                // on an iPhone, while the peer receives the sentence. The temp guid is
+                // owned by nothing — onStatuses skips an id it can't match
+                // (`if (idx < 0) continue`), so the send's status echo lands nowhere —
+                // but it IS remembered, because Apple mirrors the sent text back to us
+                // as an ordinary message and onMessages has to recognise and drop that
+                // echo. Recorded BEFORE the send: the echo can beat this call's return.
                 val body = tapbackWireText(emoji, targetBody, remove = !adding)
+                val temp = "tmp_" + System.nanoTime()
+                sentSmsTapbackTemps[temp] = true
                 Log.i(TAG, "tapback in an SMS thread room=$roomId → sending text fallback")
                 runCatching {
-                    session.sendText(roomId, body, "tmp_" + System.nanoTime(), null).ok
+                    session.sendText(roomId, body, temp, null).ok
                 }.getOrDefault(false)
             } else {
                 runCatching { session.sendTapback(roomId, messageId, emoji, remove = !adding) }.getOrDefault(false)

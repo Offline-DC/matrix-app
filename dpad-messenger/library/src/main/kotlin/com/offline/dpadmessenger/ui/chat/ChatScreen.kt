@@ -639,7 +639,17 @@ private fun Timeline(
                             senderName = if (msg.isOutgoing) null else senderNameFor(msg.senderId),
                             showSenderName = isGroup && !msg.isOutgoing && firstOfRun,
                             showQuotedParent = !repeatsParent,
-                            showReceipt = msg.id == lastOutgoingId,
+                            // No receipt line in a GROUP, which is what iMessage
+                            // does — and what the protocol assumes: rustpush never
+                            // requests a delivery receipt for a group message
+                            // (`should_send_delivered` = `IMessage && !is_group`), so
+                            // one can never arrive and any label here would be a
+                            // guess. A FAILURE still shows: "Not Delivered" is the one
+                            // piece of delivery state a group does surface, and the
+                            // only one the user can do anything about.
+                            showReceipt = msg.id == lastOutgoingId &&
+                                (!isGroup ||
+                                    msg.status == com.offline.dpadmessenger.data.MessageStatus.FAILED),
                             parentSnippet = parent,
                             onClick = { onBubbleClick(msg) },
                             // Last bubble gets the composer's DPAD-Up requester; the

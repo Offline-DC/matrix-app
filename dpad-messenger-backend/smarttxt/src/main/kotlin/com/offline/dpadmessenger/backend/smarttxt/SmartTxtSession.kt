@@ -63,6 +63,8 @@ class SmartTxtSession(
      *  Must run BEFORE [connect]. */
     fun seedSeen(guids: Collection<String>) = transport.seedSeen(guids)
 
+    fun seedGroupServices(services: Map<String, Boolean>) = transport.seedGroupServices(services)
+
     /** Open the connection. Initial sync is driven off the [TransportEvent
      *  .Connected] event (see [init]), so it runs on first connect AND on every
      *  reconnect. */

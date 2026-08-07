@@ -599,6 +599,11 @@ fun MessageBubble(
             }
             // SmartTxt: the delivery receipt sits BELOW the bubble, right-aligned
             // and gray (like real SmartTxt), so it never widens the bubble.
+            //
+            // `showReceipt` is false for every message in a GROUP except a failed one
+            // (see ChatScreen): a group never receives a delivery receipt, so there is
+            // nothing truthful to render. The reflow note below therefore applies to
+            // 1:1 threads, where the row IS always present and only its text swaps.
             // Shown for EVERY outgoing status (SENDING/SENT/DELIVERED/READ/FAILED),
             // not skipping SENT: the send ladder is SENDING → SENT → DELIVERED, and
             // hiding the row during the brief SENT step made it collapse to zero
@@ -899,12 +904,23 @@ private fun statusGlyph(status: MessageStatus, smarttxt: Boolean, readAtMs: Long
     if (smarttxt) when (status) {
         // SmartTxt shows the delivery state as words under the last sent bubble.
         MessageStatus.SENDING -> "Sending…"
-        // SENT is a transient hop on the way to DELIVERED (the FFI pushes an
-        // optimistic "delivered" right after a successful send). Label it
-        // "Sending…" too so the receipt reads continuously "Sending…" → "Delivered"
-        // with no blank frame in between (which used to collapse the row and make
-        // the thread jump). Real SmartTxt likewise never rests on a bare "Sent".
-        MessageStatus.SENT -> "Sending…"
+        // SENT means Apple accepted it and no receipt has arrived. That used to be a
+        // transient hop — the FFI pushed an optimistic "delivered" immediately — so
+        // labelling it "Sending…" hid a one-frame flicker. It is now a RESTING state
+        // for two whole categories of message, and "Sending…" is a lie in both:
+        //
+        //  - a blue message in a GROUP, which can never be delivered-confirmed because
+        //    rustpush does not ask: `should_send_delivered` is `IMessage && !is_group`
+        //    (imessage/messages.rs:1682), so the wire `D` flag is false and no
+        //    recipient ever sends an IDS 101. Captured 2026-08-07 14:48:50 — 16 targets,
+        //    `Sending done!`, and not one 101 in the entire session;
+        //  - anything whose receipt is simply slow or lost.
+        //
+        // "Sent" is honest for both, and it is what OpenBubbles shows in exactly this
+        // state (`Message.getLastUpdate` → "Sent at $dateCreated" when dateDelivered is
+        // null, io/message.dart:1704). Green messages are unaffected: they reach
+        // DELIVERED off the paired iPhone's SmsConfirmSent (IDS 146), not a 101.
+        MessageStatus.SENT -> "Sent"
         MessageStatus.DELIVERED -> "Delivered"
         // "Read 1:20 PM" / "Read Yesterday" / "Read 14 May", like real iMessage.
         // formatRelativeShort already does exactly this split (time today, then
