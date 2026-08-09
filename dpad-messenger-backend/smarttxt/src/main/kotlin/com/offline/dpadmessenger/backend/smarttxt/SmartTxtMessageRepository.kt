@@ -1881,7 +1881,7 @@ internal class SmartTxtMessageRepository(
         return when {
             others.isEmpty() -> c.guid
             others.size == 1 -> others[0].displayName.ifBlank { contactName(others[0].address) ?: prettyHandle(others[0].address) }
-            else -> others.joinToString(", ") { it.displayName.ifBlank { prettyHandle(it.address) } }
+            else -> others.joinToString(", ") { it.displayName.ifBlank { contactName(it.address) ?: prettyHandle(it.address) } }
         }
     }
 
@@ -1986,9 +1986,12 @@ internal class SmartTxtMessageRepository(
         if (contactsHealed.compareAndSet(false, true)) scope.launch { reresolveNames(idx) }
     }
 
-    /** Replace raw-handle display names (users) and 1:1 room titles with the contact
-     *  name now that [index] is populated. Never clobbers an already-resolved name
-     *  (e.g. one the relay supplied) — see [isRawHandleName]. */
+    /** Replace raw-handle display names (users) and room titles with the contact
+     *  name now that [index] is populated. A 1:1 title is a single handle; an
+     *  UNNAMED group's title is its member handles joined with ", " (the OB importer
+     *  and [displayNameFor] both build exactly that), so it heals from the members.
+     *  Never clobbers an already-resolved name (e.g. one the relay supplied, or a
+     *  group's real cv_name) — see [isRawHandleName]. */
     private suspend fun reresolveNames(index: Map<String, String>) = writeLock.withLock {
         var usersChanged = false
         val users = usersById.value.toMutableMap()
@@ -2002,7 +2005,31 @@ internal class SmartTxtMessageRepository(
 
         var roomsChanged = false
         val healed = rooms.value.map { room ->
-            if (ChatGuid.isGroup(room.id)) return@map room        // group titles aren't a 1:1 handle
+            if (ChatGuid.isGroup(room.id)) {
+                // Unnamed groups used to be skipped here outright, which stranded the
+                // OB importer's raw titles ("+1804…, +1810…") forever: 1:1s healed,
+                // named groups had their cv_name, but an unnamed group never saw the
+                // address book (reported 2026-08-09 after an OpenBubbles→Smart Txt
+                // migration: "unnamed group chats are still just showing phone
+                // numbers"). A title is auto-generated — safe to rebuild — when it's
+                // blank, the "Group" placeholder, or any comma-piece is still one of
+                // the members' raw handles; a human-set cv_name matches none of those,
+                // so it is never clobbered.
+                if (room.memberIds.isEmpty()) return@map room
+                val pieces = room.name.split(", ").filter { it.isNotBlank() }
+                val autoTitle = room.name.isBlank() || room.name == "Group" ||
+                    pieces.any { piece -> room.memberIds.any { m -> isRawHandleName(piece, m) } }
+                if (!autoTitle) return@map room
+                val rebuilt = room.memberIds.joinToString(", ") { m ->
+                    index[Handles.canon(m)]
+                        ?: users[m]?.displayName?.takeIf { !isRawHandleName(it, m) }
+                        ?: prettyHandle(m)
+                }
+                if (rebuilt.isBlank() || rebuilt == room.name) return@map room
+                roomNameById[room.id] = rebuilt
+                roomsChanged = true
+                return@map room.copy(name = rebuilt)
+            }
             val addr = room.id.substringAfterLast(';')
             if (!isRawHandleName(room.name, addr)) return@map room
             val resolved = index[Handles.canon(addr)] ?: return@map room

@@ -43,7 +43,8 @@ import java.io.File
  *    them as separate rows, and importing them as rows would show a wall of empty
  *    bubbles.
  *  - **Names are left raw** (`+18045551234`). `reresolveNames()` runs against the
- *    address book right after the restore and heals users and 1:1 room titles, so
+ *    address book right after the restore and heals users and room titles — 1:1s
+ *    AND unnamed groups, whose title is the member handles joined with ", " — so
  *    resolving contacts here would duplicate that for one launch's benefit.
  *
  * ### Failure policy
