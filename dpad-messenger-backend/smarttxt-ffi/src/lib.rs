@@ -3777,9 +3777,29 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 
         // 2) The message. Its parts are the attachment, plus — when a caption was
         // typed — the caption text so it renders as ONE bubble (image + caption),
-        // matching iMessage. NormalMessage::new builds the text part(s) from the
-        // caption; we then append the attachment part. With no caption we send the
-        // attachment alone (an empty text part would show as a blank line).
+        // matching iMessage. With no caption we send the attachment alone (an empty
+        // text part would show as a blank line).
+        //
+        // ORDER IS LOAD-BEARING: the attachment goes FIRST, the caption after it.
+        // `MessageParts::to_html` numbers parts with a counter it advances only for
+        // ATTACHMENT parts (imessage/messages.rs:210-226):
+        //
+        //     let part_idx = part.idx.unwrap_or(my_part_idx);
+        //     MessagePart::Attachment(..) => { my_part_idx += 1; … }  // advances
+        //     MessagePart::Text(..)       => { … }                    // does not
+        //
+        // so [Text, Attachment] emits message-part="0" TWICE and the receiving device
+        // drops the colliding FILE — the caption arrives, the photo does not. Observed
+        // 2026-08-10 on two handsets: `<span message-part="0">jc</span>` next to
+        // `<FILE … message-part="0">`, after a clean MMCS upload and an IDS 101.
+        // [Attachment, Text] numbers 0 then 1, which is correct and is also what
+        // OpenBubbles emits — its `partsFromBody` walks the AttributedBody runs in
+        // order and a photo-with-caption body carries the attachment run first
+        // (rustpush_service.dart:826-840).
+        //
+        // If a caption ever grows into MULTIPLE text parts (mentions, mixed
+        // formatting), the same counter will collide again on the trailing parts and
+        // they will need explicit `idx` values.
         let mut normal = if caption_s.is_empty() {
             let mut n = NormalMessage::new(String::new(), service);
             n.parts = MessageParts(vec![IndexedMessagePart {
@@ -3790,11 +3810,15 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             n
         } else {
             let mut n = NormalMessage::new(caption_s.clone(), service);
-            n.parts.0.push(IndexedMessagePart {
-                part: MessagePart::Attachment(attachment),
-                idx: None,
-                ext: None,
-            });
+            // insert(0), NOT push: see the part-numbering note above.
+            n.parts.0.insert(
+                0,
+                IndexedMessagePart {
+                    part: MessagePart::Attachment(attachment),
+                    idx: None,
+                    ext: None,
+                },
+            );
             n
         };
         normal.voice = voice;
