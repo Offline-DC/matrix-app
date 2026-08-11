@@ -4195,7 +4195,7 @@ fn rate_limit_wait_s(e: &PushError) -> Option<(u64, bool)> {
 }
 
 const SMS_FORWARDING_REMEDY: &str = "On your iPhone (same Apple ID): Settings ▸ Messages ▸ \
-     Text Message Forwarding ▸ toggle all devices OFF, restart iPhone, then toggle all devices back ON. Then send again. \
+     Text Message Forwarding ▸ toggle all devices OFF, restart iPhone, then toggle all devices back ON. \
      If that doesn't work, email support@dumb.co.";
 
 /// Build the green-SMS route from my own account's phone handle, or a user-facing
