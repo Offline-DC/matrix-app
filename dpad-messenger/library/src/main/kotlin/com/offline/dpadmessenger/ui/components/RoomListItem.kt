@@ -66,6 +66,15 @@ fun RoomListItem(
     showDivider: Boolean = true,
 ) {
     val colors = LocalDpadMessengerColors.current
+    // Does the timestamp sit on the name's line (freeing the whole width beneath
+    // for the preview), or in a trailing column?
+    //
+    // Only one thing ever needs that column: an unread count badge, which has to
+    // hang directly under the timestamp. SmartTxt never needs it — its unread is
+    // the blue dot in the LEFT margin — and the other skins only need it while
+    // there IS a badge. A read conversation would otherwise reserve a whole column
+    // for one short timestamp and ellipsise its preview to pay for it.
+    val timestampInline = colors.smarttxt || summary.unreadCount == 0
     // Layer additional FocusRequesters on top — each .focusRequester() points
     // at the next downstream focusable in the chain, which is the dpadRow.
     val extras = extraFocusRequesters.fold(Modifier as Modifier) { acc, fr ->
@@ -130,10 +139,10 @@ fun RoomListItem(
             // whole row, running UNDER the timestamp the way a notification lays
             // out.
             //
-            // The other skins keep both columns, because they show unread as a
-            // trailing count badge and that badge belongs directly under the
-            // timestamp. SmartTxt can give the width away precisely because its
-            // unread indicator is the blue dot in the LEFT margin instead.
+            // The other skins fall back to two columns only while they have an
+            // unread badge to hang under the timestamp — see [timestampInline].
+            // SmartTxt can always give the width away, because its unread indicator
+            // is the blue dot in the LEFT margin instead of a trailing badge.
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = summary.room.name,
@@ -162,7 +171,7 @@ fun RoomListItem(
                 // No 2dp nudge on this one: sharing a CenterVertically row with the
                 // name aligns the two for real, where the trailing column below has
                 // to fake a baseline match against the taller text.
-                if (colors.smarttxt) {
+                if (timestampInline) {
                     Spacer(Modifier.width(8.dp))
                     Text(
                         text = summary.lastMessage?.let { formatRelativeShort(it.timestampMs) } ?: "",
@@ -194,14 +203,13 @@ fun RoomListItem(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        // Non-SmartTxt skins keep the original trailing column: timestamp on top,
-        // unread badge directly beneath it, the pair hung off the TOP-right so they
-        // sit level with the contact name.
+        // The two-column arrangement, for the one case that still needs it: a skin
+        // with a trailing count badge, on a conversation that actually has unread.
+        // Timestamp on top, badge directly beneath, the pair hung off the TOP-right
+        // so they sit level with the contact name.
         //
-        // Rendered whether or not there is unread — this column owns the timestamp
-        // for these skins, so gating it on unreadCount would drop the time from
-        // every read conversation.
-        if (!colors.smarttxt) {
+        // No unreadCount check inside — reaching here already means there is one.
+        if (!timestampInline) {
             Spacer(Modifier.width(8.dp))
             Column(
                 horizontalAlignment = Alignment.End,
@@ -216,10 +224,8 @@ fun RoomListItem(
                     style = MaterialTheme.typography.labelSmall,
                     color = colors.mutedText,
                 )
-                if (summary.unreadCount > 0) {
-                    Spacer(Modifier.size(4.dp))
-                    UnreadBadge(count = summary.unreadCount)
-                }
+                Spacer(Modifier.size(4.dp))
+                UnreadBadge(count = summary.unreadCount)
             }
         }
     }
