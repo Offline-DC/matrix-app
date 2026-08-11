@@ -62,7 +62,11 @@ internal object ObHistoryImporter {
     const val OB_DB_PATH = "app_flutter/objectbox/data.mdb"
 
     /**
-     * How far back to import. Matches `SmartTxtMessageRepository.AUTO_DELETE_AGE_MS`,
+     * How far back to import. Deliberately FIXED at 3 days — it is no longer tied
+     * to the user's retention choice, because the import runs during the
+     * OpenBubbles migration, before they have picked anything, and a 28-day window
+     * would pull roughly nine times the rows into a 128 MB handset at the worst
+     * possible moment. Historically this matched `AUTO_DELETE_AGE_MS`,
      * which defaults ON: the repository drops anything older than this the moment it
      * restores, so importing a wider window would just be work whose result is thrown
      * away seconds later.

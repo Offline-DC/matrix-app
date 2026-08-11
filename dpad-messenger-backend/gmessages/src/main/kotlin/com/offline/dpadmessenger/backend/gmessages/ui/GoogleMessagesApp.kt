@@ -192,7 +192,7 @@ fun GoogleMessagesApp(
             return
         }
 
-        var autoDelete by remember { mutableStateOf(GoogleMessagesRepository.isAutoDeleteEnabled()) }
+        var autoDeleteDays by remember { mutableStateOf(GoogleMessagesRepository.autoDeleteDays()) }
         // Clock format: 12-hour by default, persisted across launches, applied
         // app-wide via TimeFormatPreference (Compose state — flips instantly).
         val settingsPrefs = remember {
@@ -230,10 +230,10 @@ fun GoogleMessagesApp(
                     paired = false
                 }
             },
-            autoDeleteEnabled = autoDelete,
-            onAutoDeleteChange = { enabled ->
-                autoDelete = enabled
-                GoogleMessagesRepository.setAutoDeleteEnabled(enabled)
+            autoDeleteDays = autoDeleteDays,
+            onAutoDeleteDaysChange = { days ->
+                autoDeleteDays = days
+                GoogleMessagesRepository.setAutoDeleteDays(days)
             },
             use24HourTime = use24Hour,
             onUse24HourTimeChange = { enabled ->

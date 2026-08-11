@@ -177,7 +177,8 @@ private fun SmartTxtChat(
         return
     }
 
-    val autoDelete = retention?.autoDeleteEnabled?.collectAsState()?.value ?: true
+    val autoDeleteDays = retention?.autoDeleteDays?.collectAsState()?.value
+        ?: com.offline.dpadmessenger.data.RetentionSettings.DEFAULT_RETENTION_DAYS
     // Read receipts: off by default. When off, reading still clears the notification
     // on the user's own Apple devices; only the sender-facing "Read" is suppressed.
     val sendReadReceipts = readReceipts?.sendReadReceipts?.collectAsState()?.value ?: false
@@ -228,8 +229,8 @@ private fun SmartTxtChat(
         // "Re-link phone" and "Days since last link" are intentionally left off for
         // the demo: omitting onRelink/onFreshRelink/linkAgeDays (all default to
         // null) hides both Settings rows. There's no real ~2-week IDS session here.
-        autoDeleteEnabled = autoDelete,
-        onAutoDeleteChange = retention?.let { r -> { enabled: Boolean -> r.setAutoDeleteEnabled(enabled) } },
+        autoDeleteDays = autoDeleteDays,
+        onAutoDeleteDaysChange = retention?.let { r -> { days: Int -> r.setAutoDeleteDays(days) } },
         sendReadReceipts = sendReadReceipts,
         onSendReadReceiptsChange = readReceipts?.let { r -> { enabled: Boolean -> r.setSendReadReceipts(enabled) } },
         use24HourTime = use24Hour,

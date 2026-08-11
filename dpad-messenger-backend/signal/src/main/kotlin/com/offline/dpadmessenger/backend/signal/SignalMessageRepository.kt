@@ -53,7 +53,7 @@ class SignalMessageRepository(
      *  mock/unit-test paths; when present, group rooms become sendable. */
     private val groups: SignalGroups? = null,
     /** Optional on-disk store so conversations survive process death + the
-     *  3-day auto-delete retention flag. Null in mock/unit-test paths. */
+     *  auto-delete retention setting. Null in mock/unit-test paths. */
     private val store: SignalMessageStore? = null,
     /** Optional profile-name resolver (fetch + decrypt a sender's Signal
      *  profile name from the profileKey on their messages). Null in mock paths. */
@@ -169,13 +169,21 @@ class SignalMessageRepository(
     // ---- persistence + retention (RetentionSettings) ------------------------
 
     private val persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val autoDelete = MutableStateFlow(store?.isAutoDeleteEnabled() ?: true)
-    override val autoDeleteEnabled: StateFlow<Boolean> = autoDelete.asStateFlow()
+    private val _autoDeleteDays =
+        MutableStateFlow(store?.retentionDays() ?: RetentionSettings.DEFAULT_RETENTION_DAYS)
+    override val autoDeleteDays: StateFlow<Int> = _autoDeleteDays.asStateFlow()
 
-    override fun setAutoDeleteEnabled(enabled: Boolean) {
-        store?.setAutoDeleteEnabled(enabled)
-        autoDelete.value = enabled
-        if (enabled) purgeOld()
+    override fun setAutoDeleteDays(days: Int) {
+        val clamped = if (days in RetentionSettings.RETENTION_DAY_OPTIONS) {
+            days
+        } else {
+            RetentionSettings.DEFAULT_RETENTION_DAYS
+        }
+        store?.setRetentionDays(clamped)
+        _autoDeleteDays.value = clamped
+        // Prune now so a shorter window takes effect without waiting for a
+        // restart. Harmlessly a no-op when the new window is Never.
+        purgeOld()
     }
 
     init {
@@ -192,7 +200,7 @@ class SignalMessageRepository(
             persistScope.launch {
                 while (true) {
                     delay(60 * 60 * 1000L)
-                    if (autoDelete.value) purgeOld()
+                    purgeOld()
                 }
             }
         }
@@ -224,7 +232,7 @@ class SignalMessageRepository(
             ) pr.room.copy(name = NOTE_TO_SELF) else pr.room
             RoomSummary(room, lastMessage = msgs.maxByOrNull { it.timestampMs }, unreadCount = pr.unreadCount)
         }
-        if (autoDelete.value) purgeOld()
+        purgeOld()
     }
 
     private fun saveSnapshot() {
@@ -247,9 +255,14 @@ class SignalMessageRepository(
         s.saveSnapshot(snap)
     }
 
-    /** Drop messages older than the retention window; refresh room previews. */
+    /**
+     * Drop messages older than the retention window; refresh room previews.
+     * A no-op on Never (0 days) — nothing is ever old enough to drop.
+     */
     private fun purgeOld() {
-        val cutoff = System.currentTimeMillis() - SignalMessageStore.RETENTION_MS
+        val days = _autoDeleteDays.value
+        if (days <= RetentionSettings.RETENTION_NEVER_DAYS) return
+        val cutoff = System.currentTimeMillis() - days * SignalMessageStore.DAY_MS
         val current = messagesByRoom.value
         var changed = false
         val pruned = current.mapValues { (_, msgs) ->
@@ -577,7 +590,23 @@ class SignalMessageRepository(
         return path
     }
 
-    override suspend fun sendAttachment(roomId: String, contentUri: String, caption: String?): Boolean {
+    override suspend fun sendAttachment(
+        roomId: String,
+        contentUri: String,
+        caption: String?,
+        // Signal replies aren't modelled in this backend yet; see the note on the
+        // Google Messages override.
+        replyToId: String?,
+    ): Boolean {
+        // Same story as Google Messages: the composer clears its reply banner
+        // regardless of backend, so a dropped reply is invisible on screen. Log it
+        // so a bundle at least shows the downgrade happened.
+        if (replyToId != null) {
+            Log.w(
+                TAG,
+                "sendAttachment: reply-to $replyToId ignored — no reply primitive in this backend",
+            )
+        }
         if (sender == null || attachments == null) return false
         val cap = caption?.trim().orEmpty()
         val isGroup = isGroupRoom(roomId)

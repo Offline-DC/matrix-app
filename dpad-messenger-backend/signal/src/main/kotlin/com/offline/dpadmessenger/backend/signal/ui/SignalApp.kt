@@ -5,6 +5,10 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -93,8 +97,11 @@ fun SignalApp(
         }
         // Surface the auto-delete retention toggle when the repo supports it.
         val retention = repository as? RetentionSettings
-        val autoDeleteFlow = remember(retention) { retention?.autoDeleteEnabled ?: MutableStateFlow(true) }
-        val autoDeleteEnabled by autoDeleteFlow.collectAsState()
+        val autoDeleteFlow = remember(retention) {
+            retention?.autoDeleteDays
+                ?: MutableStateFlow(RetentionSettings.DEFAULT_RETENTION_DAYS)
+        }
+        val autoDeleteDays by autoDeleteFlow.collectAsState()
 
         // Full log-out + forget the pairing so the next launch shows the QR.
         // Used by the Settings "log out" action AND the auth-expired re-link
@@ -130,8 +137,8 @@ fun SignalApp(
                 onLogout = logout,
                 initialRoomId = initialRoomId,
                 initialRoomKey = initialRoomKey,
-                autoDeleteEnabled = autoDeleteEnabled,
-                onAutoDeleteChange = retention?.let { r -> { value: Boolean -> r.setAutoDeleteEnabled(value) } },
+                autoDeleteDays = autoDeleteDays,
+                onAutoDeleteDaysChange = retention?.let { r -> { days: Int -> r.setAutoDeleteDays(days) } },
             )
         }
         return
@@ -164,9 +171,12 @@ fun SignalApp(
  * with a line explaining the pause when the one-time legacy-blob migration is
  * what we're waiting on.
  *
- * `:signal` can't reuse SmartTxt's DuckLoadingIndicator — that lives in
- * `:smarttxt` and paints a drawable from that module's R — so this is the
- * minimal local equivalent.
+ * `:signal` can't reuse SmartTxt's DuckLoadingIndicator composable — that lives
+ * in `:smarttxt` and paints a drawable from that module's R, and R classes don't
+ * cross module boundaries. So `:signal` carries its OWN copy of duck_logo.png
+ * (res/drawable-nodpi) and this is the local equivalent. Deliberately a copy
+ * rather than a move: `:smarttxt`'s boot screen is on the path every user hits at
+ * launch and is not worth disturbing for a cosmetic change over here.
  */
 @Composable
 private fun SignalLoadingScreen(
@@ -181,16 +191,38 @@ private fun SignalLoadingScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
             modifier = Modifier.padding(horizontal = 16.dp),
         ) {
-            Text(
-                text = when {
-                    error != null -> "Couldn't open Signal.\n$error"
-                    migrating != null -> "Moving your messages\u2026"
-                    else -> "Loading\u2026"
-                },
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center,
-            )
+            // No duck over an error — that state is a recovery screen with a
+            // focusable Retry, and a cheerful duck above "Couldn't open Signal"
+            // reads as though nothing is wrong. Loading and the migration line
+            // both keep it, which is what Smart Txt does with the same message.
+            if (error == null) {
+                Image(
+                    painter = painterResource(
+                        com.offline.dpadmessenger.backend.signal.R.drawable.duck_logo,
+                    ),
+                    contentDescription = null,
+                    modifier = Modifier.size(160.dp),
+                    contentScale = ContentScale.Fit,
+                )
+            }
+            // Nothing under the duck while it is just loading — the duck IS the
+            // indicator, and "Loading…" beneath it says nothing the animation
+            // doesn't. The other two states are not decoration: an error has to
+            // say what went wrong, and a migration has to explain why this wait is
+            // longer than the usual one.
+            val message = when {
+                error != null -> "Couldn't open Signal.\n$error"
+                migrating != null -> "Moving your messages\u2026"
+                else -> null
+            }
+            if (message != null) {
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
             if (error != null) {
                 // Take focus. This is the only focusable on the screen and the
                 // device has no touch, so an unfocused button is a stranded user

@@ -141,8 +141,8 @@ internal class SmartTxtMessageRepository(
     private val _authExpired = MutableStateFlow(false)
     val authExpired: StateFlow<Boolean> = _authExpired.asStateFlow()
 
-    private val _autoDelete = MutableStateFlow(prefs.getBoolean(KEY_AUTO_DELETE, true))
-    override val autoDeleteEnabled: StateFlow<Boolean> = _autoDelete.asStateFlow()
+    private val _autoDeleteDays = MutableStateFlow(loadRetentionDays())
+    override val autoDeleteDays: StateFlow<Int> = _autoDeleteDays.asStateFlow()
 
     // Whether to send peer-facing read receipts (so the SENDER sees "Read"). Off by
     // default: reading a chat still clears the notification on MY other Apple devices,
@@ -347,15 +347,65 @@ internal class SmartTxtMessageRepository(
 
     // ---- RetentionSettings --------------------------------------------------
 
-    override fun setAutoDeleteEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_AUTO_DELETE, enabled).apply()
-        _autoDelete.value = enabled
-        if (enabled) scope.launch { pruneOldMessages() }
+    /**
+     * Retention in days, migrating the pre-6.x on/off boolean the first time.
+     *
+     * Absent [KEY_AUTO_DELETE_DAYS] means we have never written one. Fall back to
+     * the legacy boolean: ON — and never-set, which defaulted to ON — becomes the
+     * 3-day default; OFF becomes `RETENTION_NEVER_DAYS` ("Ever"), which is exactly
+     * what OFF already meant, so nobody loses messages to a migration they never
+     * asked for. The answer is written back immediately, so the legacy key is read
+     * exactly once per install.
+     *
+     * "Ever" is the ONLY way anyone ends up on `RETENTION_NEVER_DAYS`: it is not in
+     * `RETENTION_DAY_OPTIONS`, so the picker cannot reach it and every
+     * setAutoDeleteDays clamps it away. Leaving it is one-way, by design.
+     */
+    private fun loadRetentionDays(): Int {
+        // -1, not 0, as the "nothing written yet" sentinel: 0 is now a real, chosen
+        // value (Never), and using it here would re-run the legacy migration on every
+        // launch for anyone who picks it — re-deriving their setting from a boolean
+        // they may have last touched years ago.
+        prefs.getInt(KEY_AUTO_DELETE_DAYS, -1).takeIf { it >= 0 }?.let { return it }
+        val legacyOn = prefs.getBoolean(KEY_AUTO_DELETE, true)
+        val migrated = if (legacyOn) {
+            com.offline.dpadmessenger.data.RetentionSettings.DEFAULT_RETENTION_DAYS
+        } else {
+            com.offline.dpadmessenger.data.RetentionSettings.LEGACY_OFF_RETENTION_DAYS
+        }
+        prefs.edit().putInt(KEY_AUTO_DELETE_DAYS, migrated).apply()
+        Log.i(TAG, "retention: migrated legacy autoDelete=$legacyOn -> $migrated day(s)")
+        return migrated
+    }
+
+    /**
+     * Messages older than this are dropped — on load, on receive, and on prune.
+     *
+     * Never (0 days) returns 0L rather than a real cutoff. Every message has
+     * `timestampMs >= 0`, so all three `>= cutoff` filters keep everything without
+     * needing to know about the special case.
+     */
+    private fun retentionCutoffMs(): Long {
+        val days = _autoDeleteDays.value
+        if (days <= com.offline.dpadmessenger.data.RetentionSettings.RETENTION_NEVER_DAYS) return 0L
+        return System.currentTimeMillis() - days * DAY_MS
+    }
+
+    override fun setAutoDeleteDays(days: Int) {
+        val opts = com.offline.dpadmessenger.data.RetentionSettings.RETENTION_DAY_OPTIONS
+        val clamped = if (days in opts) {
+            days
+        } else {
+            com.offline.dpadmessenger.data.RetentionSettings.DEFAULT_RETENTION_DAYS
+        }
+        prefs.edit().putInt(KEY_AUTO_DELETE_DAYS, clamped).apply()
+        _autoDeleteDays.value = clamped
+        Log.i(TAG, "retention: keeping $clamped day(s) — pruning now")
+        scope.launch { pruneOldMessages() }
     }
 
     private suspend fun pruneOldMessages() = writeLock.withLock {
-        if (!_autoDelete.value) return@withLock
-        val cutoff = System.currentTimeMillis() - AUTO_DELETE_AGE_MS
+        val cutoff = retentionCutoffMs()
         val pruned = messagesByRoom.value.mapValues { (_, list) -> list.filter { it.timestampMs >= cutoff } }
         if (pruned != messagesByRoom.value) { messagesByRoom.value = pruned; requestSave() }
     }
@@ -402,7 +452,7 @@ internal class SmartTxtMessageRepository(
             return
         }
         writeLock.withLock {
-            val cutoff = if (_autoDelete.value) System.currentTimeMillis() - AUTO_DELETE_AGE_MS else 0L
+            val cutoff = retentionCutoffMs()
             // Merge the cache UNDER whatever is already live instead of bailing when
             // the map is non-empty. The old guard ("if non-empty, return") threw the
             // ENTIRE stored history away if a single message landed before this slow
@@ -751,7 +801,7 @@ internal class SmartTxtMessageRepository(
         val unread = unreadByRoom.value.toMutableMap()
         val users = usersById.value.toMutableMap()
         val touched = HashSet<String>()   // rooms to sort + cap ONCE at the end
-        val cutoff = if (_autoDelete.value) System.currentTimeMillis() - AUTO_DELETE_AGE_MS else 0L
+        val cutoff = retentionCutoffMs()
         for (rm in msgs) {
             if (rm.timestampMs in 1 until cutoff) continue
             // BlueBubbles delivers tapbacks AS messages (associatedMessageType
@@ -1372,7 +1422,14 @@ internal class SmartTxtMessageRepository(
         }
         Log.i(TAG, "resend: re-uploading ${bytes.size}B ${att.mimeType} for ${failed.id}")
         // Re-send with the same caption (the failed message's body) on the bubble.
-        val ack = runCatching { session.sendAttachment(roomId, failed.id, bytes, att.mimeType, att.name, failed.body) }
+        // A retry keeps whatever the original was replying to — dropping it here
+        // would silently downgrade a reply to a plain message on the second attempt.
+        val ack = runCatching {
+            session.sendAttachment(
+                roomId, failed.id, bytes, att.mimeType, att.name, failed.body,
+                failed.replyToId.orEmpty(),
+            )
+        }
             .getOrElse {
                 Log.e(TAG, "resend: attachment upload failed", it)
                 com.offline.dpadmessenger.backend.smarttxt.transport.SendAck(false)
@@ -1733,7 +1790,12 @@ internal class SmartTxtMessageRepository(
     // Whole body runs OFF the main thread: the content-resolver queries and —
     // critically — session.sendAttachment (the MMCS network upload, which blocks
     // on a tokio runtime) would ANR the UI if run on the caller's Main dispatcher.
-    override suspend fun sendAttachment(roomId: String, contentUri: String, caption: String?): Boolean =
+    override suspend fun sendAttachment(
+        roomId: String,
+        contentUri: String,
+        caption: String?,
+        replyToId: String?,
+    ): Boolean =
         withContext(Dispatchers.IO) {
             val uri = runCatching { android.net.Uri.parse(contentUri) }.getOrNull()
                 ?: return@withContext false
@@ -1782,6 +1844,13 @@ internal class SmartTxtMessageRepository(
                 },
                 attachment = Attachment(kind = kind, mimeType = mime, name = name, localPath = localPath),
                 timestampMs = nextOutgoingTimestamp(roomId), status = MessageStatus.SENDING, isOutgoing = true,
+                // Without this the reply goes out correctly on the wire (tg =
+                // "r:0:0:0:<guid>", same shape as a text reply) and the recipient
+                // sees it threaded — but the SENDER's own bubble renders as a
+                // plain photo, which reads as "replying with a picture doesn't
+                // work". The text send path has always set this; the attachment
+                // path never did.
+                replyToId = replyToId,
             )
             writeLock.withLock {
                 messagesByRoom.value = messagesByRoom.value + (roomId to (messagesByRoom.value[roomId].orEmpty() + optimistic))
@@ -1789,7 +1858,9 @@ internal class SmartTxtMessageRepository(
             }
             Log.i(TAG, "sendAttachment: optimistic inserted tmp=$tmpId " +
                 "storeAfterInsert=${messagesByRoom.value[roomId]?.size ?: 0} localCopy=${localPath != null}")
-            val ack = runCatching { session.sendAttachment(roomId, tmpId, bytes, mime, name, cap) }
+            val ack = runCatching {
+                session.sendAttachment(roomId, tmpId, bytes, mime, name, cap, replyToId.orEmpty())
+            }
                 .onFailure { Log.w(TAG, "sendAttachment: transport threw for tmp=$tmpId", it) }
                 .getOrElse { com.offline.dpadmessenger.backend.smarttxt.transport.SendAck(false) }
             val present = messagesByRoom.value[roomId].orEmpty().any { it.id == tmpId }
@@ -2101,7 +2172,11 @@ internal class SmartTxtMessageRepository(
         private const val ME = "me"
         private const val KEY_AUTO_DELETE = "autoDeleteOldMessages"
         private const val KEY_READ_RECEIPTS = "sendReadReceipts"
-        private const val AUTO_DELETE_AGE_MS = 3L * 24 * 60 * 60 * 1000 // 3 days (matches Signal/gmessages + the settings copy)
+        // NB: KEY_AUTO_DELETE above is the pre-6.x on/off flag. It is read exactly
+        // once, by loadRetentionDays(), to migrate the user onto a day count.
+        /** Retention in days. Absent means "not migrated yet" — see loadRetentionDays. */
+        private const val KEY_AUTO_DELETE_DAYS = "autoDeleteDays"
+        private const val DAY_MS = 24L * 60 * 60 * 1000
         // Hard cap on messages kept IN MEMORY (and persisted) per conversation, so a
         // very chatty thread can't balloon RAM / the on-disk snapshot on a 1 GB
         // device. The chat view is a lazy list; older history stays reachable on the

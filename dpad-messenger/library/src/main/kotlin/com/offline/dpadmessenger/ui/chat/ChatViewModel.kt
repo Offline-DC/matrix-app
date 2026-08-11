@@ -265,8 +265,13 @@ class ChatViewModel(
      *  caption that rides the same message as the media. */
     fun sendAttachment(contentUri: String, caption: String? = null) {
         val sender = repository as? com.offline.dpadmessenger.data.AttachmentSender ?: return
+        // Read the reply target BEFORE clearing it, and clear it the way the text
+        // path does — otherwise the banner stays up and the NEXT photo silently
+        // inherits this reply.
+        val replyId = _replyTarget.value?.id
+        _replyTarget.value = null
         viewModelScope.launch {
-            runCatching { sender.sendAttachment(roomId, contentUri, caption?.trim()?.ifBlank { null }) }
+            runCatching { sender.sendAttachment(roomId, contentUri, caption?.trim()?.ifBlank { null }, replyId) }
                 // Was a bare runCatching {}: any failure in the whole attachment
                 // path vanished here with no trace anywhere.
                 .onFailure { android.util.Log.w("IMsgUiFlow", "sendAttachment failed room=$roomId", it) }

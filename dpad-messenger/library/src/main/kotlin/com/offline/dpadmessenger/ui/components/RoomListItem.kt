@@ -119,19 +119,59 @@ fun RoomListItem(
         InitialsAvatar(name = summary.room.name, colorHex = summary.room.avatarColor)
         Spacer(Modifier.width(AVATAR_GAP))
         Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = summary.room.name,
-                // SmartTxt sets the name at the SAME size as the preview beneath
-                // it and separates the two by weight and color alone, rather than
-                // by a step up in size.
-                style = if (colors.smarttxt) {
-                    MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
-                } else {
-                    MaterialTheme.typography.titleMedium
-                },
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            // Name line. In SmartTxt the timestamp joins it.
+            //
+            // The row used to be two columns for every skin — [name + preview]
+            // beside [timestamp + badge] — which charged the timestamp's width to
+            // the preview as well as the name, ellipsising it a good 45dp early
+            // with nothing actually sitting to its right. On a 240px screen that is
+            // a fifth of the line. Only the name competes with the timestamp, so in
+            // SmartTxt only the name pays for it and the preview below spans the
+            // whole row, running UNDER the timestamp the way a notification lays
+            // out.
+            //
+            // The other skins keep both columns, because they show unread as a
+            // trailing count badge and that badge belongs directly under the
+            // timestamp. SmartTxt can give the width away precisely because its
+            // unread indicator is the blue dot in the LEFT margin instead.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = summary.room.name,
+                    // SmartTxt sets the name at the SAME size as the preview beneath
+                    // it and separates the two by weight and color alone, rather than
+                    // by a step up in size.
+                    style = if (colors.smarttxt) {
+                        MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
+                    } else {
+                        MaterialTheme.typography.titleMedium
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                if (isMuted) {
+                    Spacer(Modifier.width(6.dp))
+                    // Muted indicator (🔕). Text glyph avoids pulling in the extended
+                    // material-icons dependency just for one symbol.
+                    Text(
+                        text = "🔕",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = colors.mutedText,
+                    )
+                }
+                // No 2dp nudge on this one: sharing a CenterVertically row with the
+                // name aligns the two for real, where the trailing column below has
+                // to fake a baseline match against the taller text.
+                if (colors.smarttxt) {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = summary.lastMessage?.let { formatRelativeShort(it.timestampMs) } ?: "",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = colors.mutedText,
+                        maxLines = 1,
+                    )
+                }
+            }
             val preview = summary.lastMessage?.let { msg ->
                 // No "You:" / sender-name prefix — just the message text (media-only
                 // messages have a blank body, so show a typed label instead).
@@ -154,36 +194,32 @@ fun RoomListItem(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        if (isMuted) {
-            Spacer(Modifier.width(6.dp))
-            // Muted indicator (🔕). Text glyph avoids pulling in the extended
-            // material-icons dependency just for one symbol.
-            Text(text = "🔕", style = MaterialTheme.typography.labelSmall, color = colors.mutedText)
-        }
-        Spacer(Modifier.width(8.dp))
-        Column(
-            horizontalAlignment = Alignment.End,
-            // Top-aligned, not centered: OpenBubbles hangs the timestamp off the
-            // TOP-right of the row so it sits on the same line as the contact
-            // name, with the unread badge dropping beneath it. Centering it (the
-            // old behavior) floated it opposite the gap between the name and the
-            // message preview, which read as a stray label belonging to neither.
-            // The 2dp nudge lines the small timestamp's cap-height up with the
-            // larger name's, since Top aligns their boxes, not their baselines.
-            modifier = Modifier
-                .align(Alignment.Top)
-                .padding(top = 2.dp),
-        ) {
-            Text(
-                text = summary.lastMessage?.let { formatRelativeShort(it.timestampMs) } ?: "",
-                style = MaterialTheme.typography.labelSmall,
-                color = colors.mutedText,
-            )
-            // Non-SmartTxt skins keep the trailing count badge; SmartTxt has
-            // already shown unread as the blue dot in the left margin.
-            if (!colors.smarttxt && summary.unreadCount > 0) {
-                Spacer(Modifier.size(4.dp))
-                UnreadBadge(count = summary.unreadCount)
+        // Non-SmartTxt skins keep the original trailing column: timestamp on top,
+        // unread badge directly beneath it, the pair hung off the TOP-right so they
+        // sit level with the contact name.
+        //
+        // Rendered whether or not there is unread — this column owns the timestamp
+        // for these skins, so gating it on unreadCount would drop the time from
+        // every read conversation.
+        if (!colors.smarttxt) {
+            Spacer(Modifier.width(8.dp))
+            Column(
+                horizontalAlignment = Alignment.End,
+                // The 2dp nudge lines the small timestamp's cap-height up with the
+                // larger name's, since Top aligns their boxes, not their baselines.
+                modifier = Modifier
+                    .align(Alignment.Top)
+                    .padding(top = 2.dp),
+            ) {
+                Text(
+                    text = summary.lastMessage?.let { formatRelativeShort(it.timestampMs) } ?: "",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = colors.mutedText,
+                )
+                if (summary.unreadCount > 0) {
+                    Spacer(Modifier.size(4.dp))
+                    UnreadBadge(count = summary.unreadCount)
+                }
             }
         }
     }

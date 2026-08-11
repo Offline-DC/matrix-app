@@ -148,6 +148,7 @@ class MockRelayTransport : SmartTxtTransport {
 
     override suspend fun sendAttachment(
         chatGuid: String, tempGuid: String, bytes: ByteArray, mimeType: String, name: String, caption: String,
+        @Suppress("UNUSED_PARAMETER") replyTo: String,
     ): SendAck {
         val guid = "msg_${guidSeq.incrementAndGet()}"
         val kind = if (mimeType.startsWith("video/")) "video" else if (mimeType.startsWith("image/")) "image" else "other"

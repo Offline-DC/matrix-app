@@ -243,11 +243,13 @@ class RelayWebSocketTransport(
 
     override suspend fun sendAttachment(
         chatGuid: String, tempGuid: String, bytes: ByteArray, mimeType: String, name: String, caption: String,
+        replyTo: String,
     ): SendAck = try {
         val data = request(RelayProtocol.T_SEND_ATTACHMENT) {
             put("chatGuid", chatGuid); put("tempGuid", tempGuid)
             put("mimeType", mimeType); put("name", name)
             if (caption.isNotEmpty()) put("caption", caption)
+            if (replyTo.isNotEmpty()) put("replyToGuid", replyTo)
             put("dataB64", Base64.encodeToString(bytes, Base64.NO_WRAP) ?: "")
         }.dataObject()
         SendAck(ok = true, guid = data["guid"]?.jsonPrimitive?.content)

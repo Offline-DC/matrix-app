@@ -285,14 +285,26 @@ private fun RoomList(
     // scroll/focus out from under the user (e.g. while they're on the cog).
     LaunchedEffect(Unit) {
         if (rooms.isNotEmpty()) {
-            // Restore the exact scroll position from last time (so returning
-            // from a chat lands where the user was, not at the top). Fall back
-            // to scrolling the entry row into view on first-ever entry.
+            // Restore the exact scroll position from last time, so returning from
+            // a chat lands where the user was rather than at the top.
             if (savedScroll != null) {
                 listState.scrollToItem(savedScroll.first, savedScroll.second)
-            } else {
-                val idx = rooms.indexOfFirst { it.room.id == entryRoomId }
-                if (idx >= 0) listState.scrollToItem(idx)
+                withFrameNanos {}
+            }
+            // ...then check the row we're about to focus actually ended up on
+            // screen. The saved position goes stale two ways: the list re-sorts
+            // when a message arrives, and a chat opened from a NOTIFICATION was
+            // never scrolled to in the first place — it is usually at the top
+            // while the saved offset is somewhere further down. An off-screen row
+            // never composes, so every requestFocus() below fails and the list is
+            // left with nothing focused: the "press OK twice" bug, reached by
+            // another road. Also covers first-ever entry, where there is no saved
+            // position and the entry row may be well down the list.
+            val entryIdx = rooms.indexOfFirst { it.room.id == entryRoomId }
+            if (entryIdx >= 0 &&
+                listState.layoutInfo.visibleItemsInfo.none { it.index == entryIdx }
+            ) {
+                listState.scrollToItem(entryIdx)
             }
             // Retry focus across a few frames: when returning from a chat the
             // target row isn't attached on the first frame, so a single

@@ -4,10 +4,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -32,6 +34,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.focus.dpadRow
 import com.offline.dpadmessenger.ui.components.CompactBarButton
@@ -68,10 +71,10 @@ fun SettingsScreen(
     showDarkThemeToggle: Boolean = false,
     darkTheme: Boolean = false,
     onDarkThemeChange: (Boolean) -> Unit = {},
-    /** Auto-delete-old-messages toggle. Hidden when [onAutoDeleteChange] is
-     *  null (repositories without local retention). */
-    autoDeleteEnabled: Boolean = true,
-    onAutoDeleteChange: ((Boolean) -> Unit)? = null,
+    /** How many days of messages this device keeps. The row is hidden when
+     *  [onAutoDeleteDaysChange] is null (repositories without local retention). */
+    autoDeleteDays: Int = com.offline.dpadmessenger.data.RetentionSettings.DEFAULT_RETENTION_DAYS,
+    onAutoDeleteDaysChange: ((Int) -> Unit)? = null,
     /** Send-read-receipts toggle. Hidden when [onSendReadReceiptsChange] is null
      *  (repositories that can't send receipts, e.g. the mock). Off by default:
      *  reading still clears the notification on the user's own devices, but the
@@ -169,7 +172,7 @@ fun SettingsScreen(
                 }
             }
             val showHandlePicker = onDefaultSendHandleChange != null && sendHandles.isNotEmpty()
-            if (onAutoDeleteChange != null || onSendReadReceiptsChange != null || showHandlePicker) {
+            if (onAutoDeleteDaysChange != null || onSendReadReceiptsChange != null || showHandlePicker) {
                 SettingHeader("Messages")
                 if (showHandlePicker) {
                     HandlePickerRow(
@@ -195,13 +198,25 @@ fun SettingsScreen(
                         onCheckedChange = onSendReadReceiptsChange,
                     )
                 }
-                if (onAutoDeleteChange != null) {
-                    ToggleRow(
-                        title = "Auto-delete old messages",
-                        subtitle = "Remove texts older than 3 days from this device. " +
-                            "This will not delete messages on other devices.",
-                        checked = autoDeleteEnabled,
-                        onCheckedChange = onAutoDeleteChange,
+                if (onAutoDeleteDaysChange != null) {
+                    // Press-to-cycle rather than a dropdown: there is no pointer here,
+                    // and ActionRow already gets d-pad focus right. Four options is few
+                    // enough that cycling reaches any of them in at most three presses.
+                    val opts = com.offline.dpadmessenger.data.RetentionSettings.RETENTION_DAY_OPTIONS
+                    // "Ever" is not in opts — it is a migration leftover, not a choice,
+                    // so indexOf returns -1 for it and the first press leaves it behind
+                    // for good. That press lands on the LAST option (28 days), the
+                    // closest real window: jumping straight to 1 day would prune nearly
+                    // everything on the phone in one accidental press, with no way back.
+                    val next = opts.indexOf(autoDeleteDays).let { i ->
+                        if (i < 0) opts.last() else opts[(i + 1) % opts.size]
+                    }
+                    ActionRow(
+                        title = "Keep messages for",
+                        value = retentionLabel(autoDeleteDays),
+                        subtitle = "Press OK to change. Older texts are removed from this " +
+                            "phone only; your other devices keep theirs.",
+                        onClick = { onAutoDeleteDaysChange(next) },
                     )
                 }
             }
@@ -293,6 +308,11 @@ private fun ActionRow(
     subtitle: String,
     destructive: Boolean = false,
     focusRequester: FocusRequester? = null,
+    /** Optional current value, shown bold immediately after [title] on the same
+     *  line, so a row reads "Keep messages for **3 days**" and the subtitle is
+     *  free to be the instruction rather than the value. Null keeps the plain
+     *  title-and-subtitle layout every other row uses. */
+    value: String? = null,
     onClick: () -> Unit,
 ) {
     val color = if (destructive) MaterialTheme.colorScheme.error
@@ -304,8 +324,29 @@ private fun ActionRow(
             .dpadRow(onClick = onClick, focusRequester = focusRequester, shape = RoundedCornerShape(10.dp))
             .padding(horizontal = 12.dp, vertical = 10.dp),
     ) {
-        Column {
-            Text(title, color = color, style = MaterialTheme.typography.bodyLarge)
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    title,
+                    color = color,
+                    style = MaterialTheme.typography.bodyLarge,
+                    // fill = false so the value hugs the title instead of being
+                    // flung to the right edge. On a 240px screen a hard-right
+                    // value forces the title to wrap and the pair stops reading
+                    // as one phrase.
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                if (value != null) {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        value,
+                        color = color,
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                    )
+                }
+            }
             Text(
                 subtitle,
                 style = MaterialTheme.typography.bodySmall,
@@ -359,6 +400,19 @@ private fun HandlePickerRow(
 }
 
 /** "tel:+1…" → "+1…", "mailto:x@y" → "x@y". */
+/**
+ * "Ever" / "1 day" / "3 days" — the settings row's current value.
+ *
+ * "Ever", not "Never": the value sits on the title's line, so the row reads as one
+ * sentence — "Keep messages for **Ever**". "Keep messages for Never" says the exact
+ * opposite of what that setting does.
+ */
+private fun retentionLabel(days: Int): String = when {
+    days <= com.offline.dpadmessenger.data.RetentionSettings.RETENTION_NEVER_DAYS -> "Ever"
+    days == 1 -> "1 day"
+    else -> "$days days"
+}
+
 private fun prettyHandle(h: String): String = h.removePrefix("tel:").removePrefix("mailto:")
 
 @Composable

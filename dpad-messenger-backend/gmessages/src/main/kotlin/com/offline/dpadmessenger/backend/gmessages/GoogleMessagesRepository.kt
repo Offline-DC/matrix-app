@@ -184,12 +184,13 @@ object GoogleMessagesRepository {
     fun authExpiredReasonFlow(): StateFlow<AuthFailureReason?>? =
         (instance as? GoogleMessagesMessageRepository)?.authExpiredReason
 
-    /** Auto-delete-old-messages setting (Settings toggle). Defaults to ON. */
-    fun isAutoDeleteEnabled(): Boolean =
-        (instance as? GoogleMessagesMessageRepository)?.autoDeleteOldMessages ?: true
+    /** How many days of messages this device keeps (Settings row). 0 is Never. */
+    fun autoDeleteDays(): Int =
+        (instance as? GoogleMessagesMessageRepository)?.autoDeleteDays
+            ?: com.offline.dpadmessenger.data.RetentionSettings.DEFAULT_RETENTION_DAYS
 
-    fun setAutoDeleteEnabled(enabled: Boolean) {
-        (instance as? GoogleMessagesMessageRepository)?.autoDeleteOldMessages = enabled
+    fun setAutoDeleteDays(days: Int) {
+        (instance as? GoogleMessagesMessageRepository)?.autoDeleteDays = days
     }
 
     /** Send-read-receipts setting (Settings toggle). Defaults to OFF. */

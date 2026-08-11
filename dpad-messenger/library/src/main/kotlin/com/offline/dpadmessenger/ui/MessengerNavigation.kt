@@ -76,9 +76,9 @@ fun DpadMessengerApp(
     /** Whole days since the last fresh sign-in. Drives the Settings "last linked"
      *  row and the day-13 "re-link soon" banner on the room list. Null hides both. */
     linkAgeDays: Int? = null,
-    /** Auto-delete-old-messages setting (hidden when change handler is null). */
-    autoDeleteEnabled: Boolean = true,
-    onAutoDeleteChange: ((Boolean) -> Unit)? = null,
+    /** How long this device keeps messages (hidden when change handler is null). */
+    autoDeleteDays: Int = com.offline.dpadmessenger.data.RetentionSettings.DEFAULT_RETENTION_DAYS,
+    onAutoDeleteDaysChange: ((Int) -> Unit)? = null,
     /** Send-read-receipts setting (hidden when change handler is null). */
     sendReadReceipts: Boolean = false,
     onSendReadReceiptsChange: ((Boolean) -> Unit)? = null,
@@ -199,6 +199,30 @@ fun DpadMessengerApp(
                     ChatViewModelFactory(repository, roomId)
                 }
                 val vm: ChatViewModel = viewModel(factory = chatFactory)
+                // Tell the room list which conversation the user is in, whatever
+                // route they took to get here — a list tap, a notification, or a
+                // conversation they just started. Back then lands focus on THIS
+                // row.
+                //
+                // The list's own onRoomClick used to be the only thing that set
+                // this, so a chat opened from a notification left it pointing at
+                // whichever row was last tapped IN the list: open a chat, exit
+                // with the red key, tap a notification for a different chat, press
+                // Back — and the highlight sat on the older conversation.
+                //
+                // ROOM_LIST is the start destination and the deep link above pops
+                // up to it (not inclusive), so it is on the back stack whenever a
+                // chat is; runCatching covers the case where it somehow isn't.
+                val roomListEntry = remember(backStack) {
+                    runCatching { nav.getBackStackEntry(Routes.ROOM_LIST) }.getOrNull()
+                }
+                if (roomListEntry != null) {
+                    val roomListVm: RoomListViewModel =
+                        viewModel(viewModelStoreOwner = roomListEntry, factory = factory)
+                    androidx.compose.runtime.LaunchedEffect(roomId) {
+                        roomListVm.setLastOpened(roomId)
+                    }
+                }
                 // "Re-link phone" on a failed message is a USER-INITIATED repair,
                 // so it gets the same full re-sign-in Settings does.
                 //
@@ -246,8 +270,8 @@ fun DpadMessengerApp(
                     showDarkThemeToggle = onToggleDarkTheme != null,
                     darkTheme = darkTheme,
                     onDarkThemeChange = { onToggleDarkTheme?.invoke(it) },
-                    autoDeleteEnabled = autoDeleteEnabled,
-                    onAutoDeleteChange = onAutoDeleteChange,
+                    autoDeleteDays = autoDeleteDays,
+                    onAutoDeleteDaysChange = onAutoDeleteDaysChange,
                     sendReadReceipts = sendReadReceipts,
                     onSendReadReceiptsChange = onSendReadReceiptsChange,
                     use24HourTime = use24HourTime,

@@ -14,6 +14,7 @@ import com.offline.dpadmessenger.data.MediaDownloader
 import com.offline.dpadmessenger.data.Message
 import com.offline.dpadmessenger.data.MessageRepository
 import com.offline.dpadmessenger.data.MessageStatus
+import com.offline.dpadmessenger.data.RetentionSettings
 import com.offline.dpadmessenger.data.Room
 import com.offline.dpadmessenger.data.RoomSummary
 import com.offline.dpadmessenger.data.User
@@ -124,17 +125,52 @@ internal class GoogleMessagesMessageRepository(
     private val prefs = context.getSharedPreferences("gmessages_settings", Context.MODE_PRIVATE)
 
     /**
-     * When on (DEFAULT), messages older than [AUTO_DELETE_AGE_MS] are pruned
-     * from THIS device only — we never send DELETE_MESSAGE, so the thread is
-     * untouched on the phone and everywhere else. Keeps the in-memory store
-     * (and these tiny flip-phone screens) lean.
+     * How many days of messages this device keeps. Anything older is pruned from
+     * THIS device only — we never send DELETE_MESSAGE, so the thread is untouched
+     * on the phone and everywhere else. Keeps the in-memory store (and these tiny
+     * flip-phone screens) lean.
+     *
+     * One of [RetentionSettings.RETENTION_DAY_OPTIONS], or
+     * [RetentionSettings.RETENTION_NEVER_DAYS] (0, keep everything) for a user
+     * migrated off the old on/off switch — the picker can't select that one.
      */
-    var autoDeleteOldMessages: Boolean
-        get() = prefs.getBoolean(KEY_AUTO_DELETE, true)
-        set(value) {
-            prefs.edit().putBoolean(KEY_AUTO_DELETE, value).apply()
-            if (value) scope.launch { pruneOldMessages() }
+    var autoDeleteDays: Int
+        get() {
+            // -1, not 0, as the "nothing written yet" sentinel: 0 is now a real,
+            // chosen value (Never), so using it here would re-derive the setting
+            // from the legacy boolean on every single read.
+            prefs.getInt(KEY_AUTO_DELETE_DAYS, -1).takeIf { it >= 0 }?.let { return it }
+            val migrated = if (prefs.getBoolean(KEY_AUTO_DELETE, true)) {
+                RetentionSettings.DEFAULT_RETENTION_DAYS
+            } else {
+                RetentionSettings.LEGACY_OFF_RETENTION_DAYS
+            }
+            prefs.edit().putInt(KEY_AUTO_DELETE_DAYS, migrated).apply()
+            Log.i(TAG, "retention: migrated legacy autoDelete -> $migrated day(s)")
+            return migrated
         }
+        set(value) {
+            val clamped = if (value in RetentionSettings.RETENTION_DAY_OPTIONS) {
+                value
+            } else {
+                RetentionSettings.DEFAULT_RETENTION_DAYS
+            }
+            prefs.edit().putInt(KEY_AUTO_DELETE_DAYS, clamped).apply()
+            // Prune now so a shorter window takes effect without waiting for a
+            // restart. Harmlessly a no-op when the new window is Never.
+            scope.launch { pruneOldMessages() }
+        }
+
+    /**
+     * Cutoff for the current retention window. Never (0 days) returns 0L rather
+     * than a real cutoff — every message has `timestampMs >= 0`, so all three
+     * `>= cutoff` filters keep everything without their own special case.
+     */
+    private fun autoDeleteCutoffMs(): Long {
+        val days = autoDeleteDays
+        if (days <= RetentionSettings.RETENTION_NEVER_DAYS) return 0L
+        return System.currentTimeMillis() - days * DAY_MS
+    }
 
     /**
      * Whether to send read receipts to the sender. OFF by default — opening a
@@ -146,8 +182,8 @@ internal class GoogleMessagesMessageRepository(
         set(value) { prefs.edit().putBoolean(KEY_READ_RECEIPTS, value).apply() }
 
     private suspend fun pruneOldMessages() = writeLock.withLock {
-        if (!autoDeleteOldMessages) return@withLock
-        val cutoff = System.currentTimeMillis() - AUTO_DELETE_AGE_MS
+        val cutoff = autoDeleteCutoffMs()
+        if (cutoff <= 0L) return@withLock
         val pruned = messagesByRoom.value.mapValues { (_, list) ->
             list.filter { it.timestampMs >= cutoff }
         }
@@ -342,8 +378,7 @@ internal class GoogleMessagesMessageRepository(
             // If the live session already pushed state while we were reading the
             // cache, don't clobber it with the older snapshot.
             if (rooms.value.isNotEmpty() || messagesByRoom.value.isNotEmpty()) return@withLock
-            val cutoff =
-                if (autoDeleteOldMessages) System.currentTimeMillis() - AUTO_DELETE_AGE_MS else 0L
+            val cutoff = autoDeleteCutoffMs()
             usersById.value = snap.usersById + (ME to currentUser)
             rooms.value = snap.rooms
             // Sweep leftover optimistic rows, but do NOT treat them all alike —
@@ -480,8 +515,7 @@ internal class GoogleMessagesMessageRepository(
     private suspend fun onMessages(msgs: List<GMSessionProto.GMMessage>) = writeLock.withLock {
         val byRoom = messagesByRoom.value.toMutableMap()
         val unread = unreadByRoom.value.toMutableMap()
-        val autoDeleteCutoff =
-            if (autoDeleteOldMessages) System.currentTimeMillis() - AUTO_DELETE_AGE_MS else 0L
+        val autoDeleteCutoff = autoDeleteCutoffMs()
         for (gm in msgs) {
             if (gm.isTombstone) continue // join/leave/protocol-switch system rows — skip for now
             // SMS reaction-fallback texts ('👍 to "Hi"', 'Liked "Hi"') are
@@ -1048,7 +1082,25 @@ internal class GoogleMessagesMessageRepository(
 
     // ---- AttachmentSender ---------------------------------------------------
 
-    override suspend fun sendAttachment(roomId: String, contentUri: String, caption: String?): Boolean {
+    override suspend fun sendAttachment(
+        roomId: String,
+        contentUri: String,
+        caption: String?,
+        // Google Messages has no reply primitive in this backend, so a reply-with-media
+        // sends as a plain media message. Accepted rather than dropped from the
+        // interface, so the iMessage path can carry it.
+        replyToId: String?,
+    ): Boolean {
+        // The composer clears its reply banner whichever backend is behind it, so a
+        // dropped reply leaves NOTHING on screen — an ordinary photo and no error,
+        // indistinguishable from the reply having worked. Until there is a reply
+        // primitive here, at least make the downgrade visible in a log bundle.
+        if (replyToId != null) {
+            Log.w(
+                TAG,
+                "sendAttachment: reply-to $replyToId ignored — no reply primitive in this backend",
+            )
+        }
         val uri = runCatching { android.net.Uri.parse(contentUri) }.getOrNull() ?: return false
         val resolver = appContext.contentResolver
         // getType() is null for file:// (e.g. a recorded voice memo) — fall back
@@ -1399,9 +1451,12 @@ internal class GoogleMessagesMessageRepository(
         /** Shown instead of a raw conversation/participant id when no real name
          *  or number is available yet. */
         private const val UNKNOWN_SENDER = "Unknown sender"
+        /** Legacy on/off flag. Read once, to migrate an existing install onto
+         *  [KEY_AUTO_DELETE_DAYS]; never written again. */
         private const val KEY_AUTO_DELETE = "autoDeleteOldMessages"
+        private const val KEY_AUTO_DELETE_DAYS = "autoDeleteDays"
         private const val KEY_READ_RECEIPTS = "sendReadReceipts"
-        private const val AUTO_DELETE_AGE_MS = 3L * 24 * 60 * 60 * 1000 // 3 days
+        private const val DAY_MS = 24L * 60 * 60 * 1000
 
         /** Prefix for optimistic local rows, replaced when the phone echoes the
          *  id back. */

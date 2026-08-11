@@ -24,5 +24,12 @@ interface AttachmentSender {
      * text that rides the SAME message as the media (one bubble, like iMessage);
      * null/blank sends the media alone. @return true if the send was accepted.
      */
-    suspend fun sendAttachment(roomId: String, contentUri: String, caption: String? = null): Boolean
+    suspend fun sendAttachment(
+        roomId: String,
+        contentUri: String,
+        caption: String? = null,
+        /** Guid of the message this media replies to, or null for a normal send.
+         *  Backends that don't model replies ignore it. */
+        replyToId: String? = null,
+    ): Boolean
 }

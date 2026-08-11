@@ -312,7 +312,15 @@ fun ChatScreen(
                 onDownFromCancel = { runCatching { composerFr.requestFocus() } },
             )
             DpadComposer(
-                onSend = viewModel::send,
+                // Re-assert composer focus after sending. While a reply is
+                // staged, DPAD-Up parks focus on the banner's Cancel X; sending
+                // clears replyTarget, the banner leaves the composition, and the
+                // focus it held goes with it — leaving the d-pad with nowhere to
+                // be. Asking for it back costs nothing when focus never moved.
+                onSend = { body ->
+                    viewModel.send(body)
+                    runCatching { composerFr.requestFocus() }
+                },
                 isSms = isSms,
                 prefill = editTarget?.body,
                 prefillKey = editTarget?.id,
@@ -557,8 +565,17 @@ private fun Timeline(
     // never yank the user away while they're scrolled up reading history.
     // This also guarantees the just-sent bubble is measured/visible so the
     // composer's DPAD-Up can focus it (an off-screen row can't take focus).
+    //
+    // OUR OWN send always wins. The near-bottom guard is about not yanking the
+    // reader away from history when something ARRIVES — it should never apply to
+    // a message the user just sent. Replying to something far up the thread used
+    // to leave the view parked on the old message with the reply off-screen
+    // below, which is what "it loses focus after replying" actually was.
+    val lastIsOutgoing = (timeline.lastOrNull { it is TimelineItem.MessageItem }
+        as? TimelineItem.MessageItem)?.message?.isOutgoing == true
     LaunchedEffect(lastMessageId) {
-        if (lastMessageId != null && listState.firstVisibleItemIndex <= 2) {
+        if (lastMessageId == null) return@LaunchedEffect
+        if (lastIsOutgoing || listState.firstVisibleItemIndex <= 2) {
             listState.animateScrollToItem(0)
         }
     }

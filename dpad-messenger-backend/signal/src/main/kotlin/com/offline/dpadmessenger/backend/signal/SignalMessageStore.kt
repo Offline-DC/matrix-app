@@ -6,6 +6,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.offline.dpadmessenger.backend.core.store.MessageStore
 import com.offline.dpadmessenger.data.Message
+import com.offline.dpadmessenger.data.RetentionSettings
 import com.offline.dpadmessenger.data.Room
 import com.offline.dpadmessenger.data.User
 import kotlinx.serialization.Serializable
@@ -34,8 +35,8 @@ import kotlinx.serialization.json.Json
  * mutex around read-state-then-save, or routing those three paths through
  * `upsertMessages`.
  *
- * The auto-delete retention flag deliberately stays in the old
- * [EncryptedSharedPreferences] — it is a single boolean, not message data, and
+ * The retention setting deliberately stays in the old
+ * [EncryptedSharedPreferences] — it is a single Int, not message data, and
  * moving it would buy nothing.
  *
  * Signal-specific state that has no place in a shared schema (the contact
@@ -116,11 +117,28 @@ class SignalMessageStore(context: Context) {
 
     fun saveSnapshot(snapshot: Snapshot) = store.save(snapshot.toStore(), restored)
 
-    /** Auto-delete retention flag (default true). */
-    fun isAutoDeleteEnabled(): Boolean = prefs.getBoolean(KEY_AUTO_DELETE, true)
+    /**
+     * How many days of messages to keep. 0 is Never (keep everything).
+     *
+     * Existing installs migrate once off the legacy on/off flag: ON ->
+     * [RetentionSettings.DEFAULT_RETENTION_DAYS], OFF -> Never, which is what OFF
+     * already meant. The sentinel is -1 rather than 0, since 0 is now a real value
+     * a user can choose and would otherwise re-run this migration every launch.
+     */
+    fun retentionDays(): Int {
+        prefs.getInt(KEY_AUTO_DELETE_DAYS, -1).takeIf { it >= 0 }?.let { return it }
+        val migrated = if (prefs.getBoolean(KEY_AUTO_DELETE, true)) {
+            RetentionSettings.DEFAULT_RETENTION_DAYS
+        } else {
+            RetentionSettings.LEGACY_OFF_RETENTION_DAYS
+        }
+        prefs.edit().putInt(KEY_AUTO_DELETE_DAYS, migrated).apply()
+        Log.i(TAG, "retention: migrated legacy autoDelete -> $migrated day(s)")
+        return migrated
+    }
 
-    fun setAutoDeleteEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_AUTO_DELETE, enabled).apply()
+    fun setRetentionDays(days: Int) {
+        prefs.edit().putInt(KEY_AUTO_DELETE_DAYS, days).apply()
     }
 
     fun clear() {
@@ -191,13 +209,16 @@ class SignalMessageStore(context: Context) {
         private const val BACKEND_ID = "signal"
         private const val FILE_NAME = "dpad_signal_messages"
         private const val KEY_SNAPSHOT = "snapshot_v1"
+        /** Legacy on/off flag. Read once, to migrate an existing install onto
+         *  [KEY_AUTO_DELETE_DAYS]; never written again. */
         private const val KEY_AUTO_DELETE = "auto_delete_enabled"
+        private const val KEY_AUTO_DELETE_DAYS = "auto_delete_days"
 
         private const val KV_CONTACTS = "signal_contacts"
         private const val KV_GROUP_KEYS = "signal_group_master_keys"
         private const val KV_TIMERS = "signal_expire_timers"
 
-        /** Messages older than this are purged when auto-delete is on. */
-        const val RETENTION_MS = 3L * 24 * 60 * 60 * 1000  // 3 days
+        /** One day in millis; the retention window is a whole multiple of this. */
+        const val DAY_MS = 24L * 60 * 60 * 1000
     }
 }

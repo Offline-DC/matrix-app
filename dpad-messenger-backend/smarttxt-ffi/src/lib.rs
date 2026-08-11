@@ -3670,12 +3670,14 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     mime: JString<'l>,
     name: JString<'l>,
     caption: JString<'l>,
+    reply_to: JString<'l>,
 ) -> jstring {
     let chat = jstr(&mut env, &chat_guid);
     let temp_guid = jstr(&mut env, &temp_guid); // see nativeSendText
     let mime_s = jstr(&mut env, &mime);
     let name_s = jstr(&mut env, &name);
     let caption_s = jstr(&mut env, &caption);
+    let reply_to = jstr(&mut env, &reply_to);
     let bytes = match env.convert_byte_array(&data) {
         Ok(b) => b,
         Err(_) => return out(&mut env, String::new()),
@@ -3822,6 +3824,15 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             n
         };
         normal.voice = voice;
+        // Thread the media as a reply, exactly the way nativeSendText does. Both
+        // fields are required: reply_part is a part RANGE ("<part>:<start>:<end>"),
+        // and "0:0:0" means "(all of) part 0". A bare index is not recognised as a
+        // reply by a real client — it renders as an ordinary message.
+        if !reply_to.is_empty() {
+            log::info!("nativeSendAttachment: reply to {reply_to}");
+            normal.reply_guid = Some(reply_to.clone());
+            normal.reply_part = Some("0:0:0".to_string());
+        }
         let mut inst = MessageInst::new(
             // Replay the group's real gid + members + name (or the 1:1 recipient) so the
             // attachment threads into the SAME conversation instead of a members-only one.

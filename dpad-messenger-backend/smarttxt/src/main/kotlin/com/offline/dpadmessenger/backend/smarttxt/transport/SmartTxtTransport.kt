@@ -95,6 +95,8 @@ interface SmartTxtTransport {
         mimeType: String,
         name: String,
         caption: String = "",
+        /** Guid of the message this media replies to; "" for a normal send. */
+        replyTo: String = "",
     ): SendAck
 
     /** Download attachment bytes by guid (the relay handles MMCS download +
