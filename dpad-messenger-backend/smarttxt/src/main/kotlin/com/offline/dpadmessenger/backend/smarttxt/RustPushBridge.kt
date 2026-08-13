@@ -435,9 +435,6 @@ class RustPushBridge(
         )
     }
 
-    suspend fun renew(config: MacOSConfig, account: SmartTxtAccount): RegistrationResult =
-        register(config, account.appleId)
-
     // ---- outbound -----------------------------------------------------------
 
     /** Send a text. Native: rustpush send; returns the server guid (echoed back
@@ -455,7 +452,7 @@ class RustPushBridge(
      *  Needs a live/connected client; the native side returns an error otherwise. */
     suspend fun reregister(): ReregisterResult {
         // No withContext wrapper — like registerWithLogin/sendText, this runs on the
-        // caller's dispatcher (SmartTxtRepository.reregisterNow is invoked on IO). The
+        // caller's dispatcher (SmartTxtRepository.reregisterOnce runs on IO). The
         // native call blocks until rustpush finishes (bounded ~30s) or errors.
         if (!NATIVE_AVAILABLE) return ReregisterResult.Failure("Native backend isn't loaded.")
         return try {

@@ -265,14 +265,17 @@ private fun SmartTxtChat(
             Unit
         } else null,
         // Settings → "Re-register now". This is the USER-FACING recovery for the
-        // silent-de-registration failure, so it runs the full ladder
-        // ([SmartTxtRepository.fixConnectionBlocking]) rather than the old shallow
-        // [SmartTxtRepository.reregisterNow]. The difference matters: reregisterNow
-        // goes straight to the native client and fails with "the iMessage engine
-        // isn't running yet" whenever that client is dead — which is precisely the
-        // state a stuck device is in, i.e. it broke in the only case it was needed.
-        // The ladder reconnects first, so the button works from a cold/dead client.
-        // reregisterNow() is left in place as a narrower API for manual testing.
+        // silent-de-registration failure, and it is one of only TWO places in the app
+        // that register with Apple (the other is interactive sign-in). It runs the
+        // full ladder, [SmartTxtRepository.fixConnection], which rebuilds the native
+        // client before re-registering — going straight at the client fails with "the
+        // iMessage engine isn't running yet" whenever that client is dead, which is
+        // precisely the state a stuck device is in.
+        //
+        // The narrower variants (reregisterNow / fixConnectionBlocking) were deleted
+        // in Aug 2026: they had no callers, no guards, and reached Apple in one hop.
+        // If you need a test hook, add one behind @VisibleForTesting — do not
+        // reintroduce a second production path to registration.
         onReregister = {
             Toast.makeText(context, "Reconnecting iMessage…", Toast.LENGTH_SHORT).show()
             scope.launch {

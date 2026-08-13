@@ -26,7 +26,7 @@ import kotlinx.coroutines.runBlocking
  *
  * Owns the singleton chain transport → [SmartTxtSession] → repository (a
  * per-caller instance would open duplicate connections and double-notify), the
- * [register]/[renew] entry points the setup screen + renewal worker call, and
+ * [register] entry points the setup screen calls, and
  * the [status] the UI gates on.
  *
  * The transport is chosen from [SmartTxtConfig.transportMode]/[relayBaseUrl]:
@@ -388,31 +388,6 @@ object SmartTxtRepository {
         }
     }
 
-    /** Manually force a re-registration NOW — the Settings "Re-register now" test
-     *  hook for the periodic renewal. Unlike [renew] (which re-runs the register
-     *  transport path), this asks the LIVE native client to re-register with the
-     *  current identity — no login, no 2FA — so the running session picks it up.
-     *  Requires being signed in AND connected; the native side errors otherwise. */
-    suspend fun reregisterNow(context: Context): RegistrationResult {
-        val store = SmartTxtAccountStore(context.applicationContext)
-        val account = store.loadAccount() ?: return RegistrationResult.Failure("You're not signed in yet.")
-        return when (val r = bridge().reregister()) {
-            is RustPushBridge.ReregisterResult.Success -> {
-                val updated = account.copy(
-                    lastRegisteredMs = System.currentTimeMillis(),
-                    handles = r.handles.ifEmpty { account.handles },
-                )
-                store.saveAccount(updated); store.markRegistered(updated.lastRegisteredMs)
-                Log.i(TAG, "manual re-register ok (${updated.handles.size} handles)")
-                RegistrationResult.Success(updated)
-            }
-            is RustPushBridge.ReregisterResult.Failure -> {
-                Log.w(TAG, "manual re-register failed: ${r.message}")
-                RegistrationResult.Failure(r.message)
-            }
-        }
-    }
-
     /** Mark the identity REGISTERED after an out-of-band sign-in (the OpenBubbles
      *  migration): the account store + native files are already written, so just
      *  flip [status], schedule renewal, and bring up the connection — the same tail
@@ -520,7 +495,7 @@ object SmartTxtRepository {
 
     /** Body of [ensureClientUp]; always called under [healLock] so the boot ladder,
      *  the network callback and the Settings row can never drive overlapping
-     *  reconnects. `synchronized` is reentrant, so [fixConnectionBlocking] taking the
+     *  reconnects. `synchronized` is reentrant, so [fixConnection] taking the
      *  same lock before calling in is fine. */
     private fun doEnsureClientUp(appContext: Context): Boolean {
         if (nativeClientReady()) return true
@@ -717,11 +692,10 @@ object SmartTxtRepository {
      * The full recovery ladder, and the one thing both the automatic staleness
      * check and the Settings "Re-register now" row call.
      *
-     * Why this is not just [reregisterNow]: that path goes straight to
-     * `bridge().reregister()`, which needs a LIVE native client. In the exact state
-     * we're recovering from — process up but `st().client == None` — it fails with
-     * "the iMessage engine isn't running yet", i.e. the dev hook is useless in the
-     * only situation anyone needs it. So rebuild the client FIRST, then re-register.
+     * Why it rebuilds the client FIRST: going straight to `bridge().reregister()`
+     * needs a LIVE native client, and in the exact state we're recovering from —
+     * process up but `st().client == None` — that fails with "the iMessage engine
+     * isn't running yet", i.e. it breaks in the only situation anyone needs it.
      *
      * Blocking; callers must be off the main thread.
      */
@@ -745,8 +719,11 @@ object SmartTxtRepository {
     }
 
     /**
-     * [fixConnectionBlocking] plus retry and classification — this is what the UI
-     * should call. Retries transient failures [FIX_ATTEMPTS] times with a short
+     * The recovery ladder plus retry and classification — this is the ONLY entry
+     * point the UI may call, and the only path in the app that re-registers with
+     * Apple outside of interactive sign-in. Keep it that way: narrower variants
+     * were removed in Aug 2026 precisely because they were unguarded call sites
+     * waiting to be used. Retries transient failures [FIX_ATTEMPTS] times with a short
      * backoff so the overwhelmingly common case (a hiccup talking to Apple)
      * resolves in code and the user never sees a failure at all.
      *
@@ -897,22 +874,6 @@ object SmartTxtRepository {
             (m.contains("registration error") && m.contains("6005"))
     }
 
-    fun fixConnectionBlocking(context: Context): RegistrationResult = synchronized(healLock) {
-        doFixConnection(context)
-    }
-
-    private fun doFixConnection(context: Context): RegistrationResult {
-        val appContext = context.applicationContext
-        val store = SmartTxtAccountStore(appContext)
-        if (!store.isRegistered()) return RegistrationResult.Failure(NOT_SIGNED_IN_MESSAGE)
-
-        // The two phases, once each. [fixConnection] is the entry point the UI uses
-        // and it retries phase 1 only; this variant keeps the original single-shot
-        // semantics for any caller that wants the raw result.
-        prepareClient(appContext)?.let { return RegistrationResult.Failure(it) }
-        return reregisterOnce(appContext)
-    }
-
     @Synchronized
     fun shutdown(context: Context, wipe: Boolean) {
         (instance as? SmartTxtMessageRepository)?.shutdown(clearCache = wipe)
@@ -991,7 +952,7 @@ object SmartTxtRepository {
     /** Last network-triggered reconnect, for the [NETWORK_RECONNECT_COOLDOWN_MS] guard. */
     private val lastNetworkReconnectMs = java.util.concurrent.atomic.AtomicLong(0L)
 
-    /** Serialises [fixConnectionBlocking] without taking the object monitor — the
+    /** Serialises [fixConnection] without taking the object monitor — the
      *  other @Synchronized members (create/transport/bridge/shutdown) share that
      *  monitor, and this call blocks for ~30s, so holding it would stall them. */
     private val healLock = Any()
