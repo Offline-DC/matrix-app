@@ -81,9 +81,15 @@ fun CompactTopBar(
                         .padding(horizontal = 4.dp, vertical = 2.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    if (navigationIcon != null) {
-                        Box(Modifier.align(Alignment.CenterStart)) { navigationIcon() }
-                    }
+                    // ALWAYS composed, even with no icon. This used to be wrapped
+                    // in `if (navigationIcon != null)`, which was harmless while the
+                    // slot was permanently empty — but the room list now puts the sync
+                    // spinner here, so the condition toggles, and each toggle inserts
+                    // or removes a child of THIS Box, the one that also holds the
+                    // trailing action row. Doing that while the settings cog holds DPAD
+                    // focus is asking for the focus target to be re-created underneath
+                    // it. An empty Box measures 0x0, so keeping it costs nothing.
+                    Box(Modifier.align(Alignment.CenterStart)) { navigationIcon?.invoke() }
                     // Keep the title clear of the icon slots on a 240px-wide
                     // screen — it ellipsizes rather than sliding under them.
                     if (titleContent != null) {

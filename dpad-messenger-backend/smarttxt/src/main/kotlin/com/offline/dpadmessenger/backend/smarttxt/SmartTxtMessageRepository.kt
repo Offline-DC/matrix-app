@@ -163,6 +163,13 @@ internal class SmartTxtMessageRepository(
     // Debounced persistence.
     private val saveRequests = Channel<Unit>(Channel.CONFLATED)
 
+    /** Whole-store writes this process has performed. Logged rather than merely counted:
+     *  [SaveCoalescer] can report what it WITHHELD, but nothing reported what actually
+     *  ran, so the expensive half of a flood was invisible in an export bundle. A bundle
+     *  showing `savesWithheld=0` next to a couple of hundred `save #n` lines is the
+     *  signature of the coalescing failing to engage. */
+    private var saveCount = 0
+
     // ---- catch-up coalescing -------------------------------------------------
     //
     // A catch-up (the backlog Apple replays after the phone has been off) now arrives
@@ -195,8 +202,16 @@ internal class SmartTxtMessageRepository(
         if (saveCoalescer.onSaveRequested(System.currentTimeMillis())) saveRequests.trySend(Unit)
     }
 
-    /** Enter/leave the coalescing mode. On leaving, flush whatever was held back. */
-    private fun onCatchUpChanged(active: Boolean) {
+    /**
+     * Enter/leave the coalescing mode. On leaving, flush whatever was held back.
+     *
+     * Driven by [TransportEvent.SyncActivityChanged], which tracks the native receive
+     * path — NOT by whether the inbound queue backed up. Those came apart badly on the
+     * 2026-08-12 capture: a 3,367-message sync where the queue never filled, so the old
+     * signal stayed false the whole way through, so this never ran. The spinner stayed
+     * off and every batch scheduled its own whole-store write.
+     */
+    private fun onSyncActivityChanged(active: Boolean) {
         if (saveCoalescer.catchUpActive == active) return
         _isCatchingUp.value = active
         val flush = saveCoalescer.onCatchUpChanged(active, System.currentTimeMillis())
@@ -502,7 +517,20 @@ internal class SmartTxtMessageRepository(
             unreadByRoom = unreadByRoom.value,
             mutedRooms = mutedRooms.value,
         )
+        val roomCount = rooms.value.size
+        val msgCount = messagesByRoom.value.values.sumOf { it.size }
+        val startedMs = System.currentTimeMillis()
         withContext(Dispatchers.IO) { cache.save(snap) }
+        saveCount++
+        // A full re-serialize of every room and message plus a Keystore-encrypted write.
+        // Its cost tracks the size of the STORE, not the size of the change, which is the
+        // whole reason SaveCoalescer exists — so the count and the duration are what tell
+        // you whether the coalescing did its job.
+        Log.i(
+            TAG,
+            "CATCHUP repo: save #$saveCount rooms=$roomCount msgs=$msgCount " +
+                "durMs=${System.currentTimeMillis() - startedMs} syncing=$catchUpActive",
+        )
     }
 
     fun shutdown(clearCache: Boolean) {
@@ -524,11 +552,11 @@ internal class SmartTxtMessageRepository(
             is TransportEvent.TapbackBatch -> onTapbacks(e.items)
             is TransportEvent.TypingChanged -> { /* no UI slot yet; ignore */ }
             is TransportEvent.ChatRead -> onChatReadElsewhere(e.chatGuid, e.messageGuid)
-            is TransportEvent.CatchUpChanged -> onCatchUpChanged(e.active)
+            is TransportEvent.SyncActivityChanged -> onSyncActivityChanged(e.active)
             TransportEvent.Connected -> { Log.i(TAG, "session connected"); _authExpired.value = false }
             // A drop mid-drain means no "catch-up finished" is coming; leave the
             // coalescing mode so the pending write isn't held indefinitely.
-            TransportEvent.Disconnected -> { Log.i(TAG, "session disconnected"); onCatchUpChanged(false) }
+            TransportEvent.Disconnected -> { Log.i(TAG, "session disconnected"); onSyncActivityChanged(false) }
             TransportEvent.AuthExpired -> { Log.w(TAG, "auth expired"); _authExpired.value = true }
             is TransportEvent.RegistrationFailed -> {
                 Log.w(TAG, "registration failed (needsRelogin=${e.needsRelogin}): ${e.error}")
@@ -2048,7 +2076,7 @@ internal class SmartTxtMessageRepository(
      *  under the caller's write lock. */
     private fun maybeHealContactsLater() {
         if (contactsHealed.get()) return
-        // Deferred until the backlog is drained — [onCatchUpChanged] calls this again.
+        // Deferred until the backlog is drained — [onSyncActivityChanged] calls this again.
         // The heal walks every room under the write lock, so running it mid-drain just
         // contends with the ingest it is racing.
         if (catchUpActive) return

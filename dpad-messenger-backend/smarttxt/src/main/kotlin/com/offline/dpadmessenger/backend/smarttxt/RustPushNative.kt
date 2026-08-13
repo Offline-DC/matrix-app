@@ -222,6 +222,26 @@ object RustPushNative {
      *  Empty array (`"[]"`) when nothing is pending. */
     external fun nativePollEvents(): String
 
+    /** Whether the RECEIVE PATH is busy — which [nativePollEvents] cannot tell you.
+     *
+     *  An empty poll has two entirely different meanings: "nothing is happening" and
+     *  "everything arriving is being discarded by the 3-day sync window". A phone that
+     *  has been off for a week does the second one for minutes at a time, decrypting
+     *  thousands of messages that reach neither the queue nor Kotlin.
+     *
+     *  Shape: `{"idleMs":124,"depth":0,"total":3367,"admitted":754,"outsideWindow":2613,
+     *  "alreadySeen":0}`. `idleMs` is ms since the last decrypted message, kept or thrown
+     *  away, and is the signal the sync spinner runs on. `"{}"` when there is nothing to
+     *  report. */
+    external fun nativeIngestActivity(): String
+
+    /** Null-safe ingest snapshot: `"{}"` when the `.so` isn't loaded OR predates this
+     *  symbol. Callers read that as "no visibility" and fall back to the old
+     *  batch-fullness-only behaviour, so the `.so` and this Kotlin can ship out of step
+     *  without an UnsatisfiedLinkError. */
+    fun runCatchingNativeIngestActivity(): String =
+        if (loaded) runCatching { nativeIngestActivity() }.getOrDefault("{}") else "{}"
+
     /** Tell the native side which message guids we ALREADY hold on disk, as a JSON
      *  array of strings. Apple replays its stored backlog on every APS connect, so
      *  without this the last few days of history are re-delivered on every launch.
