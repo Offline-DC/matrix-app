@@ -348,36 +348,47 @@ val Key.isDpadDirection: Boolean
 
 
 /**
- * Hand focus to [target] in response to a d-pad press, and report whether the key
- * should be CONSUMED.
+ * Hand focus to [target] in response to a d-pad press.
  *
  * ## Why this exists
  *
  * The obvious way to write a "Down from the toolbar drops into the list" handler is to
- * request focus and return true. On this hardware that is a trap. A [FocusRequester]
- * throws when no node is currently attached to it, and the targets these handlers aim
- * at are rows inside a `LazyColumn` — which disposes anything scrolled out of view, and
- * re-binds row 0's requester every time an arriving message re-sorts the list. So the
- * request fails, `runCatching` swallows the exception, the key has ALREADY been
- * consumed, and focus stays exactly where it was. Press again: identical. The user is
- * stranded on a toolbar button with no way into the list, which on a phone with no
- * touchscreen is unrecoverable — the only exit is backing out of the screen.
+ * request focus and return true. On this hardware that is a trap, for a reason that is
+ * not obvious: **[FocusRequester.requestFocus] does not report whether it worked.** On a
+ * requester with no attached node it prints "FocusRequester is not initialized" to
+ * System.out and returns NORMALLY — it does not throw. So `runCatching { … }.isSuccess`
+ * means "did not throw" and is true even when focus did not move.
  *
- * The rule that prevents it: **never consume a key you did not act on.**
+ * The targets these handlers aim at are rows inside a `LazyColumn`, which disposes
+ * anything scrolled out of view and re-binds row 0's requester every time an arriving
+ * message re-sorts the list. So the request silently does nothing, the handler reports
+ * success, the key is consumed, and focus stays exactly where it was. Press again:
+ * identical. On 2026-08-13 that stranded the user on the settings cog for 24 consecutive
+ * presses, each one logging "moved immediately".
  *
- *  1. Try synchronously. If focus moved, consume it — the common case, unchanged.
- *  2. If it did not, run [prepare] (e.g. scroll the target back into composition so its
- *     requester can bind), retry for [retryFrames] frames, and finally fall back to
- *     [FocusManager.moveFocus] in [fallback].
- *  3. Return false either way, so the platform's own focus search ALSO sees the event.
- *     That is the belt-and-braces part: even if our requester never binds, default
- *     traversal still moves the user somewhere, and a dead end becomes impossible as
- *     long as anything below is focusable.
+ * The fix is not to stop consuming — it is to VERIFY and then RECOVER:
  *
- * The cost of (3) is that focus can occasionally move twice — the platform's search
- * lands somewhere, then our retry pulls it to [target]. A visible hop in a rare case,
- * traded against a dead end in a rare case. Not a close call.
- */
+ *  1. Request focus.
+ *  2. Two frames later, read [landed] back. Two, not one, because the `onFocusChanged`
+ *     write behind it must reach the snapshot before this read can observe it.
+ *  3. If it did not land, run [prepare] (e.g. scroll the target back into composition so
+ *     its requester can bind), retry for [retryFrames] frames, and finally fall back to
+ *     [FocusManager.moveFocus] in [fallback] — the platform's own focus search, which
+ *     does not care about our requesters at all. That last step is what un-strands the
+ *     user, and before this existed it was unreachable dead code.
+ *
+ * ## Return value
+ *
+ * Always `true` — the key is ALWAYS consumed. Returning false would let the platform's
+ * focus search run as well and, in the common case where the request DID land, move
+ * focus a second time. The dead-end protection is the asynchronous recovery above, not
+ * the return value. Recovery costs ~14 frames (~230ms measured) in the failure case and
+ * nothing at all in the common one.
+ *
+ * Without [landed] there is no read-back, so there is no recovery either: the hand-off
+ * behaves exactly as it did before this function existed. That is a deliberate
+ * degradation, not a fix — a call site with no [landed] is unverified.
+  */
 fun CoroutineScope.handOffFocus(
     target: FocusRequester,
     focusManager: FocusManager,

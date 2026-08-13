@@ -2878,6 +2878,12 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    // Every decrypted message stamps the receive-path clock, whatever it turns out to
+    // be. Most of what arrives during a replay is receipts and other ancillary traffic
+    // that returns below without reaching either gate, so without this `idleMs` goes
+    // stale mid-sync and Kotlin ends the episode underneath a working drain. Counters
+    // are unaffected — see `IngestActivity::touch`.
+    st().ingest.touch(now);
     // The paired iPhone toggling Text Message Forwarding for this device on/off.
     if let Message::EnableSmsActivation(enabled) = &msg.message {
         SMS_ACTIVE.store(*enabled, Ordering::SeqCst);

@@ -241,17 +241,14 @@ pub struct IngestActivity {
     admitted: u64,
     outside_window: u64,
     already_seen: u64,
+    /// Decrypted messages the three outcomes above never see — see [`Self::touch`].
+    ancillary: u64,
 }
 
 impl IngestActivity {
     /// Record one decrypted message, whatever became of it.
     pub fn record(&mut self, what: Ingested, now_ms: u64) {
-        // Never let the recorded time go backwards. A wall-clock correction (NTP, or the
-        // user changing the date) must not make a mid-drain receive path look idle for
-        // hours and switch the spinner off underneath a working sync.
-        if now_ms > self.last_ms {
-            self.last_ms = now_ms;
-        }
+        self.advance_clock(now_ms);
         match what {
             Ingested::Admitted => self.admitted += 1,
             Ingested::OutsideWindow => self.outside_window += 1,
@@ -265,12 +262,43 @@ impl IngestActivity {
             log::info!(
                 "CATCHUP native: ingest discarded={discarded} (outsideWindow={} \
                  alreadySeen={}) admitted={} — these reach neither the queue nor Kotlin, \
-                 so this line is the only trace they leave",
+                 so this line is the only trace they leave (ancillary={})",
                 self.outside_window,
                 self.already_seen,
                 self.admitted,
+                self.ancillary,
             );
         }
+    }
+
+    /// Never let the recorded time go backwards. A wall-clock correction (NTP, or the
+    /// user changing the date) must not make a mid-drain receive path look idle for
+    /// hours and switch the spinner off underneath a working sync.
+    fn advance_clock(&mut self, now_ms: u64) {
+        if now_ms > self.last_ms {
+            self.last_ms = now_ms;
+        }
+    }
+
+    /// A decrypted message that none of the three outcomes above will ever see.
+    ///
+    /// Receipts, typing notifications, profile updates and the ~18 other `Message`
+    /// variants return from `push_relay_event` before the sync-window and replay gates,
+    /// or fall off the end of it — so they never reach [`Self::record`]. They are still
+    /// the receive path working, and on a replay they are the MAJORITY of it: the
+    /// 2026-08-12 capture carried 958 read receipts against 754 actual messages.
+    ///
+    /// Leaving them out let [`Self::idle_ms`] climb through a receipt-heavy stretch
+    /// until Kotlin's `endGraceMs` expired and ended the sync episode MID-SYNC — the
+    /// spinner switching off, and `SaveCoalescer` flushing a whole-store encrypted write
+    /// in the middle of the flood, which is the exact write it exists to withhold.
+    ///
+    /// So these advance the CLOCK but not the counters. `newWork` still excludes them
+    /// deliberately: a burst of receipts is not work the user is waiting on and must not
+    /// raise a spinner by itself — the same rule as [`Ingested::AlreadySeen`].
+    pub fn touch(&mut self, now_ms: u64) {
+        self.advance_clock(now_ms);
+        self.ancillary += 1;
     }
 
     /// Messages decrypted and then thrown away, by either gate.
@@ -303,6 +331,9 @@ impl IngestActivity {
     pub fn already_seen(&self) -> u64 {
         self.already_seen
     }
+    pub fn ancillary(&self) -> u64 {
+        self.ancillary
+    }
 
     /// The payload `nativeIngestActivity` hands Kotlin. `depth` is passed in because this
     /// type deliberately knows nothing about the queue.
@@ -314,6 +345,8 @@ impl IngestActivity {
             "admitted": self.admitted,
             "outsideWindow": self.outside_window,
             "alreadySeen": self.already_seen,
+            // Diagnostic only. Deliberately outside `total`, so nothing thresholds on it.
+            "ancillary": self.ancillary,
         })
     }
 }
@@ -529,6 +562,38 @@ mod tests {
         assert_eq!(a.total(), 2_490);
         assert_eq!(a.admitted(), 0);
         assert_eq!(a.discarded(), 2_490);
+    }
+
+    #[test]
+    fn receipt_only_traffic_keeps_the_receive_path_looking_busy() {
+        // THE F1 regression. A replay is mostly receipts, and receipts never reach
+        // record() — they return from push_relay_event before either gate. Before
+        // touch() existed, a stretch like this let idle_ms climb past Kotlin's
+        // endGraceMs and end the sync episode while the sync was still running.
+        let mut a = IngestActivity::default();
+        a.record(Ingested::Admitted, 1_000);
+        let mut t = 1_000u64;
+        for _ in 0..200 {
+            t += 120; // ~8/s, the rate the 08-12 capture ran at
+            a.touch(t);
+        }
+        assert_eq!(a.idle_ms(t), 0, "receipts ARE the receive path working");
+        assert_eq!(a.total(), 1, "but they are not work the user is waiting on");
+        assert_eq!(a.ancillary(), 200);
+    }
+
+    #[test]
+    fn receipt_only_traffic_cannot_announce_an_episode() {
+        // The other half of the rule: keeping an episode alive is not the same as
+        // starting one. Kotlin thresholds on admitted + outsideWindow, so a pure
+        // receipt burst must leave every one of those counters at zero.
+        let mut a = IngestActivity::default();
+        for i in 0..500 {
+            a.touch(i);
+        }
+        assert_eq!(a.admitted(), 0);
+        assert_eq!(a.discarded(), 0);
+        assert_eq!(a.total(), 0, "nothing here can cross minEvents");
     }
 
     #[test]
