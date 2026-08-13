@@ -320,11 +320,13 @@ class RustPushBridge(
             // Display text, e.g. "Registration Error … (6005)".
             lower.contains("rate-limit") || lower.contains("rate limit") ||
                 lower.contains("temporarily disabled") || lower.contains("(6009)") ->
-                // Deliberately says DEVICE, not account: Apple refuses this device's
-                // iMessage registration while leaving the Apple ID itself working
-                // everywhere else (confirmed on a real block — the user's iPhone and
-                // Mac kept working throughout). "Your account is limited" reads as a
-                // much bigger problem than it is and will generate support tickets.
+                // Says DEVICE because that is what Apple rejects here — but do NOT
+                // promise the customer that their other devices are fine. That claim
+                // was in this string until Aug 2026 and it is not reliably true: a
+                // customer in 6009 lost iMessage on his iPhone and Mac as well, so
+                // the copy was reassuring him about something he could see was false
+                // while he sat in a total outage. State what we know, promise nothing
+                // about blast radius.
                 //
                 // Deliberately does NOT say "try again". rustpush's own text for this
                 // condition (error.rs:38) warns that "trying to reconfigure or
@@ -338,10 +340,19 @@ class RustPushBridge(
                 // conceal what they are running is not something we should build into
                 // a product flow, and at fleet scale it draws attention to every
                 // handset rather than resolving one. Keep it as an internal support
-                // option, not app copy.
-                "Apple hasn't activated iMessage on this device yet. Other devices aren't " +
-                    "affected, and this usually clears on its own. " +
-                    "Please wait a bit and try again. For assistance contact support@dumb.co"
+                // option, not app copy: support@dumb.co walks the customer through
+                // filing with Apple person-to-person, so we can judge each case
+                // instead of shipping one blanket instruction to the whole fleet.
+                //
+                // The "wait and try again" wording this replaced was actively
+                // harmful and contradicted the paragraph above it. Observed in the
+                // field (Aug 2026): a customer in 6009 read "try again", tapped
+                // Settings -> Re-register now three times in 77s, and every tap
+                // preempted rustpush's backoff and re-hit an already-flagged
+                // account. Copy here must steer AWAY from retrying.
+                "Apple has paused iMessage registration for this device. Re-registering " +
+                    "again makes the pause last longer, so please don't retry. Email " +
+                    "support@dumb.co and we'll help you get it lifted with Apple."
             lower.contains("(6001)") ->
                 "iMessage can't register while Advanced Data Protection or Contact Key Verification " +
                     "is on. Turn both off in your Apple Account settings, then try again."
@@ -424,9 +435,6 @@ class RustPushBridge(
         )
     }
 
-    suspend fun renew(config: MacOSConfig, account: SmartTxtAccount): RegistrationResult =
-        register(config, account.appleId)
-
     // ---- outbound -----------------------------------------------------------
 
     /** Send a text. Native: rustpush send; returns the server guid (echoed back
@@ -444,14 +452,14 @@ class RustPushBridge(
      *  Needs a live/connected client; the native side returns an error otherwise. */
     suspend fun reregister(): ReregisterResult {
         // No withContext wrapper — like registerWithLogin/sendText, this runs on the
-        // caller's dispatcher (SmartTxtRepository.reregisterNow is invoked on IO). The
+        // caller's dispatcher (SmartTxtRepository.reregisterOnce runs on IO). The
         // native call blocks until rustpush finishes (bounded ~30s) or errors.
         if (!NATIVE_AVAILABLE) return ReregisterResult.Failure("Native backend isn't loaded.")
         return try {
             val obj = json.parseToJsonElement(RustPushNative.nativeReregister()).jsonObject
             obj["error"]?.jsonPrimitive?.content?.let {
                 Log.w(TAG, "reregister failed: $it")
-                return ReregisterResult.Failure(humanizeLoginError(it))
+                return ReregisterResult.Failure(humanizeLoginError(it), raw = it)
             }
             val handles = obj["handles"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
             Log.i(TAG, "reregister ok (${handles.size} handles)")
@@ -478,7 +486,13 @@ class RustPushBridge(
     /** Outcome of a manual [reregister] trigger. */
     sealed class ReregisterResult {
         data class Success(val handles: List<String>) : ReregisterResult()
-        data class Failure(val message: String) : ReregisterResult()
+        /** [message] is humanised for the user. [raw] is rustpush's untouched
+         *  Display text, which is what [SmartTxtRepository.isTerminalFailure]
+         *  pattern-matches on ("temporarily disabled", "do not retry", …).
+         *  Keeping only the humanised string silently broke that check: a 6009
+         *  was classified TRANSIENT and retried, which is the one response that
+         *  makes a 6009 worse. Defaulted so existing call sites still compile. */
+        data class Failure(val message: String, val raw: String = message) : ReregisterResult()
     }
 
     companion object {

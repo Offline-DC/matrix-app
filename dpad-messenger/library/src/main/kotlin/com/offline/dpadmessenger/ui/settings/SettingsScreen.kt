@@ -94,8 +94,15 @@ fun SettingsScreen(
     sendHandles: List<String> = emptyList(),
     defaultSendHandle: String = "",
     onDefaultSendHandleChange: ((String) -> Unit)? = null,
-    /** Force an IDS re-registration now (the periodic renewal, on demand). Shows a
-     *  "Re-register now" row when set; null hides it. Host handles the result feedback. */
+    /** Force an IDS re-registration now. Shows a "Re-register now" row when set;
+     *  null hides it. Host handles the result feedback.
+     *
+     *  This is one of only TWO paths in the app that register with Apple (the other
+     *  is interactive sign-in), and it is unthrottled by design — it calls
+     *  rustpush's `refresh_now()`, which cancels the ResourceManager's backoff
+     *  sleep. On an account Apple has already flagged (IDS 6009) repeated taps
+     *  extend the block, which is exactly how one customer lost sending entirely in
+     *  Aug 2026. Hence the subtitle steering users to support first. */
     onReregister: (() -> Unit)? = null,
     /** Export this device's Smart Txt logs to support (zips the rolling
      *  Smart-Txt-only log ring and uploads it). Shown just above Log out when
@@ -238,7 +245,7 @@ fun SettingsScreen(
             if (onReregister != null) {
                 ActionRow(
                     title = "Re-register now",
-                    subtitle = "Refresh this device's iMessage registration (no sign-in needed)",
+                    subtitle = "For debugging only \u2013 reach out to support@dumb.co before doing this!",
                     onClick = onReregister,
                 )
             }
