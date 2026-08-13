@@ -1,6 +1,8 @@
 package com.offline.dpadmessenger.ui.rooms
 
 import androidx.compose.foundation.background
+import android.util.Log
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,8 +41,11 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -49,7 +54,9 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.offline.dpadmessenger.data.RoomSummary
+import androidx.compose.ui.platform.LocalFocusManager
 import com.offline.dpadmessenger.focus.dpadRow
+import com.offline.dpadmessenger.focus.handOffFocus
 import com.offline.dpadmessenger.ui.components.CompactBarButton
 import com.offline.dpadmessenger.ui.components.CompactTopBar
 import com.offline.dpadmessenger.ui.components.RoomListItem
@@ -114,6 +121,18 @@ fun RoomListScreen(
     // composition before focusing it.
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    val focusManager = LocalFocusManager.current
+    // The escape hatch. Attached to the Box that WRAPS the list rather than to a row
+    // inside it: a row's requester unbinds the moment the row scrolls out of
+    // composition or the list re-sorts, which is exactly when you need it. This one
+    // lives as long as the screen. Requesting focus on a focus group moves focus to
+    // the first focusable within it, so this lands on whatever is currently at the
+    // top of the list without needing to know what that is.
+    val listFocus = remember { FocusRequester() }
+    // Whether focus is anywhere inside that group. The screen-level rescue below is
+    // gated on this so it only ever fires when focus is NOT in the list — pressing
+    // Down on the last row must keep doing nothing, not jump you back to the top.
+    var listHasFocus by remember { mutableStateOf(false) }
 
     Scaffold(
         // Soft keys: the two hardware buttons under the screen. "settings" is the
@@ -154,30 +173,38 @@ fun RoomListScreen(
                         onClick = onSettingsClick,
                         extraModifier = Modifier
                             .onPreviewKeyEvent { event ->
+                            // DIAGNOSTIC (temporary): the presence of this line is the
+                            // whole question. If you press Down and see nothing here,
+                            // the cog does not hold focus and the hand-off code is
+                            // innocent — see the "root key" probe below.
+                            if (event.type == KeyEventType.KeyDown) {
+                                Log.d(
+                                    com.offline.dpadmessenger.focus.DPAD_FOCUS_TAG,
+                                    "cog key: ${event.key} rooms=${rooms.size} " +
+                                        "firstVisible=${listState.firstVisibleItemIndex} " +
+                                        "catchUp=$isCatchingUp",
+                                )
+                            }
                             if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionDown) {
-                                // No rows to land on: swallow it and stay put.
-                                // "new" is on the soft-key bar now, so there's
-                                // nothing below the cog to move to.
-                                if (rooms.isEmpty()) return@onPreviewKeyEvent true
-                                // Move focus into the list. A just-arrived
-                                // message can re-sort the list and re-bind row
-                                // 0's focus requester this frame, so retry a few
-                                // frames; if the top row is scrolled out of
-                                // composition, bring it back first. (Without
-                                // this, Down from the cog silently no-ops and
-                                // the user is stuck on the cog.)
-                                scope.launch {
-                                    repeat(3) {
-                                        withFrameNanos {}
-                                        if (runCatching { firstRowFocus.requestFocus() }.isSuccess) return@launch
-                                    }
-                                    runCatching { listState.scrollToItem(0) }
-                                    repeat(8) {
-                                        withFrameNanos {}
-                                        if (runCatching { firstRowFocus.requestFocus() }.isSuccess) return@launch
-                                    }
-                                }
-                                true
+                                // Drop into the list. Consumes the key ONLY if focus
+                                // actually moved; otherwise the platform's own focus
+                                // search gets the event too, so Down can never dead-end
+                                // on the cog. See handOffFocus for the full account.
+                                //
+                                // The old code early-returned true on an empty list and
+                                // returned true unconditionally otherwise — both ate the
+                                // key whether or not anything happened, which is what
+                                // left the user stranded here.
+                                scope.handOffFocus(
+                                    target = firstRowFocus,
+                                    focusManager = focusManager,
+                                    fallback = FocusDirection.Down,
+                                    label = "cog->row0",  // DIAGNOSTIC (temporary)
+                                    // Row 0 must be composed for its requester to bind,
+                                    // so scroll it back BEFORE retrying rather than
+                                    // burning frames on a requester that cannot attach.
+                                    prepare = { listState.scrollToItem(0) },
+                                )
                             } else false
                         },
                     ) {
@@ -198,7 +225,57 @@ fun RoomListScreen(
                 },
             )
         },
-        modifier = modifier.fillMaxSize(),
+        // DIAGNOSTIC (temporary): a screen-level probe. Compose dispatches a key
+        // event down from the root to the focused node, so this fires whenever
+        // ANYTHING on this screen has focus. "root key" with no "cog key" after it
+        // therefore means focus is not on the cog — it is nowhere in particular, and
+        // the highlight on screen is stale. That is a different bug from the one the
+        // hand-off code fixes, so it is worth one line to tell them apart.
+        modifier = modifier
+            .fillMaxSize()
+            .onPreviewKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown) {
+                    Log.d(
+                        com.offline.dpadmessenger.focus.DPAD_FOCUS_TAG,
+                        "root key: ${event.key} listHasFocus=$listHasFocus",
+                    )
+                }
+                false
+            }
+            // THE RESCUE. onKeyEvent is the POST phase: Compose offers the event to
+            // the focused node and its ancestors on the way back up, so this runs
+            // only if nothing below consumed it. A Down that reaches here is a Down
+            // that did nothing — a dead end, by definition — so it is safe to act on
+            // without knowing who dropped it.
+            //
+            // Gated on !listHasFocus so normal list navigation is untouched: Down on
+            // the last row still reaches here unconsumed, and must stay a no-op.
+            .onKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown ||
+                    event.key != Key.DirectionDown ||
+                    listHasFocus
+                ) {
+                    return@onKeyEvent false
+                }
+                val tag = com.offline.dpadmessenger.focus.DPAD_FOCUS_TAG
+                // Row 0 first: it is the intended destination and usually attached.
+                if (runCatching { firstRowFocus.requestFocus() }.isSuccess) {
+                    Log.d(tag, "rescue: row0")
+                    return@onKeyEvent true
+                }
+                // Then the group, which cannot be unattached while this screen is up.
+                if (runCatching { listFocus.requestFocus() }.isSuccess) {
+                    Log.d(tag, "rescue: list group")
+                    return@onKeyEvent true
+                }
+                // Then the platform's own search, in case the group is empty but
+                // something else below is focusable.
+                val moved = runCatching { focusManager.moveFocus(FocusDirection.Down) }
+                    .getOrDefault(false)
+                Log.d(tag, "rescue: moveFocus(Down)=$moved" +
+                    if (moved) "" else "  <-- nothing below to land on (empty list?)")
+                moved
+            },
     ) { innerPadding ->
         // When the session is near its ~2-week end, pin a red re-link banner
         // above the list (tapping it opens Settings). The top inset is applied
@@ -214,7 +291,16 @@ fun RoomListScreen(
                 if (showRelinkWarning) {
                     RelinkWarningBanner(onClick = onRelinkWarningClick ?: onSettingsClick)
                 }
-                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        // Order matters: both must sit ABOVE the focus target that
+                        // focusGroup() installs, or they observe nothing.
+                        .onFocusChanged { listHasFocus = it.hasFocus }
+                        .focusRequester(listFocus)
+                        .focusGroup(),
+                ) {
                     when {
                         isLoading && rooms.isEmpty() -> LoadingState(innerPadding)
                         rooms.isEmpty() -> EmptyState(innerPadding)

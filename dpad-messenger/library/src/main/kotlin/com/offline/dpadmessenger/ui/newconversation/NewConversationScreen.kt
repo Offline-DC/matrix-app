@@ -43,6 +43,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
@@ -63,6 +64,7 @@ import com.offline.dpadmessenger.data.ConversationStarter
 import com.offline.dpadmessenger.data.GroupConversationStarter
 import com.offline.dpadmessenger.focus.dpadFocusHighlight
 import com.offline.dpadmessenger.focus.dpadRow
+import com.offline.dpadmessenger.focus.handOffFocus
 import com.offline.dpadmessenger.ui.components.CompactBarButton
 import com.offline.dpadmessenger.ui.components.CompactTopBar
 import com.offline.dpadmessenger.ui.components.InitialsAvatar
@@ -235,10 +237,17 @@ fun NewConversationScreen(
                         onClick = onBack,
                         focusRequester = backFocus,
                         extraModifier = Modifier.onPreviewKeyEvent { event ->
-                            // Down from Back returns to the search field.
+                            // Down from Back returns to the search field. Consumes
+                            // the key ONLY if focus actually moved — the old code threw
+                            // the requestFocus result away and consumed regardless, so a
+                            // field that was not yet attached left the user stuck on
+                            // Back with no way down. See handOffFocus.
                             if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionDown) {
-                                runCatching { fieldFocus.requestFocus() }
-                                true
+                                scope.handOffFocus(
+                                    target = fieldFocus,
+                                    focusManager = focusManager,
+                                    fallback = FocusDirection.Down,
+                                )
                             } else false
                         },
                     ) {

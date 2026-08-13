@@ -192,8 +192,22 @@ sealed class TransportEvent {
      * Advisory, never load-bearing: a transport that never emits it (relay, mock)
      * simply behaves as it always did, and a catch-up that is cut short by the
      * process dying is re-delivered by the next connect's replay anyway.
+     *
+     * ## Why this is broader than "catch-up", and renamed for it
+     *
+     * This used to be emitted only when the native queue handed back a FULL batch twice
+     * in a row — i.e. only when arrival outran the drain. That misses the common shape
+     * entirely. Most of a week-old backlog is discarded by the 3-day sync window before
+     * it ever reaches the queue, so the queue stays empty, no batch is ever full, and
+     * this never fired: on the 2026-08-12 capture the phone ingested 3,367 messages
+     * across eleven minutes with [active] false for every one of them. The spinner stayed
+     * off for the whole sync and the saves ran on the ordinary 1.5s debounce throughout.
+     *
+     * So it now tracks the RECEIVE PATH (`nativeIngestActivity`) rather than the queue,
+     * and is named for what it means. Poll PACING still keys off batch fullness, which
+     * genuinely is a queue-depth question — but that decision never leaves the transport.
      */
-    data class CatchUpChanged(val active: Boolean) : TransportEvent()
+    data class SyncActivityChanged(val active: Boolean) : TransportEvent()
 
     /** Typing indicator toggled in a chat. */
     data class TypingChanged(val chatGuid: String, val typing: Boolean) : TransportEvent()

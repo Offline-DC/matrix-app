@@ -1,5 +1,6 @@
 package com.offline.dpadmessenger.focus
 
+import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -7,6 +8,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -16,10 +18,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.focus.FocusManager
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -338,3 +343,70 @@ val OkKeys: Set<Key> = setOf(Key.Enter, Key.DirectionCenter, Key.NumPadEnter)
 val Key.isDpadDirection: Boolean
     get() = this == Key.DirectionUp || this == Key.DirectionDown ||
             this == Key.DirectionLeft || this == Key.DirectionRight
+
+
+/**
+ * Hand focus to [target] in response to a d-pad press, and report whether the key
+ * should be CONSUMED.
+ *
+ * ## Why this exists
+ *
+ * The obvious way to write a "Down from the toolbar drops into the list" handler is to
+ * request focus and return true. On this hardware that is a trap. A [FocusRequester]
+ * throws when no node is currently attached to it, and the targets these handlers aim
+ * at are rows inside a `LazyColumn` — which disposes anything scrolled out of view, and
+ * re-binds row 0's requester every time an arriving message re-sorts the list. So the
+ * request fails, `runCatching` swallows the exception, the key has ALREADY been
+ * consumed, and focus stays exactly where it was. Press again: identical. The user is
+ * stranded on a toolbar button with no way into the list, which on a phone with no
+ * touchscreen is unrecoverable — the only exit is backing out of the screen.
+ *
+ * The rule that prevents it: **never consume a key you did not act on.**
+ *
+ *  1. Try synchronously. If focus moved, consume it — the common case, unchanged.
+ *  2. If it did not, run [prepare] (e.g. scroll the target back into composition so its
+ *     requester can bind), retry for [retryFrames] frames, and finally fall back to
+ *     [FocusManager.moveFocus] in [fallback].
+ *  3. Return false either way, so the platform's own focus search ALSO sees the event.
+ *     That is the belt-and-braces part: even if our requester never binds, default
+ *     traversal still moves the user somewhere, and a dead end becomes impossible as
+ *     long as anything below is focusable.
+ *
+ * The cost of (3) is that focus can occasionally move twice — the platform's search
+ * lands somewhere, then our retry pulls it to [target]. A visible hop in a rare case,
+ * traded against a dead end in a rare case. Not a close call.
+ */
+fun CoroutineScope.handOffFocus(
+    target: FocusRequester,
+    focusManager: FocusManager,
+    fallback: FocusDirection,
+    retryFrames: Int = 12,
+    /** DIAGNOSTIC (temporary): when set, narrate the hand-off under [DPAD_FOCUS_TAG]. */
+    label: String? = null,
+    prepare: (suspend () -> Unit)? = null,
+): Boolean {
+    if (runCatching { target.requestFocus() }.isSuccess) {
+        if (label != null) Log.d(DPAD_FOCUS_TAG, "$label: moved immediately")
+        return true
+    }
+    if (label != null) Log.d(DPAD_FOCUS_TAG, "$label: requester UNATTACHED, retrying")
+    launch {
+        runCatching { prepare?.invoke() }
+        repeat(retryFrames) { i ->
+            withFrameNanos {}
+            if (runCatching { target.requestFocus() }.isSuccess) {
+                if (label != null) Log.d(DPAD_FOCUS_TAG, "$label: bound after ${i + 1} frame(s)")
+                return@launch
+            }
+        }
+        val moved = runCatching { focusManager.moveFocus(fallback) }.getOrDefault(false)
+        if (label != null) {
+            Log.d(DPAD_FOCUS_TAG, "$label: never bound after $retryFrames frames; " +
+                "moveFocus($fallback)=$moved  <-- if false, the user is stranded")
+        }
+    }
+    return false
+}
+
+/** DIAGNOSTIC (temporary): logcat tag for the d-pad focus probe. */
+const val DPAD_FOCUS_TAG: String = "DpadFocus"

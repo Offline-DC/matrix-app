@@ -112,6 +112,7 @@ internal object SmartTxtLogRing {
         "IMsgRepoHolder",
         "IMsgSession",
         "IMsgUiFlow",         // DIAGNOSTIC: repo->combine->viewmodel emission trace
+        "DpadFocus",          // DIAGNOSTIC (temporary): d-pad focus hand-off probe
         "RustPushBridge",
         "RustPushNative",
         "ObMigrator",
