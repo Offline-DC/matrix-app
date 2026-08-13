@@ -258,22 +258,45 @@ fun RoomListScreen(
                     return@onKeyEvent false
                 }
                 val tag = com.offline.dpadmessenger.focus.DPAD_FOCUS_TAG
-                // Row 0 first: it is the intended destination and usually attached.
-                if (runCatching { firstRowFocus.requestFocus() }.isSuccess) {
-                    Log.d(tag, "rescue: row0")
-                    return@onKeyEvent true
+                // Only aim at the list when it actually holds focusable rows.
+                //
+                // requestFocus() returns Unit and throws ONLY when nothing is
+                // attached to the requester — it never reports whether focus MOVED.
+                // listFocus is attached to the wrapper Box for the whole life of this
+                // screen (that is the entire point of hanging it there), so it can
+                // never throw, so `.isSuccess` is always true. On a list with no
+                // focusable children that consumed the key, left focus where it was,
+                // and returned before the moveFocus fallback below could run — the
+                // exact "consume a key you did not act on" trap handOffFocus exists
+                // to avoid, reintroduced here.
+                //
+                // Not hypothetical: EmptyState and LoadingState contain only Text and
+                // a progress spinner, nothing focusable. The re-link banner IS
+                // focusable (dpadRow) and sits above this Box, so it holds focus with
+                // listHasFocus == false — i.e. armed for this rescue — on every cold
+                // start where the banner is up and rooms have not loaded yet. Down
+                // from the banner did nothing, and the log claimed "rescue: list
+                // group" while it happened.
+                if (rooms.isNotEmpty()) {
+                    // Row 0 first: it is the intended destination and usually attached.
+                    if (runCatching { firstRowFocus.requestFocus() }.isSuccess) {
+                        Log.d(tag, "rescue: row0")
+                        return@onKeyEvent true
+                    }
+                    // Then the group, which cannot be unattached while this screen is up.
+                    if (runCatching { listFocus.requestFocus() }.isSuccess) {
+                        Log.d(tag, "rescue: list group")
+                        return@onKeyEvent true
+                    }
                 }
-                // Then the group, which cannot be unattached while this screen is up.
-                if (runCatching { listFocus.requestFocus() }.isSuccess) {
-                    Log.d(tag, "rescue: list group")
-                    return@onKeyEvent true
-                }
-                // Then the platform's own search, in case the group is empty but
-                // something else below is focusable.
+                // Last resort, and the only branch that reports truthfully: the
+                // platform's own focus search. Its result is returned unchanged, so a
+                // Down we could not act on stays UNCONSUMED and whatever is below
+                // still gets a chance at it.
                 val moved = runCatching { focusManager.moveFocus(FocusDirection.Down) }
                     .getOrDefault(false)
-                Log.d(tag, "rescue: moveFocus(Down)=$moved" +
-                    if (moved) "" else "  <-- nothing below to land on (empty list?)")
+                Log.d(tag, "rescue: moveFocus(Down)=$moved rooms=${rooms.size}" +
+                    if (moved) "" else "  <-- nothing below to land on")
                 moved
             },
     ) { innerPadding ->
