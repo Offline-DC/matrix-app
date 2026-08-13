@@ -23,6 +23,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.runtime.MutableState
+import kotlinx.coroutines.Job
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusManager
 import androidx.compose.ui.focus.FocusRequester
@@ -383,29 +385,84 @@ fun CoroutineScope.handOffFocus(
     retryFrames: Int = 12,
     /** DIAGNOSTIC (temporary): when set, narrate the hand-off under [DPAD_FOCUS_TAG]. */
     label: String? = null,
+    /**
+     * Reads back whether focus actually ended up on (or inside) [target].
+     *
+     * NOT diagnostics — this is the mechanism. [FocusRequester.requestFocus] cannot
+     * tell us whether it worked: on a requester with no attached node Compose prints
+     * "FocusRequester is not initialized" to System.out and returns NORMALLY. It does
+     * not throw. So `runCatching { … }.isSuccess` means only "did not throw" and is
+     * true even when focus did not move, which is why the old first branch reported
+     * "moved immediately" on 24 consecutive presses that moved nothing (2026-08-13,
+     * rooms=1, user stranded on the settings cog) and why the retry/fallback below
+     * was unreachable dead code.
+     *
+     * Checked two frames after the request so the `onFocusChanged` write that backs
+     * it has reached the snapshot. When null we cannot verify, so no recovery is
+     * possible and the hand-off behaves as it did before.
+     */
+    landed: (() -> Boolean)? = null,
+    /**
+     * Holds the in-flight recovery so a new press cancels the previous one. Without
+     * it a stuck user pressing ~6x/second (see the same capture) starts six
+     * concurrent recoveries, each ending in its own `moveFocus`, and focus walks
+     * six rows down instead of one.
+     */
+    inFlight: MutableState<Job?>? = null,
     prepare: (suspend () -> Unit)? = null,
 ): Boolean {
-    if (runCatching { target.requestFocus() }.isSuccess) {
-        if (label != null) Log.d(DPAD_FOCUS_TAG, "$label: moved immediately")
+    // Fire and hope. This may silently do nothing; see [landed].
+    runCatching { target.requestFocus() }
+
+    // No read-back wired up: we cannot tell success from silent failure, so we
+    // cannot recover either. Consume and behave exactly as before.
+    if (landed == null) {
+        if (label != null) Log.d(DPAD_FOCUS_TAG, "$label: requested (no read-back — unverified)")
         return true
     }
-    if (label != null) Log.d(DPAD_FOCUS_TAG, "$label: requester UNATTACHED, retrying")
-    launch {
+
+    // A press supersedes any recovery still running for the previous one.
+    inFlight?.value?.cancel()
+    val job = launch {
+        // Two frames, not one: the onFocusChanged write behind `landed` has to be
+        // committed to the snapshot before this read can observe it.
+        withFrameNanos {}
+        withFrameNanos {}
+        if (landed()) {
+            if (label != null) Log.d(DPAD_FOCUS_TAG, "$label: landed")
+            return@launch
+        }
+        if (label != null) Log.d(DPAD_FOCUS_TAG, "$label: did NOT land — recovering")
+        // Usually because the target is not composed. Bring it back first, then
+        // retry: burning frames on a requester that cannot attach is pointless.
         runCatching { prepare?.invoke() }
         repeat(retryFrames) { i ->
             withFrameNanos {}
-            if (runCatching { target.requestFocus() }.isSuccess) {
-                if (label != null) Log.d(DPAD_FOCUS_TAG, "$label: bound after ${i + 1} frame(s)")
+            runCatching { target.requestFocus() }
+            if (landed()) {
+                if (label != null) {
+                    Log.d(DPAD_FOCUS_TAG, "$label: landed after ${i + 1} retry frame(s)")
+                }
                 return@launch
             }
         }
+        // The requester never bound. Hand the movement to the platform's own focus
+        // search, which does not care about our requesters at all. This is the
+        // branch that un-strands the user; it had never executed before today.
         val moved = runCatching { focusManager.moveFocus(fallback) }.getOrDefault(false)
         if (label != null) {
-            Log.d(DPAD_FOCUS_TAG, "$label: never bound after $retryFrames frames; " +
-                "moveFocus($fallback)=$moved  <-- if false, the user is stranded")
+            Log.d(
+                DPAD_FOCUS_TAG,
+                "$label: requester never bound after $retryFrames frames; " +
+                    "moveFocus($fallback)=$moved" +
+                    if (moved) "" else "  <-- nothing below to land on",
+            )
         }
     }
-    return false
+    inFlight?.value = job
+    // Consumed either way. Returning false would let the platform's search run too
+    // and, in the common case where the request DID land, move focus a second time.
+    return true
 }
 
 /** DIAGNOSTIC (temporary): logcat tag for the d-pad focus probe. */

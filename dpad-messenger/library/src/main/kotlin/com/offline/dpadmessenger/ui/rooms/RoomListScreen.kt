@@ -41,6 +41,7 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import kotlinx.coroutines.Job
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -133,6 +134,9 @@ fun RoomListScreen(
     // gated on this so it only ever fires when focus is NOT in the list — pressing
     // Down on the last row must keep doing nothing, not jump you back to the top.
     var listHasFocus by remember { mutableStateOf(false) }
+    // Holds the in-flight focus recovery so a repeated Down cancels the previous
+    // attempt instead of stacking one moveFocus per press. See handOffFocus.
+    val handOffJob = remember { mutableStateOf<Job?>(null) }
 
     Scaffold(
         // Soft keys: the two hardware buttons under the screen. "settings" is the
@@ -173,18 +177,6 @@ fun RoomListScreen(
                         onClick = onSettingsClick,
                         extraModifier = Modifier
                             .onPreviewKeyEvent { event ->
-                            // DIAGNOSTIC (temporary): the presence of this line is the
-                            // whole question. If you press Down and see nothing here,
-                            // the cog does not hold focus and the hand-off code is
-                            // innocent — see the "root key" probe below.
-                            if (event.type == KeyEventType.KeyDown) {
-                                Log.d(
-                                    com.offline.dpadmessenger.focus.DPAD_FOCUS_TAG,
-                                    "cog key: ${event.key} rooms=${rooms.size} " +
-                                        "firstVisible=${listState.firstVisibleItemIndex} " +
-                                        "catchUp=$isCatchingUp",
-                                )
-                            }
                             if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionDown) {
                                 // Drop into the list. Consumes the key ONLY if focus
                                 // actually moved; otherwise the platform's own focus
@@ -199,7 +191,13 @@ fun RoomListScreen(
                                     target = firstRowFocus,
                                     focusManager = focusManager,
                                     fallback = FocusDirection.Down,
-                                    label = "cog->row0",  // DIAGNOSTIC (temporary)
+                                    label = "cog->row0",
+                                    // The read-back. requestFocus() reports nothing,
+                                    // so this is the only way to know the hand-off
+                                    // actually happened — and the trigger for the
+                                    // recovery when it did not.
+                                    landed = { listHasFocus },
+                                    inFlight = handOffJob,
                                     // Row 0 must be composed for its requester to bind,
                                     // so scroll it back BEFORE retrying rather than
                                     // burning frames on a requester that cannot attach.
@@ -225,23 +223,8 @@ fun RoomListScreen(
                 },
             )
         },
-        // DIAGNOSTIC (temporary): a screen-level probe. Compose dispatches a key
-        // event down from the root to the focused node, so this fires whenever
-        // ANYTHING on this screen has focus. "root key" with no "cog key" after it
-        // therefore means focus is not on the cog — it is nowhere in particular, and
-        // the highlight on screen is stale. That is a different bug from the one the
-        // hand-off code fixes, so it is worth one line to tell them apart.
         modifier = modifier
             .fillMaxSize()
-            .onPreviewKeyEvent { event ->
-                if (event.type == KeyEventType.KeyDown) {
-                    Log.d(
-                        com.offline.dpadmessenger.focus.DPAD_FOCUS_TAG,
-                        "root key: ${event.key} listHasFocus=$listHasFocus",
-                    )
-                }
-                false
-            }
             // THE RESCUE. onKeyEvent is the POST phase: Compose offers the event to
             // the focused node and its ancestors on the way back up, so this runs
             // only if nothing below consumed it. A Down that reaches here is a Down
