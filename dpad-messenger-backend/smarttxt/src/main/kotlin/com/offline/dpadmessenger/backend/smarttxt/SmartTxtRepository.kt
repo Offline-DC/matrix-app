@@ -647,7 +647,8 @@ object SmartTxtRepository {
      * back with no client and nothing driving it.
      *
      * On every launch, once connected, check the registration age ourselves and
-     * silently re-register if it's stale. Runs on the caller's background thread.
+     * silently rebuild the native client if it is dead. Never re-registers with
+     * Apple — rustpush owns that. Runs on the caller's background thread.
      * Silent by design: transient faults are retried in code and then left to the
      * periodic worker, so nothing reaches the user. Unrecoverable causes are logged
      * for support rather than shown — the user can reach the same recovery from the
@@ -680,33 +681,27 @@ object SmartTxtRepository {
                 return
             }
             try {
-                // PERSISTED BACKOFF. A device that keeps failing would otherwise hit
-                // Apple once per boot, and on a reboot loop that's a fast route to
-                // rate-limiting the account — a far worse outcome than the stale
-                // registration we're repairing. At most one automatic attempt per
-                // cooldown. The user-initiated Settings row deliberately does NOT go
-                // through here, so tapping it always tries immediately.
-                val prefs = appContext.getSharedPreferences(HEAL_PREFS, Context.MODE_PRIVATE)
-                val lastAttempt = prefs.getLong(KEY_LAST_HEAL_ATTEMPT, 0L)
-                val sinceMs = System.currentTimeMillis() - lastAttempt
-                if (lastAttempt > 0L && sinceMs < HEAL_COOLDOWN_MS) {
-                    Log.i(TAG, "self-heal on cooldown — last attempt ${sinceMs / (60L * 1000L)}m ago")
-                    return
-                }
-                prefs.edit().putLong(KEY_LAST_HEAL_ATTEMPT, System.currentTimeMillis()).apply()
-
-                Log.w(TAG, "registration is stale — self-healing with a silent re-register")
-                when (val r = fixConnection(appContext)) {
-                    is FixOutcome.Recovered ->
-                        Log.i(TAG, "stale registration healed silently")
-                    is FixOutcome.RetryingInBackground -> {
-                        // Transient. Already retried in code; the 12h worker and the
-                        // next launch will keep at it. Explicitly do NOT flag the
-                        // user — there is nothing for them to do.
-                        Log.w(TAG, "stale registration heal deferred to background retry")
-                    }
-                    is FixOutcome.NeedsUser ->
-                        Log.w(TAG, "stale registration needs user action: ${r.message}")
+                // LOCAL ONLY — this rebuilds a dead native client. It deliberately does
+                // NOT re-register with Apple.
+                //
+                // Launch used to run the full ladder, so booting could put a fresh
+                // registration on the wire. OpenBubbles has no launch-time
+                // re-registration at all, and it doesn't need one: rustpush already
+                // owns registration. schedule_rereg fires on Apple's own ~45-day
+                // cadence (identity_manager.rs:497) and the ResourceManager retries
+                // failures on its own 5min->24h ladder. Anything we send from the boot
+                // path only competes with that, and on a reboot loop it is a fast route
+                // to a flagged account.
+                //
+                // Because this no longer talks to Apple there is nothing left to rate
+                // limit, so the old 6h cooldown is gone with it — rebuilding a local
+                // client is cheap, and that cooldown could only ever have left a dead
+                // client dead for another six hours.
+                val err = prepareClient(appContext)
+                if (err == null) {
+                    Log.i(TAG, "dead client rebuilt on launch — registration left to rustpush")
+                } else {
+                    Log.w(TAG, "client rebuild failed on launch ($err) — leaving it to rustpush")
                 }
             } finally {
                 healing.set(false)
@@ -796,9 +791,19 @@ object SmartTxtRepository {
         // refresh_now(), which fires rustpush's retry_now_signal and wakes the
         // ResourceManager out of its sleep, so the 5-minute floor rustpush would
         // otherwise impose never applied. On an account that is already rate-limited
-        // that is the worst available response — and it is the one case where Smart
-        // Txt hit Apple HARDER than OpenBubbles, which sends exactly one (doReregister
-        // -> a single refresh_now, guarded by a busy flag).
+        // that is the worst available response, and it made us hit Apple harder than
+        // OpenBubbles, which sends exactly one refresh_now per user action.
+        //
+        // CORRECTION (verified against upstream, Aug 2026): an earlier revision of
+        // this comment said OpenBubbles guards that call "by a busy flag". It does
+        // not. openbubbles-app rust/src/api/api.rs is, in full:
+        //     pub async fn do_reregister(state: &Arc<IMClient>) -> anyhow::Result<()> {
+        //         state.identity.refresh_now().await?;
+        //         Ok(())
+        //     }
+        // No busy flag, no cooldown, no time check — and sync_now() calls refresh_now()
+        // unguarded too. So the guards below are NOT parity with OpenBubbles; they are
+        // deliberately stricter than it. Do not "simplify" them back toward OB.
         //
         // One attempt. If it fails, rustpush owns the retry: 5 minutes to 24 hours,
         // unlimited attempts, already running.
@@ -808,7 +813,10 @@ object SmartTxtRepository {
         return when (r) {
             is RegistrationResult.Success -> FixOutcome.Recovered
             is RegistrationResult.Failure ->
-                if (isTerminalFailure(r.message)) {
+                // Classify on the RAW Apple text as well as the humanised copy —
+                // isTerminalFailure matches rustpush's Display strings, which the
+                // humaniser has already replaced by this point.
+                if (isTerminalFailure(r.message) || isTerminalFailure(lastReregisterRaw.get())) {
                     FixOutcome.NeedsUser(r.message)
                 } else {
                     Log.w(
@@ -853,6 +861,9 @@ object SmartTxtRepository {
                 }
             }
             is RustPushBridge.ReregisterResult.Failure -> {
+                // Stash the RAW text so [fixConnection] can classify on what Apple
+                // actually said rather than on our own user-facing copy.
+                lastReregisterRaw.set(r.raw)
                 Log.w(TAG, "fixConnection: re-register failed: ${r.message}")
                 RegistrationResult.Failure(r.message)
             }
@@ -985,14 +996,10 @@ object SmartTxtRepository {
      *  monitor, and this call blocks for ~30s, so holding it would stall them. */
     private val healLock = Any()
 
-    private const val HEAL_PREFS = "smarttxt_heal"
-    private const val KEY_LAST_HEAL_ATTEMPT = "lastHealAttemptMs"
 
-    /** Minimum gap between AUTOMATIC heal attempts. A device stuck in a failing
-     *  state would otherwise call Apple once per boot; on a reboot loop that risks
-     *  rate-limiting the Apple ID, which is worse than the stale registration. The
-     *  user-initiated Settings row bypasses this. */
-    private const val HEAL_COOLDOWN_MS = 6L * HOUR_MS
+    /** Raw (un-humanised) text of the last re-registration failure. */
+    private val lastReregisterRaw = java.util.concurrent.atomic.AtomicReference("")
+
 
     /** Transient-failure retries inside one heal attempt. Covers the common case —
      *  a flaky NAC/anisette call or a dropped connection — without ever surfacing
