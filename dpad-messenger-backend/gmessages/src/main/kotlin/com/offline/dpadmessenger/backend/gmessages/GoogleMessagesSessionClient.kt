@@ -742,6 +742,8 @@ internal class GoogleMessagesSessionClient(
         var lastHeartbeatMs = 0L
         while (coroutineContext.isActive) {
             attempt++
+            runCatching { rotateCookiesIfDue() }
+                .onFailure { Log.w(TAG, "cookie rotation failed (continuing)", it) }
             runCatching { refreshTokenIfNeeded() }
                 .onFailure { Log.w(TAG, "token refresh failed (continuing)", it) }
             val code = runCatching { openLongPollOnce(attempt) }
@@ -1540,6 +1542,25 @@ internal class GoogleMessagesSessionClient(
     /** Why the last auth failure happened, so the UI can show the right fix.
      *  Set by [refreshToken]; read when emitting [SessionEvent.AuthExpired]. */
     @Volatile private var lastAuthFailure: AuthFailureReason = AuthFailureReason.UNKNOWN
+
+    /**
+     * Keep the rotating session cookie fresh (see [GMCookieRotation]).
+     *
+     * Off unless [GoogleMessagesConfig.cookieRotationEnabled]; cheap no-op when
+     * not due. Deliberately cannot break the poll loop: rotation failures leave
+     * the stored cookies exactly as they were, so the worst case is the same
+     * staleness we already have today.
+     */
+    private suspend fun rotateCookiesIfDue() {
+        if (!gaia) return
+        val changed = withContext(Dispatchers.IO) {
+            GMCookieRotation.rotateIfDue(httpRpc, cookies)
+        }
+        if (changed && storeWritable) {
+            runCatching { store.saveCookies(cookies) }
+            Log.i(TAG, "session cookie rotated; ${cookieSummary()}")
+        }
+    }
 
     private suspend fun refreshTokenIfNeeded() {
         // Refresh ~1h before expiry. tokenTtl is in microseconds (or 0 → 24h).

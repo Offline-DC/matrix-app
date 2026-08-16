@@ -82,27 +82,39 @@ class GoogleMessagesAccountStore(context: Context) {
     // (cookie names/values never contain tab or newline).
 
     fun saveCookies(cookies: Map<String, String>) {
-        // EXPERIMENT (Alex's ~2h SESSION_COOKIE_INVALID kick). Field logs show a
-        // consumer-account pairing dies at ~2h on RegisterRefresh with
-        // SESSION_COOKIE_INVALID while the tachyon token is still healthy — i.e.
-        // it's the rotating session cookie, not the token. The Workspace test
-        // device, whose harvest carries NO __Secure-1PSIDTS, rides the long-lived
-        // __Secure-1PSID and stays linked for days. Hypothesis: a present-but-STALE
-        // __Secure-1PSIDTS (short TTL, never refreshed because the relay never
-        // re-issues it and on-device rotation can't reach the page) is what gets
-        // rejected — whereas its ABSENCE falls back to 1PSID and survives.
+        // Persist the harvest VERBATIM — including the rotating __Secure-1PSIDTS /
+        // __Secure-3PSIDTS pair.
         //
-        // So strip the rotating *PSIDTS cookies before persisting. We log the
-        // INCOMING set first (names only, no values) so the next test still proves
-        // whether the harvest actually carried a 1PSIDTS — the strip is applied
-        // either way.
-        val STRIP = setOf("__Secure-1PSIDTS", "__Secure-3PSIDTS")
-        val hadPsidts = cookies.containsKey("__Secure-1PSIDTS")
-        val stripped = cookies.keys.filter { it in STRIP }
-        val kept = cookies.filterKeys { it !in STRIP }
-
-        val encoded = kept.entries.joinToString("\n") { "${it.key}\t${it.value}" }
-        prefs.edit().putString(KEY_COOKIES, encoded).apply()
+        // HISTORY: on 2026-06-13 (96d8f70) these two were STRIPPED here, on the
+        // theory that a present-but-STALE 1PSIDTS was what killed a consumer
+        // pairing at ~2h, and that its ABSENCE would fall back to the long-lived
+        // __Secure-1PSID. That only held while Google still honoured the
+        // 1PSID-only fallback. It no longer does. On 2026-08-14 a harvest that
+        // DID carry a valid 1PSIDTS was stripped to 15 cookies and Google refused
+        // the pairing outright: /web/config -> 403, SignInGaia -> 200, then
+        // CREATE_GAIA_PAIRING_CLIENT_FINISHED -> HTTP 401 SESSION_COOKIE_INVALID
+        // (cookie=UNKNOWN) three seconds later, and the identical cookie bytes
+        // were fully revoked 28s after that.
+        //
+        // Upstream mautrix-gmessages never strips: it offers __Secure-1PSIDTS as a
+        // login field (pkg/connector/login.go) and writes back every Set-Cookie
+        // verbatim (AuthData.UpdateCookiesFromResponse, pkg/libgm/client.go). Its
+        // docs state Google SOMETIMES REQUIRES 1PSIDTS. Deleting a credential
+        // Google may require can only ever fail closed.
+        //
+        // The cure for the ~2h death is keeping 1PSIDTS FRESH, not deleting it —
+        // see [GMCookieRotation], which needs the current 1PSIDTS in order to
+        // rotate at all, so this strip also made that fix impossible.
+        val encoded = cookies.entries.joinToString("\n") { "${it.key}\t${it.value}" }
+        prefs.edit()
+            .putString(KEY_COOKIES, encoded)
+            // Stamped so a support log can answer "did this retry send FRESH
+            // cookies, or replay the same ones?" — the fingerprint says whether
+            // they changed, this says how old they are. On 2026-08-14 four
+            // pairing attempts in four minutes all replayed one harvest; without
+            // an age there was no way to see that from the capture alone.
+            .putLong(KEY_COOKIES_SAVED_AT, System.currentTimeMillis())
+            .apply()
 
         // Log only when the SET of cookie names changes — not on every save.
         // Google re-issues the *SIDCC family on almost every response, so this
@@ -115,15 +127,24 @@ class GoogleMessagesAccountStore(context: Context) {
         // because callers construct a fresh store per save, so comparing against
         // the stored copy would trade log spam for an EncryptedSharedPreferences
         // decrypt on every RPC.
-        val names = kept.keys.sorted()
+        val names = cookies.keys.sorted()
         if (names != lastLoggedCookieNames) {
             lastLoggedCookieNames = names
             android.util.Log.i(
                 "GMCookies",
-                "cookie set changed → ${cookies.size} received ${cookies.keys.sorted()} " +
-                    "(has __Secure-1PSIDTS=$hadPsidts); stripped $stripped → persisted ${kept.size}",
+                "cookie set changed \u2192 ${cookies.size} received $names " +
+                    "(has __Secure-1PSIDTS=${cookies.containsKey("__Secure-1PSIDTS")}, " +
+                    "has __Secure-3PSIDTS=${cookies.containsKey("__Secure-3PSIDTS")}); " +
+                    "persisted ${cookies.size} (no strip)",
             )
         }
+    }
+
+    /** How long ago the stored cookies were harvested, or null if unknown
+     *  (pre-existing installs that saved cookies before this was stamped). */
+    fun cookiesAgeMs(): Long? {
+        val t = prefs.getLong(KEY_COOKIES_SAVED_AT, 0L)
+        return if (t == 0L) null else System.currentTimeMillis() - t
     }
 
     fun loadCookies(): Map<String, String> {
@@ -263,6 +284,7 @@ class GoogleMessagesAccountStore(context: Context) {
         private const val SCHEMA_VERSION = 2
         private const val KEY_SCHEMA_VERSION = "schemaVersion"
         private const val KEY_COOKIES = "gaiaCookies"
+        private const val KEY_COOKIES_SAVED_AT = "gaiaCookiesSavedAtMs"
         private const val KEY_TACHYON_AUTH = "tachyonAuthToken"
         private const val KEY_TOKEN_TTL = "tokenTtl"
         private const val KEY_BROWSER_USER_ID = "browserUserId"
