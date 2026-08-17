@@ -56,7 +56,7 @@ use rustpush::{
     MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType, Reaction,
     VerifyBody, AuthenticationFSAResponse, MADRID_SERVICE, ResourceState, IDSService, PushError
 };
-use rustpush::facetime::{FACETIME_SERVICE, VIDEO_SERVICE};
+use rustpush::facetime::{FACETIME_SERVICE, VIDEO_SERVICE, FTClient, FTState};
 use rustpush::findmy::MULTIPLEX_SERVICE;
 
 /// The IDS services this device registers for.
@@ -202,6 +202,11 @@ use group_identity::{
 // Send routing + handle reconciliation POLICY. Same reason as the two modules above:
 // dependency-free so both decisions can be proved on the host (see policy-tests/) rather
 // than by trying to provoke an IDS failure on a handset at the exact moment of a send.
+// FaceTime in-call audio pipeline + JNI (createAvc/destroyAvc/enableMicrophone
+// for FaceTimeInCallService). Self-contained: its JNI entry points are the only
+// surface, so nothing here needs to be `use`d. See facetime_av.rs.
+mod facetime_av;
+
 mod send_policy;
 use send_policy::{
     delivered_action, error_action, rate_limited_message, reconcile_action, route_for,
@@ -222,6 +227,14 @@ struct AppState {
     users: Vec<IDSUser>,
     identity: Option<IDSNGMIdentity>,
     client: Option<Arc<IMClient>>,
+
+    /// FaceTime client, stood up alongside [`Self::client`] on the same APS
+    /// connection + identity when Smart Txt initializes, and kept alive for the
+    /// life of the session. Inbound FaceTime APS messages are piped into
+    /// `FTClient::handle` from the receive loop; `nativeFaceTimeSender` uses the
+    /// identity for capability lookups. `None` until [`build_client_and_receive`]
+    /// runs (and cleared on logout/disconnect).
+    facetime: Option<Arc<FTClient>>,
 
     /// The DEFAULT handle for NEW conversations (raw rustpush form, e.g. "tel:+1…"
     /// or "mailto:…"). Empty = fall back to the first registered handle. Set from
@@ -1671,6 +1684,11 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     log::info!("anisette: configured server = {}", omnisette::DEFAULT_ANISETTE_URL_V3);
     // The rustls stack (reqwest) needs a process crypto provider; ring is bundled.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // FaceTime's QUIC relay (quinn) uses a SECOND, vendored rustls — `rustls_psk`
+    // (rustpush/third_party/rustls, package "rustls" 0.23.28) — which is a distinct
+    // crate with its own process-global CryptoProvider slot. Without this it panics
+    // ("no process-level CryptoProvider available") the first time a call connects.
+    let _ = rustls_psk::crypto::ring::default_provider().install_default();
 
     let dir = jstr(&mut env, &files_dir);
     // relay_host / relay_code are accepted only so the existing JNI signature keeps
@@ -1891,6 +1909,9 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     s.connected = false;
     s.connection = None;
     s.client = None;
+    // Tear down FaceTime with the IMClient — it holds a clone of the same APS
+    // connection, so it must not outlive it.
+    s.facetime = None;
     s.receive_started = false;
 }
 
@@ -2772,6 +2793,25 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
     // live from rustpush (get_handles) wherever needed — nothing is cached.
     st().client = Some(client.clone());
     let _ = reconcile_handles(&client).await;
+
+    // Stand up the FaceTime client on the SAME APS connection + identity as the
+    // IMClient, and keep it alive in AppState for the life of the session. This
+    // requests the FaceTime APS topics (so invites are delivered), lets
+    // `nativeFaceTimeSender` do capability lookups, and — once wired — place/answer
+    // calls. State is not persisted yet (`Box::new(|_| {})`), mirroring how the
+    // IMClient is built above; FaceTime links/pseudonyms simply re-derive per session.
+    let facetime = Arc::new(
+        FTClient::new(
+            FTState::default(),
+            Box::new(|_| {}),
+            connection.clone(),
+            client.identity.clone(),
+            os_config.clone(),
+        )
+        .await,
+    );
+    st().facetime = Some(facetime.clone());
+    log::info!("facetime: FTClient up (requested FaceTime APS topics)");
     // Restore whether SMS forwarding was previously enabled by the iPhone.
     SMS_ACTIVE.store(load_sms_active(&dir), Ordering::SeqCst);
 
@@ -2805,6 +2845,29 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
                     // Read handles live from rustpush (get_handles = cheap local read)
                     // and pass them into the sync event handler — no cached self set.
                     let my_handles = client.identity.get_handles().await;
+
+                    // Pipe a copy into the FaceTime client first. It reacts only to the
+                    // FaceTime topics and returns Ok(None) for everything else, so this
+                    // is cheap for ordinary iMessage traffic. Run it in its OWN task and
+                    // await it — same panic containment as the iMessage handle below (a
+                    // bad FaceTime frame surfaces as a JoinError, never aborts the
+                    // process or stalls the loop), and awaiting keeps FaceTime frames in
+                    // receive order. All outcomes are logged and swallowed.
+                    let ft = facetime.clone();
+                    let ft_msg = apns_msg.clone();
+                    match rt().spawn(async move { ft.handle(ft_msg).await }).await {
+                        Ok(Ok(Some(m))) => {
+                            log::info!("facetime recv: {m:?}");
+                            // Surface ring/join/leave/decline to the launcher so it
+                            // can drive its ringing screens and start the in-call
+                            // service once both sides are in the call.
+                            facetime_av::dispatch_ft_message(&m);
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => log::warn!("facetime handle error: {e:?}"),
+                        Err(join_err) => log::error!("facetime handle panicked: {join_err}"),
+                    }
+
                     let client = client.clone();
                     let joined = rt().spawn(async move { client.handle(apns_msg).await }).await;
                     match joined {
@@ -4395,6 +4458,252 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     } else {
         JNI_FALSE
     }
+}
+
+/// Is `handle` reachable on FaceTime, and if so, from which of MY handles?
+///
+/// Mirrors [`nativeIsIMessage`] but queries the FaceTime topic
+/// (`com.apple.private.alloy.facetime.multi`) instead of Madrid. Returns MY send
+/// handle (the "call as" iMessage identity — the `sender` in
+/// `validate_targets(&targets, topic, &sender)`, e.g. `tel:+1…` or `mailto:…`)
+/// when the dialed number is FaceTime-capable, and an **empty string** otherwise.
+///
+/// Empty is returned whenever we can't offer a FaceTime call — the smarttxt client
+/// isn't up (user not logged in), we have no send handle, the IDS lookup errors, or
+/// the target simply isn't on FaceTime. The dialer treats empty as "just place a
+/// normal cellular call", so this fails safe: unlike `nativeIsIMessage` (which
+/// defaults TRUE so the composer never wrongly shows green), here the safe default
+/// is "no FaceTime option", because we must not offer a call we can't complete.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeFaceTimeSender<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: JString<'l>,
+) -> jstring {
+    // The dialer passes raw contact/typed numbers ("(720) 487-8766"), but IDS
+    // needs an E164 handle ("tel:+17204878766"). `canon` does the same
+    // normalization the rest of the stack keys on (scheme-strip, US 10-digit → +1),
+    // then `to_handle` re-adds the tel:/mailto: scheme.
+    let raw = jstr(&mut env, &handle);
+    let recipient = to_handle(&canon(&raw));
+    log::info!("nativeFaceTimeSender: querying {recipient} (raw={raw})");
+    let client = st().client.clone();
+    let Some(client) = client else {
+        log::info!("nativeFaceTimeSender: no client up → \"\" (query={recipient})");
+        return out(&mut env, String::new());
+    };
+    let sender = rt().block_on(async move {
+        let handles = client.identity.get_handles().await;
+        let Some(my) = pick_send_handle(&handles) else {
+            log::info!("nativeFaceTimeSender: no send handle → \"\" (query={recipient})");
+            return String::new();
+        };
+        match client
+            .identity
+            .validate_targets(
+                &[recipient.clone()],
+                "com.apple.private.alloy.facetime.multi",
+                &my,
+            )
+            .await
+        {
+            Ok(valid) => {
+                let on_facetime = valid.iter().any(|t| t == &recipient);
+                log::info!(
+                    "nativeFaceTimeSender: query={recipient} handle={my} \
+                     on_facetime={on_facetime} valid={valid:?} → {}",
+                    if on_facetime { my.as_str() } else { "\"\"" }
+                );
+                if on_facetime { my } else { String::new() }
+            }
+            Err(e) => {
+                log::warn!(
+                    "nativeFaceTimeSender: query={recipient} handle={my} \
+                     validate failed ({e:?}) → \"\""
+                );
+                String::new()
+            }
+        }
+    });
+    out(&mut env, sender)
+}
+
+/// Place (ring) a FaceTime **audio** call. Creates the session and rings the
+/// recipient via `FTClient::create_session` (which joins with ring=true). Returns
+/// the new session guid, or "" on failure. The caller keeps this guid, shows a
+/// ringing UI, and waits for a `join` event on it before starting the in-call
+/// service; if the caller cancels first it calls [`nativeLeaveFaceTime`].
+///
+/// `handle` is MY iMessage identity to call as (the `sender` from the dialer's
+/// identity dialog); `recipient` is the number/address being called. Both are
+/// canonicalized to IDS handles here, matching `nativeFaceTimeSender`.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeStartFaceTimeCall<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: JString<'l>,
+    recipient: JString<'l>,
+) -> jstring {
+    let handle = to_handle(&canon(&jstr(&mut env, &handle)));
+    let recipient = to_handle(&canon(&jstr(&mut env, &recipient)));
+    let Some(ft) = st().facetime.clone() else {
+        log::warn!("nativeStartFaceTimeCall: no FaceTime client up");
+        return out(&mut env, String::new());
+    };
+
+    // Uppercased UUID matches the report_id / guid shape FaceTime uses on the wire.
+    let guid = uuid::Uuid::new_v4().to_string().to_uppercase();
+    log::info!("nativeStartFaceTimeCall: ringing {recipient} as {handle} guid={guid}");
+
+    let result = rt().block_on(ft.create_session(guid.clone(), handle, &[recipient], false));
+    match result {
+        Ok(()) => out(&mut env, guid),
+        Err(e) => {
+            log::warn!("nativeStartFaceTimeCall: create_session failed: {e:?}");
+            out(&mut env, String::new())
+        }
+    }
+}
+
+/// Leave / cancel a FaceTime session by guid — the caller aborting a ring, or
+/// hanging up a call that never started its in-call service. No-op if the session
+/// isn't known or no client is up.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeLeaveFaceTime<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    guid: JString<'l>,
+) {
+    let guid = jstr(&mut env, &guid);
+    let Some(ft) = st().facetime.clone() else { return };
+    log::info!("nativeLeaveFaceTime: leaving {guid}");
+    rt().spawn(async move {
+        let mut lock = ft.state.write().await;
+        if let Some(session) = lock.sessions.get_mut(&guid) {
+            if let Err(e) = ft.leave(session).await {
+                log::warn!("nativeLeaveFaceTime: leave failed: {e:?}");
+            }
+        }
+    });
+}
+
+/// Set the device's local network interfaces (IPv4 addresses) on the FaceTime
+/// client. The QUIC relay needs these to advertise candidate paths — without them
+/// `connect_to_relay` panics (`interfaces.as_ref().unwrap()`). Reading interfaces
+/// is an Android job (see `FaceTimeInterfaces` on the Kotlin side); this just takes
+/// the comma-separated list, parses each to an [`std::net::IpAddr`], and forwards.
+/// Push it before placing/answering a call and again whenever the network changes.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeSetFaceTimeInterfaces<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    interfaces_csv: JString<'l>,
+) {
+    let csv = jstr(&mut env, &interfaces_csv);
+    let Some(ft) = st().facetime.clone() else { return };
+    let list: Vec<std::net::IpAddr> = csv
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    log::info!("nativeSetFaceTimeInterfaces: {list:?}");
+    rt().spawn(async move {
+        ft.set_local_interfaces(&list).await;
+    });
+}
+
+/// Answer an incoming FaceTime call by guid: join the session that rang us
+/// (`join(session, ring=false)` — we're picking up, not ringing). Blocks on the
+/// network (the relay connect), so call off the main thread. Returns the guid on
+/// success, "" on failure so the caller only starts the in-call service when the
+/// join actually went through. Push the local interfaces first, same as placing a
+/// call — `connect_to_relay` needs them.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeAnswerFaceTimeCall<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    guid: JString<'l>,
+) -> jstring {
+    let guid = jstr(&mut env, &guid);
+    let Some(ft) = st().facetime.clone() else {
+        log::warn!("nativeAnswerFaceTimeCall: no FaceTime client up");
+        return out(&mut env, String::new());
+    };
+    log::info!("nativeAnswerFaceTimeCall: answering {guid}");
+    let ok = rt().block_on(async {
+        let mut lock = ft.state.write().await;
+        let Some(session) = lock.sessions.get_mut(&guid) else {
+            log::warn!("nativeAnswerFaceTimeCall: no session {guid}");
+            return false;
+        };
+        match ft.join(session, false).await {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("nativeAnswerFaceTimeCall: join failed: {e:?}");
+                false
+            }
+        }
+    });
+    out(&mut env, if ok { guid } else { String::new() })
+}
+
+/// Decline an incoming (ringing) FaceTime call by guid — sends a Decline to the
+/// caller via `FTClient::decline_invite`. Fire-and-forget; no-op if the session
+/// isn't known or no client is up.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeDeclineFaceTimeCall<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    guid: JString<'l>,
+) {
+    let guid = jstr(&mut env, &guid);
+    let Some(ft) = st().facetime.clone() else { return };
+    log::info!("nativeDeclineFaceTimeCall: declining {guid}");
+    rt().spawn(async move {
+        let mut lock = ft.state.write().await;
+        if let Some(session) = lock.sessions.get_mut(&guid) {
+            if let Err(e) = ft.decline_invite(session).await {
+                log::warn!("nativeDeclineFaceTimeCall: decline failed: {e:?}");
+            }
+        }
+    });
+}
+
+/// The IDS handle of whoever is calling on session [guid] — the first session
+/// member that isn't one of my own handles (e.g. "tel:+1…" / "mailto:…"). Empty if
+/// unknown. Used to label the incoming-call UI; the Kotlin side prettifies it.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeFaceTimeCallerHandle<
+    'l,
+>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    guid: JString<'l>,
+) -> jstring {
+    let guid = jstr(&mut env, &guid);
+    let Some(ft) = st().facetime.clone() else { return out(&mut env, String::new()) };
+    let caller = rt().block_on(async {
+        let lock = ft.state.read().await;
+        let Some(session) = lock.sessions.get(&guid) else { return String::new() };
+        session
+            .members
+            .iter()
+            .map(|m| m.handle.clone())
+            .find(|h| !session.my_handles.contains(h))
+            .unwrap_or_default()
+    });
+    out(&mut env, caller)
 }
 
 /// Best-effort UTI for a mime type (iMessage attachments carry a `uti-type`).
