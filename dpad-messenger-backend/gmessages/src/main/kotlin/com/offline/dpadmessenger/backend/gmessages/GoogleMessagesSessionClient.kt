@@ -412,6 +412,34 @@ internal class GoogleMessagesSessionClient(
             )
             return false
         }
+        // NOTHING CHANGED? Then there is nothing to adopt, and adopting anyway is not
+        // free: the tail of this function calls reauth(), which tears the long-poll
+        // down and restarts it. The companion re-sends the same harvest whenever it
+        // can't confirm an ack, so a byte-identical resend is the COMMON case, not an
+        // edge one — and turning each one into a stream restart is a self-inflicted
+        // receive gap on a link that was working.
+        //
+        // Declining is safe even if the session really is broken while holding these
+        // exact cookies, because that is rung 2's job, not rung 3's: a dead token
+        // surfaces as SESSION_COOKIE_INVALID on the next request, which bootstraps a
+        // fresh __Secure-1PSIDTS and retries refreshToken() — without restarting the
+        // stream. Rung 3 exists for cookies that are genuinely NEW, so requiring them
+        // to be new is the precondition, not a shortcut.
+        //
+        // KNOWN GAP, deliberately left: this catches a byte-identical resend, not one
+        // whose login cookies match but whose __Secure-1PSIDTS is STALER than the one
+        // rotation has since moved us to. That case is reachable immediately after an
+        // adopt (reauth() bootstraps a new freshness pair), so a companion resending
+        // the same blob twice can still adopt twice. The sharper rule is to compare
+        // only the login cookies (__Secure-1PSID / __Secure-3PSID / SID) and adopt on
+        // a change there, or when we hold no 1PSIDTS at all — rotation keeps the
+        // freshness pair current unaided, so a harvest carrying only a staler one
+        // brings nothing. Tighten to that if the logs show repeat adopts.
+        if (fresh.all { (k, v) -> cookies[k] == v }) {
+            Log.i(TAG, "fresh cookies are identical to the live set (${fresh.size} names) — " +
+                "ignoring the resend, session untouched")
+            return true
+        }
         val before = cookieSummary()
         cookies.putAll(fresh)
         if (storeWritable) runCatching { store.saveCookies(cookies) }
