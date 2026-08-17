@@ -62,4 +62,46 @@ object GoogleMessagesConfig {
      */
     @Volatile
     var cookieRotationEnabled: Boolean = true
+
+    /**
+     * Allow a rotation attempt when NO `__Secure-1PSIDTS` is held, to establish whether
+     * `accounts.google.com/RotateCookies` will MINT one rather than only refresh one
+     * (see [GMCookieRotation]).
+     *
+     * Must be `false` in anything that ships until a capture shows a successful
+     * bootstrap. Every already-linked device runs a stripped 14-cookie set, so enabling
+     * this fleet-wide points the whole fleet at an endpoint we have no successful
+     * response from yet.
+     *
+     * A run is conclusive when the capture contains one of:
+     * ```
+     * GMCookieRot: rotate BOOTSTRAP OK: accepted=[__Secure-1PSIDTS, …] changed=true
+     *     -> Google mints one. The phone is self-sufficient; the harvest need not carry it.
+     * GMCookieRot: rotate BOOTSTRAP OK: accepted=[] changed=false
+     *     -> Refresh-only. The harvest MUST carry a 1PSIDTS.
+     * GMCookieRot: rotate BOOTSTRAP HTTP 401/403 …
+     *     -> Our request shape is wrong, independent of cookies.
+     * ```
+     *
+     * ANSWERED 17 Aug 2026, and the answer is NO. On jacknugent27@gmail.com the probe
+     * returned `HTTP 403` with a well-formed pblite body of
+     * `[["identity.hfcr",2147483647],["di",44]]` — Int.MAX_VALUE, "never rotate".
+     * RotateCookies will not MINT a freshness cookie for a caller lacking one; it only
+     * refreshes one for a session already enrolled in rotation. The phone therefore
+     * cannot bootstrap, and a session with no `__Secure-1PSIDTS` never gains one.
+     *
+     * SOLVED 17 Aug 2026, and the answer is YES — it was our User-Agent all along. From a
+     * 14-cookie harvest with no freshness pair, RotateCookies returns
+     * `200 [["identity.hfcr",600]]` and sets BOTH `__Secure-1PSIDTS` and
+     * `__Secure-3PSIDTS`, provided the request carries a DESKTOP user-agent
+     * ([GMPairingProto.WEB_USER_AGENT]). The Android string inherited from
+     * mautrix-gmessages gets a flat 403 on the identical cookie state.
+     *
+     * Safe to default ON because minting now happens ONLY on the recovery path
+     * ([GMCookieRotation.bootstrapNow], reached from `reauth()`), never in the healthy
+     * poll loop. A device whose link is working keeps whatever state it has; a device
+     * whose auth has already failed has no stable state left to risk.
+     */
+    @Volatile
+    var cookieBootstrapOnRecovery: Boolean = true
 }

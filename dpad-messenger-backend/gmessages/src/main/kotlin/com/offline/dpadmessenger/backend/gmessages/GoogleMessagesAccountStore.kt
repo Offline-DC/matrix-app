@@ -56,6 +56,7 @@ class GoogleMessagesAccountStore(context: Context) {
             .putInt(KEY_SCHEMA_VERSION, SCHEMA_VERSION)
             .putString(KEY_TACHYON_AUTH, encode(account.tachyonAuthToken))
             .putLong(KEY_TOKEN_TTL, account.tokenTtl)
+            .putLong(KEY_TOKEN_ISSUED_AT, System.currentTimeMillis())
             .putLong(KEY_BROWSER_USER_ID, account.browser.userId)
             .putString(KEY_BROWSER_SOURCE_ID, account.browser.sourceId)
             .putString(KEY_BROWSER_NETWORK, account.browser.network)
@@ -73,8 +74,21 @@ class GoogleMessagesAccountStore(context: Context) {
         prefs.edit()
             .putString(KEY_TACHYON_AUTH, encode(tachyonAuthToken))
             .putLong(KEY_TOKEN_TTL, tokenTtl)
+            .putLong(KEY_TOKEN_ISSUED_AT, System.currentTimeMillis())
             .apply()
     }
+
+    /**
+     * Wall-clock ms at which the current token was issued, or 0 if unknown.
+     *
+     * Without this the session recomputed expiry as `now + ttl` on EVERY process
+     * start, so a 23h-old token looked brand new and the proactive refresh was
+     * pushed a full day past the real expiry. On a launcher that restarts often that
+     * made proactive refresh dead code. Persisted here so expiry is known, not
+     * assumed. Stamped by both [save] and [updateToken] — every path that mints or
+     * renews a token goes through one of them.
+     */
+    fun tokenIssuedAtMs(): Long = prefs.getLong(KEY_TOKEN_ISSUED_AT, 0L)
 
     // ---- Google-account (GAIA) cookies -------------------------------------
     // Stored encrypted, independent of the QR-pairing fields above, so the
@@ -196,7 +210,8 @@ class GoogleMessagesAccountStore(context: Context) {
             // re-link" counts from, and what the day-13 warning watches. Only a
             // full re-pair (new cookies + emoji) sets it — token refresh does
             // not — so it tracks the real age of the Google session, whose
-            // ~2-week ceiling only a re-sign-in resets.
+            // No expiry is known to be tied to this — see
+            // GMESSAGES_SEAMLESS_LINK_DESIGN_20260817.md §1(b). Kept as diagnostics.
             .putLong(KEY_LINK_TS, System.currentTimeMillis())
             .apply()
     }
@@ -285,6 +300,7 @@ class GoogleMessagesAccountStore(context: Context) {
         private const val KEY_SCHEMA_VERSION = "schemaVersion"
         private const val KEY_COOKIES = "gaiaCookies"
         private const val KEY_COOKIES_SAVED_AT = "gaiaCookiesSavedAtMs"
+        private const val KEY_TOKEN_ISSUED_AT = "tokenIssuedAtMs"
         private const val KEY_TACHYON_AUTH = "tachyonAuthToken"
         private const val KEY_TOKEN_TTL = "tokenTtl"
         private const val KEY_BROWSER_USER_ID = "browserUserId"

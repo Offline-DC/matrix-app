@@ -273,7 +273,7 @@ class GMGaiaClient(context: Context) {
         val ttl = ttlNode.asLongOrNull() ?: 0L
         if (ttl == 0L) {
             // Distinguish "Google really sent 0" from "Google sent it as a JSON
-            // string and asLongOrNull() only accepts Num" — the JSPB convention
+            // string and asLongOrNull() used to accept only Num" — the JSPB convention
             // encodes int64 fields as strings to dodge JS precision loss. The
             // response body is logged with take(1200) and tokenData is the LAST
             // element, so this is the only place the raw value is ever visible.

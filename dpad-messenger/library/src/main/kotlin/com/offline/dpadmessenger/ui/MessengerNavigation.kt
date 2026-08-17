@@ -70,7 +70,7 @@ fun DpadMessengerApp(
     onRelink: (() -> Unit)? = null,
     /** User-initiated re-link — Settings, the day-13 banner that routes there, and
      *  "Re-link phone" on a failed message: ALWAYS a full re-sign-in for a
-     *  brand-new ~2-week session, since token refresh can't extend the Google
+     *  brand-new pairing. Prefer the adaptive onRelink, which repairs the
      *  session ceiling. Keeps history. Falls back to [onRelink] when null. */
     onFreshRelink: (() -> Unit)? = null,
     /** Whole days since the last fresh sign-in. Drives the Settings "last linked"
@@ -160,11 +160,6 @@ fun DpadMessengerApp(
                     onRoomClick = { roomId -> nav.navigate(Routes.chat(roomId)) },
                     onSettingsClick = {
                         focusRelinkOnSettings = false
-                        nav.navigate(Routes.SETTINGS)
-                    },
-                    linkAgeDays = linkAgeDays,
-                    onRelinkWarningClick = {
-                        focusRelinkOnSettings = true
                         nav.navigate(Routes.SETTINGS)
                     },
                     // Only offer "new message" if the repo can actually start
@@ -262,7 +257,7 @@ fun DpadMessengerApp(
                         }
                     },
                     // Settings re-link is the user-initiated FRESH re-sign-in
-                    // (new ~2-week session). Fall back to the adaptive onRelink
+                    // (a brand-new pairing). Fall back to the adaptive onRelink
                     // if the host didn't supply a fresh variant.
                     onRelink = (onFreshRelink ?: onRelink)?.let { r -> { r(); nav.popBackStack() } },
                     linkAgeDays = linkAgeDays,

@@ -305,6 +305,16 @@ internal class GoogleMessagesMessageRepository(
      * messages. Clears the auth-expired flag on success. @return false if the
      * cookies are no longer valid (caller should then do a full re-pair).
      */
+    /** Adopt a fresh cookie harvest into the live session (rung 3). */
+    suspend fun adoptFreshCookies(fresh: Map<String, String>): Boolean = withContext(Dispatchers.IO) {
+        val ok = session.adoptFreshCookies(fresh)
+        if (ok) {
+            _authExpired.value = false
+            _authExpiredReason.value = null
+        }
+        ok
+    }
+
     suspend fun reauth(): Boolean = withContext(Dispatchers.IO) {
         // Off the main thread: the caller is a Compose `rememberCoroutineScope()`
         // (Main), and reauth() does an ECDSA key load + sign plus a blocking HTTP

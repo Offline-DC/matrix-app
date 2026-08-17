@@ -336,9 +336,41 @@ internal class GoogleMessagesSessionClient(
         Log.i(
             TAG,
             "alive: up ${uptime()} linkAge=${store.daysSinceLink() ?: -1}d " +
-                "expiry=${expirySummary(now)} net=${connectivity()} cookies[${cookieSummary()}]",
+                "expiry=${expirySummary(now)} net=${connectivity()} cookies[${cookieSummary()}] " +
+                "rot[${GMCookieRotation.status()}]",
         )
         return now
+    }
+
+    /**
+     * RUNG 3 — adopt a freshly harvested cookie set WITHOUT re-pairing.
+     *
+     * The missing rung between [reauth] and a full QR re-pair. When the Google login
+     * cookies are genuinely dead (not merely stale), [reauth] cannot help — but the
+     * user signing in again in the browser CAN, and the companion already delivers
+     * that harvest to an already-paired device. Until now the live session never saw
+     * it: [cookies] is read from the store once, at construction, and would overwrite
+     * the new set on its next `Set-Cookie` save.
+     *
+     * Adopting them here preserves the UKey2 keys, the ECDSA refresh key, `destReg`
+     * and the pairing id — so no new registration is minted and no ghost device is
+     * left behind. That matters: every full re-pair leaves a registration that can
+     * silently take over receiving, which is the leading hypothesis for Bug A.
+     *
+     * @return true if the link is live again.
+     */
+    suspend fun adoptFreshCookies(fresh: Map<String, String>): Boolean {
+        if (!gaia || fresh.isEmpty()) return false
+        val before = cookieSummary()
+        cookies.putAll(fresh)
+        if (storeWritable) runCatching { store.saveCookies(cookies) }
+        // A brand-new harvest invalidates any rotation backoff, and the token expiry
+        // belief must be re-derived from the persisted issue time rather than carried
+        // over from the credentials we just replaced.
+        GMCookieRotation.reset()
+        tokenExpiryMs = 0L
+        Log.i(TAG, "adopting fresh cookies without re-pairing: was[$before] now[${cookieSummary()}]")
+        return reauth()
     }
 
     /**
@@ -350,6 +382,13 @@ internal class GoogleMessagesSessionClient(
      */
     suspend fun reauth(): Boolean {
         Log.i(TAG, "reauth: re-link requested — net=${connectivity()} cookies[${cookieSummary()}]")
+        // Recovery-only bootstrap. If this session holds no __Secure-1PSIDTS, mint one
+        // before spending the token refresh: Google's tolerance of a set without it is
+        // inconsistent (401/401/200/401 on byte-identical input, 14 Aug 2026), while a
+        // set with it is accepted reliably. Non-fatal — a failure here leaves the stored
+        // cookies exactly as they were, so the refresh below still gets its normal shot.
+        if (gaia) runCatching { bootstrapCookiesNow() }
+            .onFailure { Log.w(TAG, "reauth: bootstrap failed (continuing)", it) }
         if (!runCatching { refreshToken() }.getOrDefault(false)) {
             // This distinction is the whole diagnosis. If the stored cookies were
             // still good and only the network was down, the credentials are fine
@@ -740,6 +779,7 @@ internal class GoogleMessagesSessionClient(
         var serverFailures = 0
         var transportFailures = 0
         var lastHeartbeatMs = 0L
+        maintenanceTick = 0
         while (coroutineContext.isActive) {
             attempt++
             runCatching { rotateCookiesIfDue() }
@@ -1515,6 +1555,19 @@ internal class GoogleMessagesSessionClient(
             ) {
                 scheduleAssertTick()
             }
+            // Cookie rotation and token refresh also ran ONLY at the top of a
+            // long-poll iteration, so on a stream that stays open and silent they
+            // stalled with everything else — and a stalled rotation is the ~2h death.
+            // Piggyback them on this timer at ~60s granularity (every 12th tick), so
+            // the cadence no longer depends on inbound traffic. Both are cheap no-ops
+            // when not due; the counter keeps refreshTokenIfNeeded's "Nmin to expiry"
+            // debug line from firing every five seconds.
+            if (longPollJob?.isActive == true && ++maintenanceTick % 12 == 0) {
+                runCatching { rotateCookiesIfDue() }
+                    .onFailure { Log.w(TAG, "timer rotation failed (continuing)", it) }
+                runCatching { refreshTokenIfNeeded() }
+                    .onFailure { Log.w(TAG, "timer token refresh failed (continuing)", it) }
+            }
             val ids = ackLock.withLock {
                 if (pendingAcks.isEmpty()) emptyList()
                 else pendingAcks.toList().also { pendingAcks.clear() }
@@ -1539,6 +1592,12 @@ internal class GoogleMessagesSessionClient(
 
     @Volatile private var tokenExpiryMs: Long = 0L
 
+    /** Depth guard for the one-shot rotate-and-retry in [refreshToken]. */
+    @Volatile private var cookieRetryInFlight = false
+
+    /** Ticks of [ackLoop]; every 12th (~60s) also runs rotation + token refresh. */
+    @Volatile private var maintenanceTick = 0
+
     /** Why the last auth failure happened, so the UI can show the right fix.
      *  Set by [refreshToken]; read when emitting [SessionEvent.AuthExpired]. */
     @Volatile private var lastAuthFailure: AuthFailureReason = AuthFailureReason.UNKNOWN
@@ -1562,24 +1621,49 @@ internal class GoogleMessagesSessionClient(
         }
     }
 
+    /**
+     * Mint a freshness cookie for a session that has none — the recovery counterpart to
+     * [rotateCookiesIfDue]. Called only from [reauth]; see [GMCookieRotation.bootstrapNow]
+     * for why this deliberately does not run on the healthy path.
+     */
+    private suspend fun bootstrapCookiesNow() {
+        val changed = withContext(Dispatchers.IO) {
+            GMCookieRotation.bootstrapNow(httpRpc, cookies)
+        }
+        if (changed && storeWritable) {
+            runCatching { store.saveCookies(cookies) }
+            Log.i(TAG, "reauth: session cookie bootstrapped; ${cookieSummary()}")
+        }
+    }
+
     private suspend fun refreshTokenIfNeeded() {
         // Refresh ~1h before expiry. tokenTtl is in microseconds (or 0 → 24h).
         val now = System.currentTimeMillis()
         if (tokenExpiryMs == 0L) {
             val ttlMs = if (account.tokenTtl > 0) account.tokenTtl / 1000 else 24 * 3600_000L
-            tokenExpiryMs = now + ttlMs
-            // KNOWN LIMITATION, logged so a capture shows it happening: expiry is
-            // in-memory only, so every process start assumes the token was issued
-            // JUST NOW. A token that is actually 23h old looks brand new here, and
-            // the proactive refresh gets scheduled long after it really died. If
-            // this line appears repeatedly in a capture, the launcher is
-            // restarting often enough that proactive refresh never runs at all.
-            Log.w(
-                TAG,
-                "expiry assumed, not known: no persisted issue time — treating token as " +
-                    "issued now with ttl=${account.tokenTtl}" +
-                    "${if (account.tokenTtl > 0) "" else " (0 → 24h)"}, linkAge=${store.daysSinceLink() ?: -1}d",
-            )
+            val issuedAt = store.tokenIssuedAtMs()
+            if (issuedAt > 0L) {
+                // Expiry is now KNOWN: issue time survives process death, so a token
+                // that is really 23h old is treated as 23h old and the proactive
+                // refresh lands before it dies instead of a day after.
+                tokenExpiryMs = issuedAt + ttlMs
+                Log.i(
+                    TAG,
+                    "token age known: issued ${(now - issuedAt) / 60_000}min ago, " +
+                        "ttl=${account.tokenTtl} → expires in ${(tokenExpiryMs - now) / 60_000}min",
+                )
+            } else {
+                // Pre-fix account: no stamp on disk. Falls back to the old optimistic
+                // assumption for one refresh cycle, then updateToken() stamps it and
+                // every later process start takes the branch above.
+                tokenExpiryMs = now + ttlMs
+                Log.w(
+                    TAG,
+                    "expiry assumed, not known: no persisted issue time — treating token as " +
+                        "issued now with ttl=${account.tokenTtl}" +
+                        "${if (account.tokenTtl > 0) "" else " (0 → 24h)"}, linkAge=${store.daysSinceLink() ?: -1}d",
+                )
+            }
         }
         val minsLeft = (tokenExpiryMs - now) / 60000
         if (now < tokenExpiryMs - 3600_000L) {
@@ -1687,6 +1771,40 @@ internal class GoogleMessagesSessionClient(
             cookieInvalid -> AuthFailureReason.COOKIE_INVALID
             code !in 200..499 -> AuthFailureReason.NETWORK
             else -> AuthFailureReason.TOKEN_DEAD
+        }
+
+        // RUNG 2 — self-heal. SESSION_COOKIE_INVALID means the freshness cookie is
+        // stale or absent, which is precisely what a rotation fixes. Mint/rotate and
+        // retry EXACTLY once before reporting failure to the user.
+        //
+        // Both AuthFailureReason.COOKIE_INVALID's own doc ("even after an on-device
+        // rotation attempt") and GMESSAGES_STATUS.md ("rotates, and retries
+        // RegisterRefresh once") already described this behaviour. Neither was true
+        // until now — refreshToken() never made a rotation call. This is the single
+        // change that most reduces how often a user is asked to re-link.
+        if (cookieInvalid && gaia && !cookieRetryInFlight) {
+            cookieRetryInFlight = true
+            try {
+                val changed = withContext(Dispatchers.IO) {
+                    GMCookieRotation.bootstrapNow(httpRpc, cookies)
+                }
+                if (changed) {
+                    if (storeWritable) runCatching { store.saveCookies(cookies) }
+                    Log.i(
+                        TAG,
+                        "SESSION_COOKIE_INVALID → cookies rotated on-device; " +
+                            "retrying RegisterRefresh once [${cookieSummary()}]",
+                    )
+                    return refreshToken()
+                }
+                Log.w(
+                    TAG,
+                    "SESSION_COOKIE_INVALID but rotation changed nothing — cookies are " +
+                        "genuinely dead, not merely stale; not retrying",
+                )
+            } finally {
+                cookieRetryInFlight = false
+            }
         }
         return false
     }

@@ -1,5 +1,6 @@
 package com.offline.dpadmessenger.backend.gmessages.ui
 
+import android.widget.Toast
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
@@ -229,6 +230,32 @@ fun GoogleMessagesApp(
                     )
                     paired = false
                 }
+            },
+            // Settings -> "Re-register now". Deliberately the NARROW recovery: mint a
+            // freshness cookie if this session holds none, then refresh the token from
+            // the STORED cookies. It never wipes and never re-pairs, which is what makes
+            // it safe to press repeatedly while testing — unlike onRelink, which falls
+            // back to a full re-pair once it decides the cookies are dead.
+            //
+            // This is the on-demand trigger for the __Secure-1PSIDTS bootstrap. Without
+            // it the recovery path is only reachable by waiting for a natural auth
+            // failure, which on a healthy link means sitting out ~2h per attempt.
+            onReregister = {
+                Toast.makeText(context, "Re-registering Google Messages…", Toast.LENGTH_SHORT).show()
+                relinkScope.launch {
+                    val ok = GoogleMessagesRepository.reauth()
+                    val reason = GoogleMessagesRepository.lastAuthFailureReason()
+                    val msg = when {
+                        ok -> "Re-registered. Check GMCookieRot / GMSession in the logs."
+                        reason == AuthFailureReason.NETWORK ->
+                            "Couldn't reach Google. Credentials kept — try again on signal."
+                        else ->
+                            "Re-register failed ($reason). Credentials kept — use Re-link " +
+                                "phone if it keeps failing."
+                    }
+                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                }
+                Unit
             },
             autoDeleteDays = autoDeleteDays,
             onAutoDeleteDaysChange = { days ->

@@ -4,7 +4,9 @@ import android.content.Context
 import android.util.Log
 import com.offline.dpadmessenger.data.InMemoryMessageRepository
 import com.offline.dpadmessenger.data.MessageRepository
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -160,6 +162,21 @@ object GoogleMessagesRepository {
      */
     val teardowns: StateFlow<Int> = _teardowns.asStateFlow()
 
+
+    /**
+     * Fire-and-forget rung 3: hand a fresh cookie harvest to the live session so an
+     * already-paired device can be repaired by a browser sign-in alone — no QR, no
+     * emoji, no new registration.
+     *
+     * Non-suspend because the caller is the relay callback in the launcher's
+     * accessibility service, which has no coroutine scope of its own. No-ops when no
+     * session is running (nothing to update — the store write the caller already did
+     * is enough, and the next session start will load it).
+     */
+    fun adoptFreshCookiesAsync(cookies: Map<String, String>) {
+        val repo = instance as? GoogleMessagesMessageRepository ?: return
+        CoroutineScope(Dispatchers.IO).launch { repo.adoptFreshCookies(cookies) }
+    }
 
     /** Re-link WITHOUT re-pairing: refresh the token from stored cookies and
      *  resume, keeping the pairing + messages. Returns false if the cookies are

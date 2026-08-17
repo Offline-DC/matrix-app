@@ -28,19 +28,30 @@ import java.util.concurrent.atomic.AtomicBoolean
  * pairing itself was refused with HTTP 401 SESSION_COOKIE_INVALID. Keeping the
  * cookie and refreshing it is the only direction that can work.
  *
- * STATUS: EXPERIMENT — DEFAULT OFF
- * --------------------------------
+ * STATUS: VERIFIED ON DEVICE — DEFAULT ON
+ * ---------------------------------------
  * Upstream mautrix-gmessages does NOT do this. It has no rotation logic at all
  * (`AuthData.UpdateCookiesFromResponse` is its entire cookie story) and instead
  * tells users to sign in from a private window so the browser can't rotate the
- * cookies out from under the bridge. This endpoint is therefore UNVERIFIED against
- * `instantmessaging-pa`; it is well attested elsewhere in the Google-web
- * reverse-engineering ecosystem (NotebookLM / Gemini web clients) but not here.
+ * cookies out from under the bridge. We go further because that advice does not
+ * survive Google's 2026-08-14 change.
  *
- * So it ships behind [GoogleMessagesConfig.cookieRotationEnabled], default false.
- * Turn it on for one device, watch whether the link survives past ~2h, and only
- * then consider defaulting it on. Every failure path here is non-destructive: we
- * never clear or downgrade a cookie we already hold.
+ * Verified 2026-08-17 on `jacknugent27@gmail.com`: `POST accounts.google.com/
+ * RotateCookies` returns `200` + `[["identity.hfcr",600],["di",N]]` and
+ * `Set-Cookie` for BOTH `__Secure-1PSIDTS` and `__Secure-3PSIDTS`, including for a
+ * caller that holds neither (the mint / bootstrap case). It also MINTS, not just
+ * refreshes — so a 14-cookie harvest with no freshness pair is enough.
+ *
+ * The one hard requirement is the User-Agent: this endpoint returns `403` +
+ * `[["identity.hfcr",2147483647]]` to a client claiming `(Linux; Android 14)`, and
+ * `200` to the byte-identical request sent with a desktop platform token. Hence
+ * [GMPairingProto.WEB_USER_AGENT] — do NOT reuse [GMPairingProto.USER_AGENT] here.
+ *
+ * It ships behind [GoogleMessagesConfig.cookieRotationEnabled], default ON. That is
+ * safe because a rotation only fires for a device that already holds a
+ * `__Secure-1PSIDTS`; the bootstrap path for devices that hold none is separately
+ * gated behind [GoogleMessagesConfig.cookieBootstrapOnRecovery]. Every failure path here
+ * is non-destructive: we never clear or downgrade a cookie we already hold.
  *
  * CONCURRENCY: exactly one rotation may be in flight process-wide. Rotation
  * INVALIDATES the previous 1PSIDTS, so two racing rotations can leave both callers
@@ -62,14 +73,50 @@ object GMCookieRotation {
      *  a cold poke. Google answers with the real next-interval regardless. */
     private const val BODY = "[000,\"-0000000000000000000\"]"
 
-    /** Never poke more often than this, whatever else says otherwise. Guards against
-     *  a restart loop hammering accounts.google.com into a 429. */
+    /** Never poke more often than this, whatever else says otherwise.
+     *
+     *  CAVEAT — this does NOT currently guard against a restart loop, which is what
+     *  it was written for. [lastAttemptMs] and [nextDueMs] live in process memory, so
+     *  a fresh process starts with `nextDueMs = 0` and rotates unconditionally on the
+     *  first maintenance tick however recently the last one ran. Confirmed 17 Aug
+     *  2026: a rotation at 10:47:29 parked the next one at 10:57:29, the process was
+     *  killed at 10:54:36, and the replacement rotated at 10:54:57 — 152s early. On a
+     *  device where the launcher is OOM-killed repeatedly this becomes one rotation
+     *  per restart with no floor, against an endpoint that is known to rate-limit,
+     *  and every rotation invalidates the previous `__Secure-1PSIDTS`.
+     *
+     *  Fix is to persist both timestamps alongside the cookies. Not done yet. */
     private const val MIN_INTERVAL_MS = 60_000L
 
     /** Used when Google's response doesn't carry an interval. Its own hint is 600s. */
     private const val DEFAULT_INTERVAL_MS = 600_000L
 
-    private const val FAILURE_BACKOFF_MS = 900_000L
+    /** Upper clamp on anything Google hands back. Without it the NEVER_ROTATE sentinel
+     *  below would push the next attempt ~68 years out and silently kill rotation for
+     *  the life of the process while lastResult still read "no-change". */
+    private const val MAX_INTERVAL_MS = 24 * 3600_000L
+
+    /** `["identity.hfcr",2147483647]` — Int.MAX_VALUE, i.e. "no rotation scheduled".
+     *
+     *  This was first read as "the session is NOT ENROLLED in cookie rotation and
+     *  never will be". That was WRONG and the retraction matters, because it is the
+     *  kind of mistake that makes you stop looking: the sentinel is what Google
+     *  returns on a request it is refusing for some OTHER reason — here, our Android
+     *  User-Agent — not a verdict about the account. The byte-identical request sent
+     *  with [GMPairingProto.WEB_USER_AGENT] returns 200 + `hfcr=600` and mints both
+     *  freshness cookies. Both observed 17 Aug 2026 on jacknugent27@gmail.com.
+     *
+     *  So treat it as "we asked wrongly", never as "this session cannot rotate", and
+     *  do NOT latch on it. */
+    private const val NEVER_ROTATE = 2_147_483_647L
+
+    /**
+     * Backoff after a failed rotation. Deliberately SHORTER than the ~600s rotation
+     * cadence: at the old 900s a single failure guaranteed the freshness cookie went
+     * stale before the next attempt, which is the ~2h death. Two minutes is long
+     * enough not to hammer Google and short enough to stay inside the window.
+     */
+    private const val FAILURE_BACKOFF_MS = 120_000L
     private const val RATE_LIMIT_BACKOFF_MS = 1_800_000L
 
     /** Cookies we will accept from a rotation response. Deliberately NOT the whole
@@ -109,24 +156,77 @@ object GMCookieRotation {
      */
     fun rotateIfDue(http: OkHttpClient, cookies: MutableMap<String, String>): Boolean {
         if (!GoogleMessagesConfig.cookieRotationEnabled) return false
-        // Nothing to refresh. Note this is also why the old strip made this fix
-        // impossible: with 1PSIDTS deleted there is no rotation to perform.
+        // A rotation is authenticated by the long-lived login cookie. Without it there
+        // is nothing to rotate against and no request worth making.
+        if (cookies["__Secure-1PSID"].isNullOrBlank()) return false
+
+        // REFRESH ONLY on the healthy path. A session holding no __Secure-1PSIDTS needs
+        // no maintenance at all and survives days-to-weeks untended, so minting one here
+        // would trade a stable state for one that must keep rotating or die at ~2h — and
+        // a stale freshness cookie is unrecoverable without a re-link, whereas an absent
+        // one cannot go stale. Minting is a RECOVERY action instead: see [bootstrapNow].
         if (cookies["__Secure-1PSIDTS"].isNullOrBlank()) return false
 
         val now = System.currentTimeMillis()
         if (now < nextDueMs) return false
         if (lastAttemptMs != 0L && now - lastAttemptMs < MIN_INTERVAL_MS) return false
-        // Single-flight: a racing caller skips rather than queues.
-        if (!inFlight.compareAndSet(false, true)) return false
+        return attempt(http, cookies, bootstrap = false, now = now)
+    }
 
+    /**
+     * Recovery entry point: MINT a `__Secure-1PSIDTS` for a session that holds none.
+     *
+     * Only call this when auth has already failed — from [GoogleMessagesSessionClient
+     * .reauth], i.e. the reconnect prompt, "Re-link phone", and Settings →
+     * "Re-register now". At that point there is no healthy state left to protect, so a
+     * bootstrap can only help: it either rescues the link or changes nothing.
+     *
+     * Verified 17 Aug 2026: from a 14-cookie harvest with no freshness pair, this
+     * returns `200 [["identity.hfcr",600]]` and Google sets BOTH
+     * `__Secure-1PSIDTS` and `__Secure-3PSIDTS` — but ONLY with a desktop
+     * [GMPairingProto.WEB_USER_AGENT]; the Android string gets a flat 403.
+     *
+     * @return true if a cookie value changed and the caller should persist.
+     */
+    fun bootstrapNow(http: OkHttpClient, cookies: MutableMap<String, String>): Boolean {
+        if (!GoogleMessagesConfig.cookieBootstrapOnRecovery) return false
+        if (cookies["__Secure-1PSID"].isNullOrBlank()) return false
+
+        val now = System.currentTimeMillis()
+        // Deliberately ignores nextDueMs: a backoff parked by the healthy path is
+        // irrelevant once auth is already broken. The MIN_INTERVAL floor still applies,
+        // so a retry loop (or a user leaning on the button) cannot hammer Google.
+        if (lastAttemptMs != 0L && now - lastAttemptMs < MIN_INTERVAL_MS) {
+            Log.i(
+                TAG,
+                "bootstrapNow: skipped — last attempt ${(now - lastAttemptMs) / 1000}s ago " +
+                    "(floor ${MIN_INTERVAL_MS / 1000}s)",
+            )
+            return false
+        }
+        val bootstrap = cookies["__Secure-1PSIDTS"].isNullOrBlank()
+        Log.i(TAG, "bootstrapNow: requested (mint=$bootstrap cookies=${cookies.size})")
+        return attempt(http, cookies, bootstrap = bootstrap, now = now)
+    }
+
+    /** Single-flight + non-destructive error handling, shared by both entry points. */
+    private fun attempt(
+        http: OkHttpClient,
+        cookies: MutableMap<String, String>,
+        bootstrap: Boolean,
+        now: Long,
+    ): Boolean {
+        // A racing caller skips rather than queues: rotation INVALIDATES the previous
+        // 1PSIDTS, so two racers would leave both holding a stale value.
+        if (!inFlight.compareAndSet(false, true)) return false
         return try {
             lastAttemptMs = now
-            rotate(http, cookies)
+            rotate(http, cookies, bootstrap)
         } catch (t: Throwable) {
             // Transport failure says nothing about the credentials. Keep what we
             // have and try again later — never clear a cookie on a network error.
             Log.w(TAG, "rotate threw — keeping existing cookies", t)
-            lastResult = "threw:${t.javaClass.simpleName}"
+            lastResult = "${if (bootstrap) "bootstrap-" else ""}threw:${t.javaClass.simpleName}"
             nextDueMs = System.currentTimeMillis() + FAILURE_BACKOFF_MS
             false
         } finally {
@@ -134,14 +234,18 @@ object GMCookieRotation {
         }
     }
 
-    private fun rotate(http: OkHttpClient, cookies: MutableMap<String, String>): Boolean {
+    private fun rotate(
+        http: OkHttpClient,
+        cookies: MutableMap<String, String>,
+        bootstrap: Boolean,
+    ): Boolean {
         val req = Request.Builder()
             .url(ROTATE_URL)
             .post(BODY.toRequestBody("application/json".toMediaType()))
             .header("Cookie", GMCookieAuth.cookieHeader(cookies))
             .header("Origin", "https://accounts.google.com")
             .header("Referer", "https://accounts.google.com/")
-            .header("user-agent", GMPairingProto.USER_AGENT)
+            .header("user-agent", GMPairingProto.WEB_USER_AGENT)
             .build()
 
         return http.newCall(req).execute().use { resp ->
@@ -157,8 +261,29 @@ object GMCookieRotation {
                 // A 401 here means the whole Google session is gone, not just the
                 // freshness cookie — but that is the long-poll's call to make, not
                 // ours. We only report it; we do not touch stored state.
-                Log.w(TAG, "rotate HTTP ${resp.code} (${body.length}B) — cookies untouched: ${body.take(160)}")
-                lastResult = "http${resp.code}"
+                Log.w(
+                    TAG,
+                    "rotate${if (bootstrap) " BOOTSTRAP" else ""} HTTP ${resp.code} " +
+                        "(${body.length}B) — cookies untouched: ${body.take(300)}",
+                )
+                Log.w(
+                    TAG,
+                    "rotate failure detail: content-type=${resp.header("content-type")} " +
+                        "setCookie=${resp.headers("Set-Cookie").map { it.substringBefore("=") }} " +
+                        "ua=web cookies=${cookies.size}",
+                )
+                if (parseNextIntervalMs(body) == NEVER_ROTATE * 1000L) {
+                    // hfcr=Int.MAX_VALUE, "never rotate". Do NOT read this as a property
+                    // of the account: on 17 Aug 2026 the identical cookie state returned
+                    // 403+never for the Android user-agent and 200+600 for a desktop one.
+                    // It means "no rotation for THIS request" — i.e. we asked wrongly.
+                    Log.w(
+                        TAG,
+                        "rotate refused with hfcr=never — this is a REQUEST problem, not an " +
+                            "account one; check the user-agent and the cookie set",
+                    )
+                }
+                lastResult = "${if (bootstrap) "bootstrap-" else ""}http${resp.code}"
                 nextDueMs = System.currentTimeMillis() + FAILURE_BACKOFF_MS
                 return false
             }
@@ -173,13 +298,22 @@ object GMCookieRotation {
             }
 
             val nextMs = (parseNextIntervalMs(body) ?: DEFAULT_INTERVAL_MS)
-                .coerceAtLeast(MIN_INTERVAL_MS)
+                .coerceIn(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
             nextDueMs = System.currentTimeMillis() + nextMs
 
-            lastResult = if (changed) "rotated" else "no-change"
+            lastResult = when {
+                bootstrap && changed -> "bootstrapped"
+                bootstrap -> "bootstrap-empty"
+                changed -> "rotated"
+                else -> "no-change"
+            }
+            // On a bootstrap run `accepted` IS the answer: a non-empty set means Google
+            // will mint a freshness cookie for a caller that had none, so the phone stops
+            // depending on the harvest carrying one. An empty set means it will not.
             Log.i(
                 TAG,
-                "rotate OK: accepted=${rotated.keys} changed=$changed nextIn=${nextMs / 1000}s",
+                "rotate${if (bootstrap) " BOOTSTRAP" else ""} OK: accepted=${rotated.keys} " +
+                    "changed=$changed nextIn=${nextMs / 1000}s result=$lastResult",
             )
             changed
         }
