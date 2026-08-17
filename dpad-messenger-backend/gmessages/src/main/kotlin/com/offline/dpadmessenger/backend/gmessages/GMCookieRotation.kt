@@ -23,18 +23,29 @@ import java.util.concurrent.atomic.AtomicBoolean
  * stale and the link dies — the "~2h SESSION_COOKIE_INVALID kick".
  *
  * The previous attempt at this was to DELETE 1PSIDTS and ride 1PSID alone
- * (GoogleMessagesAccountStore, 2026-06-13). That worked only while Google still
- * honoured the 1PSID-only fallback, and on 2026-08-14 it started failing closed:
- * pairing itself was refused with HTTP 401 SESSION_COOKIE_INVALID. Keeping the
- * cookie and refreshing it is the only direction that can work.
+ * (GoogleMessagesAccountStore, 2026-06-13). On 2026-08-14, three of four pairing
+ * attempts on that stripped cookie set were refused with HTTP 401
+ * SESSION_COOKIE_INVALID.
+ *
+ * Resist the tempting version of that sentence. It is NOT established that Google
+ * changed anything on 2026-08-14, and an earlier draft of this comment said so.
+ * `signInGaia` appears in exactly ONE of the sixteen field captures (12 Jun – 14 Aug)
+ * — the 14 Aug one — so there is no before/after: we have a single day of pairing
+ * data, and it happens to be the last capture in the set. "The date we have data for"
+ * is not "the date something changed". The 200 sitting among those four 401s argues
+ * against a policy flip too; a hard change would not intermittently succeed.
+ *
+ * What the data does support, and all this design needs: riding a stripped set is
+ * MARGINAL — accepted sometimes, refused most of the time, on byte-identical input.
+ * Keeping the cookie and refreshing it removes the coin-flip.
  *
  * STATUS: VERIFIED ON DEVICE — DEFAULT ON
  * ---------------------------------------
  * Upstream mautrix-gmessages does NOT do this. It has no rotation logic at all
  * (`AuthData.UpdateCookiesFromResponse` is its entire cookie story) and instead
  * tells users to sign in from a private window so the browser can't rotate the
- * cookies out from under the bridge. We go further because that advice does not
- * survive Google's 2026-08-14 change.
+ * cookies out from under the bridge. We go further because that advice does not fit a
+ * phone: there is no browser left to keep the session warm after the QR is scanned.
  *
  * Verified 2026-08-17 on `jacknugent27@gmail.com`: `POST accounts.google.com/
  * RotateCookies` returns `200` + `[["identity.hfcr",600],["di",N]]` and
@@ -130,6 +141,71 @@ object GMCookieRotation {
     @Volatile private var lastAttemptMs = 0L
     @Volatile private var nextDueMs = 0L
 
+    /**
+     * Where [lastAttemptMs] and [nextDueMs] survive process death.
+     *
+     * Without this the two timestamps are process memory, so every fresh process starts
+     * at `nextDueMs = 0` and rotates unconditionally on its first maintenance tick —
+     * and [MIN_INTERVAL_MS] cannot do the job its own comment claims, because the floor
+     * dies with the process too. Measured 17 Aug 2026: a rotation at 10:47:29 parked the
+     * next at 10:57:29, the process was killed at 10:54:36, and its replacement rotated
+     * at 10:54:57, 152s early. Once per restart is harmless; a device being OOM-killed
+     * and restarted repeatedly turns it into a request loop against an endpoint upstream
+     * documents as rate-limited, and every rotation invalidates the previous
+     * `__Secure-1PSIDTS`, so the loop also churns the credential it is meant to protect.
+     *
+     * Upstream (notebooklm-py) uses a file mtime for exactly this floor, i.e. a
+     * PERSISTENT check, which is the tell that in-memory is not enough.
+     *
+     * An interface rather than a direct store dependency so this object stays
+     * Android-free and unit-testable, and so a caller that has no store (link-time
+     * bootstrap, which has just called [reset] anyway) can simply not attach one.
+     */
+    interface Timestamps {
+        /** `[lastAttemptMs, nextDueMs]`, or nulls/zeros if nothing is stored yet. */
+        fun load(): LongArray
+        fun save(lastAttemptMs: Long, nextDueMs: Long)
+    }
+
+    @Volatile private var timestamps: Timestamps? = null
+    @Volatile private var hydrated = false
+
+    /** Install (or with `null`, remove) persistence. Idempotent; re-arms the one-time
+     *  load. Nullable so a caller with no store — and a test — can prove the
+     *  degrade-to-memory path rather than assuming it. */
+    fun attachTimestamps(store: Timestamps?) {
+        timestamps = store
+        hydrated = false
+    }
+
+    /** Read the persisted floor once per process, before the first gate check. Failure
+     *  is non-fatal: we fall back to in-memory behaviour rather than blocking rotation. */
+    private fun hydrate() {
+        if (hydrated) return
+        hydrated = true
+        val t = timestamps ?: return
+        runCatching { t.load() }.getOrNull()?.let { v ->
+            if (v.size >= 2) {
+                // Only ever move the floor FORWARD. A stored value is evidence that a
+                // rotation happened; a zero is absence of evidence, not permission.
+                if (v[0] > lastAttemptMs) lastAttemptMs = v[0]
+                if (v[1] > nextDueMs) nextDueMs = v[1]
+                Log.i(
+                    TAG,
+                    "hydrated rotation floor from disk: lastAttempt=${
+                        if (v[0] == 0L) "never" else "${(System.currentTimeMillis() - v[0]) / 1000}s ago"
+                    } nextDueIn=${(nextDueMs - System.currentTimeMillis()) / 1000}s",
+                )
+            }
+        }
+    }
+
+    private fun persist() {
+        val t = timestamps ?: return
+        runCatching { t.save(lastAttemptMs, nextDueMs) }
+            .onFailure { Log.w(TAG, "could not persist rotation floor (continuing)", it) }
+    }
+
     /** Support-facing one-liner: what the last rotation did. Surfaced in the
      *  "alive" heartbeat so a capture shows whether rotation is running at all. */
     @Volatile
@@ -141,6 +217,11 @@ object GMCookieRotation {
         lastAttemptMs = 0L
         nextDueMs = 0L
         lastResult = "never-run"
+        // Clear the persisted floor as well, or a fresh sign-in inherits the old
+        // session's backoff from disk — the exact bug reset() exists to prevent, just
+        // surviving longer. hydrate() is re-armed so a later attach still works.
+        hydrated = true
+        persist()
     }
 
     fun status(): String =
@@ -156,6 +237,7 @@ object GMCookieRotation {
      */
     fun rotateIfDue(http: OkHttpClient, cookies: MutableMap<String, String>): Boolean {
         if (!GoogleMessagesConfig.cookieRotationEnabled) return false
+        hydrate()
         // A rotation is authenticated by the long-lived login cookie. Without it there
         // is nothing to rotate against and no request worth making.
         if (cookies["__Secure-1PSID"].isNullOrBlank()) return false
@@ -191,6 +273,7 @@ object GMCookieRotation {
     fun bootstrapNow(http: OkHttpClient, cookies: MutableMap<String, String>): Boolean {
         if (!GoogleMessagesConfig.cookieBootstrapOnRecovery) return false
         if (cookies["__Secure-1PSID"].isNullOrBlank()) return false
+        hydrate()
 
         val now = System.currentTimeMillis()
         // Deliberately ignores nextDueMs: a backoff parked by the healthy path is
@@ -230,6 +313,9 @@ object GMCookieRotation {
             nextDueMs = System.currentTimeMillis() + FAILURE_BACKOFF_MS
             false
         } finally {
+            // Every mutation of lastAttemptMs / nextDueMs happens inside this call, so
+            // one write here covers all of them — success, 429, HTTP error and throw.
+            persist()
             inFlight.set(false)
         }
     }
@@ -297,8 +383,7 @@ object GMCookieRotation {
                 }
             }
 
-            val nextMs = (parseNextIntervalMs(body) ?: DEFAULT_INTERVAL_MS)
-                .coerceIn(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
+            val nextMs = nextIntervalMsFrom(body)
             nextDueMs = System.currentTimeMillis() + nextMs
 
             lastResult = when {
@@ -333,6 +418,25 @@ object GMCookieRotation {
      * [["identity.hfcr",600],["di",1234567]]
      * ```
      */
+    /**
+     * How long to wait before the next rotation, given a 200 response body.
+     *
+     * Extracted from [rotate] purely so it can be unit-tested: the interesting inputs
+     * are ones we cannot provoke on a device. In particular `hfcr = 2147483647`
+     * ([NEVER_ROTATE]) would otherwise become 2_147_483_647_000 ms and park the next
+     * attempt ~68 YEARS out while [lastResult] still read a healthy "no-change" — a
+     * dead rotator that logs as fine, which is the worst shape a bug can have here.
+     * We never hit it in the field only because the sentinel arrived alongside a 403,
+     * which takes the failure-backoff path instead.
+     *
+     * Clamped at BOTH ends. The floor stops a hostile or garbled small value turning
+     * into a request loop; the ceiling ([MAX_INTERVAL_MS], 24h) stops any large value
+     * — sentinel, typo or future protocol change — from silently disabling rotation.
+     */
+    internal fun nextIntervalMsFrom(body: String): Long =
+        (parseNextIntervalMs(body) ?: DEFAULT_INTERVAL_MS)
+            .coerceIn(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
+
     internal fun parseNextIntervalMs(body: String): Long? =
         Regex("\"identity\\.hfcr\"\\s*,\\s*(\\d+)")
             .find(body)?.groupValues?.get(1)?.toLongOrNull()?.times(1000L)

@@ -20,6 +20,17 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+
+    testOptions {
+        unitTests {
+            // Let plain-JVM tests exercise code that logs. Without this, any android.util.Log
+            // call on a tested path throws "Method i in android.util.Log not mocked", which in
+            // this module rules out nearly everything worth testing — the credential paths are
+            // deliberately log-heavy because a customer's logcat is the only telemetry we get.
+            // Defaults are enough here: we assert on returned values, never on log output.
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {

@@ -104,6 +104,17 @@ fun SettingsScreen(
      *  extend the block, which is exactly how one customer lost sending entirely in
      *  Aug 2026. Hence the subtitle steering users to support first. */
     onReregister: (() -> Unit)? = null,
+    /** DEBUG: arm a one-shot override so the PROACTIVE token refresh fires on the next
+     *  maintenance tick instead of an hour before a 24-hour token expires.
+     *
+     *  Distinct from [onReregister], which is the thing people reach for and the wrong
+     *  tool here: that calls `reauth()`, skipping the expiry arithmetic and the threshold
+     *  and restarting the long-poll afterwards. This row exercises the branch nobody can
+     *  otherwise reach without waiting ~23h — a refresh that fires from the timer,
+     *  mid-session, and must leave the stream and the registration untouched.
+     *
+     *  Google-Messages only; null hides the row. */
+    onForceTokenRefresh: (() -> Unit)? = null,
     /** Export this device's Smart Txt logs to support (zips the rolling
      *  Smart-Txt-only log ring and uploads it). Shown just above Log out when
      *  set; null hides the row. Host handles the result feedback. */
@@ -248,6 +259,14 @@ fun SettingsScreen(
                     title = "Re-register now",
                     subtitle = "For debugging only \u2013 reach out to support@dumb.co before doing this!",
                     onClick = onReregister,
+                )
+            }
+            if (onForceTokenRefresh != null) {
+                ActionRow(
+                    title = "Force token refresh (debug)",
+                    subtitle = "Fires the proactive refresh on the next tick. One-shot \u2013 " +
+                        "messages should keep arriving with no reconnect screen",
+                    onClick = onForceTokenRefresh,
                 )
             }
             if (onExportLogs != null) {

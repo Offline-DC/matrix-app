@@ -104,4 +104,27 @@ object GoogleMessagesConfig {
      */
     @Volatile
     var cookieBootstrapOnRecovery: Boolean = true
+
+    /**
+     * DEBUG, one-shot: override the lead time at which [GoogleMessagesSessionClient]
+     * proactively refreshes the tachyon token, in ms. `0` = off, use the shipping
+     * [GoogleMessagesSessionClient.TOKEN_REFRESH_LEAD_MS] (1h).
+     *
+     * Why this exists. The proactive refresh is the ONE credential path that cannot be
+     * exercised on demand: it fires an hour before a 24-hour token expires, so a fresh
+     * link means waiting 23 hours per attempt. Settings → "Re-register now" is not a
+     * substitute — that calls `reauth()`, which invokes `refreshToken()` directly and
+     * skips the expiry arithmetic and the threshold entirely, then restarts the
+     * long-poll. The interesting question is the opposite one: does a refresh that fires
+     * from the maintenance tick, mid-session, leave the stream and the registration
+     * alone? Setting this to 23h makes that branch fire on the next tick (≤60s) on a
+     * fresh token, taking the real `now >= tokenExpiryMs - lead` path.
+     *
+     * ONE-SHOT BY CONSTRUCTION. The reader clears it the moment it decides to refresh.
+     * A sticky 23h lead would refresh on every tick — a token request per minute against
+     * an endpoint we already treat carefully — so it must not be possible to arm it and
+     * walk away. Do not "fix" this into a persistent setting.
+     */
+    @Volatile
+    var tokenRefreshLeadOverrideMs: Long = 0L
 }

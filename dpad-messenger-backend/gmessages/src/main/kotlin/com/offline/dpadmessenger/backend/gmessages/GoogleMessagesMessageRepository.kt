@@ -721,7 +721,36 @@ internal class GoogleMessagesMessageRepository(
                     else -> mapped
                 }
             } else mapped
-            if (idx >= 0) list[idx] = preserved else list.add(preserved)
+            // Google can deliver two echoes for one send OUT OF ORDER. Observed
+            // 17 Aug 2026 on msg=2605: `matched=byBody status=1->SENT` at
+            // 11:34:20.612, then `matched=byId status=5->SENDING` 8ms later, then
+            // SENT again a second afterwards. The row is replaced wholesale just
+            // below, so the LAST echo wins and the bubble visibly walks backwards.
+            //
+            // Progress along SENDING → SENT → DELIVERED → READ is one-way: never
+            // apply an echo that moves a row back down it.
+            //
+            // Deliberately does NOT touch anything involving FAILED, in either
+            // direction. A late echo reclaiming a FAILED row is a real recovery
+            // path (see the fallback above), and a genuine late failure has to be
+            // able to reach the user. Suppressing either to smooth out a flicker
+            // would trade a cosmetic bug for a silent one.
+            val settled = if (idx >= 0) {
+                val was = list[idx].status
+                val failedInvolved = was == MessageStatus.FAILED ||
+                    preserved.status == MessageStatus.FAILED
+                if (failedInvolved || preserved.status.ordinal >= was.ordinal) {
+                    preserved
+                } else {
+                    Log.w(
+                        TAG,
+                        "echo: msg=${gm.messageId} conv=${gm.conversationId} would regress " +
+                            "$was->${preserved.status} — keeping $was",
+                    )
+                    preserved.copy(status = was)
+                }
+            } else preserved
+            if (idx >= 0) list[idx] = settled else list.add(settled)
             list.sortBy { it.timestampMs }
             byRoom[gm.conversationId] = list
             // Unread badge: only for a genuinely-new incoming message that

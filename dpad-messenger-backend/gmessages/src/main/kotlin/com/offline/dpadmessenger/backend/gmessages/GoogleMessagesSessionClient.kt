@@ -306,6 +306,11 @@ internal class GoogleMessagesSessionClient(
      *  goes wrong next. `linkAge` is the closest proxy we persist for the real
      *  age of the Google session (token issue time is not persisted). */
     private fun logSessionStart() {
+        // Earliest point where a store is definitely in hand. Attaching here rather than
+        // at construction keeps GMCookieRotation Android-free and means the floor is in
+        // place before the first maintenance tick can consult it.
+        runCatching { GMCookieRotation.attachTimestamps(store.rotationTimestamps()) }
+            .onFailure { Log.w(TAG, "could not attach rotation floor (continuing)", it) }
         Log.i(
             TAG,
             "session start: gaia=$gaia linkAge=${store.daysSinceLink() ?: -1}d " +
@@ -323,6 +328,16 @@ internal class GoogleMessagesSessionClient(
      *  support capture regardless of the tag filter. Truncate first, then mask:
      *  a token clipped at the boundary is still masked as long as a long run
      *  remains. */
+    /** Short, non-reversible fingerprint of a single cookie value, for logs. Cookie
+     *  values are live credentials and the rolling logcat gets emailed to us, so they
+     *  are hashed — never written out. Enough to tell two values apart, which is all
+     *  the same-account check needs to justify itself in a capture. */
+    private fun valueFp(value: String?): String = runCatching {
+        if (value.isNullOrEmpty()) return "none"
+        val d = java.security.MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
+        d.take(4).joinToString("") { "%02x".format(it) }
+    }.getOrElse { "err" }
+
     private fun redacted(body: String, limit: Int): String =
         SECRET_RUN.replace(body) { "«redacted:${it.value.length}b»" }.take(limit)
 
@@ -337,6 +352,16 @@ internal class GoogleMessagesSessionClient(
             TAG,
             "alive: up ${uptime()} linkAge=${store.daysSinceLink() ?: -1}d " +
                 "expiry=${expirySummary(now)} net=${connectivity()} cookies[${cookieSummary()}] " +
+                // The one number that separates our two bugs, and it belongs on the
+                // line that dominates a capture. Bug B (the ~2h death) announces
+                // itself: a 401, a cookieInvalid=true, a rotation that stopped. Bug A
+                // (silent receive loss) looks EXACTLY like a healthy quiet device from
+                // every other field here — session up, cookies fresh, rotation on
+                // cadence, no alerts. Until now the inbound age only reached the log on
+                // the 30-minute re-assert line, so a capture could show hours of
+                // apparently perfect heartbeats with no hint that nothing had arrived
+                // since the first one.
+                "inbound[${inboundGap(now)}] " +
                 "rot[${GMCookieRotation.status()}]",
         )
         return now
@@ -361,6 +386,32 @@ internal class GoogleMessagesSessionClient(
      */
     suspend fun adoptFreshCookies(fresh: Map<String, String>): Boolean {
         if (!gaia || fresh.isEmpty()) return false
+        // SAME ACCOUNT ONLY. Everything below preserves the UKey2 keys, the ECDSA refresh
+        // key, destReg and the pairing id — that is the whole point of rung 3 — so a
+        // harvest belonging to a DIFFERENT Google account would graft one account's login
+        // onto another account's pairing. Reachable in normal use: both re-link paths drop
+        // to a full sign-in with an account picker (see GoogleMessagesAccountStore.clear),
+        // so a user who picks the wrong account lands here. Before rung 3 existed this
+        // branch dead-ended, which makes this OUR regression to prevent, not an inherited
+        // one.
+        //
+        // `__Secure-1PSID` is the long-lived per-account login cookie, so it is the
+        // cheapest available identity check. Only a POSITIVE mismatch refuses: if either
+        // side lacks the cookie we have no evidence of a different account, and refusing
+        // on absence would break a legitimate partial refresh. Refusing returns false,
+        // which drops the caller through to a full re-pair — the pre-rung-3 behaviour,
+        // and safe.
+        val mine = cookies["__Secure-1PSID"]
+        val theirs = fresh["__Secure-1PSID"]
+        if (!mine.isNullOrBlank() && !theirs.isNullOrBlank() && mine != theirs) {
+            Log.w(
+                TAG,
+                "refusing fresh cookies: __Secure-1PSID belongs to a DIFFERENT Google " +
+                    "account (mine=${valueFp(mine)} theirs=${valueFp(theirs)}) — keeping " +
+                    "this pairing intact and falling through to a full re-pair",
+            )
+            return false
+        }
         val before = cookieSummary()
         cookies.putAll(fresh)
         if (storeWritable) runCatching { store.saveCookies(cookies) }
@@ -1666,9 +1717,26 @@ internal class GoogleMessagesSessionClient(
             }
         }
         val minsLeft = (tokenExpiryMs - now) / 60000
-        if (now < tokenExpiryMs - 3600_000L) {
+        // A debug override shortens the lead so this branch can be exercised without
+        // waiting 23h for a fresh token to age into it. Consumed on use — see
+        // [GoogleMessagesConfig.tokenRefreshLeadOverrideMs] for why it must stay one-shot.
+        val override = GoogleMessagesConfig.tokenRefreshLeadOverrideMs
+        val lead = if (override > 0L) override else TOKEN_REFRESH_LEAD_MS
+        if (now < tokenExpiryMs - lead) {
             Log.d(TAG, "refreshTokenIfNeeded: ${minsLeft}min to expiry — skipping")
             return
+        }
+        if (override > 0L) {
+            // Clear BEFORE refreshing, not after: refreshToken() suspends, and the next
+            // maintenance tick can arrive while it is in flight.
+            GoogleMessagesConfig.tokenRefreshLeadOverrideMs = 0L
+            Log.w(
+                TAG,
+                "refreshTokenIfNeeded: DEBUG lead override ${override / 3600_000L}h consumed — " +
+                    "taking the proactive branch on a token with ${minsLeft}min left. " +
+                    "Shipping behaviour is unchanged; watch that the long-poll and the " +
+                    "registration survive this without a reconnect screen.",
+            )
         }
         Log.i(TAG, "refreshTokenIfNeeded: ${minsLeft}min to expiry — refreshing now")
         refreshToken()
@@ -1928,6 +1996,13 @@ internal class GoogleMessagesSessionClient(
         /** How often the long-poll logs a liveness line while everything is fine.
          *  Without it a healthy session is indistinguishable from a dead one in a
          *  capture, and we can't tell how long a link survived before it broke. */
+        /** Refresh the tachyon token this long before it expires. The token's own TTL is
+         *  24h, so this is a 1-in-24 duty cycle — long enough that a device which is
+         *  offline or Dozing through the window still has an hour of slack to catch up,
+         *  short enough that we are not refreshing a healthy token for no reason.
+         *  [GoogleMessagesConfig.tokenRefreshLeadOverrideMs] overrides it once, for tests. */
+        internal const val TOKEN_REFRESH_LEAD_MS = 3600_000L
+
         private const val HEARTBEAT_INTERVAL_MS = 5 * 60_000L
         /** Floor between active-session registration attempts; doubles per
          *  consecutive rejection up to [ACTIVE_SESSION_RETRY_MAX_MS]. */

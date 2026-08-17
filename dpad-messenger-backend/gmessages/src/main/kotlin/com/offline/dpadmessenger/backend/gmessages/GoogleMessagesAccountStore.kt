@@ -102,13 +102,19 @@ class GoogleMessagesAccountStore(context: Context) {
         // HISTORY: on 2026-06-13 (96d8f70) these two were STRIPPED here, on the
         // theory that a present-but-STALE 1PSIDTS was what killed a consumer
         // pairing at ~2h, and that its ABSENCE would fall back to the long-lived
-        // __Secure-1PSID. That only held while Google still honoured the
-        // 1PSID-only fallback. It no longer does. On 2026-08-14 a harvest that
+        // __Secure-1PSID. On 2026-08-14 a harvest that
         // DID carry a valid 1PSIDTS was stripped to 15 cookies and Google refused
         // the pairing outright: /web/config -> 403, SignInGaia -> 200, then
         // CREATE_GAIA_PAIRING_CLIENT_FINISHED -> HTTP 401 SESSION_COOKIE_INVALID
         // (cookie=UNKNOWN) three seconds later, and the identical cookie bytes
-        // were fully revoked 28s after that.
+        // were fully revoked 28s after that. Three of the four attempts that evening
+        // failed the same way; one succeeded.
+        //
+        // Do NOT upgrade that into "Google stopped honouring the 1PSID-only fallback
+        // on 2026-08-14" — an earlier version of this comment did. `signInGaia` shows
+        // up in only ONE of the sixteen captures, so there is no earlier pairing to
+        // compare against and no evidence of a change on any date. Stripping is wrong
+        // because the stripped set is a coin flip, which is enough.
         //
         // Upstream mautrix-gmessages never strips: it offers __Secure-1PSIDTS as a
         // login field (pkg/connector/login.go) and writes back every Set-Cookie
@@ -283,6 +289,28 @@ class GoogleMessagesAccountStore(context: Context) {
      * [getOrCreateDeviceSessionId] is only consulted when Google's own config
      * response carries no device UUID.
      */
+    /**
+     * Disk backing for the cookie-rotation floor. See [GMCookieRotation.Timestamps] for
+     * why it has to outlive the process.
+     *
+     * Deliberately in the SAME prefs file as the cookies it throttles, so [clear] wipes
+     * the floor along with the credentials it belongs to — a floor that outlived its
+     * session would silently suppress the first rotation of the next one.
+     */
+    fun rotationTimestamps(): GMCookieRotation.Timestamps = object : GMCookieRotation.Timestamps {
+        override fun load() = longArrayOf(
+            prefs.getLong(KEY_ROT_LAST_ATTEMPT, 0L),
+            prefs.getLong(KEY_ROT_NEXT_DUE, 0L),
+        )
+
+        override fun save(lastAttemptMs: Long, nextDueMs: Long) {
+            prefs.edit()
+                .putLong(KEY_ROT_LAST_ATTEMPT, lastAttemptMs)
+                .putLong(KEY_ROT_NEXT_DUE, nextDueMs)
+                .apply()
+        }
+    }
+
     fun clear() {
         prefs.edit().clear().apply()
     }
@@ -317,6 +345,8 @@ class GoogleMessagesAccountStore(context: Context) {
         private const val KEY_GAIA_PAIRING_ATTEMPT = "gaiaPairingAttemptId"
         private const val KEY_LINK_TS = "linkTimestampMs"
         private const val KEY_DEVICE_SESSION_ID = "deviceSessionId"
+        private const val KEY_ROT_LAST_ATTEMPT = "rotLastAttemptMs"
+        private const val KEY_ROT_NEXT_DUE = "rotNextDueMs"
     }
 }
 

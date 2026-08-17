@@ -94,6 +94,9 @@ fun DpadMessengerApp(
     /** Force an IDS re-registration now (periodic renewal, on demand). Adds a
      *  "Re-register now" row to Settings when set; null hides it. */
     onReregister: (() -> Unit)? = null,
+    /** DEBUG: arm the one-shot proactive-token-refresh override. Adds a
+     *  "Force token refresh (debug)" row to Settings when set; null hides it. */
+    onForceTokenRefresh: (() -> Unit)? = null,
     /** Export Smart Txt logs to support. Adds an "Export logs" row to Settings
      *  (just above Log out) when set; null hides it. */
     onExportLogs: (() -> Unit)? = null,
@@ -275,6 +278,7 @@ fun DpadMessengerApp(
                     defaultSendHandle = defaultSendHandle,
                     onDefaultSendHandleChange = onDefaultSendHandleChange,
                     onReregister = onReregister,
+                    onForceTokenRefresh = onForceTokenRefresh,
                     onExportLogs = onExportLogs,
                 )
             }
