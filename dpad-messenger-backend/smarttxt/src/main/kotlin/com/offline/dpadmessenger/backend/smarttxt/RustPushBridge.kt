@@ -474,6 +474,11 @@ class RustPushBridge(
      *  [NativeRustPushTransport] poll loop calls this and parses to events. */
     fun pollNativeEvents(): String = if (NATIVE_AVAILABLE) RustPushNative.nativePollEvents() else "[]"
 
+    /** Native receive-path activity, for the sync signal. `"{}"` on a build with no
+     *  native library — the transport then degrades to batch fullness alone. */
+    fun ingestActivity(): String =
+        if (NATIVE_AVAILABLE) RustPushNative.runCatchingNativeIngestActivity() else "{}"
+
     suspend fun emitStubInbound(roomId: String, senderHandle: String, body: String) {
         _inbound.emit(BridgeEvent.IncomingMessage(roomId, senderHandle, body))
     }

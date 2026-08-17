@@ -259,6 +259,15 @@ struct AppState {
     /// Relay-wire-shaped event JSON objects waiting for `nativePollEvents`, behind a
     /// bounded queue that also tallies the burst (see [`mod@inbound`]).
     inbound: inbound::InboundQueue,
+    /// What the receive path is DOING, as opposed to what is waiting in `inbound`.
+    ///
+    /// The two are not the same thing, and conflating them is what left the "still
+    /// syncing" spinner off through a seven-minute sync: the great majority of a
+    /// week-old backlog is discarded by [`SYNC_WINDOW_MS`] before it ever reaches the
+    /// queue, so `inbound` stays empty while the receive path is saturated. Kotlin reads
+    /// this through `nativeIngestActivity` to tell busy from idle. See
+    /// [`inbound::IngestActivity`].
+    ingest: inbound::IngestActivity,
     /// Received attachments, keyed by the guid we hand Kotlin ("<msgid>:<idx>").
     /// `nativeDownloadAttachment` looks the rustpush `Attachment` back up here and
     /// streams it from MMCS (or returns the inline bytes) on demand.
@@ -2869,6 +2878,12 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    // Every decrypted message stamps the receive-path clock, whatever it turns out to
+    // be. Most of what arrives during a replay is receipts and other ancillary traffic
+    // that returns below without reaching either gate, so without this `idleMs` goes
+    // stale mid-sync and Kotlin ends the episode underneath a working drain. Counters
+    // are unaffected — see `IngestActivity::touch`.
+    st().ingest.touch(now);
     // The paired iPhone toggling Text Message Forwarding for this device on/off.
     if let Message::EnableSmsActivation(enabled) = &msg.message {
         SMS_ACTIVE.store(*enabled, Ordering::SeqCst);
@@ -3122,6 +3137,12 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
         && msg.sent_timestamp > 0
         && msg.sent_timestamp + SYNC_WINDOW_MS < now
     {
+        // Report the discard before returning. Nothing downstream will ever see this
+        // message, so this is the only trace it leaves — and, more importantly, it is
+        // what lets Kotlin tell that the receive path is working while the inbound queue
+        // sits empty. Without it a week-old backlog is invisible: thousands of decrypts
+        // producing no events, and a spinner that never comes on.
+        st().ingest.record(inbound::Ingested::OutsideWindow, now);
         return;
     }
     // Replay guard: Apple re-sends its stored backlog on every APS connect (see
@@ -3138,8 +3159,14 @@ fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
         let already_stored = !st().seen_guids.insert(msg.id.clone());
         if already_stored {
             log::debug!("skip replay: guid={} already stored", msg.id);
+            st().ingest.record(inbound::Ingested::AlreadySeen, now);
             return;
         }
+        // Past both gates — the sync window above and the replay guard here — so this
+        // message really is being ingested. Recorded once here rather than at each queue
+        // site below, because those branches diverge (message / reaction / attachment)
+        // and all of them count identically for "is the receive path busy".
+        st().ingest.record(inbound::Ingested::Admitted, now);
     }
     // A reaction (tapback) from someone — emit a tapback event the repo folds into
     // the target message's reactions.
@@ -4515,6 +4542,39 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     check_push_cert_rejected();
     let drained: Vec<serde_json::Value> = st().inbound.drain_batch(inbound::POLL_BATCH_MAX);
     out(&mut env, serde_json::to_string(&drained).unwrap_or_else(|_| "[]".into()))
+}
+
+/// Report whether the receive path is BUSY, which `nativePollEvents` cannot tell you.
+///
+/// An empty poll has two completely different meanings — "nothing is happening" and
+/// "everything arriving is being discarded by the sync window" — and the second one is
+/// what a phone that has been off for a week does for minutes on end. Kotlin polls this
+/// alongside the event drain and uses `idleMs` to drive the "still syncing" spinner and
+/// the save coalescing. See [`inbound::IngestActivity`] for the full account.
+///
+/// Deliberately a SEPARATE function rather than a new field on the poll payload: the
+/// `.so` and the Kotlin that calls it can ship out of step, and a missing symbol
+/// degrades to the previous behaviour (see `RustPushNative.runCatchingNativeIngestActivity`)
+/// instead of breaking the event wire format that everything else depends on.
+///
+/// Shape: `{"idleMs":124,"depth":0,"total":3367,"admitted":754,"outsideWindow":2613,
+/// "alreadySeen":0}`. `{}` if anything goes wrong, which Kotlin reads as "no visibility".
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeIngestActivity(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // One lock for both halves, so depth and the counters describe the same instant.
+    let snapshot = {
+        let s = st();
+        let depth = s.inbound.len();
+        s.ingest.snapshot_json(now, depth)
+    };
+    out(&mut env, serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into()))
 }
 
 /// True once we've raised the alert for the CURRENT episode. Cleared when APS connects.

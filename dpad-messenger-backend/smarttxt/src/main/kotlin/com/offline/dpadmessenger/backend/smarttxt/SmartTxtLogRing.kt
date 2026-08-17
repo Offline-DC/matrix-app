@@ -112,6 +112,10 @@ internal object SmartTxtLogRing {
         "IMsgRepoHolder",
         "IMsgSession",
         "IMsgUiFlow",         // DIAGNOSTIC: repo->combine->viewmodel emission trace
+        // Kept, not temporary. One line per hand-off (a few per session), and it is
+        // the only record of whether focus actually MOVED — the thing requestFocus()
+        // cannot report and the thing every d-pad complaint turns out to hinge on.
+        "DpadFocus",
         "RustPushBridge",
         "RustPushNative",
         "ObMigrator",

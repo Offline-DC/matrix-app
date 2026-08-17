@@ -45,7 +45,7 @@ class TransportModelTest {
     @Test
     fun `chat guid encodes service and group-ness`() {
         val dm = ChatGuid.forDm("+15551234567")
-        assertEquals("SmartTxt;-;+15551234567", dm)
+        assertEquals("iMessage;-;+15551234567", dm)
         assertEquals("iMessage", ChatGuid.service(dm))
         assertFalse(ChatGuid.isGroup(dm))
         assertTrue(ChatGuid.isGroup("SmartTxt;+;chat4827"))

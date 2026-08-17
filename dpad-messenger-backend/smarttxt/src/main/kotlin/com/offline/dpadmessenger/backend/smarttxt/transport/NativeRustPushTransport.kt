@@ -18,9 +18,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 
 /**
  * The on-device NATIVE transport: rustpush compiled to `libsmarttxt_ffi.so`,
@@ -179,7 +181,14 @@ class NativeRustPushTransport(
      */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
+        // Two signals, deliberately separate, because they answer different questions.
+        // The pacer asks "is the QUEUE backed up" — a throughput question, and the right
+        // input for how soon to poll again. The signal asks "is the RECEIVE PATH busy" —
+        // which is what the user-visible spinner and the save coalescing actually care
+        // about, and which stays true through a discard-only stretch the queue never
+        // sees. Keying the second off the first is the bug this replaces.
         val pacer = CatchUpPacer()
+        val signal = SyncSignal()
         // Measures the drain and prints the CATCHUP lines an "export logs" bundle is
         // read for. Native heap comes from Android's allocator, which the pure
         // CatchUpStats can't reach on its own.
@@ -191,29 +200,62 @@ class NativeRustPushTransport(
                 var delayMs = POLL_INTERVAL_MS
                 runCatching {
                     val batchSize = parseAndEmit(bridge.pollNativeEvents())
-                    val step = pacer.onBatch(batchSize)
+                    // Queried EVERY tick, not just on a short batch. The alternative —
+                    // skipping it while batches come back full — makes the event counter
+                    // alternate between the native total and a local tally, and a source
+                    // switch mid-sync reads as the counter going backwards. One extra JNI
+                    // hop returning ~90 bytes, against a poll that already takes the same
+                    // native lock: the cost is noise, and the correctness is worth it.
+                    val snap = IngestSnapshot.parse(bridge.ingestActivity())
+                    val step = pacer.onBatch(batchSize, snap?.depth ?: -1)
                     delayMs = step.delayMs
-                    if (step.catchUpChanged && step.catchUpActive) {
+                    // Drain pressure is now logged rather than acted on outside the
+                    // transport: it is the "the queue really did back up" diagnostic, and
+                    // distinguishing it from a slow sync is exactly what was missing.
+                    if (step.catchUpChanged) {
+                        Log.i(
+                            TAG,
+                            "CATCHUP pacer: drainPressure=${step.catchUpActive} " +
+                                "depth=${snap?.depth ?: -1}",
+                        )
+                    }
+
+                    val sync = signal.onPoll(batchSize, snap)
+                    if (sync.changed && sync.active) {
                         // Sample the heap BEFORE announcing, so the start figure is the
                         // baseline the peak is measured against.
                         Log.i(TAG, stats.begin())
-                        _events.emit(TransportEvent.CatchUpChanged(true))
+                        _events.emit(TransportEvent.SyncActivityChanged(true))
                     }
-                    if (pacer.catchUpActive) stats.onBatch(batchSize)?.let { Log.i(TAG, it) }
-                    if (step.catchUpChanged && !step.catchUpActive) {
+                    if (signal.active) stats.onBatch(batchSize)?.let { Log.i(TAG, it) }
+                    if (sync.changed && !sync.active) {
                         stats.onBatch(batchSize)   // count the tail batch that ended it
                         Log.i(TAG, stats.finish())
-                        _events.emit(TransportEvent.CatchUpChanged(false))
+                        // The line that would have explained the 08-12 bundle on sight:
+                        // how much was decrypted, how much survived the sync window, and
+                        // so how much of the elapsed time was spent on messages the user
+                        // was never going to see.
+                        sync.episode?.let {
+                            Log.i(
+                                TAG,
+                                "CATCHUP ingest: decrypted=${it.total} admitted=${it.admitted} " +
+                                    "outsideWindow=${it.outsideWindow} " +
+                                    "alreadySeen=${it.alreadySeen} " +
+                                    "discardedPct=${it.discardedPct()}",
+                            )
+                        }
+                        _events.emit(TransportEvent.SyncActivityChanged(false))
                     }
                 }.onFailure {
                     Log.w(TAG, "poll parse failed: ${it.message}")
                     // A parse failure tells us nothing about queue depth; fall back to the
                     // idle cadence rather than hot-looping on a payload that keeps failing.
-                    if (pacer.catchUpActive) {
-                        Log.w(TAG, "CATCHUP aborted mid-drain: ${stats.finish()}")
-                        _events.emit(TransportEvent.CatchUpChanged(false))
+                    if (signal.active) {
+                        Log.w(TAG, "CATCHUP aborted mid-sync: ${stats.finish()}")
+                        _events.emit(TransportEvent.SyncActivityChanged(false))
                     }
                     pacer.reset()
+                    signal.reset()
                 }
                 delay(delayMs)
             }
@@ -340,7 +382,13 @@ internal class CatchUpPacer(
      *   caller emits exactly one event per transition. */
     data class Step(val delayMs: Long, val catchUpChanged: Boolean, val catchUpActive: Boolean)
 
-    fun onBatch(size: Int): Step {
+    /** @param nativeDepth events still queued natively, or -1 when unknown (an older
+     *   `.so`, or a transport with no native visibility). Used ONLY to decide the next
+     *   delay: a short batch on top of a non-empty queue means the drain is keeping up
+     *   but is not finished, and sitting out a full idle gap there just adds latency.
+     *   It deliberately does NOT feed catch-up detection, which stays a question about
+     *   whether arrival is outrunning us. */
+    fun onBatch(size: Int, nativeDepth: Int = -1): Step {
         // A batch at the native cap means the native queue still holds more. A short
         // batch means we drained it — even a zero-length one.
         val full = size >= batchLimit
@@ -348,8 +396,9 @@ internal class CatchUpPacer(
         val nowActive = if (full) fullStreak >= catchUpThreshold else false
         val changed = nowActive != catchUpActive
         catchUpActive = nowActive
+        val moreQueued = full || nativeDepth > 0
         return Step(
-            delayMs = if (full) drainDelayMs else idleDelayMs,
+            delayMs = if (moreQueued) drainDelayMs else idleDelayMs,
             catchUpChanged = changed,
             catchUpActive = nowActive,
         )
@@ -371,6 +420,244 @@ internal class CatchUpPacer(
          * the loop runs at the ordinary idle cadence, exactly as it did before.
          */
         const val NATIVE_POLL_BATCH_MAX = 50
+    }
+}
+
+/**
+ * One reading of what the native receive path is doing, from `nativeIngestActivity`.
+ *
+ * Every field except [idleMs] and [depth] is a process-lifetime counter, so consumers
+ * threshold on DELTAS and never on an absolute value.
+ */
+internal data class IngestSnapshot(
+    /** Ms since the receive path last handled a decrypted message — kept OR discarded.
+     *  The whole point: a discarded message is invisible everywhere else. */
+    val idleMs: Long,
+    /** Events still waiting in the native queue. */
+    val depth: Int,
+    /** Every decrypted message this process has seen. Monotonic. */
+    val total: Long,
+    /** Passed the sync window and the replay guard, and was queued for us. */
+    val admitted: Long,
+    /** Dropped for being older than the 3-day sync window. */
+    val outsideWindow: Long,
+    /** Suppressed because our on-disk cache already held it. */
+    val alreadySeen: Long,
+) {
+    /** Decrypted, then thrown away — real work with no user-visible result. */
+    val discarded: Long get() = outsideWindow + alreadySeen
+
+    /**
+     * Decrypts that represent work the user could be waiting on — i.e. everything except
+     * replay duplicates.
+     *
+     * This, not [total], is what may ANNOUNCE a sync episode. Apple re-delivers its
+     * stored backlog aggressively and the replay guard discards it on sight; those
+     * decrypts cost CPU but produce nothing, so on their own they must not put a spinner
+     * in front of the user. Three device runs made the case: 54/90/206 decrypts of which
+     * 64%/80%/97% were duplicates, each turning the spinner on for 26-38 seconds while
+     * the message count never moved once.
+     *
+     * [outsideWindow] IS counted, deliberately — a message dropped for being older than
+     * the sync window produces nothing visible either, but it is exactly the 2026-08-12
+     * failure: minutes of decrypting with an empty screen, which is precisely when the
+     * user needs to be told the app is working.
+     */
+    val newWork: Long get() = admitted + outsideWindow
+
+    /** This snapshot minus an earlier one, so a summary can report ONE sync episode
+     *  instead of everything since process start. [idleMs] and [depth] are instantaneous
+     *  and carry through unchanged. */
+    fun minus(start: IngestSnapshot): IngestSnapshot = IngestSnapshot(
+        idleMs = idleMs,
+        depth = depth,
+        total = total - start.total,
+        admitted = admitted - start.admitted,
+        outsideWindow = outsideWindow - start.outsideWindow,
+        alreadySeen = alreadySeen - start.alreadySeen,
+    )
+
+    /** Share of the decrypts that never reached storage or the UI. On 2026-08-12 this was
+     *  78 — which is why the sync took minutes with nothing to show for most of them. */
+    fun discardedPct(): Long = if (total <= 0L) 0L else discarded * 100L / total
+
+    companion object {
+        /**
+         * Parse the native payload. Null when the native side had nothing to say — `"{}"`,
+         * a `.so` predating the symbol, or anything malformed. Callers treat null as "no
+         * visibility" and fall back to batch fullness alone, i.e. exactly the behaviour
+         * that shipped before this existed.
+         */
+        fun parse(payload: String): IngestSnapshot? = runCatching {
+            val o = RelayProtocol.json.parseToJsonElement(payload).jsonObject
+            val idle = o["idleMs"]?.jsonPrimitive?.long
+            val total = o["total"]?.jsonPrimitive?.long
+            if (idle == null || total == null) {
+                null
+            } else {
+                IngestSnapshot(
+                    idleMs = idle,
+                    depth = o["depth"]?.jsonPrimitive?.int ?: 0,
+                    total = total,
+                    admitted = o["admitted"]?.jsonPrimitive?.long ?: 0L,
+                    outsideWindow = o["outsideWindow"]?.jsonPrimitive?.long ?: 0L,
+                    alreadySeen = o["alreadySeen"]?.jsonPrimitive?.long ?: 0L,
+                )
+            }
+        }.getOrNull()
+    }
+}
+
+/**
+ * Decides when the app is in a SYNC EPISODE — busy enough, for long enough, that the user
+ * should be told and the expensive per-batch work should be held back.
+ *
+ * ## Why this is not [CatchUpPacer]
+ *
+ * [CatchUpPacer] answers "is the queue backed up", by watching whether a poll came back
+ * full. That is the right input for pacing and the wrong one for everything else, because
+ * a batch can only be full if arrival is outrunning the drain — and in the case that
+ * actually hurts, it isn't. A phone switched on after a week offline decrypts thousands of
+ * messages of which the great majority are older than the 3-day sync window and dropped
+ * natively before they reach the queue. The queue stays empty. Every poll is short. The
+ * pacer, correctly by its own definition, says there is no catch-up.
+ *
+ * On the 2026-08-12 capture that produced: 3,367 messages decrypted over eleven minutes,
+ * 754 admitted, 2,613 discarded, and for the first seven and a half minutes NOTHING
+ * crossed the FFI boundary at all. `catchUp` was false on all 242 UI emits. The spinner
+ * never came on, so the user watched a half-filled room list with no way to tell "still
+ * arriving" from "this is everything"; and the save coalescing never engaged, so the
+ * ordinary 1.5s debounce ran whole-store encrypted writes for the entire sync.
+ *
+ * So this watches the receive path instead, via [IngestSnapshot.idleMs] — which counts
+ * discarded messages, because the CPU does.
+ *
+ * ## Why a volume threshold and not just a timer
+ *
+ * [idleGraceMs] alone would flash the spinner on every incoming text: one live message
+ * makes the receive path "recently active" for the whole grace window. So an episode also
+ * has to clear [minEvents] decrypts, measured as a delta on the monotonic counter. Twenty
+ * events is about two seconds at the rate the 08-12 sync ran, and is unreachable by a
+ * single message or a group thread waking up — the same reasoning as
+ * `CatchUpPacer.catchUpThreshold`, applied to a signal that can actually see the work.
+ *
+ * The counter thresholded on is [IngestSnapshot.newWork], not [IngestSnapshot.total]:
+ * replay duplicates are genuine CPU but produce nothing the user is waiting for, and
+ * counting them announced three separate spinners on device that had no messages behind
+ * them at all.
+ *
+ * Pure state with no clock of its own: it reads time only through the snapshot the native
+ * side stamped, which is what makes it testable without a device or a real backlog.
+ */
+internal class SyncSignal(
+    /** Quiet time that still counts as "starting to work", before an episode is
+     *  announced. Short, because announcing late is the failure we are fixing. */
+    private val idleGraceMs: Long = 3_000L,
+    /**
+     * Quiet time tolerated WITHIN an announced episode before calling it over —
+     * deliberately much longer than [idleGraceMs].
+     *
+     * Hysteresis, and it is not optional. The decrypt stream is bursty: on the 2026-08-12
+     * capture the median gap between decrypts was 82ms, but seventeen gaps exceeded three
+     * seconds and the largest was 25.8s. With one symmetric grace window the spinner
+     * flapped eleven times across that sync, which is a worse experience than leaving it
+     * off. Replaying the same trace at a range of values, ten seconds is the knee (one
+     * clean on/off) and twenty leaves margin while still ending the episode within
+     * seconds of the real end — the last UI emit that day was 09:25:36 and this ends it
+     * at 09:25:30.
+     *
+     * A long tail is harmless in the case that matters, because a short burst never
+     * announces an episode at all: it cannot clear [minEvents].
+     */
+    private val endGraceMs: Long = 20_000L,
+    /** Decrypts required before an episode is announced. Keeps one live message — or a
+     *  handful — from flashing the spinner. */
+    private val minEvents: Long = 20L,
+) {
+    /** Whether we are in an announced sync episode. */
+    var active: Boolean = false
+        private set
+
+    /** Counter value when the current run of native activity began; -1 while idle. */
+    private var runStartCount: Long = -1L
+
+    /** Snapshot at the start of the run, so the summary reports THIS episode. */
+    private var runStartSnapshot: IngestSnapshot? = null
+
+    /** Fallback tally for a build with no native visibility, so the class still works
+     *  (just less well) against the relay and mock transports. */
+    private var observed: Long = 0L
+    private var lastCount: Long = 0L
+
+    /** @param changed true only on the tick [active] flipped, so the caller emits exactly
+     *   one event per transition.
+     *  @param events decrypts so far in this run — below [minEvents] until it is announced.
+     *  @param episode this episode's counters (a delta), for the summary line. */
+    data class Step(
+        val changed: Boolean,
+        val active: Boolean,
+        val events: Long,
+        val episode: IngestSnapshot?,
+    )
+
+    fun onPoll(batchSize: Int, snapshot: IngestSnapshot?): Step {
+        observed += batchSize.toLong()
+        // newWork, NOT total: replay duplicates are real CPU but bring the user nothing,
+        // so they must not be able to start an episode. They still keep one alive
+        // through idleMs below. See IngestSnapshot.newWork.
+        val count = snapshot?.newWork ?: observed
+        // A counter that went BACKWARDS means a new native process — they are
+        // per-process, and this hardware restarts the app constantly. Re-baseline rather
+        // than reporting a nonsense episode length.
+        if (count < lastCount) {
+            runStartCount = -1L
+            runStartSnapshot = null
+        }
+        lastCount = count
+
+        // Asymmetric on purpose: quick to notice work starting, slow to declare it over.
+        // See endGraceMs — a symmetric window flaps on this traffic shape.
+        val grace = if (active) endGraceMs else idleGraceMs
+        val working = when {
+            // Events in hand prove it, whatever the snapshot says.
+            batchSize > 0 -> true
+            // No native visibility: fall back to event flow alone, i.e. old behaviour.
+            snapshot == null -> false
+            // The case this class exists for — busy with work we will never be handed.
+            else -> snapshot.idleMs < grace || snapshot.depth > 0
+        }
+
+        if (!working) {
+            val changed = active
+            val episode = delta(snapshot)
+            active = false
+            runStartCount = -1L
+            runStartSnapshot = null
+            return Step(changed = changed, active = false, events = 0L, episode = episode)
+        }
+
+        if (runStartCount < 0L) {
+            runStartCount = count
+            runStartSnapshot = snapshot
+        }
+        val events = count - runStartCount
+        val nowActive = events >= minEvents
+        val changed = nowActive != active
+        active = nowActive
+        return Step(changed = changed, active = nowActive, events = events, episode = delta(snapshot))
+    }
+
+    /** Drop out of the episode without reporting a transition — used when a poll failed,
+     *  so we know nothing about what the native side is doing. */
+    fun reset() {
+        active = false
+        runStartCount = -1L
+        runStartSnapshot = null
+    }
+
+    private fun delta(now: IngestSnapshot?): IngestSnapshot? {
+        val start = runStartSnapshot ?: return null
+        return now?.minus(start)
     }
 }
 

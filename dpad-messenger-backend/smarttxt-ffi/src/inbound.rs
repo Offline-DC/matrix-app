@@ -182,6 +182,175 @@ impl InboundQueue {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ingest activity — is the receive path busy, even when the queue is empty?
+// ---------------------------------------------------------------------------
+
+/// Reported as `idleMs` when the receive path has not seen a single message yet.
+/// Large enough to read as "idle" everywhere, small enough to survive the trip through
+/// JSON into a Kotlin `Long` (`u64::MAX` would not).
+const IDLE_NEVER_MS: u64 = u32::MAX as u64;
+
+/// Log the running discard tally every this-many discarded messages. Same reasoning as
+/// [`DROP_LOG_EVERY`]: leave a clear trail without becoming a flood.
+const DISCARD_LOG_EVERY: u64 = 250;
+
+/// What the receive path did with one decrypted message.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Ingested {
+    /// Passed both gates and was queued for Kotlin.
+    Admitted,
+    /// Older than `SYNC_WINDOW_MS` — dropped before marshal, queue, storage or UI.
+    OutsideWindow,
+    /// Kotlin already holds it, so Apple's replay of it was suppressed.
+    AlreadySeen,
+}
+
+/// Counts what the receive path is doing, so Kotlin can tell "busy" from "idle" even
+/// while nothing is reaching it.
+///
+/// ## Why this exists
+///
+/// Everything else in this module measures the QUEUE, and that turns out to be the wrong
+/// instrument for the case this whole module was built for. A phone switched on after a
+/// week offline decrypts thousands of messages, and the great majority are older than
+/// `SYNC_WINDOW_MS` and dropped on the spot — correctly; that is the entire point of the
+/// window. But a dropped message never reaches the queue. So the queue stays empty,
+/// every poll comes back short, `CatchUpPacer` concludes there is no backlog, and the
+/// "still syncing" spinner never appears.
+///
+/// The 2026-08-12 capture is exactly that: 3,367 messages decrypted, 754 admitted, 2,613
+/// discarded — and for the first seven and a half minutes NOTHING crossed the FFI
+/// boundary at all. The user watched a half-filled room list with no sign the app was
+/// working, because by every signal the app had, it wasn't.
+///
+/// So the receive path reports itself here. [`Self::idle_ms`] is the signal that
+/// matters: time since the last decrypted message, kept or thrown away. The counters are
+/// the evidence a support bundle needs — until now both discard paths were a bare
+/// `return` and a `log::debug!`, so a bundle could show that nothing old got THROUGH, but
+/// never that the filter had fired at all.
+///
+/// The clock is passed in rather than read here, for the same reason as everything else
+/// in this module: no dependencies, and the arithmetic (saturating on a backwards
+/// wall-clock jump) is the part worth pinning by test.
+#[derive(Default)]
+pub struct IngestActivity {
+    /// Wall-clock ms of the last decrypted message to reach the receive path; 0 = none
+    /// yet.
+    last_ms: u64,
+    admitted: u64,
+    outside_window: u64,
+    already_seen: u64,
+    /// Decrypted messages the three outcomes above never see — see [`Self::touch`].
+    ancillary: u64,
+}
+
+impl IngestActivity {
+    /// Record one decrypted message, whatever became of it.
+    pub fn record(&mut self, what: Ingested, now_ms: u64) {
+        self.advance_clock(now_ms);
+        match what {
+            Ingested::Admitted => self.admitted += 1,
+            Ingested::OutsideWindow => self.outside_window += 1,
+            Ingested::AlreadySeen => self.already_seen += 1,
+        }
+        if what == Ingested::Admitted {
+            return;
+        }
+        let discarded = self.discarded();
+        if discarded % DISCARD_LOG_EVERY == 0 {
+            log::info!(
+                "CATCHUP native: ingest discarded={discarded} (outsideWindow={} \
+                 alreadySeen={}) admitted={} — these reach neither the queue nor Kotlin, \
+                 so this line is the only trace they leave (ancillary={})",
+                self.outside_window,
+                self.already_seen,
+                self.admitted,
+                self.ancillary,
+            );
+        }
+    }
+
+    /// Never let the recorded time go backwards. A wall-clock correction (NTP, or the
+    /// user changing the date) must not make a mid-drain receive path look idle for
+    /// hours and switch the spinner off underneath a working sync.
+    fn advance_clock(&mut self, now_ms: u64) {
+        if now_ms > self.last_ms {
+            self.last_ms = now_ms;
+        }
+    }
+
+    /// A decrypted message that none of the three outcomes above will ever see.
+    ///
+    /// Receipts, typing notifications, profile updates and the ~18 other `Message`
+    /// variants return from `push_relay_event` before the sync-window and replay gates,
+    /// or fall off the end of it — so they never reach [`Self::record`]. They are still
+    /// the receive path working, and on a replay they are the MAJORITY of it: the
+    /// 2026-08-12 capture carried 958 read receipts against 754 actual messages.
+    ///
+    /// Leaving them out let [`Self::idle_ms`] climb through a receipt-heavy stretch
+    /// until Kotlin's `endGraceMs` expired and ended the sync episode MID-SYNC — the
+    /// spinner switching off, and `SaveCoalescer` flushing a whole-store encrypted write
+    /// in the middle of the flood, which is the exact write it exists to withhold.
+    ///
+    /// So these advance the CLOCK but not the counters. `newWork` still excludes them
+    /// deliberately: a burst of receipts is not work the user is waiting on and must not
+    /// raise a spinner by itself — the same rule as [`Ingested::AlreadySeen`].
+    pub fn touch(&mut self, now_ms: u64) {
+        self.advance_clock(now_ms);
+        self.ancillary += 1;
+    }
+
+    /// Messages decrypted and then thrown away, by either gate.
+    pub fn discarded(&self) -> u64 {
+        self.outside_window + self.already_seen
+    }
+
+    /// Every decrypted message seen, kept or not. Monotonic for the life of the process;
+    /// Kotlin thresholds on the DELTA, so it never needs an absolute meaning.
+    pub fn total(&self) -> u64 {
+        self.admitted + self.discarded()
+    }
+
+    /// Ms since the last decrypted message. Saturating, so a backwards clock reports 0
+    /// ("busy") rather than a huge number ("idle") — erring toward leaving the spinner ON
+    /// is the safe direction.
+    pub fn idle_ms(&self, now_ms: u64) -> u64 {
+        if self.last_ms == 0 {
+            return IDLE_NEVER_MS;
+        }
+        now_ms.saturating_sub(self.last_ms)
+    }
+
+    pub fn admitted(&self) -> u64 {
+        self.admitted
+    }
+    pub fn outside_window(&self) -> u64 {
+        self.outside_window
+    }
+    pub fn already_seen(&self) -> u64 {
+        self.already_seen
+    }
+    pub fn ancillary(&self) -> u64 {
+        self.ancillary
+    }
+
+    /// The payload `nativeIngestActivity` hands Kotlin. `depth` is passed in because this
+    /// type deliberately knows nothing about the queue.
+    pub fn snapshot_json(&self, now_ms: u64, depth: usize) -> Value {
+        serde_json::json!({
+            "idleMs": self.idle_ms(now_ms),
+            "depth": depth,
+            "total": self.total(),
+            "admitted": self.admitted,
+            "outsideWindow": self.outside_window,
+            "alreadySeen": self.already_seen,
+            // Diagnostic only. Deliberately outside `total`, so nothing thresholds on it.
+            "ancillary": self.ancillary,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +541,126 @@ mod tests {
         while !q.drain_batch(POLL_BATCH_MAX).is_empty() {}
         assert_eq!(q.dropped_total(), 0);
         assert_eq!(q.delivered_total(), 1_500);
+    }
+
+    // ---- ingest activity -----------------------------------------------------
+
+    #[test]
+    fn a_discard_only_burst_still_reads_as_busy() {
+        // THE regression this type exists for. Every message is older than the sync
+        // window, so the queue never sees one and stays empty — but the receive path is
+        // working flat out, and Kotlin has to be able to tell.
+        let q = InboundQueue::default();
+        let mut a = IngestActivity::default();
+        let mut t = 1_000_000u64;
+        for _ in 0..2_490 {
+            a.record(Ingested::OutsideWindow, t);
+            t += 120; // ~8/s, the rate the 08-12 capture actually ran at
+        }
+        assert!(q.is_empty(), "nothing was ever queued");
+        assert_eq!(a.idle_ms(t), 120, "yet the receive path was busy 120ms ago");
+        assert_eq!(a.total(), 2_490);
+        assert_eq!(a.admitted(), 0);
+        assert_eq!(a.discarded(), 2_490);
+    }
+
+    #[test]
+    fn receipt_only_traffic_keeps_the_receive_path_looking_busy() {
+        // THE F1 regression. A replay is mostly receipts, and receipts never reach
+        // record() — they return from push_relay_event before either gate. Before
+        // touch() existed, a stretch like this let idle_ms climb past Kotlin's
+        // endGraceMs and end the sync episode while the sync was still running.
+        let mut a = IngestActivity::default();
+        a.record(Ingested::Admitted, 1_000);
+        let mut t = 1_000u64;
+        for _ in 0..200 {
+            t += 120; // ~8/s, the rate the 08-12 capture ran at
+            a.touch(t);
+        }
+        assert_eq!(a.idle_ms(t), 0, "receipts ARE the receive path working");
+        assert_eq!(a.total(), 1, "but they are not work the user is waiting on");
+        assert_eq!(a.ancillary(), 200);
+    }
+
+    #[test]
+    fn receipt_only_traffic_cannot_announce_an_episode() {
+        // The other half of the rule: keeping an episode alive is not the same as
+        // starting one. Kotlin thresholds on admitted + outsideWindow, so a pure
+        // receipt burst must leave every one of those counters at zero.
+        let mut a = IngestActivity::default();
+        for i in 0..500 {
+            a.touch(i);
+        }
+        assert_eq!(a.admitted(), 0);
+        assert_eq!(a.discarded(), 0);
+        assert_eq!(a.total(), 0, "nothing here can cross minEvents");
+    }
+
+    #[test]
+    fn idle_ms_reports_never_before_the_first_message() {
+        let a = IngestActivity::default();
+        assert_eq!(a.idle_ms(5_000), IDLE_NEVER_MS);
+        // And it has to survive JSON → Kotlin Long. u64::MAX would not.
+        assert!(IDLE_NEVER_MS < i64::MAX as u64);
+    }
+
+    #[test]
+    fn a_backwards_clock_reports_busy_not_idle() {
+        // An NTP correction or a user changing the date mid-drain must not switch the
+        // spinner off. Erring toward "busy" is the safe direction.
+        let mut a = IngestActivity::default();
+        a.record(Ingested::Admitted, 10_000);
+        assert_eq!(a.idle_ms(5_000), 0, "a now BEFORE the last record is not 'idle for ages'");
+        a.record(Ingested::Admitted, 5_000);
+        assert_eq!(a.idle_ms(10_000), 0, "and the recorded time never regresses");
+    }
+
+    #[test]
+    fn the_three_outcomes_are_counted_separately() {
+        let mut a = IngestActivity::default();
+        a.record(Ingested::Admitted, 1);
+        a.record(Ingested::Admitted, 2);
+        a.record(Ingested::OutsideWindow, 3);
+        a.record(Ingested::AlreadySeen, 4);
+        a.record(Ingested::AlreadySeen, 5);
+        assert_eq!(a.admitted(), 2);
+        assert_eq!(a.outside_window(), 1);
+        assert_eq!(a.already_seen(), 2);
+        assert_eq!(a.discarded(), 3);
+        assert_eq!(a.total(), 5);
+    }
+
+    #[test]
+    fn the_snapshot_carries_queue_depth_and_the_counters() {
+        let mut a = IngestActivity::default();
+        a.record(Ingested::OutsideWindow, 1_000);
+        let snap = a.snapshot_json(1_250, 7);
+        assert_eq!(snap["idleMs"], 250);
+        assert_eq!(snap["depth"], 7);
+        assert_eq!(snap["total"], 1);
+        assert_eq!(snap["admitted"], 0);
+        assert_eq!(snap["outsideWindow"], 1);
+        assert_eq!(snap["alreadySeen"], 0);
+    }
+
+    #[test]
+    fn the_total_is_monotonic_so_kotlin_can_threshold_on_a_delta() {
+        // Kotlin decides "this is an episode, not one busy moment" by differencing this
+        // counter, so it must only ever climb.
+        let mut a = IngestActivity::default();
+        let mut last = 0u64;
+        for i in 0..500u64 {
+            a.record(
+                match i % 3 {
+                    0 => Ingested::Admitted,
+                    1 => Ingested::OutsideWindow,
+                    _ => Ingested::AlreadySeen,
+                },
+                i,
+            );
+            assert!(a.total() > last);
+            last = a.total();
+        }
+        assert_eq!(a.total(), 500);
     }
 }
