@@ -28,6 +28,24 @@ internal object GMPairingProto {
     const val USER_AGENT =
         "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) " +
             "Chrome/146.0.0.0 Safari/537.36"
+    /**
+     * Desktop twin of [USER_AGENT], for calls to `accounts.google.com` — the web
+     * session's own keepalive surface, which no Android client would ever hit.
+     *
+     * [USER_AGENT] is an ANDROID string inherited from mautrix-gmessages, correct for
+     * the messaging endpoints but incoherent here: the cookies we present were
+     * harvested from a DESKTOP browser. Verified 17 Aug 2026 — a desktop browser gets
+     * `200 [["identity.hfcr",600]]` from RotateCookies on a jar with no
+     * `__Secure-1PSIDTS`, while the phone sending the Android string gets `403`
+     * `[["identity.hfcr",2147483647]]` on the same cookie state.
+     *
+     * Deliberately identical to [USER_AGENT] except for the platform token, so this
+     * stays a one-variable experiment. Same Chrome major as [SEC_UA] claims.
+     */
+    const val WEB_USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+            "Chrome/146.0.0.0 Safari/537.36"
+
     const val SEC_UA =
         "\"Google Chrome\";v=\"146\", \"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\""
     const val X_USER_AGENT = "grpc-web-javascript/0.1"
