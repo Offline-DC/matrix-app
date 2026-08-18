@@ -12,6 +12,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+
+    // Let plain JVM unit tests run without Robolectric: android.util.Log and friends
+    // return defaults (0/null) instead of throwing "not mocked". MediaCacheTest needs
+    // exactly this much — it exercises real java.io.File behaviour, not Android APIs.
+    testOptions { unitTests.isReturnDefaultValues = true }
 }
 
 dependencies {
@@ -23,4 +28,6 @@ dependencies {
 
     api("androidx.core:core-ktx:1.12.0")
     api("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+
+    testImplementation("junit:junit:4.13.2")
 }

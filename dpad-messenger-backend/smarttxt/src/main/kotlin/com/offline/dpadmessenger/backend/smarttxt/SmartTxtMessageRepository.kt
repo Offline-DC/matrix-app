@@ -2,6 +2,7 @@ package com.offline.dpadmessenger.backend.smarttxt
 
 import android.content.Context
 import android.util.Log
+import com.offline.dpadmessenger.backend.core.MediaCache
 import com.offline.dpadmessenger.backend.smarttxt.transport.ChatGuid
 import com.offline.dpadmessenger.backend.smarttxt.transport.Handles
 import com.offline.dpadmessenger.backend.smarttxt.transport.RelayChat
@@ -1764,7 +1765,12 @@ internal class SmartTxtMessageRepository(
 
     // ---- MediaDownloader / AttachmentSender --------------------------------
 
-    private val mediaDir by lazy { java.io.File(appContext.cacheDir, "smarttxt_media").apply { mkdirs() } }
+    // Deliberately NOT `by lazy { ... mkdirs() }`. That form runs mkdirs() exactly once
+    // per process and memoises the File; when Android evicts cache/ (routine on a
+    // low-storage device) the directory is gone and every later write fails with ENOENT
+    // for the rest of the process lifetime. Resolve the path cheaply here and let
+    // MediaCache re-assert the directory on each write. See MediaCache's kdoc.
+    private val mediaDir: java.io.File get() = java.io.File(appContext.cacheDir, "smarttxt_media")
 
     override suspend fun downloadMedia(roomId: String, messageId: String): String? {
         val msg = messagesByRoom.value[roomId]?.firstOrNull { it.id == messageId }
@@ -1804,14 +1810,14 @@ internal class SmartTxtMessageRepository(
             att.kind == AttachmentKind.AUDIO -> "m4a"
             else -> "bin"
         }
-        val file = java.io.File(mediaDir, "${messageId.filter { it.isLetterOrDigit() }}.$ext")
-        runCatching { file.writeBytes(saveBytes) }.getOrElse { Log.e(TAG, "downloadMedia: media write failed", it); return null }
+        val file = MediaCache.write(mediaDir, "${messageId.filter { it.isLetterOrDigit() }}.$ext", saveBytes)
+            ?: run { Log.e(TAG, "downloadMedia: media write failed for msg=$messageId — see the mediaCache line above"); return null }
         val path = file.absolutePath
         writeLock.withLock {
             updateMessage(roomId, messageId) { m -> m.copy(attachment = m.attachment?.copy(localPath = path)) }
             requestSave()
         }
-        Log.i(TAG, "downloadMedia: saved $path for msg=$messageId")
+        Log.i(TAG, "downloadMedia: saved ${saveBytes.size}B -> $path for msg=$messageId (kind=${att.kind})")
         return path
     }
 
@@ -1855,8 +1861,9 @@ internal class SmartTxtMessageRepository(
                 else -> AttachmentKind.OTHER
             }
             val ext = mime.substringAfterLast('/', "bin").substringBefore(';').ifBlank { "bin" }
-            val localCopy = java.io.File(mediaDir, "${tmpId.filter { it.isLetterOrDigit() }}.$ext")
-            val localPath = runCatching { localCopy.writeBytes(bytes); localCopy.absolutePath }.getOrNull()
+            // Same directory as inbound media, so the same eviction hazard applies.
+            val localPath = MediaCache.write(mediaDir, "${tmpId.filter { it.isLetterOrDigit() }}.$ext", bytes)
+                ?.absolutePath
             // The caption rides the SAME message as the media (one bubble). It's
             // the body when present; otherwise a placeholder only when we couldn't
             // keep a local copy to render.

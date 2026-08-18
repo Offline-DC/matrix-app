@@ -2,6 +2,7 @@ package com.offline.dpadmessenger.backend.gmessages
 
 import android.content.Context
 import android.util.Log
+import com.offline.dpadmessenger.backend.core.MediaCache
 import com.offline.dpadmessenger.data.Attachment
 import com.offline.dpadmessenger.data.AttachmentKind
 import com.offline.dpadmessenger.data.AttachmentSender
@@ -1026,9 +1027,11 @@ internal class GoogleMessagesMessageRepository(
 
     // ---- MediaDownloader ----------------------------------------------------
 
-    private val mediaDir by lazy {
-        java.io.File(appContext.cacheDir, "gm_media").apply { mkdirs() }
-    }
+    // Deliberately NOT `by lazy { ... mkdirs() }`. That runs mkdirs() once per process
+    // and memoises the File; when Android evicts cache/ the directory is gone and every
+    // later write fails with ENOENT for the rest of the process lifetime. MediaCache
+    // re-asserts the directory on each write — see its kdoc for the full story.
+    private val mediaDir: java.io.File get() = java.io.File(appContext.cacheDir, "gm_media")
 
     override suspend fun downloadMedia(roomId: String, messageId: String): String? {
         val msg = messagesByRoom.value[roomId]?.firstOrNull { it.id == messageId }
@@ -1067,8 +1070,8 @@ internal class GoogleMessagesMessageRepository(
             }
             else -> "bin"
         }
-        val file = java.io.File(mediaDir, "${messageId.filter { it.isLetterOrDigit() }}.$ext")
-        runCatching { file.writeBytes(bytes) }.getOrElse { Log.e(TAG, "media write failed", it); return null }
+        val file = MediaCache.write(mediaDir, "${messageId.filter { it.isLetterOrDigit() }}.$ext", bytes)
+            ?: run { Log.e(TAG, "media write failed for msg=$messageId — see the mediaCache line above"); return null }
         val path = file.absolutePath
 
         writeLock.withLock {
@@ -1136,10 +1139,9 @@ internal class GoogleMessagesMessageRepository(
             else -> AttachmentKind.OTHER
         }
         val ext = mime.substringAfterLast('/', "bin").substringBefore(';').ifBlank { "bin" }
-        val localCopy = java.io.File(mediaDir, "${tmpId.filter { it.isLetterOrDigit() }}.$ext")
-        val localPath = runCatching { localCopy.writeBytes(bytes); localCopy.absolutePath }
-            .onFailure { Log.w(TAG, "sendAttachment: could not keep a local copy", it) }
-            .getOrNull()
+        // Same directory as inbound media, so the same eviction hazard applies.
+        val localPath = MediaCache.write(mediaDir, "${tmpId.filter { it.isLetterOrDigit() }}.$ext", bytes)
+            ?.absolutePath
 
         // The caption rides the SAME message as the media (one bubble). It is the
         // body when present; the "[photo]"-style placeholder is now only a
