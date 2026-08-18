@@ -2,7 +2,6 @@ package com.offline.dpadmessenger.backend.core
 
 import android.util.Log
 import java.io.File
-import java.io.IOException
 
 /**
  * Writes attachment bytes into an app-cache directory, re-creating that directory
@@ -87,7 +86,11 @@ object MediaCache {
             try {
                 file.writeBytes(bytes)
                 return file
-            } catch (e: IOException) {
+            } catch (e: Throwable) {
+                // Throwable, not IOException: the code this replaced used runCatching, which
+                // swallows everything. On a 128 MB-heap device a write can plausibly fail
+                // with something that is not an IOException, and an attachment that will not
+                // save must degrade to a retry affordance — never take down the caller.
                 lastError = e
                 Log.w(TAG, "mediaCache: write attempt $attempt/$MAX_ATTEMPTS failed for ${file.path} " +
                         "(${bytes.size}B, dirExists=${dir.isDirectory})", e)
