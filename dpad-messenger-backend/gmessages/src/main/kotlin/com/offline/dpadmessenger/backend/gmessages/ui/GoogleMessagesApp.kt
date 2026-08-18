@@ -42,13 +42,71 @@ import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesRepository
  *
  * The same namespace already carries `device_phone_number` (PhoneNumberReader /
  * DeviceRegistrar), so this follows an established convention here rather than
- * inventing a new one. Read once per composition; flipping it needs a screen
- * re-entry to take effect, which is fine for a probe.
+ * inventing a new one. Read once per composition — flipping the adb flag needs a
+ * screen re-entry to take effect, which is fine for a probe. The in-app gesture
+ * below ([TimeFormatDebugUnlockGesture]) updates the same Compose state directly
+ * instead, so it needs no re-entry.
  */
+/**
+ * In-app equivalent of the adb unlock for [debugToolsUnlocked]: flipping the 12/24-hour
+ * time-format switch in Settings ten times within two minutes reveals "Re-register now"
+ * and "Force token refresh (debug)" without a computer.
+ *
+ * WHY THIS SETTING. It's a row every build already has, flippable from Settings with no
+ * debug menu and no adb — the same reasoning [debugToolsUnlocked] gives for the adb
+ * route, just reachable from the phone alone. Ten GENUINE value changes (12->24->12...)
+ * inside the window, not ten taps of an already-selected value, so it can't fire by
+ * accident: nobody flips their clock format ten times in two minutes while actually
+ * trying to change it.
+ *
+ * Persisted to the same `gmessages_settings` prefs the time-format toggle itself uses,
+ * so the unlock survives process restarts — otherwise re-testing the token-refresh
+ * probe across a reboot would mean redoing the gesture every time.
+ */
+private object TimeFormatDebugUnlockGesture {
+    private const val TAG = "GMDebugUnlock"
+    private const val REQUIRED_FLIPS = 10
+    private const val WINDOW_MS = 120_000L
+    private const val PREFS_NAME = "gmessages_settings"
+    private const val PREFS_KEY_UNLOCKED = "debugToolsUnlockedViaGesture"
+
+    private val flips = ArrayDeque<Long>()
+
+    /** Call on every genuine change of the 12/24-hour switch. Returns true the instant
+     *  the gesture completes, so the caller can flip visible UI state immediately
+     *  instead of waiting on a re-read of prefs. */
+    @Synchronized
+    fun onToggle(context: android.content.Context): Boolean {
+        val now = System.currentTimeMillis()
+        flips.addLast(now)
+        while (flips.isNotEmpty() && now - flips.first() > WINDOW_MS) flips.removeFirst()
+        android.util.Log.i(TAG, "time-format flip ${flips.size}/$REQUIRED_FLIPS")
+        if (flips.size < REQUIRED_FLIPS) return false
+        flips.clear()
+        runCatching {
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREFS_KEY_UNLOCKED, true)
+                .apply()
+        }
+        android.util.Log.i(TAG, "gesture complete -- debug tools unlocked")
+        return true
+    }
+
+    /** Whether a prior gesture already unlocked this device. Checked in addition to the
+     *  adb flag so either route works. */
+    fun isUnlocked(context: android.content.Context): Boolean = runCatching {
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+            .getBoolean(PREFS_KEY_UNLOCKED, false)
+    }.getOrDefault(false)
+}
+
 private fun debugToolsUnlocked(ctx: android.content.Context): Boolean =
     runCatching {
         android.provider.Settings.Secure.getInt(ctx.contentResolver, "dumb_gm_debug_tools", 0) == 1
-    }.getOrDefault(false)
+    }.getOrDefault(false) || TimeFormatDebugUnlockGesture.isUnlocked(ctx)
 
 /**
  * Top-level entry for the in-app Google Messages experience.
@@ -80,7 +138,10 @@ fun GoogleMessagesApp(
 ) {
     val context = LocalContext.current
     // Hidden gate for the two diagnostic Settings rows — see [debugToolsUnlocked].
-    val debugTools = remember { debugToolsUnlocked(context) }
+    // Mutable (not a one-shot remember): the in-app gesture below flips this live, so
+    // the rows can appear immediately without a screen re-entry the way the adb-flag
+    // path needs.
+    var debugTools by remember { mutableStateOf(debugToolsUnlocked(context)) }
     val store = remember { GoogleMessagesAccountStore(context) }
 
     // Snapshot pairing status once. Flips to true when pairing completes.
@@ -333,6 +394,19 @@ fun GoogleMessagesApp(
                 use24Hour = enabled
                 TimeFormatPreference.use24Hour = enabled
                 settingsPrefs.edit().putBoolean("use24HourTime", enabled).apply()
+                // Hidden unlock gesture — see [TimeFormatDebugUnlockGesture]. Guarded on
+                // !debugTools purely so an already-unlocked device isn't still growing
+                // (and logging) a flip counter it no longer needs.
+                if (!debugTools && TimeFormatDebugUnlockGesture.onToggle(context)) {
+                    debugTools = true
+                    Toast.makeText(
+                        context,
+                        "Debug tools unlocked. Settings now shows \"Re-register now\" and " +
+                            "\"Force token refresh (debug)\" -- the second one forces the " +
+                            "24h proactive refresh without waiting a day.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
             },
             initialRoomId = initialRoomId,
             initialRoomKey = initialRoomKey,
