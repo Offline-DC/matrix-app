@@ -134,10 +134,11 @@ internal object SmartTxtLogRing {
     private fun isNoise(line: String): Boolean =
         // NOTE: relaxing this filter does NOT surface rustpush's ResourceManager
         // lifecycle lines ("Resource Identity: preparing/generating/final error").
-        // Those are `debug!` in rustpush's util.rs, and the Rust logger is capped at
-        // Info (`with_max_level(LevelFilter::Info)` in smarttxt-ffi's init_logger), so
-        // they never reach logcat at all — this filter never saw them. Raising the
-        // logger level is the only way to get them, at the cost of the mutex flood.
+        // Those are `debug!` in rustpush's util.rs, and smarttxt-ffi's init_logger
+        // holds `rustpush::util` to Warn, so they never reach logcat at all — this
+        // filter never saw them. (The global ceiling there is Debug now, so it is
+        // the per-target directive doing the work, not the ceiling; opting util in
+        // is a one-line change there, at the cost of the mutex flood.)
         // For registration health, prefer the REGSTATE lines and rustpush's own
         // info-level "Reregistering in N seconds", both of which are already captured.
         // logcat prints "--------- beginning of <buffer>" on stdout every time
