@@ -135,7 +135,19 @@ internal object PbLite {
             (this as? Arr)?.items?.getOrNull(i) ?: Null
 
         fun asIntOrNull(): Int? = (this as? Num)?.value?.toInt()
-        fun asLongOrNull(): Long? = (this as? Num)?.value?.toLong()
+        /**
+         * JSPB encodes 64-bit ints as STRINGS, because a double cannot hold them
+         * losslessly. Accepting only [Num] meant every token TTL Google ever sent us
+         * parsed as 0 — verified in the field 17 Aug 2026:
+         * `signInGaia: TTL parsed as 0 — raw node=Str(value=86400000000)`. The 24h
+         * fallback happened to match, so this hid for months while making the
+         * proactive token refresh schedule pure guesswork.
+         */
+        fun asLongOrNull(): Long? = when (this) {
+            is Num -> value.toLong()
+            is Str -> value.trim().toLongOrNull()
+            else -> null
+        }
         fun asStringOrNull(): String? = (this as? Str)?.value
     }
 

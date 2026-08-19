@@ -1,6 +1,5 @@
 package com.offline.dpadmessenger.ui.rooms
 
-import androidx.compose.foundation.background
 import android.util.Log
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.focusable
@@ -18,10 +17,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountCircle
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -61,7 +58,6 @@ import com.offline.dpadmessenger.focus.handOffFocus
 import com.offline.dpadmessenger.ui.components.CompactBarButton
 import com.offline.dpadmessenger.ui.components.CompactTopBar
 import com.offline.dpadmessenger.ui.components.RoomListItem
-import com.offline.dpadmessenger.ui.settings.RELINK_WARN_DAYS
 import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 import com.offline.dpadmessenger.ui.theme.SmartTxtAvatarGray
 import com.offline.dpadmessenger.ui.navbar.SoftKey
@@ -90,12 +86,6 @@ fun RoomListScreen(
     /** Open the new-conversation flow. When null, the "new" soft key is hidden
      *  (repository can't start conversations — e.g. the mock). */
     onNewMessage: (() -> Unit)? = null,
-    /** Whole days since the last fresh sign-in. At/after [RELINK_WARN_DAYS] a red
-     *  "re-link in settings" banner is pinned above the list. Null hides it. */
-    linkAgeDays: Int? = null,
-    /** Tapping the day-13 re-link banner. Defaults to [onSettingsClick]; the host
-     *  passes a variant that opens Settings focused on the Re-link row. */
-    onRelinkWarningClick: (() -> Unit)? = null,
 ) {
     val rooms by viewModel.rooms.collectAsState()
     val isLoading by viewModel.isInitialLoading.collectAsState()
@@ -263,23 +253,14 @@ fun RoomListScreen(
                 moved
             },
     ) { innerPadding ->
-        // When the session is near its ~2-week end, pin a red re-link banner
-        // above the list (tapping it opens Settings). The top inset is applied
-        // once here on the Column so the banner clears the top bar; the list
-        // below only needs its bottom inset.
-        val showRelinkWarning = linkAgeDays != null && linkAgeDays >= RELINK_WARN_DAYS
+        // The top inset is applied once here on the Column; the list below only
+        // needs its bottom inset.
         Box(modifier = Modifier.fillMaxSize()) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(top = innerPadding.calculateTopPadding()),
             ) {
-                // With rooms present the banner is item 0 of the list (see
-                // [RoomList]) so it joins ordinary d-pad traversal. With no rooms
-                // there is no list to put it in, so it stays here as chrome.
-                if (showRelinkWarning && rooms.isEmpty()) {
-                    RelinkWarningBanner(onClick = onRelinkWarningClick ?: onSettingsClick)
-                }
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -305,8 +286,6 @@ fun RoomListScreen(
                             padding = PaddingValues(bottom = innerPadding.calculateBottomPadding()),
                             entryRowFocus = entryRowFocus,
                             firstRowFocus = firstRowFocus,
-                            showRelinkWarning = showRelinkWarning,
-                            onRelinkClick = onRelinkWarningClick ?: onSettingsClick,
                             savedScroll = viewModel.savedScroll,
                             onScrollChanged = viewModel::saveScroll,
                             listState = listState,
@@ -345,8 +324,6 @@ private fun RoomList(
     padding: PaddingValues,
     entryRowFocus: FocusRequester,
     firstRowFocus: FocusRequester,
-    showRelinkWarning: Boolean,
-    onRelinkClick: () -> Unit,
     savedScroll: Pair<Int, Int>?,
     onScrollChanged: (index: Int, offset: Int) -> Unit,
     listState: androidx.compose.foundation.lazy.LazyListState,
@@ -379,15 +356,13 @@ private fun RoomList(
             // left with nothing focused: the "press OK twice" bug, reached by
             // another road. Also covers first-ever entry, where there is no saved
             // position and the entry row may be well down the list.
-            // The banner, when shown, is LazyColumn item 0 — so a room's index in
-            // `rooms` is one less than its index in the list. Getting this wrong
-            // scrolls to the row above the one we then try to focus.
-            val bannerOffset = if (showRelinkWarning) 1 else 0
+            // Rooms are now the only list items, so a room's index in `rooms` is its
+            // index in the list (the day-13 banner that used to occupy item 0 is gone).
             val entryIdx = rooms.indexOfFirst { it.room.id == entryRoomId }
             if (entryIdx >= 0 &&
-                listState.layoutInfo.visibleItemsInfo.none { it.index == entryIdx + bannerOffset }
+                listState.layoutInfo.visibleItemsInfo.none { it.index == entryIdx }
             ) {
-                listState.scrollToItem(entryIdx + bannerOffset)
+                listState.scrollToItem(entryIdx)
             }
             // Retry focus across a few frames: when returning from a chat the
             // target row isn't attached on the first frame, so a single
@@ -430,15 +405,10 @@ private fun RoomList(
             ),
     ) {
         // The re-link warning is a ROW, not chrome. As a list item it takes part in
-        // ordinary d-pad traversal — cog -> banner -> row 0 -> row 1 — instead of
-        // sitting outside the focus group where Down had to be rescued. It also
-        // makes listHasFocus true while focused, so the screen-level rescue
-        // correctly stays out of it.
-        if (showRelinkWarning) {
-            item(key = "relink-warning") {
-                RelinkWarningBanner(onClick = onRelinkClick, focusRequester = firstRowFocus)
-            }
-        }
+        // ordinary d-pad traversal — cog -> row 0 -> row 1 — instead of sitting
+        // outside the focus group where Down had to be rescued. It also makes
+        // listHasFocus true while focused, so the screen-level rescue correctly
+        // stays out of it.
         items(items = rooms, key = { it.room.id }) { summary ->
             val isEntry = summary.room.id == entryRoomId
             val isFirst = summary.room.id == firstRoomId
@@ -452,52 +422,13 @@ private fun RoomList(
                 // can hand it focus regardless of last-opened. When isEntry &&
                 // isFirst, both requesters point at the same row (which is
                 // what we want — they're separate handles to the same target).
-                // ...unless the banner is showing, in which case IT is the cog's
-                // Down target and row 0 is simply the next row down.
                 extraFocusRequesters =
-                    if (isFirst && !showRelinkWarning) listOf(firstRowFocus) else emptyList(),
+                    if (isFirst) listOf(firstRowFocus) else emptyList(),
                 onLongClick = onRoomLongClick?.let { handler -> { handler(summary) } },
                 isMuted = summary.room.id in mutedRooms,
                 // No rule under the final row — it would hang below the list
                 // rather than separate two conversations.
                 showDivider = summary.room.id != rooms.lastOrNull()?.room?.id,
-            )
-        }
-    }
-}
-
-/** Red, DPAD-focusable banner pinned above the chat list when the Google
- *  session is near its ~2-week expiry. OK opens Settings (where Re-link lives).
- *  Reachable by DPAD-Up from the top conversation row. */
-@Composable
-private fun RelinkWarningBanner(onClick: () -> Unit, focusRequester: FocusRequester? = null) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 8.dp, vertical = 4.dp)
-            .clip(RoundedCornerShape(10.dp))
-            .background(MaterialTheme.colorScheme.errorContainer)
-            .dpadRow(onClick = onClick, focusRequester = focusRequester, shape = RoundedCornerShape(10.dp))
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-    ) {
-        Icon(
-            imageVector = Icons.Filled.Warning,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.error,
-            modifier = Modifier.size(18.dp),
-        )
-        Spacer(Modifier.width(8.dp))
-        Column {
-            Text(
-                "Re-link in settings",
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            Text(
-                "You may be logged out in the next day as your session expires.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onErrorContainer,
             )
         }
     }

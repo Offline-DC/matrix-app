@@ -56,11 +56,11 @@ import com.offline.dpadmessenger.ui.theme.LocalDpadMessengerColors
 fun SettingsScreen(
     onBack: () -> Unit,
     onLogout: () -> Unit,
-    /** Re-link the phone — a fresh sign-in for a new ~2-week session, keeping
+    /** Re-link the phone — a fresh sign-in that keeps
      *  messages. Shown above Log out when set; null hides it. */
     onRelink: (() -> Unit)? = null,
     /** Whole days since the last fresh sign-in. When set, shows a "last linked"
-     *  row under Re-link (and warns when the session is near its ~2-week end). */
+     *  row under Re-link. Informational only — no expiry is tied to it. */
     linkAgeDays: Int? = null,
     /** When true, land initial focus on the "Re-link phone" row instead of the
      *  back button — used when the user arrives here from the day-13 banner. */
@@ -116,6 +116,17 @@ fun SettingsScreen(
      *  extend the block, which is exactly how one customer lost sending entirely in
      *  Aug 2026. Hence the subtitle steering users to support first. */
     onReregister: (() -> Unit)? = null,
+    /** DEBUG: arm a one-shot override so the PROACTIVE token refresh fires on the next
+     *  maintenance tick instead of an hour before a 24-hour token expires.
+     *
+     *  Distinct from [onReregister], which is the thing people reach for and the wrong
+     *  tool here: that calls `reauth()`, skipping the expiry arithmetic and the threshold
+     *  and restarting the long-poll afterwards. This row exercises the branch nobody can
+     *  otherwise reach without waiting ~23h — a refresh that fires from the timer,
+     *  mid-session, and must leave the stream and the registration untouched.
+     *
+     *  Google-Messages only; null hides the row. */
+    onForceTokenRefresh: (() -> Unit)? = null,
     /** Export this device's Smart Txt logs to support (zips the rolling
      *  Smart-Txt-only log ring and uploads it). Shown just above Log out when
      *  set; null hides the row. Host handles the result feedback. */
@@ -259,21 +270,30 @@ fun SettingsScreen(
             if (onRelink != null) {
                 ActionRow(
                     title = "Re-link phone",
-                    subtitle = "Scan the code again for a fresh 2-week session — keeps your messages",
-                    // Tint the row when the session is near its end so it stands out.
-                    destructive = linkAgeDays != null && linkAgeDays >= RELINK_WARN_DAYS,
+                    subtitle = "Scan the code again if messages stop arriving — keeps your messages",
                     focusRequester = relinkFocus,
                     onClick = onRelink,
                 )
             }
             if (linkAgeDays != null) {
                 StaticRow(title = "Days since last link", subtitle = linkAgeDays.toString())
+                // NB: informational only. There is no known expiry tied to this number —
+                // see GMESSAGES_SEAMLESS_LINK_DESIGN_20260817.md §1(b)/§3. Do not
+                // reintroduce a day-threshold warning without measured evidence.
             }
             if (onReregister != null) {
                 ActionRow(
                     title = "Re-register now",
                     subtitle = "For debugging only \u2013 reach out to support@dumb.co before doing this!",
                     onClick = onReregister,
+                )
+            }
+            if (onForceTokenRefresh != null) {
+                ActionRow(
+                    title = "Force token refresh (debug)",
+                    subtitle = "Fires the proactive refresh on the next tick. One-shot \u2013 " +
+                        "messages should keep arriving with no reconnect screen",
+                    onClick = onForceTokenRefresh,
                 )
             }
             if (onExportLogs != null) {
@@ -293,9 +313,6 @@ fun SettingsScreen(
     }
 }
 
-/** Day threshold at/after which we warn the user their ~2-week Google session is
- *  about to expire and they should re-link. Shared with the room-list banner. */
-internal const val RELINK_WARN_DAYS = 13
 
 @Composable
 private fun SettingHeader(text: String) {

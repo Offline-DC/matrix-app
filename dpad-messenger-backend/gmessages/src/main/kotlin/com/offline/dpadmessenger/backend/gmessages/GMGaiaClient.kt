@@ -11,6 +11,7 @@ import java.nio.ByteBuffer
 import java.security.KeyPairGenerator
 import java.security.spec.ECGenParameterSpec
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.TimeUnit
 
 /**
@@ -63,6 +64,27 @@ class GMGaiaClient(context: Context) {
      *  processed; show it so the user can tap the matching one on their phone.
      *  @return true if pairing completed and the account was saved. */
     fun run(onEmoji: (String) -> Unit = { Log.i(TAG, "PAIRING EMOJI (no UI callback): $it") }): Boolean {
+        val attempt = ATTEMPTS.incrementAndGet()
+        val t0 = System.currentTimeMillis()
+        configCode = 0
+        signInCode = 0
+        val ok = runInner(onEmoji)
+        // ONE line per attempt, so a capture with several retries reads as a
+        // table instead of interleaved blocks. The 2026-08-14 report took four
+        // attempts in four minutes and the only way to separate them was by
+        // timestamp arithmetic. Order matters: config -> signIn -> (pairing,
+        // logged by GMGaiaPair's own RESULT line).
+        Log.i(
+            TAG_RESULT,
+            "ATTEMPT #$attempt result=${if (ok) "PAIRED" else "FAILED"} " +
+                "config=$configCode signIn=$signInCode " +
+                "elapsed=${(System.currentTimeMillis() - t0) / 100 / 10.0}s " +
+                "cookieAge=${store.cookiesAgeMs()?.let { "${it / 1000}s" } ?: "unknown"}",
+        )
+        return ok
+    }
+
+    private fun runInner(onEmoji: (String) -> Unit): Boolean {
         lastError = null
         val cookies = store.loadCookies()
         if (!GMCookieAuth.hasRequiredCookies(cookies)) {
@@ -80,7 +102,13 @@ class GMGaiaClient(context: Context) {
         Log.i(TAG, "run: starting with ${cookies.size} cookies; names=${cookies.keys.sorted()}; " +
             "fp=${cookieFingerprint(cookies)}; " +
             "has1PSIDTS=${!cookies["__Secure-1PSIDTS"].isNullOrBlank()} " +
-            "has3PSIDTS=${!cookies["__Secure-3PSIDTS"].isNullOrBlank()}")
+            "has3PSIDTS=${!cookies["__Secure-3PSIDTS"].isNullOrBlank()}; " +
+            // Per-cookie fingerprints: the SET fingerprint above changes if ANY
+            // cookie moved, which can't distinguish "the browser rotated 1PSIDTS
+            // under us" from "SIDCC ticked over". These two are the ones that
+            // decide whether Google accepts us.
+            "sid=${valueFp(cookies["SID"])} psidts=${valueFp(cookies["__Secure-1PSIDTS"])}; " +
+            "ageOfHarvest=${store.cookiesAgeMs()?.let { "${it / 1000}s" } ?: "unknown"}")
 
         val deviceUuid = fetchConfig(cookies)
         // Reuse ONE persisted web-device UUID instead of minting a fresh random one
@@ -123,8 +151,16 @@ class GMGaiaClient(context: Context) {
             http.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 Log.i(TAG, "fetchConfig HTTP ${resp.code} (${body.length} bytes)")
+                configCode = resp.code
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "fetchConfig failed body: ${body.take(500)}")
+                    // Google answers this one with a full HTML error page, so the
+                    // old 500-char body dump was 500 chars of CSS. The <title>
+                    // plus the headers are the entire diagnostic value. This call
+                    // returned 403 on all four attempts of the 2026-08-14 report
+                    // and that went unexplained because none of this was captured.
+                    val title = Regex("<title>(.*?)</title>").find(body)?.groupValues?.get(1)
+                    Log.w(TAG, "fetchConfig failed: HTTP ${resp.code} title=${title ?: "?"} " +
+                        "bodyLen=${body.length} ${diagHeaders(resp)}")
                     return null
                 }
                 // The web config embeds the device id somewhere; log a chunk so
@@ -189,8 +225,10 @@ class GMGaiaClient(context: Context) {
             http.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 Log.i(TAG, "signInGaia HTTP ${resp.code} (${body.length} bytes)")
+                signInCode = resp.code
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "signInGaia failed body: ${body.take(600)}")
+                    Log.w(TAG, "signInGaia failed body: ${body.take(800)}")
+                    Log.w(TAG, "signInGaia failed headers: ${diagHeaders(resp)}")
                     lastError = describeHttpFailure("Google sign-in", resp.code, body)
                     return@use false
                 }
@@ -235,7 +273,7 @@ class GMGaiaClient(context: Context) {
         val ttl = ttlNode.asLongOrNull() ?: 0L
         if (ttl == 0L) {
             // Distinguish "Google really sent 0" from "Google sent it as a JSON
-            // string and asLongOrNull() only accepts Num" — the JSPB convention
+            // string and asLongOrNull() used to accept only Num" — the JSPB convention
             // encodes int64 fields as strings to dodge JS precision loss. The
             // response body is logged with take(1200) and tokenData is the LAST
             // element, so this is the only place the raw value is ever visible.
@@ -376,8 +414,42 @@ class GMGaiaClient(context: Context) {
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
+    /** 4 hex chars of SHA-256 over ONE cookie value. Never reversible, never the
+     *  value — these logs get emailed to us by customers. */
+    private fun valueFp(value: String?): String {
+        if (value.isNullOrBlank()) return "absent"
+        return runCatching {
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(value.toByteArray(Charsets.UTF_8))
+                .take(2)
+                .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+        }.getOrDefault("??")
+    }
+
+    /** Non-secret response headers that separate "credentials refused" from
+     *  "you are being throttled". Set-Cookie is reported by NAME only. */
+    private fun diagHeaders(resp: okhttp3.Response): String {
+        val interesting = listOf(
+            "www-authenticate", "retry-after", "x-goog-api-version",
+            "x-goog-quota-exceeded", "x-ratelimit-remaining", "content-type",
+        ).mapNotNull { n -> resp.header(n)?.let { "$n=$it" } }
+        val setCookieNames = resp.headers("Set-Cookie").map { it.substringBefore('=') }
+        return (interesting + listOf("setCookieNames=$setCookieNames")).joinToString(" ")
+    }
+
+    @Volatile private var configCode: Int = 0
+    @Volatile private var signInCode: Int = 0
+
     companion object {
         private const val TAG = "GMGaia"
+
+        /** Secret-free outcome tag. Separate from [TAG] because GMGaia logs the
+         *  SignInGaia response (which carries the tachyon token) and is kept out
+         *  of the routine hourly snapshot; these summary lines are safe there and
+         *  are usually all support needs to triage a failed link. */
+        internal const val TAG_RESULT = "GMPairResult"
+        /** Process-wide so repeated retries read as #1..#n in one capture. */
+        private val ATTEMPTS = AtomicInteger(0)
         private const val GDITTO = "GDitto"
         private const val CONTENT_TYPE_PBLITE = "application/json+protobuf"
         private const val CONFIG_URL = "https://messages.google.com/web/config"
