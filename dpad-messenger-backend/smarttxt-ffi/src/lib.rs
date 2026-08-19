@@ -446,16 +446,46 @@ fn init_logger() {
     //
     // env_logger is already a mandatory (non-optional) dependency of android_logger
     // 0.13, so naming it directly in Cargo.toml pulls in nothing new.
+    //
+    // ## Getting a `debug!` to actually appear
+    // Two gates, and BOTH have to let a line through — this is the thing that
+    // makes "I added a debug! and it never showed up" so confusing:
+    //
+    //  1. `with_max_level` below, which calls `log::set_max_level`. The `debug!`
+    //     macro tests that global BEFORE it formats anything, so a line above the
+    //     ceiling costs nothing and produces nothing — the format arguments are
+    //     never even evaluated. Raising a per-target directive alone cannot beat
+    //     it.
+    //  2. This filter. Its catch-all `None => Info` drops DEBUG for every target
+    //     that has no longer directive of its own.
+    //
+    // So enabling one module's debug output means raising the ceiling AND naming
+    // the module here. Raising the ceiling on its own would NOT flood the log:
+    // the catch-all still holds every other target at Info, and util/aps stay at
+    // Warn, so the ~95%-of-lines problem this filter exists to solve stays
+    // solved. The ceiling is permission; the filter is policy.
     let filter = {
         let mut b = env_logger::filter::Builder::new();
         b.filter(None, log::LevelFilter::Info);
         b.filter(Some("rustpush::util"), log::LevelFilter::Warn);
         b.filter(Some("rustpush::aps"), log::LevelFilter::Warn);
+        // TEMPORARY, for chasing an iMessage payload bug: the `debug!("xml: …")`
+        // calls in rustpush's imessage/messages.rs (lines ~306 and ~2574).
+        //
+        // Each of these logs a whole XML message body, so a catch-up replay emits
+        // one large String per message — the same allocation churn the util/aps
+        // lines above were silenced to avoid. Fine for a debugging session on a
+        // handset somebody is watching; take it back out before shipping, or move
+        // it behind a runtime switch if it turns out to be wanted permanently.
+        b.filter(Some("rustpush::imessage::messages"), log::LevelFilter::Debug);
         b.build()
     };
     android_logger::init_once(
         android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Info)
+            // Debug, not Info: the ceiling has to clear the highest level any
+            // directive above asks for, or that directive is dead letter. Policy
+            // still lives in the filter — see the note above.
+            .with_max_level(log::LevelFilter::Debug)
             .with_filter(filter)
             .with_tag("SmartTxtRust"),
     );

@@ -8,7 +8,21 @@ recommendations to review, not applied changes.
 
 ## Finding 1 (highest impact): the noise ratio
 
-The FFI's `android_logger` runs at `LevelFilter::Info` (lib.rs:239), and rustpush
+> **Since updated.** The measurements below describe the logger as it was when this
+> was written: one flat `LevelFilter::Info` with no per-target directives. It is now
+> a global ceiling of `Debug` plus an `env_logger` filter that holds the catch-all at
+> `Info` and pins `rustpush::util` / `rustpush::aps` to `Warn`, so the two floods
+> below are silenced at the source rather than dropped downstream. `SmartTxtLogRing`
+> still filters them from older captures. Read the ratios as the case for that change,
+> not as the current state.
+>
+> Two gates decide whether a line appears, and both must pass: the ceiling
+> (`with_max_level`, which sets `log::set_max_level` and is checked inside the
+> `debug!` macro before it formats anything) and the per-target filter. Enabling one
+> module's debug output means raising the ceiling **and** naming the module — that is
+> the usual reason an added `debug!` never shows up.
+
+The FFI's `android_logger` ran at `LevelFilter::Info` (lib.rs:239), and rustpush
 logs **every mutex lock/unlock** under `rustpush::util` and APNs internals under
 `rustpush::aps` at INFO. Measured on one real bundle:
 
