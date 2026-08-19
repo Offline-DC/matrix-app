@@ -121,7 +121,12 @@ class GMCookieRotationTest {
         assertTrue(GMCookieAuth.OPTIONAL_COOKIES.contains("__Secure-1PSIDTS"))
         assertTrue(GMCookieAuth.OPTIONAL_COOKIES.contains("__Secure-3PSIDTS"))
         assertTrue(
-            "1PSIDTS must not be treated as required — Workspace harvests lack it",
+            // A fresh harvest usually arrives without 1PSIDTS: the browser mints it on
+            // Google's own schedule, after the extension has already frozen the cookie
+            // blob (19 Aug 2026 — five consecutive 14-cookie harvests, none carrying
+            // it). Requiring it HERE would reject every one of those before the
+            // link-time mint gets a chance to fill it in.
+            "1PSIDTS must not be in REQUIRED_COOKIES — a fresh harvest usually lacks it",
             !GMCookieAuth.REQUIRED_COOKIES.contains("__Secure-1PSIDTS"),
         )
     }

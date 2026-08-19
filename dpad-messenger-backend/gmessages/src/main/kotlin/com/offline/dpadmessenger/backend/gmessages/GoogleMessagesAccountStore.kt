@@ -205,8 +205,11 @@ class GoogleMessagesAccountStore(context: Context) {
      *  but it is the only thing that identifies this pairing to Google, and
      *  RevokeGaiaPairing takes nothing else. Without it we cannot tell the
      *  account "forget this device" on logout, so every re-link leaves another
-     *  identically-named entry behind in the phone's Device-pairing list, and
-     *  those stale entries compete for the receive slot. */
+     *  identically-named entry behind in the phone's Device-pairing list — a list
+     *  the user sees and has to clean up by hand. (Whether a stale entry can also
+     *  interfere with receiving is UNKNOWN: two captures holding 30+ and 11 entries
+     *  contained no displacement of the active registration at all. Do not cite it
+     *  as a cause without a log that shows one.) */
     fun saveGaiaSession(destRegB64: String, pairingAttemptId: String) {
         prefs.edit()
             .putBoolean(KEY_GAIA_MODE, true)

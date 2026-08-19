@@ -130,6 +130,43 @@ object GMCookieRotation {
     private const val FAILURE_BACKOFF_MS = 120_000L
     private const val RATE_LIMIT_BACKOFF_MS = 1_800_000L
 
+    /**
+     * Link-time counterpart to [RATE_LIMIT_BACKOFF_MS].
+     *
+     * Thirty minutes is right for the steady-state loop, where a 429 means "you are
+     * rotating too often, stand down". At LINK time it means something else entirely:
+     * the BROWSER rotated seconds ago, as part of the very sign-in we are pairing
+     * from, and Google's floor on this endpoint is ~60s. Applying the steady-state
+     * value there converts a sixty-second refusal into a thirty-minute window with NO
+     * rotation at all, on a session that holds no freshness cookie yet. Measured 19
+     * Aug 2026, seconds after a link the phone had just declared complete:
+     * `hydrated rotation floor from disk: lastAttempt=0s ago nextDueIn=1799s`.
+     */
+    private const val LINK_RATE_LIMIT_BACKOFF_MS = 70_000L
+
+    /**
+     * How long [bootstrapForLink] waits before its single retry.
+     *
+     * Google's floor on RotateCookies is ~60s — three calls from a signed-in console
+     * on 19 Aug 2026 returned 200, then 429, then 429 — so one wait past it clears a
+     * link-time 429 outright. The collision is with the browser's own rotation, which
+     * has already happened and will not fire again.
+     *
+     * WHY 70s AND NOT 90s. Shipped at 90s and measured on device 19 Aug 11:33 — a
+     * real 429 cleared on the retry, but the user watched a confirmed pairing emoji
+     * sit for a minute and a half and reasonably assumed it had hung. The floor runs
+     * from the BROWSER's rotation, which is already at least a few seconds in the
+     * past by the time our refused call happens, so any wait >= 60s clears it under
+     * that model; 70s also clears it under the harsher reading where our own refused
+     * call restarts the clock. Ten seconds of headroom on a 60s floor, and twenty
+     * seconds off what the user sits through.
+     *
+     * MUST stay above [MIN_INTERVAL_MS] or the retry silently becomes a no-op that
+     * only costs the user a wait. Asserted in GMCookieRotationTest so a later trim
+     * of either constant has to notice.
+     */
+    internal const val LINK_RETRY_DELAY_MS = 70_000L
+
     /** Cookies we will accept from a rotation response. Deliberately NOT the whole
      *  Set-Cookie set: this is an accounts.google.com call and we only want the two
      *  freshness cookies from it. Anything else stays owned by the messaging
@@ -212,11 +249,29 @@ object GMCookieRotation {
     var lastResult: String = "never-run"
         private set
 
+    /**
+     * HTTP status of the last rotation attempt. `0` = success or never ran.
+     *
+     * Exists because the RETRY DECISION depends on which failure it was, and
+     * [lastResult] flattens that into a string. Google's three refusals mean three
+     * different things and only two of them are worth waiting out:
+     *
+     *  - `429` — you asked too early. Waiting is the entire remedy.
+     *  - `200` + no cookie — cause unknown (Alex Browning, 19 Aug 2026). Retry is
+     *    cheap and might help; we have no theory either way.
+     *  - `401`/`403` — the credentials are REJECTED. Waiting cannot make a dead login
+     *    valid, so a retry burns 70s of the user's time to reach the same answer.
+     */
+    @Volatile
+    var lastHttpCode: Int = 0
+        private set
+
     /** Call on sign-in / re-link so a new session isn't held back by an old backoff. */
     fun reset() {
         lastAttemptMs = 0L
         nextDueMs = 0L
         lastResult = "never-run"
+        lastHttpCode = 0
         // Clear the persisted floor as well, or a fresh sign-in inherits the old
         // session's backoff from disk — the exact bug reset() exists to prevent, just
         // surviving longer. hydrate() is re-armed so a later attach still works.
@@ -270,7 +325,13 @@ object GMCookieRotation {
      *
      * @return true if a cookie value changed and the caller should persist.
      */
-    fun bootstrapNow(http: OkHttpClient, cookies: MutableMap<String, String>): Boolean {
+    fun bootstrapNow(
+        http: OkHttpClient,
+        cookies: MutableMap<String, String>,
+        /** Shortens the 429 backoff to [LINK_RATE_LIMIT_BACKOFF_MS]; set only by
+         *  [bootstrapForLink]. See that constant for why the two differ. */
+        linkTime: Boolean = false,
+    ): Boolean {
         if (!GoogleMessagesConfig.cookieBootstrapOnRecovery) return false
         if (cookies["__Secure-1PSID"].isNullOrBlank()) return false
         hydrate()
@@ -289,7 +350,93 @@ object GMCookieRotation {
         }
         val bootstrap = cookies["__Secure-1PSIDTS"].isNullOrBlank()
         Log.i(TAG, "bootstrapNow: requested (mint=$bootstrap cookies=${cookies.size})")
-        return attempt(http, cookies, bootstrap = bootstrap, now = now)
+        return attempt(http, cookies, bootstrap = bootstrap, now = now, linkTime = linkTime)
+    }
+
+    /**
+     * Link-time bootstrap: mint the freshness pair at the one moment the harvest is
+     * known fresh, and RETRY ONCE if Google refuses.
+     *
+     * Why this is not just [bootstrapNow]. At link time the phone's RotateCookies call
+     * lands seconds after the browser's own: the desktop sign-in mints 1PSIDTS on
+     * Google's schedule, the extension freezes the cookie blob at whatever instant
+     * OSID appears — often BEFORE that rotation — and the user scans ~30s later. Both
+     * calls follow the same sign-in, so whether the phone lands inside Google's ~60s
+     * floor is luck. That luck is the whole reason pairing looked random: Alex
+     * Browning, same account and same extension, failed at 06:41 and succeeded at
+     * 08:20 on 19 Aug 2026. One wait past the floor removes it.
+     *
+     * The retry re-enters [attempt] rather than [bootstrapNow] on purpose:
+     * [MIN_INTERVAL_MS] would decline it, and we have just slept LONGER than the
+     * floor, so the floor has nothing left to protect against. It fires at most once
+     * per pairing, and only while no `__Secure-1PSIDTS` is held.
+     *
+     * @param sleep seam for tests only — production passes [Thread.sleep].
+     * @param onRetryWait invoked with [LINK_RETRY_DELAY_MS] immediately before the
+     *   wait begins, and ONLY when a wait is actually going to happen. The pairing UI
+     *   subscribes to this: without it the screen has no way to distinguish "still
+     *   talking to Google" from "hung", so it kept telling the user it was waiting on
+     *   their phone while the phone had already confirmed. Never called on the happy
+     *   path, so the screen does not flash a message it has to immediately retract.
+     * @return true if a cookie value changed and the caller should persist. DO NOT
+     *   read this as "we are protected": a harvest that already carried the pair
+     *   changes nothing and is healthy, while a failed mint also changes nothing and
+     *   is fatal. Ask [cookies] for `__Secure-1PSIDTS` instead. Conflating the two is
+     *   exactly what shipped `GAIA PAIRING COMPLETE` on an unprotected session.
+     */
+    fun bootstrapForLink(
+        http: OkHttpClient,
+        cookies: MutableMap<String, String>,
+        sleep: (Long) -> Unit = { Thread.sleep(it) },
+        onRetryWait: (Long) -> Unit = {},
+    ): Boolean {
+        if (!GoogleMessagesConfig.cookieBootstrapOnRecovery) {
+            Log.w(TAG, "bootstrapForLink: disabled by config — link will hold no freshness cookie")
+            return false
+        }
+        if (cookies["__Secure-1PSID"].isNullOrBlank()) {
+            Log.w(TAG, "bootstrapForLink: no __Secure-1PSID to rotate against")
+            return false
+        }
+
+        val changed = bootstrapNow(http, cookies, linkTime = true)
+        if (!cookies["__Secure-1PSIDTS"].isNullOrBlank()) return changed
+
+        // A REJECTION is not a rate limit, and treating them alike costs the user 70
+        // seconds to arrive at an answer we already have. Measured 19 Aug 2026 15:39:
+        // a companion re-sent a 51-minute-old harvest (fp=a8fe5420, the same blob that
+        // minted fine at 14:48), Google answered 401, we waited 70s behind a screen
+        // promising "this can take a minute or two", got 401 again, and only then told
+        // the user to sign in. Waiting cannot make a dead login valid.
+        if (lastHttpCode == 401 || lastHttpCode == 403) {
+            Log.w(
+                TAG,
+                "bootstrapForLink: Google REJECTED these credentials (HTTP $lastHttpCode) — " +
+                    "NOT retrying. A rejection does not expire; the harvest is stale or the " +
+                    "Google session is gone, and only a fresh sign-in fixes either.",
+            )
+            return changed
+        }
+        Log.w(
+            TAG,
+            "bootstrapForLink: nothing minted (result=$lastResult) — waiting " +
+                "${LINK_RETRY_DELAY_MS / 1000}s for Google's floor to clear, then retrying once",
+        )
+        runCatching { onRetryWait(LINK_RETRY_DELAY_MS) }
+            .onFailure { Log.w(TAG, "onRetryWait callback threw (continuing)", it) }
+        if (runCatching { sleep(LINK_RETRY_DELAY_MS) }.isFailure) {
+            Log.w(TAG, "bootstrapForLink: retry wait interrupted — not retrying")
+            return changed
+        }
+        val bootstrap = cookies["__Secure-1PSIDTS"].isNullOrBlank()
+        Log.i(TAG, "bootstrapForLink: retry (mint=$bootstrap cookies=${cookies.size})")
+        val retried = attempt(
+            http, cookies,
+            bootstrap = bootstrap,
+            now = System.currentTimeMillis(),
+            linkTime = true,
+        )
+        return retried || changed
     }
 
     /** Single-flight + non-destructive error handling, shared by both entry points. */
@@ -298,13 +445,14 @@ object GMCookieRotation {
         cookies: MutableMap<String, String>,
         bootstrap: Boolean,
         now: Long,
+        linkTime: Boolean = false,
     ): Boolean {
         // A racing caller skips rather than queues: rotation INVALIDATES the previous
         // 1PSIDTS, so two racers would leave both holding a stale value.
         if (!inFlight.compareAndSet(false, true)) return false
         return try {
             lastAttemptMs = now
-            rotate(http, cookies, bootstrap)
+            rotate(http, cookies, bootstrap, linkTime)
         } catch (t: Throwable) {
             // Transport failure says nothing about the credentials. Keep what we
             // have and try again later — never clear a cookie on a network error.
@@ -324,6 +472,7 @@ object GMCookieRotation {
         http: OkHttpClient,
         cookies: MutableMap<String, String>,
         bootstrap: Boolean,
+        linkTime: Boolean = false,
     ): Boolean {
         val req = Request.Builder()
             .url(ROTATE_URL)
@@ -338,9 +487,18 @@ object GMCookieRotation {
             val body = resp.body?.string().orEmpty()
 
             if (resp.code == 429) {
-                Log.w(TAG, "rotate rate-limited (429) — backing off ${RATE_LIMIT_BACKOFF_MS / 60_000}min")
+                // Link time and steady state mean different things by a 429 — see
+                // [LINK_RATE_LIMIT_BACKOFF_MS]. Parking a fresh, unprotected link for
+                // half an hour is strictly worse than asking again in seventy seconds.
+                val backoff = if (linkTime) LINK_RATE_LIMIT_BACKOFF_MS else RATE_LIMIT_BACKOFF_MS
+                Log.w(
+                    TAG,
+                    "rotate rate-limited (429) — ${if (linkTime) "link-time, " else ""}backing off " +
+                        "${backoff / 1000}s ${diagHeaders(resp)}",
+                )
                 lastResult = "429"
-                nextDueMs = System.currentTimeMillis() + RATE_LIMIT_BACKOFF_MS
+                lastHttpCode = 429
+                nextDueMs = System.currentTimeMillis() + backoff
                 return false
             }
             if (!resp.isSuccessful) {
@@ -370,6 +528,7 @@ object GMCookieRotation {
                     )
                 }
                 lastResult = "${if (bootstrap) "bootstrap-" else ""}http${resp.code}"
+                lastHttpCode = resp.code
                 nextDueMs = System.currentTimeMillis() + FAILURE_BACKOFF_MS
                 return false
             }
@@ -384,6 +543,7 @@ object GMCookieRotation {
             }
 
             val nextMs = nextIntervalMsFrom(body)
+            lastHttpCode = 0
             nextDueMs = System.currentTimeMillis() + nextMs
 
             lastResult = when {
@@ -400,9 +560,36 @@ object GMCookieRotation {
                 "rotate${if (bootstrap) " BOOTSTRAP" else ""} OK: accepted=${rotated.keys} " +
                     "changed=$changed nextIn=${nextMs / 1000}s result=$lastResult",
             )
+            if (bootstrap && !changed) {
+                // The one line that can still answer the open question. Alex Browning's
+                // 19 Aug 2026 failure was HTTP 200 with an EMPTY Set-Cookie — not a 429
+                // — and nothing here explains why. The response is in hand at this point
+                // and the old code discarded it, then printed "harvest may already carry
+                // the pair", which was false: the same capture read has1PSIDTS=false
+                // three lines above. Whatever the cause turns out to be, this names it on
+                // the next occurrence. Never log Set-Cookie VALUES — those are the
+                // credential; names only.
+                Log.w(
+                    TAG,
+                    "rotate BOOTSTRAP empty — HTTP ${resp.code} bodyLen=${body.length} " +
+                        "setCookie=${resp.headers("Set-Cookie").map { it.substringBefore('=') }} " +
+                        "body=${body.take(200)} ${diagHeaders(resp)}",
+                )
+            }
             changed
         }
     }
+
+    /** Non-secret response headers that separate "credentials refused" from "you are
+     *  being throttled" — the ambiguity that made the empty-mint path unreadable.
+     *  Set-Cookie is reported by NAME only, never value: the value IS the credential. */
+    private fun diagHeaders(resp: okhttp3.Response): String =
+        listOf(
+            "retry-after", "www-authenticate", "content-type",
+            "x-goog-quota-exceeded", "x-ratelimit-remaining",
+        ).mapNotNull { n -> resp.header(n)?.let { "$n=$it" } }
+            .joinToString(" ")
+            .ifEmpty { "(no diag headers)" }
 
     // ---- Pure helpers -------------------------------------------------------
     // No Android, no network: this module's unit tests run on plain JVM (see

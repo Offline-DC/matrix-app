@@ -127,4 +127,34 @@ object GoogleMessagesConfig {
      */
     @Volatile
     var tokenRefreshLeadOverrideMs: Long = 0L
+
+    /**
+     * DEBUG: shorten the receive stream's per-read deadline
+     * ([GoogleMessagesSessionClient.STREAM_READ_DEADLINE_MS]), in ms. `0` = off, use
+     * the shipping value.
+     *
+     * Why this exists. The shipping deadline is 25 minutes, chosen to sit above the
+     * longest healthy stream lifetime ever observed (~19 min, 19 Aug 2026). That makes
+     * the recovery path almost impossible to exercise deliberately: you would need to
+     * blackhole the phone's packets for half an hour while Android still believes it is
+     * connected, and Android's own connectivity probe tends to notice and mask it. So
+     * the wedge is hard to stage — but the RECOVERY is easy to verify if you simply
+     * make the deadline short. Set this to 60_000 and a perfectly healthy quiet stream
+     * will trip the deadline, throw, and reopen, proving the whole path end to end in a
+     * couple of minutes.
+     *
+     * NOT one-shot, unlike [tokenRefreshLeadOverrideMs] — you want it to hold across
+     * several consecutive streams to watch reopen → reopen → reopen. That makes it
+     * sticky, and a sticky 60s deadline means ~1400 reconnects a day, each replaying a
+     * backlog. Two guards, both deliberate: it defaults to 0, and
+     * GMSessionStreamTest asserts that default so it cannot ship enabled; and every
+     * stream open logs loudly while it is active, so no capture taken during a test can
+     * ever be mistaken for shipping behaviour.
+     *
+     * ```
+     * GoogleMessagesConfig.streamReadDeadlineOverrideMs = 60_000L  // debug builds only
+     * ```
+     */
+    @Volatile
+    var streamReadDeadlineOverrideMs: Long = 0L
 }
