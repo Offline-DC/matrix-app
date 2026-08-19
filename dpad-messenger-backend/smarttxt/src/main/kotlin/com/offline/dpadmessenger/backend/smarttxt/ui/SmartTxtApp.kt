@@ -11,9 +11,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import android.widget.Toast
 import androidx.compose.ui.platform.LocalContext
+import com.offline.dpadmessenger.backend.smarttxt.DefaultCalling
 import com.offline.dpadmessenger.backend.smarttxt.OpenBubblesMigrator
 import com.offline.dpadmessenger.backend.smarttxt.RustPushNative
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtAccountStore
+import com.offline.dpadmessenger.backend.smarttxt.SmartTxtCallPreference
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtLogExporter
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtLogRing
 import com.offline.dpadmessenger.backend.core.store.MigrationStatus
@@ -218,6 +220,11 @@ private fun SmartTxtChat(
     // which contacts Apple and mints a real re-registration, the one thing this whole
     // area exists to avoid doing casually. The count is EVEN, so the preference lands
     // back exactly where the user found it and the gesture leaves no trace.
+    // Which network outgoing calls use, when the peer can be reached both ways.
+    // The launcher's dialer reads the same store — see SmartTxtCallPreference —
+    // so this row is what stops it asking on every call.
+    var defaultCalling by remember { mutableStateOf(SmartTxtCallPreference.defaultCalling(context)) }
+
     var debugToggleCount by remember { mutableStateOf(0) }
     var debugLastToggleMs by remember { mutableStateOf(0L) }
     var showDebug by remember { mutableStateOf(false) }
@@ -253,6 +260,13 @@ private fun SmartTxtChat(
                     "DEBUG_MENU unlocked (24-hour toggle x" + DEBUG_TOGGLE_COUNT + ")",
                 )
             }
+        },
+        defaultCallingOptions = DefaultCalling.entries.map { it.storedValue to it.label },
+        defaultCalling = defaultCalling.storedValue,
+        onDefaultCallingChange = { stored ->
+            val next = DefaultCalling.fromStored(stored)
+            defaultCalling = next
+            SmartTxtCallPreference.setDefaultCalling(context, next)
         },
         sendHandles = sendHandles,
         defaultSendHandle = defaultHandle,
