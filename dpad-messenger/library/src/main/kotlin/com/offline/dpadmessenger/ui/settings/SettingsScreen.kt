@@ -94,6 +94,18 @@ fun SettingsScreen(
     sendHandles: List<String> = emptyList(),
     defaultSendHandle: String = "",
     onDefaultSendHandleChange: ((String) -> Unit)? = null,
+    /** "Calling" picker — which network an outgoing call goes out on when the
+     *  person can be reached both ways. Hidden when [onDefaultCallingChange] is
+     *  null, which is every host that has no dialer (the demo harness, and any
+     *  backend that isn't Smart Txt).
+     *
+     *  [defaultCallingOptions] is a list of (stored value, label) pairs supplied
+     *  by the host rather than an enum owned here: this module is the shared
+     *  messenger UI and has no business knowing what FaceTime is. It renders a
+     *  labelled choice; the host decides what the choices mean. */
+    defaultCallingOptions: List<Pair<String, String>> = emptyList(),
+    defaultCalling: String = "",
+    onDefaultCallingChange: ((String) -> Unit)? = null,
     /** Force an IDS re-registration now. Shows a "Re-register now" row when set;
      *  null hides it. Host handles the result feedback.
      *
@@ -197,6 +209,21 @@ fun SettingsScreen(
                         handles = sendHandles,
                         selected = defaultSendHandle.ifBlank { sendHandles.first() },
                         onSelect = onDefaultSendHandleChange!!,
+                    )
+                }
+                if (onDefaultCallingChange != null && defaultCallingOptions.isNotEmpty()) {
+                    ChoicePickerRow(
+                        title = "Smart calling options",
+                        description = "When dialing numbers with an Apple account, " +
+                            "decide which number to call from: smart, dumb, or you choose.",
+                        subtitleFor = { value ->
+                            defaultCallingOptions.firstOrNull { it.first == value }?.second
+                                ?: defaultCallingOptions.first().second
+                        },
+                        options = defaultCallingOptions,
+                        selected = defaultCalling.ifBlank { defaultCallingOptions.first().first },
+                        onSelect = onDefaultCallingChange,
+                        contentDescription = "Change which network outgoing calls use",
                     )
                 }
                 if (onSendReadReceiptsChange != null) {
@@ -376,6 +403,68 @@ private fun ActionRow(
                 style = MaterialTheme.typography.bodySmall,
                 color = LocalDpadMessengerColors.current.mutedText,
             )
+        }
+    }
+}
+
+/**
+ * A settings row that opens a menu of labelled choices — [HandlePickerRow]'s
+ * general-purpose sibling.
+ *
+ * That one is welded to handles: it formats its options with `prettyHandle` and
+ * hardcodes its own title. This takes its options and its title from the caller,
+ * so a host can add a choice this module doesn't need to understand.
+ */
+@Composable
+private fun ChoicePickerRow(
+    title: String,
+    options: List<Pair<String, String>>,
+    selected: String,
+    subtitleFor: (String) -> String,
+    onSelect: (String) -> Unit,
+    contentDescription: String,
+    /** What the setting is for. Rendered above the current value; omitted when
+     *  the title already says everything, as it does for the handle picker. */
+    description: String? = null,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .dpadRow(onClick = { expanded = true }, shape = RoundedCornerShape(10.dp))
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.bodyLarge)
+                if (description != null) {
+                    Text(
+                        description,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LocalDpadMessengerColors.current.mutedText,
+                    )
+                }
+                // The current answer goes last and unmuted, so the row still
+                // reads at a glance as "this is what it is set to" once the
+                // explanation above it has been read once and skipped after.
+                Text(
+                    subtitleFor(selected),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Icon(Icons.Filled.ArrowDropDown, contentDescription = contentDescription)
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            options.forEach { (value, label) ->
+                DropdownMenuItem(
+                    text = { Text(label) },
+                    onClick = {
+                        onSelect(value)
+                        expanded = false
+                    },
+                )
+            }
         }
     }
 }

@@ -91,6 +91,12 @@ fun DpadMessengerApp(
     sendHandles: List<String> = emptyList(),
     defaultSendHandle: String = "",
     onDefaultSendHandleChange: ((String) -> Unit)? = null,
+    /** "Calling" picker — see the same-named params on [SettingsScreen]. Passed
+     *  straight through; this module renders labelled choices without knowing
+     *  what they mean. */
+    defaultCallingOptions: List<Pair<String, String>> = emptyList(),
+    defaultCalling: String = "",
+    onDefaultCallingChange: ((String) -> Unit)? = null,
     /** Force an IDS re-registration now (periodic renewal, on demand). Adds a
      *  "Re-register now" row to Settings when set; null hides it. */
     onReregister: (() -> Unit)? = null,
@@ -277,6 +283,9 @@ fun DpadMessengerApp(
                     sendHandles = sendHandles,
                     defaultSendHandle = defaultSendHandle,
                     onDefaultSendHandleChange = onDefaultSendHandleChange,
+                    defaultCallingOptions = defaultCallingOptions,
+                    defaultCalling = defaultCalling,
+                    onDefaultCallingChange = onDefaultCallingChange,
                     onReregister = onReregister,
                     onForceTokenRefresh = onForceTokenRefresh,
                     onExportLogs = onExportLogs,
