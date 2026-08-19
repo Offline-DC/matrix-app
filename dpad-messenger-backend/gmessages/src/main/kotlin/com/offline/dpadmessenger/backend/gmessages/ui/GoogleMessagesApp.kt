@@ -320,13 +320,21 @@ fun GoogleMessagesApp(
         // wiping auth flips us to the companion sign-in screen.
         val freshRelink: () -> Unit = {
             relinkScope.launch {
-                // This is the path that accumulates junk. Every re-link mints a
-                // new pairing, and until now the old one was simply abandoned:
+                // This is the path that accumulates entries. Every re-link mints a
+                // new pairing, and until now the old one was simply abandoned, so
                 // the phone's Google Messages device list fills up with
-                // identically-named entries, and those entries still compete for
-                // the receive slot. A user who has re-linked six times has five
-                // ghosts, any of which can silently take over receiving and
-                // leave the real phone long-polling into nothing.
+                // identically-named entries. That much is observed directly: one
+                // test account reached 30+ entries, a customer's reached 11.
+                //
+                // What is NOT observed is any of those stale entries interfering
+                // with receiving. Both of those captures were searched for
+                // BROWSER_INACTIVE and for displacement of the active receive
+                // registration and neither contained a single real occurrence,
+                // despite the entry counts above. So the cleanup below is
+                // housekeeping — it keeps the user's device list honest and keeps
+                // revoke reachable while the credentials are still good — not a
+                // fix for a known receive bug. If a stale-entry takeover is ever
+                // seen in a log, say so here with the evidence.
                 GoogleMessagesRepository.unpairAndTearDown(store, clearMessages = false)
                 paired = false
             }

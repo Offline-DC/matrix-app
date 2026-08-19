@@ -217,33 +217,31 @@ class GMGaiaPairing(
             Log.i(TAG, "pairing CONFIRMED by phone; deriving session keys (keyDerivVer=${sresp.confirmedKeyDerivVer})")
 
             val (aesKey, hmacKey) = session.deriveSessionKeys(sresp.confirmedKeyDerivVer)
+
+            // INVARIANT, belt and braces. [GMGaiaClient.ensureFreshnessCookie] has
+            // already minted __Secure-1PSIDTS and aborted the entire run if it could
+            // not, BEFORE SignInGaia — which is why the mint no longer lives here.
+            // (It did, briefly, right above this line; moving it earlier is what stops
+            // a failed mint from stranding an un-revokable device entry in the user's
+            // Google account.) The check stays for two reasons: `cookies` is a
+            // constructor argument, so a future caller can hand this class anything;
+            // and the cost of being wrong is the exact bug we are closing — a link the
+            // user is told is healthy that dies within the hour. If this ever fires,
+            // the defect is upstream of here.
+            if (cookies["__Secure-1PSIDTS"].isNullOrBlank()) {
+                Log.e(
+                    TAG,
+                    "REFUSING to complete pairing: no __Secure-1PSIDTS among the " +
+                        "${cookies.size} cookies handed to the handshake. GMGaiaClient " +
+                        "should have minted it before SignInGaia and aborted if it could " +
+                        "not, so this path should be unreachable — fix the caller.",
+                )
+                lastError = "Couldn't finish securing the connection to Google. Wait a " +
+                    "minute, then sign in again on the computer and rescan the code."
+                return false
+            }
+
             persist(aesKey, hmacKey)
-            // A fresh pairing must not inherit the previous session's rotation backoff.
-            // GMCookieRotation is an `object`, so nextDueMs outlives a re-link within one
-            // process: without this, one failed rotation parks it for 15 minutes and the
-            // NEXT re-link silently does nothing, which looks identical to "rotation is
-            // broken". Nothing called this before.
-            GMCookieRotation.reset()
-            // RUNG 0 — one auth state for the whole fleet. A harvest often arrives
-            // with no __Secure-1PSIDTS (the browser only mints one on its own
-            // periodic rotation, which may not have run before the QR was scanned).
-            // Google accepts a set WITHOUT one only capriciously — 401/401/200/401 on
-            // byte-identical input, 14 Aug 2026 — and reliably WITH one. So mint here,
-            // at the one moment we know the cookies are fresh, rather than leaving
-            // half the fleet in the unreliable state until something breaks.
-            //
-            // Runs before the session is constructed, so the session comes up already
-            // holding the pair and rotation takes over from there. Non-fatal: pairing
-            // has already succeeded and a failure here just leaves the old behaviour.
-            runCatching {
-                val withFreshness = HashMap(cookies)
-                if (GMCookieRotation.bootstrapNow(httpSend, withFreshness)) {
-                    store.saveCookies(withFreshness)
-                    Log.i(TAG, "link-time bootstrap OK — persisted ${withFreshness.size} cookies")
-                } else {
-                    Log.i(TAG, "link-time bootstrap: nothing minted (harvest may already carry the pair)")
-                }
-            }.onFailure { Log.w(TAG, "link-time bootstrap failed (continuing)", it) }
             Log.i(TAG, "================ GAIA PAIRING COMPLETE — account saved ================")
             return true
         } catch (t: Throwable) {

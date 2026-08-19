@@ -198,6 +198,31 @@ internal class GoogleMessagesSessionClient(
      *  does not tell us. */
     @Volatile private var lastInboundMs = 0L
 
+    /**
+     * Wall-clock ms of the last BYTE read off the receive stream — heartbeats,
+     * replayed backlog and live traffic alike.
+     *
+     * Deliberately NOT [lastInboundMs]. That one excludes heartbeats on purpose, so
+     * it answers "are messages reaching this device", and it cannot tell a phone
+     * nobody has texted from a phone whose socket is dead. This one answers "is the
+     * socket alive at all", which is the question the 19 Aug 2026 outage needed and
+     * nothing here could answer: long-poll #14 opened at 11:24:27 and the stream was
+     * still nominally open, with rotation on cadence and sends returning 200, when the
+     * capture ended 1h55m later. `last inbound 99m ago` was logged three times and
+     * treated as "quiet", because from [lastInboundMs] alone that is indistinguishable.
+     */
+    @Volatile private var lastStreamActivityMs = 0L
+
+    /** Previous stream heartbeat, purely so the heartbeat log can print the GAP.
+     *  Google's interval on this stream is not documented anywhere we can find and
+     *  was never logged, which is why [STREAM_READ_DEADLINE_MS] had to be derived
+     *  from observed stream lifetimes instead of from the keepalive it is guarding. */
+    @Volatile private var lastStreamHeartbeatMs = 0L
+
+    /** Throttle state for the `alive:` line. A FIELD, not a local in [longPollLoop],
+     *  because the line is now emitted from [ackLoop]'s timer — see [maybeHeartbeat]. */
+    @Volatile private var aliveLogLastMs = 0L
+
     /** DataEvents still to come on THIS stream that are replayed backlog rather
      *  than live traffic. Set from the stream's opening ack count. */
     @Volatile private var staleReplayRemaining = 0
@@ -218,6 +243,9 @@ internal class GoogleMessagesSessionClient(
         activeSessionEstablished = false
         lastActiveSessionAssertMs = 0L
         lastInboundMs = 0L
+        lastStreamActivityMs = 0L
+        lastStreamHeartbeatMs = 0L
+        aliveLogLastMs = 0L
         displacements.set(0)
         activeSessionFailures.set(0)
         activeSessionGaveUp = false
@@ -345,6 +373,16 @@ internal class GoogleMessagesSessionClient(
      *  [HEARTBEAT_INTERVAL_MS]. Without it a healthy session is invisible in a
      *  capture and we can't tell how long a link survived before it broke.
      *  @return the new "last heartbeat" timestamp. */
+    /**
+     * Emit the periodic `alive:` line, at most once per [HEARTBEAT_INTERVAL_MS].
+     *
+     * Called from [ackLoop]'s timer, NOT from the long-poll. Driving it off stream
+     * closes — which is what it did originally — meant the one state it exists to make
+     * visible, a stream that stays open and delivers nothing, produced no line at all.
+     * Gated on `longPollJob?.isActive` at the call site so it keeps reporting through a
+     * wedge (the job is alive, blocked in a read) but goes quiet once the loop has
+     * returned fatally and the user has already been shown a reconnect screen.
+     */
     private fun maybeHeartbeat(lastMs: Long): Long {
         val now = System.currentTimeMillis()
         if (lastMs != 0L && now - lastMs < HEARTBEAT_INTERVAL_MS) return lastMs
@@ -362,6 +400,11 @@ internal class GoogleMessagesSessionClient(
                 // apparently perfect heartbeats with no hint that nothing had arrived
                 // since the first one.
                 "inbound[${inboundGap(now)}] " +
+                // inbound[] alone cannot distinguish "nobody has texted me" from "my
+                // receive socket is dead" — 19 Aug 2026 logged `last inbound 99m ago`
+                // on a wedged stream and it read as a quiet afternoon. stream[] is the
+                // field that separates them.
+                "stream[${streamGap(now)}] " +
                 "rot[${GMCookieRotation.status()}]",
         )
         return now
@@ -378,9 +421,14 @@ internal class GoogleMessagesSessionClient(
      * the new set on its next `Set-Cookie` save.
      *
      * Adopting them here preserves the UKey2 keys, the ECDSA refresh key, `destReg`
-     * and the pairing id — so no new registration is minted and no ghost device is
-     * left behind. That matters: every full re-pair leaves a registration that can
-     * silently take over receiving, which is the leading hypothesis for Bug A.
+     * and the pairing id — so no new registration is minted and no stale entry is
+     * left behind in the phone's device list. The reason that matters is the USER's
+     * time, not a receive bug: a full re-pair costs a QR scan and a second emoji
+     * handshake on the smart phone, and adds one more identically-named entry for
+     * them to clean up. (It is sometimes claimed that a stale entry can take over
+     * receiving. That is unverified — see saveGaiaSession — and it is NOT what
+     * caused the two link failures we diagnosed: those were a missing
+     * __Secure-1PSIDTS and an unbounded stream read.)
      *
      * @return true if the link is live again.
      */
@@ -857,7 +905,6 @@ internal class GoogleMessagesSessionClient(
         // permanent "re-link your phone".
         var serverFailures = 0
         var transportFailures = 0
-        var lastHeartbeatMs = 0L
         maintenanceTick = 0
         while (coroutineContext.isActive) {
             attempt++
@@ -880,7 +927,6 @@ internal class GoogleMessagesSessionClient(
                     reauthTried = false
                     serverFailures = 0
                     transportFailures = 0
-                    lastHeartbeatMs = maybeHeartbeat(lastHeartbeatMs)
                     delay(2000)
                 }
                 // We never reached Google at all (DNS, no route, TLS, airplane
@@ -1006,6 +1052,49 @@ internal class GoogleMessagesSessionClient(
                 return resp.code
             }
             val source = resp.body?.source() ?: return 0
+            // FIX 1 — BOUND THE READ.
+            //
+            // [http] is built readTimeout(0) because a long-poll is supposed to stay
+            // open, and the consequence is that `source.read` below has no deadline. A
+            // socket killed WITHOUT a FIN — carrier NAT idle-kill is the usual cause,
+            // and the 19 Aug 2026 capture was net=cell — leaves that read blocked
+            // forever: no bytes, no EOF, no exception. The coroutine stays isActive, so
+            // ackLoop's `longPollJob?.isActive` gate stays true and every other
+            // subsystem keeps running perfectly against a stream that will never
+            // deliver again. Sends still work (separate client, fresh connection), which
+            // is exactly what the user reports: "still synced, can send, no incoming".
+            //
+            // The error-body path twenty lines up already bounds its read for the same
+            // reason. This is that guard applied to the path that actually matters.
+            //
+            // On expiry okio throws, `openLongPollOnce` unwinds, and [longPollLoop]
+            // logs "long-poll #N threw" and reopens — the existing recovery path, now
+            // reachable. See [STREAM_READ_DEADLINE_MS] for why the value is what it is.
+            // The override is debug-only and logs on EVERY stream open while it is set,
+            // at W. A short deadline is the only practical way to exercise this recovery
+            // path (see [GoogleMessagesConfig.streamReadDeadlineOverrideMs]), and a
+            // capture taken with it active must never be readable as shipping behaviour.
+            val readDeadlineMs = GoogleMessagesConfig.streamReadDeadlineOverrideMs
+                .takeIf { it > 0L }
+                ?.also {
+                    Log.w(
+                        TAG,
+                        "STREAM DEADLINE OVERRIDE ACTIVE — ${it}ms instead of " +
+                            "${STREAM_READ_DEADLINE_MS}ms. DEBUG ONLY; reopens will look " +
+                            "far more frequent than shipping behaviour.",
+                    )
+                }
+                ?: STREAM_READ_DEADLINE_MS
+            source.timeout().timeout(readDeadlineMs, TimeUnit.MILLISECONDS)
+            lastStreamActivityMs = System.currentTimeMillis()
+            // Per-STREAM, so the first heartbeat on a new stream reports "first on this
+            // stream" rather than a gap that silently spans the reconnect. Without this
+            // every reopen injects a fake outlier into the one distribution the log
+            // exists to measure — observed 19 Aug 2026 under the 5s test override, where
+            // cross-stream "gaps" of 14s, 23s, 37s and 65s were really the retry backoff
+            // being counted as keepalive latency. Exactly the wrong number to leave in a
+            // capture that is going to be used to pick a timeout.
+            lastStreamHeartbeatMs = 0L
             val splitter = PbLite.StreamSplitter()
             val buf = okio.Buffer()
             // Each stream announces its own replay backlog. Reset before the
@@ -1021,6 +1110,11 @@ internal class GoogleMessagesSessionClient(
                 val read = source.read(buf, 8192L)
                 if (read == -1L) break
                 if (read == 0L) continue
+                // Any byte is proof the socket is alive, which is the whole point of
+                // tracking this separately from lastInboundMs. Stamped BEFORE the
+                // elements are handled so a parse failure can't make a live stream look
+                // dead to the watchdog.
+                lastStreamActivityMs = System.currentTimeMillis()
                 for (element in splitter.feed(buf.readUtf8())) {
                     runCatching { handleElement(element) }
                         .onFailure { Log.w(TAG, "element handling failed", it) }
@@ -1047,7 +1141,26 @@ internal class GoogleMessagesSessionClient(
                 staleReplayRemaining = evt.count
                 Log.d(TAG, "startup ack count=${evt.count}")
             }
-            GMSessionProto.LongPollEvent.Heartbeat -> {}
+            // FIX 3 — SAY that the stream is alive.
+            //
+            // This was `-> {}`. Silently discarding the one signal that distinguishes a
+            // healthy quiet stream from a dead one is why the 19 Aug 2026 outage took a
+            // code read to diagnose rather than a grep: the capture showed hours of
+            // apparently perfect state with no way to see that nothing was arriving.
+            // The gap is printed, not just the event, so the next capture MEASURES
+            // Google's keepalive interval and [STREAM_READ_DEADLINE_MS] can stop being
+            // an estimate.
+            GMSessionProto.LongPollEvent.Heartbeat -> {
+                val nowMs = System.currentTimeMillis()
+                val gap = if (lastStreamHeartbeatMs == 0L) -1L
+                    else (nowMs - lastStreamHeartbeatMs) / 1000
+                lastStreamHeartbeatMs = nowMs
+                Log.d(
+                    TAG,
+                    "stream heartbeat — " +
+                        if (gap < 0) "first on this stream" else "${gap}s since previous",
+                )
+            }
             null -> Log.v(TAG, "unparsed element: ${element.take(120)}")
         }
     }
@@ -1493,6 +1606,14 @@ internal class GoogleMessagesSessionClient(
         if (lastInboundMs == 0L) "nothing pushed since this session started"
         else "last inbound ${(now - lastInboundMs) / 60_000}m ago"
 
+    /** How long since ANY byte arrived on the receive stream, heartbeats included.
+     *  A healthy stream never went quiet for more than ~19 minutes across three hours
+     *  of 19 Aug 2026 field data, so a number materially above that in a capture means
+     *  the socket is gone, whatever the rest of the line says. */
+    private fun streamGap(now: Long): String =
+        if (lastStreamActivityMs == 0L) "no bytes yet on this stream"
+        else "quiet ${(now - lastStreamActivityMs) / 1000}s"
+
     /**
      * Ask Google to revoke THIS pairing, so it stops appearing in the phone's
      * Google Messages device list. Called on logout and on a deliberate
@@ -1629,6 +1750,35 @@ internal class GoogleMessagesSessionClient(
             // permanently dead session would POST SetActiveSession with
             // known-dead credentials every five minutes, forever, on a phone
             // whose owner has already been shown the reconnect screen.
+            // FIX 2 — WATCHDOG, backstop to the read deadline.
+            //
+            // [STREAM_READ_DEADLINE_MS] should catch a wedged stream first and recover
+            // through longPollLoop's normal reopen; this fires only if it did not —
+            // a read that never even reaches the socket, a starved dispatcher, a
+            // timeout the transport swallowed. Hence STREAM_STALE_MS > the deadline: if
+            // this ever logs, the cheaper mechanism failed and that is worth knowing.
+            //
+            // Cancelling a coroutine blocked in a socket read does not unblock it
+            // immediately — the old call unwinds when its deadline expires. That is
+            // tolerated: the replacement stream opens now, and the deadline bounds how
+            // long the zombie can linger. Same cancel-and-relaunch shape reauth uses.
+            val streamQuietFor = lastStreamActivityMs.let {
+                if (it == 0L) 0L else System.currentTimeMillis() - it
+            }
+            if (longPollJob?.isActive == true && streamQuietFor >= STREAM_STALE_MS) {
+                Log.e(
+                    TAG,
+                    "receive stream silent for ${streamQuietFor / 60_000}m with the poll " +
+                        "still nominally open — the read deadline did not fire; forcing a " +
+                        "reopen [up ${uptime()}, ${inboundGap(System.currentTimeMillis())}]",
+                )
+                lastStreamActivityMs = 0L
+                lastStreamHeartbeatMs = 0L
+                activeSessionEstablished = false
+                longPollJob?.cancel()
+                longPollJob = scope.launch { longPollLoop() }
+                continue
+            }
             if (longPollJob?.isActive == true &&
                 (!activeSessionEstablished || reassertDue())
             ) {
@@ -1646,6 +1796,18 @@ internal class GoogleMessagesSessionClient(
                     .onFailure { Log.w(TAG, "timer rotation failed (continuing)", it) }
                 runCatching { refreshTokenIfNeeded() }
                     .onFailure { Log.w(TAG, "timer token refresh failed (continuing)", it) }
+                // The `alive:` line belongs on this timer for the SAME reason rotation
+                // and token refresh were moved here, and it was left behind. It used to
+                // be emitted once per clean stream close, so on a stream that stays open
+                // it never printed at all — and "stays open forever" is precisely the
+                // failure it is supposed to expose. 19 Aug 2026: Alex's alive lines stop
+                // at 11:24:22, the exact second long-poll #14 opened and never closed. It
+                // read like the maintenance loop had died; nothing had died, the line was
+                // simply keyed on an event that stopped happening. Self-throttled to
+                // HEARTBEAT_INTERVAL_MS internally, so a 60s tick still yields one line
+                // every five minutes.
+                runCatching { aliveLogLastMs = maybeHeartbeat(aliveLogLastMs) }
+                    .onFailure { Log.w(TAG, "alive heartbeat log failed (continuing)", it) }
             }
             val ids = ackLock.withLock {
                 if (pendingAcks.isEmpty()) emptyList()
@@ -2058,6 +2220,63 @@ internal class GoogleMessagesSessionClient(
          * interval.
          */
         private const val ACTIVE_SESSION_REASSERT_MS = 30 * 60_000L
+
+        /**
+         * Google's observed keepalive interval on the receive stream.
+         *
+         * MEASURED 19 Aug 2026, screen ON, across ~105 consecutive intervals over 18
+         * minutes and one natural stream rotation: every single gap was 9s or 10s. The
+         * only outlier in the whole set is a 3s gap immediately after `session long-poll
+         * #2 open`, which is the new stream's timer landing out of phase, not a stall.
+         *
+         * Remarkably tight, and the shape matters: this is a SERVER-SIDE timer, not
+         * traffic-dependent, so an idle healthy stream is never byte-silent. That single
+         * fact is what makes [STREAM_READ_DEADLINE_MS] tunable at all — and it is also
+         * why a deadline can never fire spuriously on a live socket, at any value above
+         * a few heartbeats.
+         *
+         * CAVEAT, and the reason [STREAM_READ_DEADLINE_MS] is still five minutes rather
+         * than sixty seconds: every one of these samples was taken with the screen on.
+         * Doze is the unmeasured variable, and sizing a timeout off the wrong signal is
+         * the exact mistake that put 25 minutes here in the first place.
+         *
+         * Documented rather than used directly: the deadline is a MULTIPLE of this, and
+         * the multiple is the thing worth arguing about.
+         */
+        internal const val STREAM_HEARTBEAT_OBSERVED_MS = 10_000L
+
+        /**
+         * Per-read deadline on the receive stream (FIX 1). 30× the measured keepalive.
+         *
+         * HISTORY, because the first number here was wrong in an instructive way. It
+         * shipped at 25 minutes, sized off stream LIFETIMES (~19 min max across three
+         * healthy hours) because the keepalive had never been logged and lifetime was
+         * the only signal available. The very first capture with heartbeat logging
+         * showed a byte every ~10s, making 25 minutes roughly 150× longer than needed —
+         * so recovery would have taken 25 minutes when 30 seconds of evidence was
+         * already conclusive. Sizing a timeout off the wrong signal is easy to do and
+         * hard to notice; measuring first is why this is now five minutes.
+         *
+         * Why 5 min and not 60s, which 10s heartbeats would justify on their own: the
+         * screen-off overnight case is the one that matters (that is when the customer
+         * notices in the morning) and it is the one where Doze can legitimately stall a
+         * read for minutes on a healthy socket. A spurious reopen is cheap — one request
+         * plus a replayed backlog, and the field already does 13 an afternoon — but a
+         * deadline that fires every couple of minutes all night is log noise that would
+         * bury the signal we are trying to read. Five minutes clears any plausible
+         * heartbeat hiccup by 30×, clears short Doze windows, and still cuts worst-case
+         * silent receive loss from 25 minutes to 5.
+         *
+         * TIGHTEN FURTHER once an overnight capture shows the gap distribution with the
+         * screen off. If heartbeats hold near 10s through the night, 60–90s is correct
+         * and this becomes ~1 minute of exposure.
+         */
+        internal const val STREAM_READ_DEADLINE_MS = 5 * 60_000L
+
+        /** Watchdog threshold (FIX 2). MUST stay above [STREAM_READ_DEADLINE_MS] so the
+         *  cheap in-loop deadline is what normally recovers and this stays a backstop
+         *  whose firing is itself a bug report. Asserted in GMSessionStreamTest. */
+        internal const val STREAM_STALE_MS = 10 * 60_000L
         /** How many displacement alerts, arriving within one re-assert interval
          *  of each other, we will reclaim the slot from before giving up. Two
          *  LIVE devices paired to one account would otherwise evict each other
