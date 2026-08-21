@@ -98,18 +98,6 @@ keystore = { path = "../../../rustpush/keystore" }
 [build-dependencies]
 prost-build = { version = "0.12.0" }
 
-# rustpush's own [patch.crates-io] (its Cargo.toml) redirects `quinn` to its
-# third_party/quinn fork (needed for rustpush's h3/HTTP-3 use). That patch
-# table only applies when rustpush's manifest IS the workspace root — it does
-# NOT propagate into us just because we path-depend on rustpush. Without
-# re-declaring it here, cargo pulls crates.io's quinn for h3-quinn while
-# rustpush's own code links the third_party fork, and h3_quinn::Connection::new
-# fails with "expected h3_quinn::quinn::Connection, found quinn::Connection" —
-# two different types named `quinn::Connection` in the same build. Keep this
-# in sync with rustpush's own patch (same path, one level further up).
-[patch.crates-io]
-quinn = { path = "../../../rustpush/third_party/quinn/quinn" }
-
 [profile.release]
 opt-level = "z"     # optimize for size — these go on a 916 MB-RAM flip phone
 lto = true
