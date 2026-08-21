@@ -96,7 +96,7 @@ omnisette = { path = "../../../rustpush/third_party/apple-private-apis/omnisette
 keystore = { path = "../../../rustpush/keystore" }
 
 # Anchor quinn onto rustpush's vendored copy (0.11.7). This is NOT used by our own
-# code -- it exists solely to unify the version. rustpush depends on the vendored
+# code — it exists solely to unify the version. rustpush depends on the vendored
 # quinn directly, while `h3-quinn` (pulled transitively) depends on `quinn` from
 # crates.io with a `^0.11.7` requirement. The `[patch.crates-io]` below only
 # SHADOWS the 0.11.7 entry in the crates.io source; it does not remove the newer
