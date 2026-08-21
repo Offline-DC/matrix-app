@@ -56,6 +56,7 @@ class GoogleMessagesAccountStore(context: Context) {
             .putInt(KEY_SCHEMA_VERSION, SCHEMA_VERSION)
             .putString(KEY_TACHYON_AUTH, encode(account.tachyonAuthToken))
             .putLong(KEY_TOKEN_TTL, account.tokenTtl)
+            .putLong(KEY_TOKEN_ISSUED_AT, System.currentTimeMillis())
             .putLong(KEY_BROWSER_USER_ID, account.browser.userId)
             .putString(KEY_BROWSER_SOURCE_ID, account.browser.sourceId)
             .putString(KEY_BROWSER_NETWORK, account.browser.network)
@@ -73,8 +74,21 @@ class GoogleMessagesAccountStore(context: Context) {
         prefs.edit()
             .putString(KEY_TACHYON_AUTH, encode(tachyonAuthToken))
             .putLong(KEY_TOKEN_TTL, tokenTtl)
+            .putLong(KEY_TOKEN_ISSUED_AT, System.currentTimeMillis())
             .apply()
     }
+
+    /**
+     * Wall-clock ms at which the current token was issued, or 0 if unknown.
+     *
+     * Without this the session recomputed expiry as `now + ttl` on EVERY process
+     * start, so a 23h-old token looked brand new and the proactive refresh was
+     * pushed a full day past the real expiry. On a launcher that restarts often that
+     * made proactive refresh dead code. Persisted here so expiry is known, not
+     * assumed. Stamped by both [save] and [updateToken] — every path that mints or
+     * renews a token goes through one of them.
+     */
+    fun tokenIssuedAtMs(): Long = prefs.getLong(KEY_TOKEN_ISSUED_AT, 0L)
 
     // ---- Google-account (GAIA) cookies -------------------------------------
     // Stored encrypted, independent of the QR-pairing fields above, so the
@@ -82,27 +96,45 @@ class GoogleMessagesAccountStore(context: Context) {
     // (cookie names/values never contain tab or newline).
 
     fun saveCookies(cookies: Map<String, String>) {
-        // EXPERIMENT (Alex's ~2h SESSION_COOKIE_INVALID kick). Field logs show a
-        // consumer-account pairing dies at ~2h on RegisterRefresh with
-        // SESSION_COOKIE_INVALID while the tachyon token is still healthy — i.e.
-        // it's the rotating session cookie, not the token. The Workspace test
-        // device, whose harvest carries NO __Secure-1PSIDTS, rides the long-lived
-        // __Secure-1PSID and stays linked for days. Hypothesis: a present-but-STALE
-        // __Secure-1PSIDTS (short TTL, never refreshed because the relay never
-        // re-issues it and on-device rotation can't reach the page) is what gets
-        // rejected — whereas its ABSENCE falls back to 1PSID and survives.
+        // Persist the harvest VERBATIM — including the rotating __Secure-1PSIDTS /
+        // __Secure-3PSIDTS pair.
         //
-        // So strip the rotating *PSIDTS cookies before persisting. We log the
-        // INCOMING set first (names only, no values) so the next test still proves
-        // whether the harvest actually carried a 1PSIDTS — the strip is applied
-        // either way.
-        val STRIP = setOf("__Secure-1PSIDTS", "__Secure-3PSIDTS")
-        val hadPsidts = cookies.containsKey("__Secure-1PSIDTS")
-        val stripped = cookies.keys.filter { it in STRIP }
-        val kept = cookies.filterKeys { it !in STRIP }
-
-        val encoded = kept.entries.joinToString("\n") { "${it.key}\t${it.value}" }
-        prefs.edit().putString(KEY_COOKIES, encoded).apply()
+        // HISTORY: on 2026-06-13 (96d8f70) these two were STRIPPED here, on the
+        // theory that a present-but-STALE 1PSIDTS was what killed a consumer
+        // pairing at ~2h, and that its ABSENCE would fall back to the long-lived
+        // __Secure-1PSID. On 2026-08-14 a harvest that
+        // DID carry a valid 1PSIDTS was stripped to 15 cookies and Google refused
+        // the pairing outright: /web/config -> 403, SignInGaia -> 200, then
+        // CREATE_GAIA_PAIRING_CLIENT_FINISHED -> HTTP 401 SESSION_COOKIE_INVALID
+        // (cookie=UNKNOWN) three seconds later, and the identical cookie bytes
+        // were fully revoked 28s after that. Three of the four attempts that evening
+        // failed the same way; one succeeded.
+        //
+        // Do NOT upgrade that into "Google stopped honouring the 1PSID-only fallback
+        // on 2026-08-14" — an earlier version of this comment did. `signInGaia` shows
+        // up in only ONE of the sixteen captures, so there is no earlier pairing to
+        // compare against and no evidence of a change on any date. Stripping is wrong
+        // because the stripped set is a coin flip, which is enough.
+        //
+        // Upstream mautrix-gmessages never strips: it offers __Secure-1PSIDTS as a
+        // login field (pkg/connector/login.go) and writes back every Set-Cookie
+        // verbatim (AuthData.UpdateCookiesFromResponse, pkg/libgm/client.go). Its
+        // docs state Google SOMETIMES REQUIRES 1PSIDTS. Deleting a credential
+        // Google may require can only ever fail closed.
+        //
+        // The cure for the ~2h death is keeping 1PSIDTS FRESH, not deleting it —
+        // see [GMCookieRotation], which needs the current 1PSIDTS in order to
+        // rotate at all, so this strip also made that fix impossible.
+        val encoded = cookies.entries.joinToString("\n") { "${it.key}\t${it.value}" }
+        prefs.edit()
+            .putString(KEY_COOKIES, encoded)
+            // Stamped so a support log can answer "did this retry send FRESH
+            // cookies, or replay the same ones?" — the fingerprint says whether
+            // they changed, this says how old they are. On 2026-08-14 four
+            // pairing attempts in four minutes all replayed one harvest; without
+            // an age there was no way to see that from the capture alone.
+            .putLong(KEY_COOKIES_SAVED_AT, System.currentTimeMillis())
+            .apply()
 
         // Log only when the SET of cookie names changes — not on every save.
         // Google re-issues the *SIDCC family on almost every response, so this
@@ -115,15 +147,24 @@ class GoogleMessagesAccountStore(context: Context) {
         // because callers construct a fresh store per save, so comparing against
         // the stored copy would trade log spam for an EncryptedSharedPreferences
         // decrypt on every RPC.
-        val names = kept.keys.sorted()
+        val names = cookies.keys.sorted()
         if (names != lastLoggedCookieNames) {
             lastLoggedCookieNames = names
             android.util.Log.i(
                 "GMCookies",
-                "cookie set changed → ${cookies.size} received ${cookies.keys.sorted()} " +
-                    "(has __Secure-1PSIDTS=$hadPsidts); stripped $stripped → persisted ${kept.size}",
+                "cookie set changed \u2192 ${cookies.size} received $names " +
+                    "(has __Secure-1PSIDTS=${cookies.containsKey("__Secure-1PSIDTS")}, " +
+                    "has __Secure-3PSIDTS=${cookies.containsKey("__Secure-3PSIDTS")}); " +
+                    "persisted ${cookies.size} (no strip)",
             )
         }
+    }
+
+    /** How long ago the stored cookies were harvested, or null if unknown
+     *  (pre-existing installs that saved cookies before this was stamped). */
+    fun cookiesAgeMs(): Long? {
+        val t = prefs.getLong(KEY_COOKIES_SAVED_AT, 0L)
+        return if (t == 0L) null else System.currentTimeMillis() - t
     }
 
     fun loadCookies(): Map<String, String> {
@@ -164,8 +205,11 @@ class GoogleMessagesAccountStore(context: Context) {
      *  but it is the only thing that identifies this pairing to Google, and
      *  RevokeGaiaPairing takes nothing else. Without it we cannot tell the
      *  account "forget this device" on logout, so every re-link leaves another
-     *  identically-named entry behind in the phone's Device-pairing list, and
-     *  those stale entries compete for the receive slot. */
+     *  identically-named entry behind in the phone's Device-pairing list — a list
+     *  the user sees and has to clean up by hand. (Whether a stale entry can also
+     *  interfere with receiving is UNKNOWN: two captures holding 30+ and 11 entries
+     *  contained no displacement of the active registration at all. Do not cite it
+     *  as a cause without a log that shows one.) */
     fun saveGaiaSession(destRegB64: String, pairingAttemptId: String) {
         prefs.edit()
             .putBoolean(KEY_GAIA_MODE, true)
@@ -175,7 +219,8 @@ class GoogleMessagesAccountStore(context: Context) {
             // re-link" counts from, and what the day-13 warning watches. Only a
             // full re-pair (new cookies + emoji) sets it — token refresh does
             // not — so it tracks the real age of the Google session, whose
-            // ~2-week ceiling only a re-sign-in resets.
+            // No expiry is known to be tied to this — see
+            // GMESSAGES_SEAMLESS_LINK_DESIGN_20260817.md §1(b). Kept as diagnostics.
             .putLong(KEY_LINK_TS, System.currentTimeMillis())
             .apply()
     }
@@ -247,6 +292,28 @@ class GoogleMessagesAccountStore(context: Context) {
      * [getOrCreateDeviceSessionId] is only consulted when Google's own config
      * response carries no device UUID.
      */
+    /**
+     * Disk backing for the cookie-rotation floor. See [GMCookieRotation.Timestamps] for
+     * why it has to outlive the process.
+     *
+     * Deliberately in the SAME prefs file as the cookies it throttles, so [clear] wipes
+     * the floor along with the credentials it belongs to — a floor that outlived its
+     * session would silently suppress the first rotation of the next one.
+     */
+    fun rotationTimestamps(): GMCookieRotation.Timestamps = object : GMCookieRotation.Timestamps {
+        override fun load() = longArrayOf(
+            prefs.getLong(KEY_ROT_LAST_ATTEMPT, 0L),
+            prefs.getLong(KEY_ROT_NEXT_DUE, 0L),
+        )
+
+        override fun save(lastAttemptMs: Long, nextDueMs: Long) {
+            prefs.edit()
+                .putLong(KEY_ROT_LAST_ATTEMPT, lastAttemptMs)
+                .putLong(KEY_ROT_NEXT_DUE, nextDueMs)
+                .apply()
+        }
+    }
+
     fun clear() {
         prefs.edit().clear().apply()
     }
@@ -263,6 +330,8 @@ class GoogleMessagesAccountStore(context: Context) {
         private const val SCHEMA_VERSION = 2
         private const val KEY_SCHEMA_VERSION = "schemaVersion"
         private const val KEY_COOKIES = "gaiaCookies"
+        private const val KEY_COOKIES_SAVED_AT = "gaiaCookiesSavedAtMs"
+        private const val KEY_TOKEN_ISSUED_AT = "tokenIssuedAtMs"
         private const val KEY_TACHYON_AUTH = "tachyonAuthToken"
         private const val KEY_TOKEN_TTL = "tokenTtl"
         private const val KEY_BROWSER_USER_ID = "browserUserId"
@@ -279,6 +348,8 @@ class GoogleMessagesAccountStore(context: Context) {
         private const val KEY_GAIA_PAIRING_ATTEMPT = "gaiaPairingAttemptId"
         private const val KEY_LINK_TS = "linkTimestampMs"
         private const val KEY_DEVICE_SESSION_ID = "deviceSessionId"
+        private const val KEY_ROT_LAST_ATTEMPT = "rotLastAttemptMs"
+        private const val KEY_ROT_NEXT_DUE = "rotNextDueMs"
     }
 }
 

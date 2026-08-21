@@ -101,6 +101,19 @@ class GMGaiaPairing(
     /** Run the full handshake. Blocking; call off the main thread. Returns true
      *  if pairing succeeded and the account was persisted. */
     fun run(): Boolean {
+        val ok = runInner()
+        // One grep-able terminal line per handshake. Pair it with GMGaia's
+        // "ATTEMPT #n" line and four scattered attempts become four readable rows.
+        Log.i(
+            GMGaiaClient.TAG_RESULT,
+            "RESULT attempt=$pairingAttemptId paired=$ok stage=$lastStage " +
+                "lastHttp=$lastHttpCode reason=${lastHttpReason ?: "-"} " +
+                "elapsed=${(System.currentTimeMillis() - startTs) / 100 / 10.0}s",
+        )
+        return ok
+    }
+
+    private fun runInner(): Boolean {
         Log.i(TAG, "starting; attempt=$pairingAttemptId dest=$destRegB64 mobile=${mobile.sourceId} ttl=$ttlMicros")
         val pollThread = thread(name = "gaia-longpoll") { runLongPoll() }
         try {
@@ -204,6 +217,30 @@ class GMGaiaPairing(
             Log.i(TAG, "pairing CONFIRMED by phone; deriving session keys (keyDerivVer=${sresp.confirmedKeyDerivVer})")
 
             val (aesKey, hmacKey) = session.deriveSessionKeys(sresp.confirmedKeyDerivVer)
+
+            // INVARIANT, belt and braces. [GMGaiaClient.ensureFreshnessCookie] has
+            // already minted __Secure-1PSIDTS and aborted the entire run if it could
+            // not, BEFORE SignInGaia — which is why the mint no longer lives here.
+            // (It did, briefly, right above this line; moving it earlier is what stops
+            // a failed mint from stranding an un-revokable device entry in the user's
+            // Google account.) The check stays for two reasons: `cookies` is a
+            // constructor argument, so a future caller can hand this class anything;
+            // and the cost of being wrong is the exact bug we are closing — a link the
+            // user is told is healthy that dies within the hour. If this ever fires,
+            // the defect is upstream of here.
+            if (cookies["__Secure-1PSIDTS"].isNullOrBlank()) {
+                Log.e(
+                    TAG,
+                    "REFUSING to complete pairing: no __Secure-1PSIDTS among the " +
+                        "${cookies.size} cookies handed to the handshake. GMGaiaClient " +
+                        "should have minted it before SignInGaia and aborted if it could " +
+                        "not, so this path should be unreachable — fix the caller.",
+                )
+                lastError = "Couldn't finish securing the connection to Google. Wait a " +
+                    "minute, then sign in again on the computer and rescan the code."
+                return false
+            }
+
             persist(aesKey, hmacKey)
             Log.i(TAG, "================ GAIA PAIRING COMPLETE — account saved ================")
             return true
@@ -264,7 +301,23 @@ class GMGaiaPairing(
             httpSend.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 Log.i(TAG, "send action=$action HTTP ${resp.code} (${body.length} bytes)")
-                if (!resp.isSuccessful) Log.w(TAG, "send failed body: ${body.take(400)}")
+                if (!resp.isSuccessful) {
+                    // 800, not 400: at 400 the google.rpc.ErrorInfo metadata was
+                    // cut mid-token in the 2026-08-14 capture, losing the
+                    // ["method", …] / ["service", …] pairs that say WHICH call
+                    // Google rejected. The whole body is ~470 bytes.
+                    Log.w(TAG, "send failed body: ${body.take(800)}")
+                    // Distinguishes a credential rejection from throttling — the
+                    // ambiguity that made the 401/401/200/401 sequence on
+                    // 2026-08-14 unreadable. Header NAMES + values only for the
+                    // non-secret diagnostic set; never Set-Cookie values.
+                    Log.w(TAG, "send failed headers: ${diagHeaders(resp)}")
+                }
+                lastStage = if (action == ACTION_CLIENT_INIT) "CLIENT_INIT" else "CLIENT_FINISHED"
+                lastHttpCode = resp.code
+                if (!resp.isSuccessful) {
+                    lastHttpReason = Regex("\"([A-Z][A-Z0-9_]{4,})\"").find(body)?.groupValues?.get(1)
+                }
                 resp.isSuccessful
             }
         }.getOrElse { Log.e(TAG, "send threw", it); false }
@@ -494,6 +547,21 @@ class GMGaiaPairing(
             .header("sec-fetch-mode", "cors")
             .header("sec-fetch-dest", "empty")
     }
+
+    /** Non-secret response headers that separate "credentials refused" from
+     *  "you are being throttled". Set-Cookie is reported by NAME only. */
+    private fun diagHeaders(resp: okhttp3.Response): String {
+        val interesting = listOf(
+            "www-authenticate", "retry-after", "x-goog-api-version",
+            "x-goog-quota-exceeded", "x-ratelimit-remaining", "alt-svc",
+        ).mapNotNull { n -> resp.header(n)?.let { "$n=$it" } }
+        val setCookieNames = resp.headers("Set-Cookie").map { it.substringBefore('=') }
+        return (interesting + listOf("setCookieNames=$setCookieNames")).joinToString(" ")
+    }
+
+    @Volatile private var lastHttpCode: Int = 0
+    @Volatile private var lastHttpReason: String? = null
+    @Volatile private var lastStage: String = "-"
 
     companion object {
         private const val TAG = "GMGaiaPair"

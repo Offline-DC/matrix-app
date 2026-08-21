@@ -1,5 +1,6 @@
 package com.offline.dpadmessenger.backend.gmessages.ui
 
+import android.widget.Toast
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
@@ -18,7 +19,94 @@ import com.offline.dpadmessenger.ui.DpadMessengerApp
 import com.offline.dpadmessenger.ui.util.TimeFormatPreference
 import com.offline.dpadmessenger.backend.gmessages.AuthFailureReason
 import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesAccountStore
+import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesConfig
 import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesRepository
+
+/**
+ * Are the Google-Messages diagnostic rows unlocked on this device?
+ *
+ * "Re-register now" and "Force token refresh (debug)" are engineering probes. Both
+ * are one tap from a consumer's Settings screen on a phone bought for its
+ * simplicity, and neither has a meaning a user could act on — "Force token refresh"
+ * is not a thing anyone should be asked to reason about, and Re-register hits
+ * `reauth()`, which mints credentials against Google. Shipping them visible is how
+ * a support call becomes "tap the debug button and see."
+ *
+ * Gated on a `Settings.Secure` flag rather than `BuildConfig.DEBUG` deliberately:
+ * the builds we actually test with are release-shaped sideloads, so a DEBUG gate
+ * would hide these from the one person who needs them. This unlocks with one adb
+ * command, needs no rebuild, survives reboots, and is invisible to users:
+ *
+ *     adb shell settings put secure dumb_gm_debug_tools 1     # show the rows
+ *     adb shell settings delete secure dumb_gm_debug_tools    # hide them again
+ *
+ * The same namespace already carries `device_phone_number` (PhoneNumberReader /
+ * DeviceRegistrar), so this follows an established convention here rather than
+ * inventing a new one. Read once per composition — flipping the adb flag needs a
+ * screen re-entry to take effect, which is fine for a probe. The in-app gesture
+ * below ([TimeFormatDebugUnlockGesture]) updates the same Compose state directly
+ * instead, so it needs no re-entry.
+ */
+/**
+ * In-app equivalent of the adb unlock for [debugToolsUnlocked]: flipping the 12/24-hour
+ * time-format switch in Settings ten times within two minutes reveals "Re-register now"
+ * and "Force token refresh (debug)" without a computer.
+ *
+ * WHY THIS SETTING. It's a row every build already has, flippable from Settings with no
+ * debug menu and no adb — the same reasoning [debugToolsUnlocked] gives for the adb
+ * route, just reachable from the phone alone. Ten GENUINE value changes (12->24->12...)
+ * inside the window, not ten taps of an already-selected value, so it can't fire by
+ * accident: nobody flips their clock format ten times in two minutes while actually
+ * trying to change it.
+ *
+ * Persisted to the same `gmessages_settings` prefs the time-format toggle itself uses,
+ * so the unlock survives process restarts — otherwise re-testing the token-refresh
+ * probe across a reboot would mean redoing the gesture every time.
+ */
+private object TimeFormatDebugUnlockGesture {
+    private const val TAG = "GMDebugUnlock"
+    private const val REQUIRED_FLIPS = 10
+    private const val WINDOW_MS = 120_000L
+    private const val PREFS_NAME = "gmessages_settings"
+    private const val PREFS_KEY_UNLOCKED = "debugToolsUnlockedViaGesture"
+
+    private val flips = ArrayDeque<Long>()
+
+    /** Call on every genuine change of the 12/24-hour switch. Returns true the instant
+     *  the gesture completes, so the caller can flip visible UI state immediately
+     *  instead of waiting on a re-read of prefs. */
+    @Synchronized
+    fun onToggle(context: android.content.Context): Boolean {
+        val now = System.currentTimeMillis()
+        flips.addLast(now)
+        while (flips.isNotEmpty() && now - flips.first() > WINDOW_MS) flips.removeFirst()
+        android.util.Log.i(TAG, "time-format flip ${flips.size}/$REQUIRED_FLIPS")
+        if (flips.size < REQUIRED_FLIPS) return false
+        flips.clear()
+        runCatching {
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREFS_KEY_UNLOCKED, true)
+                .apply()
+        }
+        android.util.Log.i(TAG, "gesture complete -- debug tools unlocked")
+        return true
+    }
+
+    /** Whether a prior gesture already unlocked this device. Checked in addition to the
+     *  adb flag so either route works. */
+    fun isUnlocked(context: android.content.Context): Boolean = runCatching {
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+            .getBoolean(PREFS_KEY_UNLOCKED, false)
+    }.getOrDefault(false)
+}
+
+private fun debugToolsUnlocked(ctx: android.content.Context): Boolean =
+    runCatching {
+        android.provider.Settings.Secure.getInt(ctx.contentResolver, "dumb_gm_debug_tools", 0) == 1
+    }.getOrDefault(false) || TimeFormatDebugUnlockGesture.isUnlocked(ctx)
 
 /**
  * Top-level entry for the in-app Google Messages experience.
@@ -49,6 +137,11 @@ fun GoogleMessagesApp(
     companionSignIn: (@Composable (onPaired: () -> Unit) -> Unit)? = null,
 ) {
     val context = LocalContext.current
+    // Hidden gate for the two diagnostic Settings rows — see [debugToolsUnlocked].
+    // Mutable (not a one-shot remember): the in-app gesture below flips this live, so
+    // the rows can appear immediately without a screen re-entry the way the adb-flag
+    // path needs.
+    var debugTools by remember { mutableStateOf(debugToolsUnlocked(context)) }
     val store = remember { GoogleMessagesAccountStore(context) }
 
     // Snapshot pairing status once. Flips to true when pairing completes.
@@ -129,6 +222,65 @@ fun GoogleMessagesApp(
         // Shared by the auth-expired reconnect prompt, the "Re-link phone" action
         // on a failed message, and Settings → Re-link phone.
         val relinkScope = rememberCoroutineScope()
+
+        // Settings -> "Re-register now". Deliberately the NARROW recovery: mint a
+        // freshness cookie if this session holds none, then refresh the token from the
+        // STORED cookies. It never wipes and never re-pairs, which is what makes it safe
+        // to press repeatedly while testing — unlike onRelink, which falls back to a full
+        // re-pair once it decides the cookies are dead.
+        //
+        // This is the on-demand trigger for the __Secure-1PSIDTS bootstrap. Without it
+        // the recovery path is only reachable by waiting for a natural auth failure,
+        // which on a healthy link means sitting out ~2h per attempt.
+        //
+        // Null hides the row — see [debugToolsUnlocked]. Declared as a typed val rather
+        // than inlined at the call site because `if (x) null else { … }` reads as a
+        // BLOCK there, not a lambda, and quietly types as Unit.
+        val reregisterAction: (() -> Unit)? = if (!debugTools) null else {
+            {
+                Toast.makeText(context, "Re-registering Google Messages…", Toast.LENGTH_SHORT).show()
+                relinkScope.launch {
+                    val ok = GoogleMessagesRepository.reauth()
+                    val reason = GoogleMessagesRepository.lastAuthFailureReason()
+                    val msg = when {
+                        ok -> "Re-registered. Check GMCookieRot / GMSession in the logs."
+                        reason == AuthFailureReason.NETWORK ->
+                            "Couldn't reach Google. Credentials kept — try again on signal."
+                        else ->
+                            "Re-register failed ($reason). Credentials kept — use Re-link " +
+                                "phone if it keeps failing."
+                    }
+                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                }
+                Unit // launch() returns a Job; the row wants () -> Unit.
+            }
+        }
+
+        // Settings -> "Force token refresh (debug)". Arms a one-shot lead-time override
+        // so refreshTokenIfNeeded() takes its proactive branch on the next maintenance
+        // tick (<=60s) instead of an hour before a 24-hour token expires.
+        //
+        // NOT the same test as Re-register now, which is the trap: that goes through
+        // reauth(), which calls refreshToken() directly, skips the expiry arithmetic and
+        // the threshold, and restarts the long-poll and the ack loop afterwards. The
+        // question this row answers is whether a refresh arriving from the TIMER,
+        // mid-session, leaves the stream and the registration alone. Confirmed 17 Aug
+        // 2026: 592ms, HTTP 200, no reconnect, messages never stopped.
+        //
+        // Nothing is refreshed here and now: the flag only lowers a threshold, and the
+        // session reads and clears it on its own schedule. Pressing it on a link whose
+        // token is already inside the real 1h window is a no-op.
+        val forceTokenRefreshAction: (() -> Unit)? = if (!debugTools) null else {
+            {
+                GoogleMessagesConfig.tokenRefreshLeadOverrideMs = 23 * 3600_000L
+                Toast.makeText(
+                    context,
+                    "Armed. Next tick (<=60s) should log 'refreshing now'. Watch GMSession, " +
+                        "then text this phone to confirm receive survived.",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
         val relink: () -> Unit = {
             relinkScope.launch {
                 if (GoogleMessagesRepository.reauth()) return@launch
@@ -168,13 +320,21 @@ fun GoogleMessagesApp(
         // wiping auth flips us to the companion sign-in screen.
         val freshRelink: () -> Unit = {
             relinkScope.launch {
-                // This is the path that accumulates junk. Every re-link mints a
-                // new pairing, and until now the old one was simply abandoned:
+                // This is the path that accumulates entries. Every re-link mints a
+                // new pairing, and until now the old one was simply abandoned, so
                 // the phone's Google Messages device list fills up with
-                // identically-named entries, and those entries still compete for
-                // the receive slot. A user who has re-linked six times has five
-                // ghosts, any of which can silently take over receiving and
-                // leave the real phone long-polling into nothing.
+                // identically-named entries. That much is observed directly: one
+                // test account reached 30+ entries, a customer's reached 11.
+                //
+                // What is NOT observed is any of those stale entries interfering
+                // with receiving. Both of those captures were searched for
+                // BROWSER_INACTIVE and for displacement of the active receive
+                // registration and neither contained a single real occurrence,
+                // despite the entry counts above. So the cleanup below is
+                // housekeeping — it keeps the user's device list honest and keeps
+                // revoke reachable while the credentials are still good — not a
+                // fix for a known receive bug. If a stale-entry takeover is ever
+                // seen in a log, say so here with the evidence.
                 GoogleMessagesRepository.unpairAndTearDown(store, clearMessages = false)
                 paired = false
             }
@@ -230,6 +390,8 @@ fun GoogleMessagesApp(
                     paired = false
                 }
             },
+            onReregister = reregisterAction,
+            onForceTokenRefresh = forceTokenRefreshAction,
             autoDeleteDays = autoDeleteDays,
             onAutoDeleteDaysChange = { days ->
                 autoDeleteDays = days
@@ -240,6 +402,19 @@ fun GoogleMessagesApp(
                 use24Hour = enabled
                 TimeFormatPreference.use24Hour = enabled
                 settingsPrefs.edit().putBoolean("use24HourTime", enabled).apply()
+                // Hidden unlock gesture — see [TimeFormatDebugUnlockGesture]. Guarded on
+                // !debugTools purely so an already-unlocked device isn't still growing
+                // (and logging) a flip counter it no longer needs.
+                if (!debugTools && TimeFormatDebugUnlockGesture.onToggle(context)) {
+                    debugTools = true
+                    Toast.makeText(
+                        context,
+                        "Debug tools unlocked. Settings now shows \"Re-register now\" and " +
+                            "\"Force token refresh (debug)\" -- the second one forces the " +
+                            "24h proactive refresh without waiting a day.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
             },
             initialRoomId = initialRoomId,
             initialRoomKey = initialRoomKey,

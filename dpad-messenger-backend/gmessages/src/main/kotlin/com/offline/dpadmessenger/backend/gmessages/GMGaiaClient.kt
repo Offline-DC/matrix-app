@@ -11,6 +11,7 @@ import java.nio.ByteBuffer
 import java.security.KeyPairGenerator
 import java.security.spec.ECGenParameterSpec
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.TimeUnit
 
 /**
@@ -61,10 +62,41 @@ class GMGaiaClient(context: Context) {
      *
      *  @param onEmoji called with the verification emoji once SERVER_INIT is
      *  processed; show it so the user can tap the matching one on their phone.
+     *  @param onSecuring called with a duration in ms when the link-time freshness
+     *  mint has to wait out Google's rate limit before retrying. Show it: this is a
+     *  minute-plus pause with nothing else on screen, and the ONLY reason it happens
+     *  is that we are still working. Not called on the fast path.
      *  @return true if pairing completed and the account was saved. */
-    fun run(onEmoji: (String) -> Unit = { Log.i(TAG, "PAIRING EMOJI (no UI callback): $it") }): Boolean {
+    fun run(
+        onEmoji: (String) -> Unit = { Log.i(TAG, "PAIRING EMOJI (no UI callback): $it") },
+        onSecuring: (Long) -> Unit = { Log.i(TAG, "securing (no UI callback): waiting ${it / 1000}s") },
+    ): Boolean {
+        val attempt = ATTEMPTS.incrementAndGet()
+        val t0 = System.currentTimeMillis()
+        configCode = 0
+        signInCode = 0
+        val ok = runInner(onEmoji, onSecuring)
+        // ONE line per attempt, so a capture with several retries reads as a
+        // table instead of interleaved blocks. The 2026-08-14 report took four
+        // attempts in four minutes and the only way to separate them was by
+        // timestamp arithmetic. Order matters: config -> signIn -> (pairing,
+        // logged by GMGaiaPair's own RESULT line).
+        Log.i(
+            TAG_RESULT,
+            "ATTEMPT #$attempt result=${if (ok) "PAIRED" else "FAILED"} " +
+                "config=$configCode signIn=$signInCode " +
+                "elapsed=${(System.currentTimeMillis() - t0) / 100 / 10.0}s " +
+                "cookieAge=${store.cookiesAgeMs()?.let { "${it / 1000}s" } ?: "unknown"}",
+        )
+        return ok
+    }
+
+    private fun runInner(onEmoji: (String) -> Unit, onSecuring: (Long) -> Unit): Boolean {
         lastError = null
-        val cookies = store.loadCookies()
+        // MUTABLE: the link-time freshness mint below writes __Secure-1PSIDTS /
+        // __Secure-3PSIDTS into this map before anything else touches Google, so
+        // fetchConfig and SignInGaia are authenticated with the completed set.
+        val cookies = HashMap(store.loadCookies())
         if (!GMCookieAuth.hasRequiredCookies(cookies)) {
             Log.w(TAG, "run: missing required cookies; have=${cookies.keys.sorted()}")
             lastError = "The Google login was incomplete (missing cookies: " +
@@ -80,7 +112,43 @@ class GMGaiaClient(context: Context) {
         Log.i(TAG, "run: starting with ${cookies.size} cookies; names=${cookies.keys.sorted()}; " +
             "fp=${cookieFingerprint(cookies)}; " +
             "has1PSIDTS=${!cookies["__Secure-1PSIDTS"].isNullOrBlank()} " +
-            "has3PSIDTS=${!cookies["__Secure-3PSIDTS"].isNullOrBlank()}")
+            "has3PSIDTS=${!cookies["__Secure-3PSIDTS"].isNullOrBlank()}; " +
+            // Per-cookie fingerprints: the SET fingerprint above changes if ANY
+            // cookie moved, which can't distinguish "the browser rotated 1PSIDTS
+            // under us" from "SIDCC ticked over". These two are the ones that
+            // decide whether Google accepts us.
+            "sid=${valueFp(cookies["SID"])} psidts=${valueFp(cookies["__Secure-1PSIDTS"])}; " +
+            "ageOfHarvest=${store.cookiesAgeMs()?.let { "${it / 1000}s" } ?: "unknown"}")
+
+        // ---- FIX 6: mint the freshness cookie BEFORE we touch Google -------------
+        //
+        // This used to run at the very END of pairing, after CLIENT_FINISHED had
+        // already registered this companion with Google. Two things were wrong with
+        // that, and both were paid for on 19 Aug 2026:
+        //
+        //  1. An abort came too late to be clean. The companion was already in the
+        //     account's device list, and revoking it needs the very credential we had
+        //     just failed to obtain — `unpair: Google REJECTED the revoke (HTTP 401)`
+        //     at 08:19:38. The entry is stranded there permanently and the user has to
+        //     delete it by hand. Aborting HERE registers nothing, so there is nothing
+        //     to strand.
+        //  2. SignInGaia ran on the weaker cookie set. GoogleMessagesConfig records the
+        //     12 Jun 2026 capture: three SignInGaia attempts on a set with no 1PSIDTS
+        //     were refused 401, and the attempt 12 seconds later WITH one returned 200
+        //     and paired. Minting first means the call that decides whether we can pair
+        //     at all is made with the credential Google sometimes insists on.
+        //
+        // The honest cost: our RotateCookies call now lands seconds after the
+        // browser's own rather than ~6s later, which makes a 429 marginally MORE
+        // likely, not less. bootstrapForLink's single retry absorbs that — and the
+        // wait now happens BEFORE the user is shown an emoji to tap, instead of
+        // stranding a confirmed emoji on screen for over a minute (19 Aug 11:33).
+        //
+        // A fresh pairing must not inherit the previous session's rotation backoff
+        // (GMCookieRotation is an `object`, so nextDueMs outlives a re-link within one
+        // process). reset() moved up here with the mint it exists to unblock.
+        GMCookieRotation.reset()
+        if (!ensureFreshnessCookie(cookies, onSecuring)) return false
 
         val deviceUuid = fetchConfig(cookies)
         // Reuse ONE persisted web-device UUID instead of minting a fresh random one
@@ -93,6 +161,78 @@ class GMGaiaClient(context: Context) {
         }
         val sessionId = deviceUuid ?: store.getOrCreateDeviceSessionId()
         return signInGaia(cookies, sessionId, onEmoji)
+    }
+
+    /**
+     * Guarantee a `__Secure-1PSIDTS` before any request that could register this
+     * device, or refuse to pair at all.
+     *
+     * A harvest normally arrives WITHOUT one: the browser mints it on Google's own
+     * schedule and the extension freezes the cookie blob at whatever instant OSID
+     * appears, which is usually earlier. That is expected, and
+     * [GMCookieRotation.bootstrapForLink] exists to fill it in.
+     *
+     * The refusal is the point. Before this, a failed mint was treated as cosmetic —
+     * the log claimed the harvest "may already carry the pair" while the same capture
+     * read `has1PSIDTS=false` three lines up, and pairing reported success on a
+     * session with no refreshing credential. Alex Browning's such session was declared
+     * complete at 06:41:14 and was dead by 06:54. A link the user cannot tell is
+     * broken is worse than a failure they can retry, so this returns false and lets
+     * the caller surface [lastError].
+     */
+    private fun ensureFreshnessCookie(
+        cookies: MutableMap<String, String>,
+        onSecuring: (Long) -> Unit,
+    ): Boolean {
+        if (!cookies["__Secure-1PSIDTS"].isNullOrBlank()) {
+            // A 16-cookie harvest — the browser rotated before the QR was rendered.
+            // Deliberately NOT refreshed here: rotating invalidates the value the
+            // browser still holds, and an unexpired cookie we already have is worth
+            // more than a newer one plus a race. The session's own rotation loop takes
+            // it from here.
+            Log.i(TAG, "freshness: harvest already carries __Secure-1PSIDTS — nothing to mint")
+            return true
+        }
+
+        runCatching {
+            GMCookieRotation.bootstrapForLink(http, cookies, onRetryWait = onSecuring)
+        }.onSuccess { changed ->
+            if (changed) {
+                runCatching { store.saveCookies(cookies) }
+                    .onFailure { Log.w(TAG, "freshness: could not persist minted cookies", it) }
+            }
+        }.onFailure { Log.w(TAG, "freshness: link-time bootstrap threw", it) }
+
+        // Ask the COOKIE, never whether the rotation "changed" anything: a harvest
+        // that already carried the pair changes nothing and is healthy, and a failed
+        // mint also changes nothing and is fatal. Only this tells them apart.
+        if (cookies["__Secure-1PSIDTS"].isNullOrBlank()) {
+            Log.w(
+                TAG,
+                "freshness: FAILED — no __Secure-1PSIDTS " +
+                    "(rotation result=${GMCookieRotation.lastResult} http=${GMCookieRotation.lastHttpCode} " +
+                    "cookies=${cookies.size}); " +
+                    "aborting BEFORE SignInGaia, so nothing is registered with Google and " +
+                    "no device entry is stranded",
+            )
+            // Two different failures, two different instructions. A rejection means the
+            // login itself is dead, so "wait a minute" is both wrong and slower than the
+            // truth; a rate limit or an unexplained empty mint really may clear.
+            lastError = if (GMCookieRotation.lastHttpCode == 401 || GMCookieRotation.lastHttpCode == 403) {
+                "Google rejected this login. On the computer, sign in again" +
+                    ", then rescan the code."
+            } else {
+                "Couldn't finish securing the connection to Google. Wait a " +
+                    "minute, then sign in again on the computer and rescan the code."
+            }
+            return false
+        }
+        Log.i(
+            TAG,
+            "freshness: OK — ${cookies.size} cookies with __Secure-1PSIDTS in hand " +
+                "before SignInGaia (result=${GMCookieRotation.lastResult})",
+        )
+        return true
     }
 
     /**
@@ -123,8 +263,16 @@ class GMGaiaClient(context: Context) {
             http.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 Log.i(TAG, "fetchConfig HTTP ${resp.code} (${body.length} bytes)")
+                configCode = resp.code
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "fetchConfig failed body: ${body.take(500)}")
+                    // Google answers this one with a full HTML error page, so the
+                    // old 500-char body dump was 500 chars of CSS. The <title>
+                    // plus the headers are the entire diagnostic value. This call
+                    // returned 403 on all four attempts of the 2026-08-14 report
+                    // and that went unexplained because none of this was captured.
+                    val title = Regex("<title>(.*?)</title>").find(body)?.groupValues?.get(1)
+                    Log.w(TAG, "fetchConfig failed: HTTP ${resp.code} title=${title ?: "?"} " +
+                        "bodyLen=${body.length} ${diagHeaders(resp)}")
                     return null
                 }
                 // The web config embeds the device id somewhere; log a chunk so
@@ -189,8 +337,10 @@ class GMGaiaClient(context: Context) {
             http.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 Log.i(TAG, "signInGaia HTTP ${resp.code} (${body.length} bytes)")
+                signInCode = resp.code
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "signInGaia failed body: ${body.take(600)}")
+                    Log.w(TAG, "signInGaia failed body: ${body.take(800)}")
+                    Log.w(TAG, "signInGaia failed headers: ${diagHeaders(resp)}")
                     lastError = describeHttpFailure("Google sign-in", resp.code, body)
                     return@use false
                 }
@@ -235,7 +385,7 @@ class GMGaiaClient(context: Context) {
         val ttl = ttlNode.asLongOrNull() ?: 0L
         if (ttl == 0L) {
             // Distinguish "Google really sent 0" from "Google sent it as a JSON
-            // string and asLongOrNull() only accepts Num" — the JSPB convention
+            // string and asLongOrNull() used to accept only Num" — the JSPB convention
             // encodes int64 fields as strings to dodge JS precision loss. The
             // response body is logged with take(1200) and tokenData is the LAST
             // element, so this is the only place the raw value is ever visible.
@@ -376,8 +526,42 @@ class GMGaiaClient(context: Context) {
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
+    /** 4 hex chars of SHA-256 over ONE cookie value. Never reversible, never the
+     *  value — these logs get emailed to us by customers. */
+    private fun valueFp(value: String?): String {
+        if (value.isNullOrBlank()) return "absent"
+        return runCatching {
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(value.toByteArray(Charsets.UTF_8))
+                .take(2)
+                .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+        }.getOrDefault("??")
+    }
+
+    /** Non-secret response headers that separate "credentials refused" from
+     *  "you are being throttled". Set-Cookie is reported by NAME only. */
+    private fun diagHeaders(resp: okhttp3.Response): String {
+        val interesting = listOf(
+            "www-authenticate", "retry-after", "x-goog-api-version",
+            "x-goog-quota-exceeded", "x-ratelimit-remaining", "content-type",
+        ).mapNotNull { n -> resp.header(n)?.let { "$n=$it" } }
+        val setCookieNames = resp.headers("Set-Cookie").map { it.substringBefore('=') }
+        return (interesting + listOf("setCookieNames=$setCookieNames")).joinToString(" ")
+    }
+
+    @Volatile private var configCode: Int = 0
+    @Volatile private var signInCode: Int = 0
+
     companion object {
         private const val TAG = "GMGaia"
+
+        /** Secret-free outcome tag. Separate from [TAG] because GMGaia logs the
+         *  SignInGaia response (which carries the tachyon token) and is kept out
+         *  of the routine hourly snapshot; these summary lines are safe there and
+         *  are usually all support needs to triage a failed link. */
+        internal const val TAG_RESULT = "GMPairResult"
+        /** Process-wide so repeated retries read as #1..#n in one capture. */
+        private val ATTEMPTS = AtomicInteger(0)
         private const val GDITTO = "GDitto"
         private const val CONTENT_TYPE_PBLITE = "application/json+protobuf"
         private const val CONFIG_URL = "https://messages.google.com/web/config"
