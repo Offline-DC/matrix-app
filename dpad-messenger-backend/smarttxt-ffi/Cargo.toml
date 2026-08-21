@@ -89,7 +89,10 @@ rustls = { version = "0.23", default-features = false, features = ["logging", "s
 # ../../imessage-register). To pin a git rev, swap `path` for `git`/`rev` —
 # rustpush has submodules, so clone with --recurse-submodules.
 rustpush = { path = "../../../rustpush", default-features = false, features = ["remote-anisette-v3"] }
-omnisette = { path = "../../../rustpush/apple-private-apis/omnisette", features = ["remote-anisette-v3"] }
+# apple-private-apis moved under third_party/ upstream at rustpush@71b66f9;
+# repointed here in the same change that bumped rustpush-ref past that move
+# (see build-smarttxt-so/action.yml). keystore did NOT move.
+omnisette = { path = "../../../rustpush/third_party/apple-private-apis/omnisette", features = ["remote-anisette-v3"] }
 keystore = { path = "../../../rustpush/keystore" }
 
 [build-dependencies]
