@@ -95,6 +95,22 @@ rustpush = { path = "../../../rustpush", default-features = false, features = ["
 omnisette = { path = "../../../rustpush/third_party/apple-private-apis/omnisette", features = ["remote-anisette-v3"] }
 keystore = { path = "../../../rustpush/keystore" }
 
+# Anchor quinn onto rustpush's vendored copy (0.11.7). This is NOT used by our own
+# code -- it exists solely to unify the version. rustpush depends on the vendored
+# quinn directly, while `h3-quinn` (pulled transitively) depends on `quinn` from
+# crates.io with a `^0.11.7` requirement. The `[patch.crates-io]` below only
+# SHADOWS the 0.11.7 entry in the crates.io source; it does not remove the newer
+# registry 0.11.11, which also satisfies `^0.11.7`. Without a dependency edge that
+# pins 0.11.7 into the graph, the resolver picks registry 0.11.11 for h3-quinn,
+# the patch is reported unused, and the build ends up with two incompatible quinns.
+# rustpush's own Cargo.toml does exactly this (a direct path dep PLUS the patch);
+# when smarttxt-ffi is the build root, rustpush's dep table anchors nothing here,
+# so we must re-add the anchor ourselves. Keep in sync with rustpush/Cargo.toml.
+quinn = { path = "../../../rustpush/third_party/quinn/quinn" }
+
+[patch.crates-io]
+quinn = { path = "../../../rustpush/third_party/quinn/quinn" }
+
 [build-dependencies]
 prost-build = { version = "0.12.0" }
 
