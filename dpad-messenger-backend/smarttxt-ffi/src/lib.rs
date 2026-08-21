@@ -4217,12 +4217,60 @@ fn save_reconcile_now(dir: &str) {
 
 /// The user's chosen send-from handle if it's still one of their registered
 /// handles, else the first registered handle.
+///
+/// The match is EXACT first, then canonical. Exact-only was a silent way to lose
+/// the user's choice: registered handles come back from IDS and are not
+/// guaranteed to be spelled the way they were when the preference was saved
+/// ("tel:+14045551212" vs "tel:+1 404 555 1212"), and any such difference made
+/// `preferred` look unregistered — so this fell through to `handles.first()`,
+/// which is typically the Apple ID email. The account's own migration path
+/// already compares canonically for exactly this reason; this now agrees with it.
+///
+/// `canon` strips the scheme, lowercases emails and reduces phones to "+<digits>",
+/// and is the same function Kotlin's `Handles.canon` implements — so both sides
+/// agree about when two spellings are the same handle.
+///
+/// Returns the element FROM `handles`, never `preferred` itself: the caller needs
+/// the address as IDS knows it, not as the user's preference happened to spell it.
 fn pick_send_handle(handles: &[String]) -> Option<String> {
     let preferred = st().send_handle.clone();
-    if !preferred.is_empty() && handles.iter().any(|h| h == &preferred) {
-        return Some(preferred);
+    if !preferred.is_empty() {
+        if let Some(h) = handles.iter().find(|h| *h == &preferred) {
+            return Some(h.clone());
+        }
+        if let Some(h) = handles.iter().find(|h| canon(h) == canon(&preferred)) {
+            log::info!("pick_send_handle: '{preferred}' matched '{h}' canonically");
+            return Some(h.clone());
+        }
+        log::warn!(
+            "pick_send_handle: preferred '{preferred}' is not among {} registered handles \
+             — falling back to the default",
+            handles.len()
+        );
     }
-    handles.first().cloned()
+    default_send_handle(handles)
+}
+
+/// The handle to send from when the user has expressed no usable preference:
+/// their first PHONE number, or the first handle of any kind if they have none.
+///
+/// Phone first, not `handles.first()`. IDS commonly returns the Apple ID email
+/// ahead of the numbers, so taking the first handle meant an account with no
+/// stored preference sent from the email — which reads to the recipient as a
+/// message from a stranger rather than from the number they have saved. A phone
+/// handle is also the one every recipient can reply to, on any network.
+///
+/// This is the same rule the Kotlin side already applies in two places — the
+/// Settings seed in `SmartTxtApp` and `OpenBubblesMigrator.sendFromHandle` — both
+/// of which pick `firstOrNull { it.startsWith("tel:") }` before falling back.
+/// Until now the native fallback disagreed with both, so which handle you got
+/// depended on whether the answer came from Kotlin or from here.
+fn default_send_handle(handles: &[String]) -> Option<String> {
+    handles
+        .iter()
+        .find(|h| h.starts_with("tel:"))
+        .or_else(|| handles.first())
+        .cloned()
 }
 
 /// Record that conversation `chat_guid` transmits from `handle`. No-op if unchanged;
