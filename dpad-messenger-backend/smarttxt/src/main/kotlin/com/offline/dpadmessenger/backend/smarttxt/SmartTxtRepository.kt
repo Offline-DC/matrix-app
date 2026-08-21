@@ -512,7 +512,39 @@ object SmartTxtRepository {
         }
         val ready = nativeClientReady()
         appendConnectLog(appContext, "ensureClientUp: nativeConnect=$connected clientReady=$ready")
+        if (ready) restoreSendHandle(appContext)
         return ready
+    }
+
+    /**
+     * Push the user's saved "start new messages from" handle back into the native
+     * runtime.
+     *
+     * `AppState.send_handle` is in-memory and dies with the process. Until this
+     * existed, the ONLY thing that set it was the Smart Txt chat UI composing —
+     * so after any restart, anything that sent without the user first opening
+     * Smart Txt (a reply from the notification, the launcher's call-history
+     * "message", the dialer's smart txt) found it empty. `pick_send_handle` then
+     * falls back to the first registered handle, which for most accounts is the
+     * Apple ID email: the user's preference appeared to spuriously revert, and
+     * opening Smart Txt appeared to "fix" it.
+     *
+     * Hung off client-up rather than native init because this is the one funnel
+     * every revival goes through, and because a handle set before the client
+     * exists has nothing to apply to.
+     *
+     * Best-effort by design: a handle we can't read or push is not a reason to
+     * fail the connection — the native side still sends, just from its own
+     * default, which is exactly the old behaviour.
+     */
+    private fun restoreSendHandle(appContext: Context) {
+        val saved = runCatching { SmartTxtAccountStore(appContext).defaultHandle() }
+            .onFailure { Log.w(TAG, "restoreSendHandle: couldn't read the saved handle: ${it.message}") }
+            .getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: return
+        Log.i(TAG, "restoreSendHandle: re-applying '$saved' after client (re)start")
+        RustPushNative.runCatchingNativeSetSendHandle(saved)
     }
 
     /**
