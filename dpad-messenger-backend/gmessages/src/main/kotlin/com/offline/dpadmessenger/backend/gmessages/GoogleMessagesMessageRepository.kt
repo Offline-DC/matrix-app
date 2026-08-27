@@ -59,6 +59,11 @@ internal class GoogleMessagesMessageRepository(
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val notifier = GoogleMessagesNotifier(context)
+
+    /** Debug Settings row -> "Check pairing now". Asks Google AND the phone, and
+     *  returns a one-line summary for the toast. See
+     *  [GoogleMessagesSessionClient.checkPairingNow]. */
+    internal suspend fun checkPairingNow(): String = session.checkPairingNow()
     private val cache = GoogleMessagesCache(context)
 
     // Debounced persistence: mutations request a save; the loop collapses
@@ -254,6 +259,13 @@ internal class GoogleMessagesMessageRepository(
         // Restore the on-disk cache so history shows on launch, before the
         // network sync lands. Off the constructor thread (IO inside) so a large
         // cache can't jank/ANR startup; guarded against clobbering live data.
+        // A live notification cannot outlive the session that raised it. This
+        // constructor runs on a fresh session — process start, or the moment after a
+        // successful re-pair — so anything still showing is from the previous one and is
+        // now unproven. If the link really is still broken the detector re-posts it
+        // within minutes; the alternative is a stale "you were unlinked" sitting on a
+        // phone the user just fixed, which teaches people to ignore the warning.
+        notifier.clearLinkBroken(reason = "fresh-session")
         scope.launch { restoreFromCache() }
         scope.launch {
             session.events.collect { evt ->
@@ -267,11 +279,17 @@ internal class GoogleMessagesMessageRepository(
                         Log.w(TAG, "auth expired — re-pair needed (reason=${evt.reason})")
                         _authExpiredReason.value = evt.reason
                         _authExpired.value = true
+                        // The reconnect screen is a screen you have to walk into, and
+                        // MEASURED, two customers took 8 h and 15 h to walk into it. Tell
+                        // them where they actually are. NETWORK is filtered out inside
+                        // notifyLinkBroken — a dead zone must never raise this.
+                        notifier.notifyLinkBroken(evt.reason)
                     }
                     SessionEvent.AuthRestored -> {
                         Log.i(TAG, "auth restored — dismissing the reconnect screen")
                         _authExpired.value = false
                         _authExpiredReason.value = null
+                        notifier.clearLinkBroken(reason = "auth-restored")
                     }
                 }
             }
@@ -1466,11 +1484,30 @@ internal class GoogleMessagesMessageRepository(
                 // Ids only. This is THE line that says "the phone is not
                 // answering" — one per stranded send, so a support log shows
                 // immediately whether a customer's link is dead.
+                // NOT proof of non-delivery - we only know no echo arrived. The echo
+                // comes from the paired phone, so this fires whenever the phone is not
+                // answering, and MEASURED 25-26 Aug 2026 the commonest cause is that our
+                // pairing entry has been removed from the account while the send itself
+                // returned HTTP 200. The message may well have gone out.
+                //
+                // The UI still shows MessageStatus.FAILED ("Not Delivered" / "!") here,
+                // which overstates what we know - see
+                // reference/GMESSAGES_RECEIVE_DISPLACEMENT_20260825.md section 15. Fixing
+                // that means a new value in the sibling library's MessageStatus enum plus
+                // three exhaustive `when` sites in its UI, so it is a product decision,
+                // not a logging one, and is deliberately NOT done here.
+                // Tell the session: a stranded send is the fastest corroboration we
+                // ever get that the far end is not answering, and it arrives while the
+                // user is watching. It probes immediately rather than waiting up to
+                // 30 min for the scheduled re-assert.
+                runCatching { session.noteSendTimeout() }
+                    .onFailure { Log.w(TAG, "noteSendTimeout failed (continuing)", it) }
                 Log.w(
                     TAG,
                     "send-timeout: no echo for tmp=$tmpId conv=$roomId after " +
-                        "${SEND_ECHO_TIMEOUT_MS / 1000}s — marking Not Delivered " +
-                        "(phone unlinked or unreachable?)",
+                        "${SEND_ECHO_TIMEOUT_MS / 1000}s — UNCONFIRMED, not proven " +
+                        "undelivered (paired phone not answering; check the account's " +
+                        "device pairing). UI will show Not Delivered",
                 )
                 pendingMediaByTmpId.remove(tmpId)
                 requestSave()

@@ -156,10 +156,35 @@ class GMGaiaClient(context: Context) {
         // every try, which is why the account's device list kept growing. The phone
         // (the ==1 destination) is unaffected — this is only our local web identity.
         // (mautrix does the same via a persisted SessionID.)
-        if (deviceUuid == null) {
+        // Prefer the id GOOGLE issued for this cookie jar over one we minted.
+        //
+        // This is the OQ-20 mechanism-E experiment. mautrix and the real web client both
+        // register under `Config.deviceInfo.deviceID`; we minted our own only because the
+        // config call 403'd on every attempt. Now that it returns 200 (27 Aug), use it.
+        //
+        // Persist it either way, so the identity is stable if a later config fetch fails,
+        // and log a change loudly — a device id that moves is a new registration on the
+        // account (OQ-10), and we have already been bitten twice by that happening
+        // silently.
+        val stored = store.getOrCreateDeviceSessionId()
+        val sessionId = if (deviceUuid != null) {
+            val a = webDeviceHexOrNull(deviceUuid)
+            val b = webDeviceHexOrNull(stored)
+            if (a != null && a != b) {
+                Log.w(
+                    TAG,
+                    "run: web-device id CHANGING to the one Google issued (was ${b ?: "unparseable"} " +
+                        "-> now $a). This registers a new messages-web-* entry once, on purpose. " +
+                        "If this line repeats on every link, the config id is not stable and we " +
+                        "should go back to the persisted one (OQ-28).",
+                )
+                runCatching { store.saveDeviceSessionId(deviceUuid) }
+            }
+            deviceUuid
+        } else {
             Log.i(TAG, "run: no device UUID from config — reusing persisted web-device UUID")
+            stored
         }
-        val sessionId = deviceUuid ?: store.getOrCreateDeviceSessionId()
         return signInGaia(cookies, sessionId, onEmoji)
     }
 
@@ -258,7 +283,41 @@ class GMGaiaClient(context: Context) {
     /** GET /web/config (cookie-authed). Logs the response and tries to extract
      *  the device UUID. Returns the UUID if found. */
     private fun fetchConfig(cookies: Map<String, String>): String? {
-        val req = Request.Builder().url(CONFIG_URL).get().gaiaHeaders(cookies).build()
+        // /web/config is the ONE request on this path that is same-origin, and it has
+        // to be shaped like one or Google's frontend rejects it.
+        //
+        // MEASURED-FROM-SOURCE (mautrix-gmessages `pkg/libgm/client.go:353-363`): they
+        // build the standard relay headers and then go out of their way to undo exactly
+        // three of them for this call and nothing else —
+        //
+        //     util.BuildRelayHeaders(req, "", "*/*")
+        //     req.Header.Set("sec-fetch-site", "same-origin")
+        //     req.Header.Del("x-user-agent")
+        //     req.Header.Del("origin")
+        //
+        // We were sending the relay set unchanged: an `Origin:` header and
+        // `sec-fetch-site: cross-site` on a same-origin GET to messages.google.com,
+        // plus the gRPC-web `x-user-agent`. That is the shape a CSRF filter is built to
+        // refuse, and **this call has returned 403 on every attempt we have ever
+        // logged** (four in the 2026-08-14 report alone).
+        //
+        // INFERRED, not proven: that these three headers are the 403. It is the best
+        // available explanation and it costs nothing to test, because the call already
+        // fails 100% of the time — there is no working behaviour here to regress.
+        //
+        // Why it matters beyond tidiness (displacement doc §33.2): behind this 403 is
+        // `deviceInfo.deviceID`, the web-device identity **Google issues for this cookie
+        // jar**. mautrix never generates one; it uses Google's. We mint our own random
+        // UUID because we cannot read theirs. Whether Google's reaper treats a
+        // self-minted `messages-web-*` differently from one it issued is UNKNOWN — but
+        // it is the only field where we are demonstrably not what a browser is, and
+        // OQ-20 has no better candidate left.
+        val req = Request.Builder().url(CONFIG_URL).get()
+            .gaiaHeaders(cookies)
+            .removeHeader("origin")
+            .removeHeader("x-user-agent")
+            .header("sec-fetch-site", "same-origin")
+            .build()
         return runCatching {
             http.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
@@ -278,8 +337,42 @@ class GMGaiaClient(context: Context) {
                 // The web config embeds the device id somewhere; log a chunk so
                 // we can pin its exact location, and grab the first UUID we see.
                 Log.i(TAG, "fetchConfig head: ${body.take(800)}")
-                val uuid = UUID_REGEX.find(body)?.value
-                Log.i(TAG, "fetchConfig deviceUuid candidate=$uuid")
+                // Parse the documented path rather than scraping.
+                //
+                // MEASURED-FROM-SOURCE (`pkg/libgm/gmproto/config.proto:26-35`):
+                //     message Config { ... DeviceInfo deviceInfo = 5; }
+                //     message DeviceInfo { string email = 2; string zero = 3;
+                //                          string deviceID = 4; }
+                // so in pblite (0-based) that is root[4][3]. mautrix reads exactly this
+                // (`client.go:345`) and parses it as a UUID.
+                //
+                // The old `UUID_REGEX.find(body)` took the FIRST uuid-shaped substring
+                // anywhere in the response. That was a reasonable placeholder while the
+                // call only ever 403'd and we had never seen a success body — but it
+                // would silently pick up some unrelated flag value the first time it
+                // did work, and we would have registered under it. Keep it as a
+                // fallback so a shape change degrades instead of failing, and log which
+                // path produced the answer so the first 200 tells us the truth.
+                val typed = runCatching {
+                    (PbLite.parse(body) as? PbLite.Node.Arr)
+                        ?.get(4)?.let { it as? PbLite.Node.Arr }
+                        ?.get(3)?.asStringOrNull()
+                }.getOrNull()?.takeIf { it.isNotBlank() }
+                val scraped = UUID_REGEX.find(body)?.value
+                if (typed != null && scraped != null && typed != scraped) {
+                    Log.w(
+                        TAG,
+                        "fetchConfig: deviceInfo.deviceID=$typed but the first uuid in the " +
+                            "body is $scraped — the old regex would have registered us " +
+                            "under the wrong id",
+                    )
+                }
+                val uuid = typed ?: scraped
+                Log.i(
+                    TAG,
+                    "fetchConfig deviceUuid=$uuid " +
+                        "via=${if (typed != null) "deviceInfo.deviceID" else "regex-fallback"}",
+                )
                 uuid
             }
         }.getOrElse { Log.e(TAG, "fetchConfig threw", it); null }
@@ -302,7 +395,17 @@ class GMGaiaClient(context: Context) {
         val refreshPriv = refreshKey.private.encoded // PKCS#8 DER (for RegisterRefresh)
 
         val requestId = UUID.randomUUID().toString()
-        val deviceIdStr = "messages-web-" + uuidToHex(sessionId)
+        val hex = webDeviceHexOrNull(sessionId)
+        if (hex == null) {
+            // Refuse rather than invent. An unparseable id here means the caller handed
+            // us something unexpected, and the old code's answer to that was to register
+            // a random new device — see [webDeviceHexOrNull].
+            Log.e(TAG, "signInGaia: web-device id is not a UUID or 32-hex value — refusing " +
+                "to invent one. Pairing aborted so we do not mint a ghost registration.")
+            lastError = "Internal error preparing the device identity. Try again."
+            return false
+        }
+        val deviceIdStr = "messages-web-" + hex
 
         // --- build the pblite SignInGaiaRequest -----------------------------
         // configVersion {Year=3,Month=4,Day=5,V1=7,V2=9}
@@ -391,6 +494,21 @@ class GMGaiaClient(context: Context) {
             // element, so this is the only place the raw value is ever visible.
             // Deliberately logs the node, not the body: the body carries the token.
             Log.w(TAG, "signInGaia: TTL parsed as 0 — raw node=$ttlNode")
+        }
+
+        // root[1] = SignInGaiaResponse field 2 = the registration id Google considers
+        // OURS. Previously discarded as "maybeBrowserUUID". It is the key the real web
+        // client matches against the account's registration list to find itself
+        // ([GMDeviceListProbe]), so persisting it here is what makes a positive pairing
+        // check possible later without another mode-0 call.
+        root[1].asStringOrNull()?.let { b64 ->
+            val id = runCatching { String(B64.decode(b64), Charsets.US_ASCII) }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() && it.all { c -> c.code in 0x20..0x7E } }
+            if (id != null) {
+                store.saveOwnRegistrationId(id)
+                Log.i(TAG, "signInGaia: our registration id per Google = $id")
+            }
         }
 
         val deviceData = root[2]
@@ -500,6 +618,18 @@ class GMGaiaClient(context: Context) {
             .header("x-goog-api-key", GMPairingProto.GOOGLE_API_KEY)
             .header("x-user-agent", GMPairingProto.X_USER_AGENT)
             .header("user-agent", GMPairingProto.USER_AGENT)
+            // The client-hints trio, `accept` and `accept-language` were missing here
+            // while `applyRelayHeaders` in the session client has always sent them.
+            // Backwards, and worth fixing: the requests that go through THIS builder are
+            // SignInGaia and the pairing handshake — the calls that MINT the
+            // registration. The one request whose fingerprint matters most had the
+            // weakest one we send. Matches mautrix's `BuildRelayHeaders`
+            // (`pkg/libgm/util/func.go:14-32`), which sets all of these on every call.
+            .header("sec-ch-ua", GMPairingProto.SEC_UA)
+            .header("sec-ch-ua-mobile", "?1")
+            .header("sec-ch-ua-platform", "\"Android\"")
+            .header("accept", "*/*")
+            .header("accept-language", "en-US,en;q=0.9")
             .header("origin", GMCookieAuth.ORIGIN)
             .header("referer", "https://messages.google.com/")
             .header("sec-fetch-site", "cross-site")
@@ -516,9 +646,34 @@ class GMGaiaClient(context: Context) {
         }
     }
 
-    /** Lowercase hex of a UUID's 16 bytes (mautrix uses hex(SessionID[:])). */
-    private fun uuidToHex(uuidStr: String): String {
-        val u = runCatching { UUID.fromString(uuidStr) }.getOrElse { UUID.randomUUID() }
+    /**
+     * Lowercase 32-char hex of a web-device id, accepting BOTH shapes we see.
+     *
+     * ⚠️ **MEASURED 27 Aug, and this function used to corrupt our identity.** It was:
+     *
+     *     val u = runCatching { UUID.fromString(uuidStr) }.getOrElse { UUID.randomUUID() }
+     *
+     * The moment the `/web/config` 403 was fixed, Google started handing us a real
+     * device id — **already dash-free**, e.g. `65cfc970e217c235d20ffec32b7edb4c`.
+     * `UUID.fromString` throws on that, so the `getOrElse` **silently minted a brand-new
+     * random UUID** and we registered as `messages-web-00fc99c9…` instead. Fixing the
+     * 403 therefore turned a stable identity into a fresh one on every link — the ghost
+     * engine (OQ-10) resurrected in a new form, and strictly worse than the 403 it fixed.
+     *
+     * Two lessons, both worth keeping: **never invent identity in a formatting helper**,
+     * and Google's own id is not in the shape our own generator produces.
+     *
+     * Returns null on anything unparseable. The caller decides what to do about it —
+     * that decision is not this function's to make.
+     */
+    private fun webDeviceHexOrNull(raw: String): String? {
+        val t = raw.trim()
+        // Already 32 hex chars (Google's /web/config shape).
+        if (t.length == 32 && t.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }) {
+            return t.lowercase()
+        }
+        // Canonical dashed UUID (the shape store.getOrCreateDeviceSessionId() mints).
+        val u = runCatching { UUID.fromString(t) }.getOrNull() ?: return null
         val bytes = ByteBuffer.allocate(16)
             .putLong(u.mostSignificantBits)
             .putLong(u.leastSignificantBits)

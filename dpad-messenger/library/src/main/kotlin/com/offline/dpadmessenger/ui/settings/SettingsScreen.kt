@@ -115,6 +115,17 @@ fun SettingsScreen(
      *
      *  Google-Messages only; null hides the row. */
     onForceTokenRefresh: (() -> Unit)? = null,
+    /** DEBUG: run the pairing check on demand — ask Google whether this device is still
+     *  in the account's registration list, AND fire a live re-assert to see whether the
+     *  paired phone still answers.
+     *
+     *  Exists because the shipping detector is deliberately slow: it must outlast a
+     *  late `BROWSER_ACTIVE` echo (MEASURED at +768 s and +884 s on a healthy device)
+     *  before it can accuse a link of being dead, so reproducing an unpair takes 11-30
+     *  minutes of waiting. This row answers the same question in about 30 seconds.
+     *
+     *  Google-Messages only; null hides the row. */
+    onCheckPairing: (() -> Unit)? = null,
     /** Export this device's Smart Txt logs to support (zips the rolling
      *  Smart-Txt-only log ring and uploads it). Shown just above Log out when
      *  set; null hides the row. Host handles the result feedback. */
@@ -267,6 +278,14 @@ fun SettingsScreen(
                     subtitle = "Fires the proactive refresh on the next tick. One-shot \u2013 " +
                         "messages should keep arriving with no reconnect screen",
                     onClick = onForceTokenRefresh,
+                )
+            }
+            if (onCheckPairing != null) {
+                ActionRow(
+                    title = "Check pairing now (debug)",
+                    subtitle = "Asks Google and the phone whether this device is still " +
+                        "linked. Takes ~30s \u2013 result in a toast, detail in the logs",
+                    onClick = onCheckPairing,
                 )
             }
             if (onExportLogs != null) {

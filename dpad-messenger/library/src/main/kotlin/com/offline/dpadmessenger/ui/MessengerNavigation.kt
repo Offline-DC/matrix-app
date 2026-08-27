@@ -97,6 +97,10 @@ fun DpadMessengerApp(
     /** DEBUG: arm the one-shot proactive-token-refresh override. Adds a
      *  "Force token refresh (debug)" row to Settings when set; null hides it. */
     onForceTokenRefresh: (() -> Unit)? = null,
+    /** DEBUG: run the pairing check on demand (Google's registration list + a live
+     *  re-assert to the phone). Adds a "Check pairing now (debug)" row to Settings when
+     *  set; null hides it. */
+    onCheckPairing: (() -> Unit)? = null,
     /** Export Smart Txt logs to support. Adds an "Export logs" row to Settings
      *  (just above Log out) when set; null hides it. */
     onExportLogs: (() -> Unit)? = null,
@@ -279,6 +283,7 @@ fun DpadMessengerApp(
                     onDefaultSendHandleChange = onDefaultSendHandleChange,
                     onReregister = onReregister,
                     onForceTokenRefresh = onForceTokenRefresh,
+                    onCheckPairing = onCheckPairing,
                     onExportLogs = onExportLogs,
                 )
             }

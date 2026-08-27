@@ -281,6 +281,33 @@ fun GoogleMessagesApp(
                 ).show()
             }
         }
+        // Settings -> "Check pairing now (debug)". The on-demand version of the whole
+        // unpair detector.
+        //
+        // Why it earns a row: the shipping detector is deliberately slow. It escalates on
+        // an ABSENCE — the phone not answering — and a healthy phone's echo has been
+        // MEASURED arriving as late as +884 s, so nothing is allowed to conclude anything
+        // for 20 minutes. Reproducing an unpair therefore costs 11-30 minutes of staring
+        // at logcat per attempt. This asks both questions directly and answers in ~30 s.
+        //
+        // It runs the REAL paths (GMDeviceListProbe + the normal reassertRequested tick),
+        // not a debug copy of them, so what it reports is what the detector would see.
+        val checkPairingAction: (() -> Unit)? = if (!debugTools) null else {
+            {
+                Toast.makeText(
+                    context,
+                    "Checking pairing… ~30s (asking Google, then the phone)",
+                    Toast.LENGTH_SHORT,
+                ).show()
+                relinkScope.launch {
+                    val summary = runCatching { GoogleMessagesRepository.checkPairingNow() }
+                        .getOrElse { "Check failed: ${it.message ?: it::class.simpleName}" }
+                    Toast.makeText(context, summary, Toast.LENGTH_LONG).show()
+                }
+                Unit // launch() returns a Job; the row wants () -> Unit.
+            }
+        }
+
         val relink: () -> Unit = {
             relinkScope.launch {
                 if (GoogleMessagesRepository.reauth()) return@launch
@@ -300,8 +327,14 @@ fun GoogleMessagesApp(
                 }
                 android.util.Log.w(
                     "GMSession",
-                    "re-link: Google rejected the stored credentials (reason=$reason) " +
-                        "— wiping auth for a full re-pair",
+                    if (reason == AuthFailureReason.UNPAIRED) {
+                        "re-link: this device is UNPAIRED — the credentials are fine, the " +
+                            "pairing entry is gone, so a token refresh cannot help. Wiping " +
+                            "auth for a real re-pair; the user signs in again via the extension"
+                    } else {
+                        "re-link: Google rejected the stored credentials (reason=$reason) " +
+                            "— wiping auth for a full re-pair"
+                    },
                 )
                 // Revoke, tear down, wipe — in that order, and uninterruptibly.
                 // Google has just rejected these credentials so the revoke will
@@ -392,6 +425,7 @@ fun GoogleMessagesApp(
             },
             onReregister = reregisterAction,
             onForceTokenRefresh = forceTokenRefreshAction,
+            onCheckPairing = checkPairingAction,
             autoDeleteDays = autoDeleteDays,
             onAutoDeleteDaysChange = { days ->
                 autoDeleteDays = days
