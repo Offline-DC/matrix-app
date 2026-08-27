@@ -219,6 +219,146 @@ internal class GoogleMessagesSessionClient(
      *  from observed stream lifetimes instead of from the keepalive it is guarding. */
     @Volatile private var lastStreamHeartbeatMs = 0L
 
+    /**
+     * Wall-clock ms of the last NON-KEEPALIVE frame that reached us on the receive
+     * stream: a live user alert, a conversation update or a message. Replayed backlog
+     * and heartbeats excluded.
+     *
+     * Read it as "is the far end alive" rather than "is Google up". Everything on this
+     * stream above the keepalive originates with the PAIRED PHONE, so this clock going
+     * flat means the phone has stopped answering — which on 25 Aug 2026 it had, for
+     * 6.6 h, while every companion-to-Google check stayed perfect.
+     *
+     * The third clock, and the one the 25 Aug 2026 outage needed. [lastInboundMs]
+     * is stamped only for conversations/messages, so a device nobody has texted
+     * reads the same as a displaced one. [lastStreamActivityMs] counts keepalives,
+     * so it read 0-10s straight through a 34.5-minute total receive outage. This
+     * one is bounded ABOVE by the protocol: the 30-minute re-assert is answered
+     * with a BROWSER_ACTIVE alert, which is itself a payload, so a healthy device
+     * refreshes this at least every [ACTIVE_SESSION_REASSERT_MS] whether or not
+     * anyone texts it.
+     *
+     * MEASURED (…9307, 08-23 11:30 -> 08-25 08:25, 44.9h, 848 payload events):
+     * gap ceiling 30.0 min; single worst gap 42.6 min, and that one was this same
+     * failure self-healing. See reference/GMESSAGES_RECEIVE_DISPLACEMENT_20260825.md.
+     */
+    @Volatile private var lastPayloadMs = 0L
+
+    /** When a REASSERT was accepted by Google and we started waiting for the
+     *  BROWSER_ACTIVE echo that confirms it actually took. 0 = not waiting.
+     *  Deliberately NOT cleared on timeout, so a late echo is still measured —
+     *  MEASURED 08-24 06:35: one arrived +12.7 min and delivery resumed. */
+    @Volatile private var echoAwaitedSinceMs = 0L
+
+    /**
+     * When the phone last said `BROWSER_ACTIVE`, **whichever branch handled it**.
+     *
+     * MEASURED 26 Aug 2026, 15:24:51–55: the re-assert POST took 3.4 s and the phone's
+     * echo came back on the stream at +1.0 s — i.e. BEFORE [echoAwaitedSinceMs] was
+     * armed, because arming happens after the POST returns. The echo was therefore
+     * handled as "unsolicited", the arm that followed it timed out, and the debug
+     * pairing check reported `Phone: no answer in 30s` on a **healthy paired device**.
+     *
+     * A stamp that does not care which branch saw it fixes both readers: the manual
+     * check counts any answer during its wait, and the re-assert arm below can notice
+     * that the answer already arrived while the POST was in flight.
+     */
+    @Volatile private var lastBrowserActiveMs = 0L
+
+    /** When the phone last sent a BrowserPresenceCheck. Diagnostic only — see the
+     *  handler in [handleRpc] for why its cadence is worth knowing. */
+    @Volatile private var lastPresenceCheckMs = 0L
+
+    /** When the phone last said it was rebuilding its own SMS/MMS database, or 0.
+     *  While this is set, message DELETIONS are withheld — see [withheldDeletions]. */
+    @Volatile private var mobileDbSyncSinceMs = 0L
+
+    /** Monotonic count of `BROWSER_ACTIVE` frames, for the same reason as
+     *  [lastBrowserActiveMs] — a reader that must not miss a race. */
+    private val browserActiveSeen = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Set when the echo window expires, so the UNCONFIRMED line logs once per
+     *  wait rather than every 5s ackLoop tick. */
+    @Volatile private var echoTimedOut = false
+
+    /** Per-stream frame tallies, reset on every long-poll open. A stream that
+     *  closes with payloads=0 twice running IS the displacement diagnosis. */
+    @Volatile private var streamKeepalives = 0
+    @Volatile private var streamPayloads = 0
+
+    /** Since process start, for the `alive:` line. Two ints is the whole of
+     *  OQ-14 for this failure mode — and note that neither of OQ-14's originally
+     *  proposed counters would have caught it, because both keyed on
+     *  `stream[quiet]`, which stayed healthy throughout. */
+    private val reassertsConfirmed = java.util.concurrent.atomic.AtomicInteger(0)
+    private val reassertsUnconfirmed = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Live (non-replayed) alerts the PHONE has pushed this session, any type.
+     *  MEASURED 26 Aug 2026 (deliberate unpair): on an unpaired account this stays
+     *  at 0 forever while every local check reads healthy, so it is the cheapest
+     *  single number separating "linked" from "silently unpaired". */
+    private val phoneAlerts = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /**
+     * Consecutive re-asserts that went unanswered, and stranded sends since the last
+     * confirmed answer. Together they decide when to TELL THE USER.
+     *
+     * Why two signals instead of one: **MEASURED, Ben's 53 healthy re-asserts — 51
+     * echoed inside 30 s and 2 arrived late (+768 s, +884 s), both beside a stream
+     * break.** So a single miss is ~4% likely to be transient, and showing a
+     * "re-link" screen on it would have false-alarmed twice on a working device —
+     * and following that prompt is what mints duplicate pairings (see [onUserAlert]).
+     * Two *consecutive* misses never happened while healthy, and happened 12x and 20x
+     * running once unpaired.
+     *
+     * A stranded send is independent corroboration arriving in 60 s while the user is
+     * actually looking at the screen, so one unanswered re-assert alongside one is
+     * enough. That is the fast path: ~90 s from the user's own action instead of ~60 min.
+     */
+    private val unconfirmedStreak = java.util.concurrent.atomic.AtomicInteger(0)
+    private val sendTimeoutsSinceConfirm = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /**
+     * Last time [probeDeviceList] actually went to the network, so a burst of
+     * unanswered re-asserts cannot turn into a burst of SignInGaia calls.
+     */
+    @Volatile private var lastDeviceProbeMs = 0L
+
+    /**
+     * Last time the quiet-phone watchdog fired an out-of-band probe. Separate from
+     * [lastActiveSessionAssertMs] because that one is also moved by the ordinary
+     * 30-minute tick, and this watchdog needs its own floor.
+     */
+    @Volatile private var lastQuietProbeMs = 0L
+
+    /** Debounce for [noteSendTimeout]'s probe, so a burst of stranded sends produces
+     *  one extra POST rather than one per message. */
+    @Volatile private var lastSendProbeMs = 0L
+
+    /**
+     * True when the surfaced reconnect screen was raised by [maybeSurfaceUnpaired]
+     * rather than by Google rejecting us.
+     *
+     * It exists to stop the screen FLAPPING. The recovery path below clears
+     * `activeSessionGaveUp` on any HTTP 2xx from `setActiveSession` — which is correct
+     * for a rejection, and wrong here, because **an unpaired account returns 200 to
+     * every attempt (MEASURED: 32 of 32 across two customers).** Without this flag the
+     * screen would appear, vanish on the next 30-minute re-assert, and come back, on a
+     * device that never recovered. For an unpair, only the phone's echo counts as
+     * recovery, so the clear happens in [onUserAlert] instead.
+     */
+    @Volatile private var gaveUpWasUnpaired = false
+
+    /**
+     * When to re-probe the phone after ONE unanswered re-assert. 0 = nothing pending.
+     *
+     * Without this, a suspicion raised at minute 0 waits for the next scheduled
+     * re-assert to be corroborated — up to 30 minutes of a user's texts going nowhere
+     * on a device nobody happens to be sending from. Re-probing sooner costs nothing on
+     * a healthy device, because it is only ever armed after a miss.
+     */
+    @Volatile private var recheckDueAtMs = 0L
+
     /** Throttle state for the `alive:` line. A FIELD, not a local in [longPollLoop],
      *  because the line is now emitted from [ackLoop]'s timer — see [maybeHeartbeat]. */
     @Volatile private var aliveLogLastMs = 0L
@@ -249,6 +389,7 @@ internal class GoogleMessagesSessionClient(
         displacements.set(0)
         activeSessionFailures.set(0)
         activeSessionGaveUp = false
+        gaveUpWasUnpaired = false
         reassertRequested = false
         longPollJob = scope.launch { longPollLoop() }
         ackJob = scope.launch { ackLoop() }
@@ -404,7 +545,18 @@ internal class GoogleMessagesSessionClient(
                 // receive socket is dead" — 19 Aug 2026 logged `last inbound 99m ago`
                 // on a wedged stream and it read as a quiet afternoon. stream[] is the
                 // field that separates them.
-                "stream[${streamGap(now)}] " +
+                // stream[] answers "is the socket alive" and inbound[] answers "has
+                // anyone texted me". Neither answers "is Google still routing to me",
+                // which is what broke on 25 Aug 2026 while both of the others read
+                // perfectly healthy. payloadQuiet[] is that third question, and it is
+                // the one with a protocol-guaranteed ceiling — see [lastPayloadMs].
+                "stream[${streamGap(now)}] payloadQuiet[${payloadGap(now)}] " +
+                // The field that would have ended the 25-26 Aug investigation on the
+                // first capture instead of the fourth. Everything in it is the phone
+                // reporting, so "alerts=0 answered=0/N" on a device that has been up for
+                // hours means we are not paired any more, whatever else reads fine.
+                "phone[${phoneSummary(now)}] " +
+                "counts[displaced=${displacements.get()}] " +
                 "rot[${GMCookieRotation.status()}]",
         )
         return now
@@ -509,6 +661,27 @@ internal class GoogleMessagesSessionClient(
      */
     suspend fun reauth(): Boolean {
         Log.i(TAG, "reauth: re-link requested — net=${connectivity()} cookies[${cookieSummary()}]")
+        // Captured BEFORE anything below can reset it: the success tail of this function
+        // clears gaveUpWasUnpaired, so reading it later would always see false.
+        //
+        // WHY THIS GUARD EXISTS. reauth() is RUNG 2 — refresh the tachyon token from the
+        // stored cookies. That fixes CREDENTIAL death. It cannot fix an UNPAIRED device,
+        // because there is nothing wrong with the credentials: the pairing ENTRY is gone
+        // from the account and only a real SignInGaia + UKey2 pairing recreates it.
+        //
+        // MEASURED 26 Aug 2026, dev device, deliberate unpair: the user pressed Re-link,
+        // this ran, `token refresh OK … (HTTP 200)` and `reauth OK — link restored from
+        // stored cookies WITHOUT re-pairing`, the UI declared success and dropped the
+        // user back into a messenger that was still dead. Two minutes later the next
+        // stranded send raised UNPAIRED again. A loop, and every trip through it tells
+        // the user their phone is fixed when it is not.
+        //
+        // So: report FAILURE with reason=UNPAIRED. The caller's existing
+        // reauth-failed branch already does the right thing — tear down and fall back to
+        // a full re-pair, which flips to the sign-in screen where the extension delivers
+        // a fresh harvest. Honest, and it reuses a path that already works (MEASURED:
+        // Ben's re-link completed in 4.3 s and BROWSER_ACTIVE returned in 0.5 s).
+        val wasUnpaired = gaveUpWasUnpaired
         // Recovery-only bootstrap. If this session holds no __Secure-1PSIDTS, mint one
         // before spending the token refresh: Google's tolerance of a set without it is
         // inconsistent (401/401/200/401 on byte-identical input, 14 Aug 2026), while a
@@ -516,6 +689,19 @@ internal class GoogleMessagesSessionClient(
         // cookies exactly as they were, so the refresh below still gets its normal shot.
         if (gaia) runCatching { bootstrapCookiesNow() }
             .onFailure { Log.w(TAG, "reauth: bootstrap failed (continuing)", it) }
+        if (wasUnpaired) {
+            // Refresh the token anyway — it is cheap, it is not wrong, and a fresh token
+            // is what the imminent re-pair wants. Just do not call it a restored link.
+            runCatching { refreshToken() }
+            lastAuthFailure = AuthFailureReason.UNPAIRED
+            Log.w(
+                TAG,
+                "reauth CANNOT fix this: the device is UNPAIRED, and a token refresh does " +
+                    "not recreate a pairing entry. Reporting failure so the caller does a " +
+                    "real re-pair (the user will need to sign in again via the extension)",
+            )
+            return false
+        }
         if (!runCatching { refreshToken() }.getOrDefault(false)) {
             // This distinction is the whole diagnosis. If the stored cookies were
             // still good and only the network was down, the credentials are fine
@@ -529,6 +715,59 @@ internal class GoogleMessagesSessionClient(
                 },
             )
             return false
+        }
+        // VERIFY BEFORE CLAIMING SUCCESS.
+        //
+        // The `wasUnpaired` guard above only fires once [maybeSurfaceUnpaired] has fully
+        // escalated, and escalation is deliberately slow — it has to outlast a late echo
+        // (MEASURED +768 s / +884 s), so it needs two strikes AND 20 minutes of silence.
+        // A user who presses "Re-link" or "Re-register now" inside that window hits this
+        // path instead, with `gaveUpWasUnpaired` still false.
+        //
+        // MEASURED 26 Aug 2026, 15:15:46: exactly that. The detector had reached
+        // `far end unanswered (streak=1)` and no further; the token refresh returned 200;
+        // this logged `reauth OK — link restored`, the toast said success, and the phone
+        // still could not send. The §25.4 fix did not cover it.
+        //
+        // So when there is already evidence the far end stopped answering, spend 30
+        // seconds proving the link before telling the user it is fixed. Only then; a
+        // healthy reauth pays nothing.
+        val suspect = unconfirmedStreak.get() > 0 || sendTimeoutsSinceConfirm.get() > 0
+        if (suspect) {
+            Log.w(
+                TAG,
+                "reauth: token refreshed, but the phone had already stopped answering " +
+                    "(unconfirmed=${unconfirmedStreak.get()} stranded=${sendTimeoutsSinceConfirm.get()}) " +
+                    "— verifying with a live re-assert before claiming anything",
+            )
+            // The restarted stream has to be up for a re-assert to be answerable.
+            sessionStartedMs = System.currentTimeMillis()
+            longPollJob?.cancel(); longPollJob = scope.launch { longPollLoop() }
+            ackJob?.cancel(); ackJob = scope.launch { ackLoop() }
+            activeSessionEstablished = false
+            val echoMs = awaitPhoneEcho()
+            if (echoMs == null) {
+                lastAuthFailure = AuthFailureReason.UNPAIRED
+                Log.w(
+                    TAG,
+                    "reauth did NOT fix this: the token refreshed fine but the phone still " +
+                        "does not answer, so the credentials were never the problem — the " +
+                        "pairing entry is gone. Reporting failure so the caller does a real " +
+                        "re-pair instead of dropping the user back into a dead messenger",
+                )
+                return false
+            }
+            Log.i(TAG, "reauth VERIFIED: the phone answered +${echoMs}ms — the link really is back")
+            unconfirmedStreak.set(0)
+            sendTimeoutsSinceConfirm.set(0)
+            recheckDueAtMs = 0L
+            activeSessionRejects.set(0)
+            activeSessionFailures.set(0)
+            activeSessionGaveUp = false
+            gaveUpWasUnpaired = false
+            reassertRequested = false
+            displacements.set(0)
+            return true
         }
         Log.i(TAG, "reauth OK — link restored from stored cookies WITHOUT re-pairing (no QR/emoji)")
         sessionStartedMs = System.currentTimeMillis()
@@ -544,6 +783,7 @@ internal class GoogleMessagesSessionClient(
         activeSessionRejects.set(0)
         activeSessionFailures.set(0)
         activeSessionGaveUp = false
+        gaveUpWasUnpaired = false
         reassertRequested = false
         displacements.set(0)
         return true
@@ -609,7 +849,17 @@ internal class GoogleMessagesSessionClient(
         }
         val plain = resp.encryptedData?.let(::decrypt)
         if (plain == null) {
-            Log.w(TAG, "listContacts: response had no encryptedData (enc=${resp.encryptedData?.size}, unenc=${resp.unencryptedData?.size})")
+            // payloadQuiet is on this line because the two correlated perfectly on
+            // 25 Aug 2026: this warning's FIRST occurrence in 44.9h landed 33 minutes
+            // into the receive outage. One data point, so INFERRED at best — but if it
+            // repeats with a large payloadQuiet it stops being a coincidence, and that
+            // is only visible if the two numbers share a line.
+            Log.w(
+                TAG,
+                "listContacts: response had no encryptedData " +
+                    "(enc=${resp.encryptedData?.size}, unenc=${resp.unencryptedData?.size}) " +
+                    "payloadQuiet=${payloadGap(System.currentTimeMillis())}",
+            )
             return emptyList()
         }
         val contacts = GMSessionProto.parseListContactsResponse(plain)
@@ -985,13 +1235,30 @@ internal class GoogleMessagesSessionClient(
                         delay(backoffMs)
                         continue
                     }
+                    // Getting here means a 401/403 that a token refresh did not fix —
+                    // either the refresh failed with a definite classification, or it
+                    // SUCCEEDED and Google then rejected the brand-new token anyway.
+                    //
+                    // That second case used to surface as UNKNOWN, because
+                    // [refreshToken] resets `lastAuthFailure` to UNKNOWN on success and
+                    // nothing overwrote it afterwards. UNKNOWN is the reason string the
+                    // user's reconnect screen reads from, so a perfectly diagnosable
+                    // failure showed up as "cause not specifically identified" and told
+                    // both them and us nothing. A freshly-minted token being refused is
+                    // exactly what [AuthFailureReason.TOKEN_DEAD] describes.
+                    val fatalReason =
+                        if (lastAuthFailure == AuthFailureReason.UNKNOWN) {
+                            AuthFailureReason.TOKEN_DEAD
+                        } else {
+                            lastAuthFailure
+                        }
                     Log.e(
                         TAG,
                         "long-poll fatal HTTP $code after ${uptime()} — declaring link dead " +
-                            "(reason=$lastAuthFailure net=${connectivity()} " +
+                            "(reason=$fatalReason raw=$lastAuthFailure net=${connectivity()} " +
                             "expiry=${expirySummary()} cookies[${cookieSummary()}])",
                     )
-                    _events.emit(SessionEvent.AuthExpired(lastAuthFailure))
+                    _events.emit(SessionEvent.AuthExpired(fatalReason))
                     return
                 }
                 // Any other SERVER error (e.g. 404 = registration not found /
@@ -1101,6 +1368,8 @@ internal class GoogleMessagesSessionClient(
             // first element, or a previous stream's leftover count would
             // silently discard live events on this one.
             staleReplayRemaining = 0
+            streamKeepalives = 0
+            streamPayloads = 0
             Log.d(TAG, "session long-poll #$attempt open")
             // The receive stream is up — register as the active session if we
             // aren't yet, or re-assert if the registration is stale. Launched on
@@ -1126,6 +1395,18 @@ internal class GoogleMessagesSessionClient(
                 // pending.
                 if (!activeSessionEstablished || reassertDue()) scheduleAssertTick()
             }
+            // The split is the diagnosis. A stream can close after a perfectly
+            // healthy-looking 15 minutes having carried nothing but keepalives, and
+            // until now no line said so: `long-poll #96 open` and a run of
+            // `stream heartbeat` lines look identical whether or not any message
+            // arrived. MEASURED 25 Aug 2026: #96 and #97 both opened cleanly inside
+            // the outage and delivered payloads=0. Two of those in a row is the whole
+            // finding, greppable, with no corpus and no script.
+            Log.i(
+                TAG,
+                "session long-poll #$attempt closed: keepalives=$streamKeepalives " +
+                    "payloads=$streamPayloads",
+            )
             return 0
         }
     }
@@ -1151,6 +1432,7 @@ internal class GoogleMessagesSessionClient(
             // Google's keepalive interval and [STREAM_READ_DEADLINE_MS] can stop being
             // an estimate.
             GMSessionProto.LongPollEvent.Heartbeat -> {
+                streamKeepalives++
                 val nowMs = System.currentTimeMillis()
                 val gap = if (lastStreamHeartbeatMs == 0L) -1L
                     else (nowMs - lastStreamHeartbeatMs) / 1000
@@ -1168,7 +1450,19 @@ internal class GoogleMessagesSessionClient(
     private suspend fun handleRpc(rpc: GMSessionProto.IncomingRpc) {
         // Always ack what we received, or the phone re-delivers it forever.
         if (rpc.responseId.isNotEmpty()) queueAck(rpc.responseId)
-        if (rpc.bugleRoute != GMSessionProto.ROUTE_DATA_EVENT) return
+        // ROUTE_PAIR_EVENT used to die in the `!= ROUTE_DATA_EVENT` return below,
+        // unparsed and unlogged. mautrix-gmessages reads a `revoked` arm off this
+        // route and treats it as an unpair; see [handlePairEvent].
+        if (rpc.bugleRoute == GMSessionProto.ROUTE_PAIR_EVENT) {
+            handlePairEvent(rpc)
+            return
+        }
+        if (rpc.bugleRoute != GMSessionProto.ROUTE_DATA_EVENT) {
+            // Not silence any more: if Google starts using a third route to tell us
+            // something, the next capture says so instead of us re-deriving it.
+            Log.d(TAG, "pushed frame on unhandled route ${rpc.bugleRoute} — ignoring")
+            return
+        }
         // Consume one slot of this stream's replay backlog. Counted for EVERY
         // DataEvent, including ones dropped below, so the tally stays aligned
         // with what the server actually re-delivered.
@@ -1177,17 +1471,161 @@ internal class GoogleMessagesSessionClient(
         val data = rpc.messageData ?: return
         val msg = GMSessionProto.parseRpcMessageData(data)
 
+        // ---- GAIA LOGOUT SENTINEL — checked BEFORE the waiter lookup ----------
+        //
+        // Order matters and it did not use to. The sentinel test lived below the
+        // waiter lookup, which means a pushed `72 00` whose sessionId happened to
+        // match an in-flight request id would have been handed to that waiter and
+        // consumed as if it were a response — the one frame that tells us we are
+        // logged out, swallowed by a send. It has not bitten us yet (the 16:17:42
+        // capture arrived with no matching waiter) but it is a race, not a
+        // guarantee, and mautrix-gmessages checks it first for the same reason
+        // (`pkg/libgm/session_handler.go`, before the response-router dispatch).
+        //
+        // Scoped tightly on purpose: ONLY the exact two-byte body on a GET_UPDATES
+        // action jumps the queue. Anything else with an unencrypted body falls
+        // through to the normal path below, so no legitimate response can be
+        // stolen by this guard in the other direction.
+        if (isGaiaLogoutSentinel(msg)) {
+            onGaiaLogoutSentinel(msg, stale)
+            return
+        }
+
+        // ---- DECOY FRAMES MUST NOT BE ALLOWED TO WIN A WAITER -----------------
+        //
+        // MEASURED-FROM-SOURCE (mautrix-gmessages `pkg/libgm/session_handler.go:143-157`),
+        // which does this check BEFORE its response-router dispatch, gated on cookie
+        // (i.e. GAIA) mode:
+        //
+        //     // Very hacky way to ignore weird messages that come before real responses
+        //     // TODO figure out how to properly handle these
+        //     if msg.Message.UnencryptedData != nil && msg.Message.EncryptedData == nil {
+        //         return false
+        //     }
+        //
+        // Google emits frames with an unencrypted body and no encrypted body that can
+        // carry a sessionId matching an in-flight request. Ours used to hand those
+        // straight to the waiter, which then resolved with a response containing no
+        // payload — and the REAL response, arriving later, found no waiter and was
+        // dropped.
+        //
+        // **We have field evidence this is already happening to us.** The
+        // `listContacts: response had no encryptedData (enc=null, unenc=2)` warning
+        // (twice in the 25-26 Aug corpus) can only be printed when a waiter was
+        // completed by exactly this shape of frame. The displacement doc §4 recorded
+        // that line as a "repeatable correlate" of the broken state; it is at least
+        // partly an artefact of this race. **Do not retire that correlate on the
+        // strength of this comment** — the line firing only inside the broken state is
+        // still unexplained, and one plausible reading is that the decoy is normally
+        // beaten by a real response and only wins when no real response is coming.
+        // INFERRED, and the next capture after this change is what settles it.
+        //
+        // Note we need NO GAIA-pairing exemption where mautrix does: our pairing
+        // handshake runs on its own waiter map in `GMGaiaPairing.kt:64`, so nothing
+        // routed here can be a pairing response.
+        val decoy = GoogleMessagesConfig.decoyGuardEnabled &&
+            msg.encryptedData == null &&
+            msg.unencryptedData != null &&
+            msg.unencryptedData!!.isNotEmpty()
+
         // Is this the response to a request we're awaiting?
-        if (msg.sessionId.isNotEmpty()) {
+        if (!decoy && msg.sessionId.isNotEmpty()) {
             val waiter = waitersLock.withLock { waiters.remove(msg.sessionId) }
             if (waiter != null) { waiter.complete(msg); return }
         }
+        if (decoy && msg.sessionId.isNotEmpty()) {
+            val waiting = waitersLock.withLock { waiters.containsKey(msg.sessionId) }
+            if (waiting) {
+                Log.w(
+                    TAG,
+                    "decoy frame REFUSED a waiter it would previously have won " +
+                        "(sessionId matched an in-flight request, ${msg.unencryptedData?.size} " +
+                        "unencrypted bytes, no encryptedData) — the real response is still " +
+                        "awaited [action=${msg.action}, up ${uptime()}]",
+                )
+            }
+        }
 
         // Otherwise it's a pushed update (GET_UPDATES).
+        //
+        // Any OTHER unencrypted pushed frame. The `72 00` sentinel can no longer
+        // reach here — it is intercepted above, before the waiter lookup — so this
+        // is the catch-all that keeps us from re-learning the same lesson twice:
+        // frames with no encryptedData used to be dropped on the floor silently,
+        // which is precisely how the logout marker went unseen across ten captures
+        // while we asserted "Google never announces an unpair". The bodies are a
+        // handful of bytes, never a credential, so they are safe to log verbatim.
+        if (msg.encryptedData == null) {
+            val unenc = msg.unencryptedData
+            if (unenc != null && unenc.isNotEmpty()) {
+                val hex = unenc.joinToString(" ") { "%02x".format(it) }
+                Log.w(
+                    TAG,
+                    "pushed frame with unencrypted body and no encryptedData: " +
+                        "${unenc.size} bytes [$hex] action=${msg.action} stale=$stale " +
+                        "— not the 2-byte GAIA logout marker, shape unknown",
+                )
+            }
+            return
+        }
         val plain = msg.encryptedData?.let(::decrypt) ?: return
         val updates = runCatching { GMSessionProto.parseUpdateEvents(plain) }.getOrNull() ?: return
+        // Proof that Google is still ROUTING to this device — weaker than
+        // [lastInboundMs] (which needs real message traffic) and stronger than
+        // [lastStreamActivityMs] (which a keepalive satisfies). A live user alert
+        // counts, and that is the point: it is what the 30-minute re-assert echo
+        // arrives as, and therefore what gives this clock its 30-minute ceiling.
+        if (!stale) {
+            lastPayloadMs = System.currentTimeMillis()
+            streamPayloads++
+            // Broadest possible recovery signal, and the right one: ANY live pushed frame
+            // means the phone is talking to us again, so an unpaired warning must go.
+            //
+            // Narrowing this to the BROWSER_ACTIVE branch of [onUserAlert] left a hole.
+            // MEASURED 26 Aug, immediately after a re-pair: `startup ack count=3` marked
+            // the first three DataEvents as replayed backlog, and the first BROWSER_ACTIVE
+            // arrived on that stale path — which returns early, before the clear. Live
+            // traffic followed within seconds so nothing was visibly stuck, but the clear
+            // should not depend on which frame type happens to arrive first when texts
+            // themselves are proof enough.
+            if (activeSessionGaveUp && gaveUpWasUnpaired) {
+                activeSessionGaveUp = false
+                gaveUpWasUnpaired = false
+                unconfirmedStreak.set(0)
+                sendTimeoutsSinceConfirm.set(0)
+                recheckDueAtMs = 0L
+                Log.i(
+                    TAG,
+                    "the phone is pushing to us again — clearing the unpaired warning " +
+                        "[up ${uptime()}]",
+                )
+                _events.emit(SessionEvent.AuthRestored)
+            }
+        }
         updates.userAlert?.let { onUserAlert(it, stale) }
-        if (updates.isBrowserPresenceCheck) { runCatching { ackBrowserPresence() }; return }
+        if (updates.isBrowserPresenceCheck) {
+            // The phone asking "are you still there?" — and it is the ONLY thing on this
+            // protocol that is phone-originated, unsolicited, and expects a reply. We
+            // have always answered it (mautrix only added the same handling in their
+            // PR #51, Apr 2026) but we have never LOGGED it, so its cadence is unknown
+            // and it is invisible in every support capture we hold.
+            //
+            // Worth knowing because if it arrives on a tight cadence it is a better
+            // liveness clock than the 30-minute re-assert echo, whose late tail
+            // (+768 s / +884 s MEASURED) is what forces the 20-minute confidence floor
+            // on absence-based unpair detection. UNKNOWN until a capture says.
+            val sinceLast =
+                if (lastPresenceCheckMs == 0L) "first this session"
+                else "${(System.currentTimeMillis() - lastPresenceCheckMs) / 1000}s since previous"
+            lastPresenceCheckMs = System.currentTimeMillis()
+            Log.i(
+                TAG,
+                "phone presence check — answering with ACK_BROWSER_PRESENCE " +
+                    "($sinceLast, stale=$stale) [up ${uptime()}]",
+            )
+            runCatching { ackBrowserPresence() }
+            return
+        }
         if (updates.conversations.isNotEmpty() || updates.messages.isNotEmpty()) {
             // Proof that traffic is genuinely reaching this device, which is the
             // one thing an HTTP 200 from SetActiveSession does not establish.
@@ -1197,7 +1635,7 @@ internal class GoogleMessagesSessionClient(
             _events.emit(SessionEvent.ConversationsUpdated(updates.conversations))
         }
         if (updates.messages.isNotEmpty()) {
-            _events.emit(SessionEvent.MessagesUpdated(updates.messages))
+            _events.emit(SessionEvent.MessagesUpdated(withheldDeletions(updates.messages)))
         }
     }
 
@@ -1210,12 +1648,24 @@ internal class GoogleMessagesSessionClient(
      * [stale] events are replayed backlog from the stream opening and are
      * logged but never acted on.
      */
-    private fun onUserAlert(alert: Int, stale: Boolean) {
+    // suspend, because the BROWSER_ACTIVE branch now emits SessionEvent.AuthRestored to
+    // un-show the unpaired warning — the echo is the only thing that proves recovery, so
+    // this is the only place that clear can legitimately happen. Sole caller is
+    // [handleRpc], which is already suspend, and `let` is inline, so the call site is
+    // unchanged.
+    private suspend fun onUserAlert(alert: Int, stale: Boolean) {
         val name = GMSessionProto.alertName(alert)
         if (stale) {
-            Log.d(TAG, "user alert $name — replayed backlog, not acting on it")
+            Log.d(TAG, "phone alert $name — replayed backlog, not acting on it")
             return
         }
+        // "phone alert", not "user alert". EVERY alert this protocol carries is the
+        // paired handset reporting about itself: BROWSER_ACTIVE alongside
+        // MOBILE_BATTERY_RESTORED / MOBILE_WIFI_CONNECTION / MOBILE_DATA_CONNECTION /
+        // MOBILE_BATTERY_LOW (see GMSessionProto.alertName). Establishing that took a
+        // proto read during a live outage, and it is the fact the whole diagnosis turns
+        // on; one word in the log saves the next reader the trip.
+        phoneAlerts.incrementAndGet()
         when {
             GMSessionProto.isBrowserInactiveAlert(alert) -> {
                 val now = System.currentTimeMillis()
@@ -1227,7 +1677,7 @@ internal class GoogleMessagesSessionClient(
                 if (n <= MAX_AUTO_RECLAIMS) {
                     Log.w(
                         TAG,
-                        "user alert $name (#$n) — Google says another session took the " +
+                        "phone alert $name (#$n) — Google says another session took the " +
                             "receive slot; reclaiming it now [up ${uptime()}]",
                     )
                     // A REASSERT, deliberately, NOT a REGISTER — even though we
@@ -1251,7 +1701,7 @@ internal class GoogleMessagesSessionClient(
                     // is removing one of the pairings.
                     Log.e(
                         TAG,
-                        "user alert $name (#$n) — something keeps taking the receive slot " +
+                        "phone alert $name (#$n) — something keeps taking the receive slot " +
                             "back. Not reclaiming again: this account probably has another " +
                             "LIVE paired device, and racing it would leave both half-working. " +
                             "Falling back to the periodic re-assert [up ${uptime()}]",
@@ -1259,11 +1709,93 @@ internal class GoogleMessagesSessionClient(
                 }
             }
             alert == GMSessionProto.ALERT_BROWSER_ACTIVE -> {
+                // Stamped BEFORE the branch split, so an echo that beats its own
+                // re-assert POST still counts as the phone answering.
+                lastBrowserActiveMs = System.currentTimeMillis()
+                browserActiveSeen.incrementAndGet()
                 // Confirmation we hold the slot — the positive half of the
                 // signal, and the line that proves a reclaim worked.
-                Log.i(TAG, "user alert BROWSER_ACTIVE — this device is the receive target [up ${uptime()}]")
+                val awaited = echoAwaitedSinceMs
+                if (awaited == 0L) {
+                    Log.i(
+                        TAG,
+                        "phone alert BROWSER_ACTIVE — this device is the receive target " +
+                            "[up ${uptime()}]",
+                    )
+                } else {
+                    // The positive half of the signal, now TIMED. MEASURED across 44.9h:
+                    // 86 of 87 re-asserts echoed in 0-10s, median ~2s. The 87th never
+                    // echoed, and that device was not receiving.
+                    val ms = System.currentTimeMillis() - awaited
+                    echoAwaitedSinceMs = 0L
+                    if (echoTimedOut) {
+                        // Late. Worth its own line: it means the failure can resolve
+                        // itself, and how long that took is the number we do not have.
+                        Log.w(
+                            TAG,
+                            "re-assert CONFIRMED LATE: BROWSER_ACTIVE echo +${ms / 1000}s, " +
+                                "past the ${REASSERT_ECHO_CONFIRM_MS / 1000}s window — this " +
+                                "device is receiving again [up ${uptime()}]",
+                        )
+                    } else {
+                        reassertsConfirmed.incrementAndGet()
+                        Log.i(
+                            TAG,
+                            "re-assert CONFIRMED: BROWSER_ACTIVE echo +${ms}ms — this device " +
+                                "is the receive target [up ${uptime()}]",
+                        )
+                    }
+                    // The phone answered, so nothing is wrong now whatever we thought a
+                    // moment ago. Clearing BOTH counters here is what keeps the user-facing
+                    // warning from latching over a link that healed itself — the failure
+                    // mode the AuthRestored comment below was written about.
+                    unconfirmedStreak.set(0)
+                    sendTimeoutsSinceConfirm.set(0)
+                    recheckDueAtMs = 0L
+                    // And THIS is the only place an UNPAIRED warning is allowed to clear,
+                    // because the echo is the only thing that actually proves the phone is
+                    // listening again. Covers the good case where the user re-links and the
+                    // new pairing answers within half a second (MEASURED: +0.5 s).
+                    if (activeSessionGaveUp && gaveUpWasUnpaired) {
+                        activeSessionGaveUp = false
+                        gaveUpWasUnpaired = false
+                        Log.i(
+                            TAG,
+                            "the phone is answering again — clearing the unpaired warning " +
+                                "[up ${uptime()}]",
+                        )
+                        _events.emit(SessionEvent.AuthRestored)
+                    }
+                }
             }
-            else -> Log.d(TAG, "user alert $name")
+            // Only STARTED opens the window, matching mautrix
+            // (`handlegmessages.go:298-304` keys on SYNC_STARTED and SYNC_COMPLETE only).
+            // ALERT_MOBILE_DB_SYNCING (11) is deliberately NOT included: it is UNKNOWN
+            // whether the phone sends it once or repeats it as a progress heartbeat, and
+            // if it repeats, treating it as a window-opener would suppress deletions far
+            // more often than intended. It falls through to the plain log below, so the
+            // next capture tells us which it is.
+            alert == GMSessionProto.ALERT_MOBILE_DB_SYNC_STARTED -> {
+                if (mobileDbSyncSinceMs == 0L) mobileDbSyncSinceMs = System.currentTimeMillis()
+                Log.w(
+                    TAG,
+                    "phone alert $name — the handset is rebuilding its SMS database. " +
+                        "WITHHOLDING message deletions until it says COMPLETE: during a " +
+                        "rebuild it sends deletions that are not real (mautrix hit this " +
+                        "too, CHANGELOG v26.05) [up ${uptime()}]",
+                )
+            }
+            alert == GMSessionProto.ALERT_MOBILE_DB_SYNC_COMPLETE -> {
+                val forMs = if (mobileDbSyncSinceMs == 0L) 0L
+                    else System.currentTimeMillis() - mobileDbSyncSinceMs
+                mobileDbSyncSinceMs = 0L
+                Log.i(
+                    TAG,
+                    "phone alert $name — database rebuild finished after ${forMs / 1000}s; " +
+                        "deletions are trusted again [up ${uptime()}]",
+                )
+            }
+            else -> Log.d(TAG, "phone alert $name")
         }
     }
 
@@ -1314,7 +1846,21 @@ internal class GoogleMessagesSessionClient(
             }
         } else null
 
-        var (code, _) = post(sendUrl, envelope, client)
+        // Retry a 5xx only for actions that are READS. mautrix retries every
+        // non-long-poll request at the HTTP layer (`pkg/libgm/http.go:52-80`,
+        // 3 attempts / 1s) and we deliberately do not go that far: a 5xx does not say
+        // whether Google processed the request before falling over, so retrying
+        // SEND_MESSAGE or SEND_REACTION risks sending the user's text twice.
+        //
+        // But the same caution was over-applied. LIST_CONVERSATIONS / LIST_MESSAGES /
+        // LIST_CONTACTS have no side effect at all, and a transient 502 on one of them
+        // currently produces an empty contact picker or a conversation sync that
+        // silently returns nothing — including the post-registration sync that runs
+        // right after a re-link, which is the worst possible moment for it.
+        val idempotentRead = action == GMSessionProto.ACTION_LIST_CONVERSATIONS ||
+            action == GMSessionProto.ACTION_LIST_MESSAGES ||
+            action == GMSessionProto.ACTION_LIST_CONTACTS
+        var (code, _) = post(sendUrl, envelope, client, retryOn5xx = idempotentRead)
         if (code == 401 && retryOn401) {
             // The tachyon token lapsed at send time. Refresh from the stored
             // cookies and retry ONCE so the message isn't silently dropped — the
@@ -1327,7 +1873,7 @@ internal class GoogleMessagesSessionClient(
                     messageType = messageType, tachyonAuthToken = acct2.tachyonAuthToken,
                     ttl = acct2.tokenTtl, destRegB64 = destRegB64,
                 )
-                code = post(sendUrl, envelope2, client).first
+                code = post(sendUrl, envelope2, client, retryOn5xx = idempotentRead).first
             } else {
                 Log.e(TAG, "send RPC 401 and token refresh failed — message not sent")
             }
@@ -1393,6 +1939,7 @@ internal class GoogleMessagesSessionClient(
                     "nobody has texted look identical from here",
             )
         }
+        val postStartedMs = System.currentTimeMillis()
         val result = try {
             runCatching {
                 val accepted = setActiveSession()
@@ -1429,7 +1976,7 @@ internal class GoogleMessagesSessionClient(
             // lost a cell handover: the alert comes once, so the request has to
             // outlive a failed attempt or it is simply gone.
             reassertRequested = false
-            if (activeSessionGaveUp) {
+            if (activeSessionGaveUp && !gaveUpWasUnpaired) {
                 // We had told the user to re-link. We were wrong, or it fixed
                 // itself. Say so, or the reconnect screen stays up over a device
                 // that is receiving and notifying perfectly well behind it.
@@ -1440,9 +1987,43 @@ internal class GoogleMessagesSessionClient(
                 )
                 _events.emit(SessionEvent.AuthRestored)
             }
-            activeSessionGaveUp = false
+            // An UNPAIRED warning is NOT cleared here on purpose: this branch means
+            // HTTP 2xx, and an unpaired account answers 2xx every time. Only the
+            // phone's own BROWSER_ACTIVE echo proves recovery, so [onUserAlert] clears
+            // it. Clearing on 200 would make the screen flap on a dead link.
+            if (!gaveUpWasUnpaired) activeSessionGaveUp = false
             if (trigger == ActiveSessionTrigger.REASSERT) {
-                Log.i(TAG, "setActiveSession re-asserted OK [up ${uptime()}]")
+                // NOT "OK". A 200 here means Google accepted the POST, and nothing
+                // more. On 25 Aug 2026 this line read OK 1.0s after the request, on a
+                // device that had already stopped receiving and would not receive again
+                // before the capture ended 20 minutes later. The word cost the
+                // investigation a day. The confirmation is the BROWSER_ACTIVE echo,
+                // which [onUserAlert] resolves.
+                if (lastBrowserActiveMs >= postStartedMs) {
+                    // The phone already answered — while this POST was still in flight.
+                    // Arming now would wait 30 s for an echo that has been and gone, and
+                    // report UNCONFIRMED on a device that is demonstrably receiving.
+                    echoAwaitedSinceMs = 0L
+                    echoTimedOut = false
+                    reassertsConfirmed.incrementAndGet()
+                    unconfirmedStreak.set(0)
+                    sendTimeoutsSinceConfirm.set(0)
+                    recheckDueAtMs = 0L
+                    Log.i(
+                        TAG,
+                        "re-assert CONFIRMED (echo beat the POST by " +
+                            "${postStartedMs - lastBrowserActiveMs + (System.currentTimeMillis() - postStartedMs)}ms " +
+                            "of round trip) — this device is the receive target [up ${uptime()}]",
+                    )
+                } else {
+                    echoAwaitedSinceMs = System.currentTimeMillis()
+                    echoTimedOut = false
+                    Log.i(
+                        TAG,
+                        "re-assert: setActiveSession http-accepted — awaiting BROWSER_ACTIVE " +
+                            "echo [up ${uptime()}, payloadQuiet=${payloadGap(System.currentTimeMillis())}]",
+                    )
+                }
             } else {
                 Log.i(TAG, "setActiveSession OK — registered to receive messages [up ${uptime()}]")
             }
@@ -1554,6 +2135,201 @@ internal class GoogleMessagesSessionClient(
 
     /** True when a registered session should re-assert: either a displacement
      *  alert asked for it, or the periodic interval has elapsed. */
+    /**
+     * A send went 60 s with no echo from the phone. Corroborating evidence that the
+     * far end is not answering — so probe it now instead of waiting up to 30 minutes
+     * for the scheduled re-assert.
+     *
+     * Called from [GoogleMessagesMessageRepository]'s send-echo timeout. Uses the same
+     * `reassertRequested` + [scheduleAssertTick] path a displacement reclaim uses, so
+     * it adds no new registration mechanics — and [ensureActiveSession]'s retry floor
+     * still applies, so this cannot become a POST per stranded message.
+     *
+     * Deliberately does NOT itself decide anything: it records the corroboration and
+     * asks a question. The answer (or the absence of one) is what escalates, in the
+     * echo-timeout check in [ackLoop].
+     */
+    internal fun noteSendTimeout() {
+        if (!GoogleMessagesConfig.unpairDetectionEnabled) return
+        val n = sendTimeoutsSinceConfirm.incrementAndGet()
+        val now = System.currentTimeMillis()
+        if (now - lastSendProbeMs < SEND_PROBE_DEBOUNCE_MS) return
+        lastSendProbeMs = now
+        Log.w(
+            TAG,
+            "send stranded (#$n since last confirmed answer) — probing the far end now " +
+                "instead of waiting for the ${ACTIVE_SESSION_REASSERT_MS / 60_000}min " +
+                "re-assert [payloadQuiet=${payloadGap(now)}]",
+        )
+        reassertRequested = true
+        scheduleAssertTick()
+    }
+
+    /**
+     * Ask GOOGLE whether our registration is still on the account — no phone involved.
+     *
+     * This is the only check here that is POSITIVE evidence rather than an absence, and
+     * it is what Google's own web client does on every warm start (see
+     * [GMDeviceListProbe]).
+     *
+     * **Logging only in this build.** The verdict is deliberately NOT wired to
+     * [maybeSurfaceUnpaired] or to any UI, because it is UNKNOWN whether a pairing
+     * revoke is even visible in this list: `RegisterRefresh` returned 200 with a fresh
+     * token while unpaired (doc 27.5), so the registration can plainly outlive the
+     * pairing. The paired-vs-unpaired diff has to be captured before a user-facing
+     * screen is allowed to depend on it. Rule 2.1b.
+     *
+     * Set [GoogleMessagesConfig.deviceListProbeDrivesUi] once that diff says it can.
+     */
+    private suspend fun probeDeviceList(reason: String): GMDeviceListProbe.ProbeResult? {
+        if (!GoogleMessagesConfig.deviceListProbeEnabled) return null
+        val now = System.currentTimeMillis()
+        if (now - lastDeviceProbeMs < DEVICE_PROBE_DEBOUNCE_MS) return null
+        lastDeviceProbeMs = now
+        val result = withContext(Dispatchers.IO) {
+            runCatching {
+                GMDeviceListProbe.probe(
+                    http = httpRpc,
+                    cookies = cookies,
+                    webDeviceUuid = store.getOrCreateDeviceSessionId(),
+                    knownOwnRegId = store.loadOwnRegistrationId(),
+                    reason = reason,
+                )
+            }.getOrElse {
+                Log.w(TAG, "device-list probe failed (changing nothing)", it)
+                null
+            }
+        } ?: return null
+
+        // Corroboration, not a decision. If Google says we are gone AND the phone has
+        // stopped answering, those are two independent instruments agreeing, which is
+        // exactly what this failure never had before.
+        val absent = result.verdict == GMDeviceListProbe.Verdict.ABSENT ||
+            result.verdict == GMDeviceListProbe.Verdict.PRESENT_DISABLED
+        if (absent && GoogleMessagesConfig.deviceListProbeDrivesUi) {
+            if (!activeSessionGaveUp) {
+                activeSessionGaveUp = true
+                gaveUpWasUnpaired = true
+                Log.e(
+                    TAG,
+                    "UNPAIRED (via device-list): Google's own registration list says " +
+                        "verdict=${result.verdict} for this device. This is POSITIVE " +
+                        "evidence, not an absence, so it does not wait out the " +
+                        "${UNPAIRED_CONFIDENCE_MS / 60_000}min echo floor " +
+                        "[up ${uptime()}, payloadQuiet=${payloadGap(now)}]",
+                )
+                _events.emit(SessionEvent.AuthExpired(AuthFailureReason.UNPAIRED))
+            }
+        } else if (absent) {
+            Log.w(
+                TAG,
+                "device-list probe says verdict=${result.verdict} — NOT surfacing it: " +
+                    "deviceListProbeDrivesUi is off until the paired-vs-unpaired diff is " +
+                    "captured. This line IS the diff.",
+            )
+        }
+        return result
+    }
+
+    /**
+     * The debug Settings row: answer "am I still paired?" on demand, in about 30 seconds,
+     * instead of waiting out the detector.
+     *
+     * Both halves, because they answer different questions and can disagree — which is
+     * the single most useful thing this button can show:
+     *
+     *  - **Google's answer**, from the registration list ([GMDeviceListProbe]). Positive
+     *    evidence, one round trip, phone not involved.
+     *  - **The phone's answer**, a real re-assert and its `BROWSER_ACTIVE` echo. This is
+     *    the signal the shipping detector actually escalates on.
+     *
+     * A disagreement is a finding, not a bug in the button. `Google: PRESENT` +
+     * `Phone: no answer` is what a revoked *pairing* over a surviving *registration*
+     * would look like, which is exactly the open question in OQ-21 — and the reason the
+     * probe's verdict is not allowed to drive the UI yet.
+     *
+     * Bypasses [DEVICE_PROBE_DEBOUNCE_MS] and [GoogleMessagesConfig.deviceListProbeEnabled]:
+     * a human pressed a button, so rate limits meant for automatic polling do not apply.
+     * Runs the re-assert through the normal `reassertRequested` path, so it exercises the
+     * real code rather than a parallel copy of it.
+     *
+     * @return a one-line summary for the toast. Full detail is in the log under
+     *         the `probe (...)` lines under `GMSession` and `GMSession`.
+     */
+    /**
+     * Fire a re-assert and wait for the paired phone's `BROWSER_ACTIVE` echo.
+     *
+     * @return round-trip milliseconds if the phone answered, or null if it did not
+     *         inside [REASSERT_ECHO_CONFIRM_MS] (plus scheduling slack).
+     *
+     * Polls a counter rather than adding a callback: this is used by a debug row and by
+     * [reauth]'s verification, and neither is worth new shared state that the shipping
+     * detector could trip over.
+     */
+    private suspend fun awaitPhoneEcho(): Long? {
+        // [browserActiveSeen], not reassertsConfirmed: the echo can arrive before its
+        // own re-assert POST returns, in which case the "confirmed" bookkeeping never
+        // runs. MEASURED 26 Aug — it made the debug check report "no answer" on a
+        // healthy device. Any BROWSER_ACTIVE inside the window means the phone answered,
+        // and that is the only question being asked here.
+        val seenBefore = browserActiveSeen.get()
+        val startedAt = System.currentTimeMillis()
+        reassertRequested = true
+        scheduleAssertTick()
+        val deadline = startedAt + REASSERT_ECHO_CONFIRM_MS + MANUAL_CHECK_SLACK_MS
+        while (System.currentTimeMillis() < deadline) {
+            delay(400)
+            if (browserActiveSeen.get() > seenBefore) {
+                return System.currentTimeMillis() - startedAt
+            }
+        }
+        return null
+    }
+
+    internal suspend fun checkPairingNow(): String {
+        Log.w(TAG, "===== manual pairing check requested (debug Settings row) =====")
+
+        // --- half 1: ask Google ------------------------------------------------
+        val wasEnabled = GoogleMessagesConfig.deviceListProbeEnabled
+        GoogleMessagesConfig.deviceListProbeEnabled = true
+        lastDeviceProbeMs = 0L
+        val probe = runCatching { probeDeviceList("manual debug check") }
+            .onFailure { Log.w(TAG, "manual check: device-list probe threw", it) }
+            .getOrNull()
+        GoogleMessagesConfig.deviceListProbeEnabled = wasEnabled
+
+        val googleSays = when {
+            probe == null -> "Google: probe failed"
+            else -> {
+                val e = probe.ours
+                val extra = if (e == null) {
+                    ""
+                } else {
+                    " (enabled=${e.enabled}, n=${probe.entries.size})"
+                }
+                "Google: ${probe.verdict}$extra"
+            }
+        }
+
+        if (!activeSessionEstablished) {
+            val msg = "$googleSays · Phone: not asked (no active session)"
+            Log.w(TAG, "manual pairing check → $msg")
+            return msg
+        }
+
+        // --- half 2: ask the phone ---------------------------------------------
+        val echoMs = awaitPhoneEcho()
+        val phoneSays = if (echoMs != null) {
+            "Phone: answered in ${echoMs}ms"
+        } else {
+            "Phone: no answer in ${REASSERT_ECHO_CONFIRM_MS / 1000}s"
+        }
+
+        val summary = "$googleSays · $phoneSays"
+        Log.w(TAG, "manual pairing check → $summary")
+        return summary
+    }
+
     private fun reassertDue(): Boolean =
         activeSessionEstablished &&
             (reassertRequested ||
@@ -1563,6 +2339,223 @@ internal class GoogleMessagesSessionClient(
      *  calls this after every read batch; without the guard a device that is
      *  merely throttled by the retry floor would spawn a coroutine per batch
      *  for the whole floor. */
+    /**
+     * Decide whether to TELL THE USER their link is gone, and do it once.
+     *
+     * This exists because the escalation that was already here could never fire on this
+     * failure. It is gated on [ACTIVE_SESSION_MAX_REJECTS] *rejections*, and an unpaired
+     * account does not reject: **MEASURED across two customers, `setActiveSession`
+     * returned HTTP 200 on all 32 attempts during 8 h and 15 h outages.** So
+     * `activeSessionRejects` stayed at 0, the reconnect screen never came up, and both
+     * users found out by noticing their texts had stopped. That is the UX bug.
+     *
+     * Thresholds and their evidence are in [unconfirmedStreak]. Reuses
+     * [SessionEvent.AuthExpired] and the existing reconnect screen — no new surface —
+     * and the existing [SessionEvent.AuthRestored] path already un-shows it if the
+     * phone comes back, which matters more here than usual because the remedy the
+     * screen offers (re-link) mints a `messages-web-*` entry every time.
+     */
+    private suspend fun maybeSurfaceUnpaired() {
+        if (!GoogleMessagesConfig.unpairDetectionEnabled) return
+        if (activeSessionGaveUp) return
+        val now = System.currentTimeMillis()
+        val streak = unconfirmedStreak.incrementAndGet()
+        val stranded = sendTimeoutsSinceConfirm.get()
+        val quietFor = if (lastPayloadMs == 0L) Long.MAX_VALUE else now - lastPayloadMs
+        // Two independent routes to "confident".
+        //
+        // Corroborated: a stranded send is POSITIVE evidence, not another absence, so
+        // one unanswered probe alongside it is enough. ~90s, user is watching.
+        //
+        // Uncorroborated: absence only, so we have to outlast the late-echo tail before
+        // we can be sure. MEASURED, Ben's 53 healthy re-asserts: 2 echoed LATE, at
+        // +768s and +884s (~12.8 and ~14.7 min). Escalating inside that window on
+        // repeated "misses" would false-alarm on a device whose echo was merely slow —
+        // and the remedy we would offer, re-linking, mints a ghost entry every time
+        // (OQ-10). Hence [UNPAIRED_CONFIDENCE_MS] at 20 min: past the observed tail with
+        // margin, and still well inside the 8-15 h these customers actually lost.
+        val corroborated = stranded > 0
+        val confidentByAbsence =
+            streak >= UNPAIRED_CONFIRM_STREAK && quietFor >= UNPAIRED_CONFIDENCE_MS
+        if (!corroborated && !confidentByAbsence) {
+            // Re-probe sooner than the 30-minute tick so the second data point does not
+            // cost half an hour. Armed only after a miss, so healthy devices pay nothing.
+            if (recheckDueAtMs == 0L) recheckDueAtMs = now + UNPAIR_RECHECK_MS
+            Log.w(
+                TAG,
+                "far end unanswered (streak=$streak stranded=$stranded " +
+                    "payloadQuiet=${payloadGap(now)}) — not telling the user yet: a single " +
+                    "miss can be a late echo (MEASURED 2 of 53 arrived +768s/+884s). " +
+                    "Re-probing in ${UNPAIR_RECHECK_MS / 60_000}min",
+            )
+            return
+        }
+        activeSessionGaveUp = true
+        gaveUpWasUnpaired = true
+        Log.e(
+            TAG,
+            "UNPAIRED (via ${if (corroborated) "stranded-send" else "absence"}): the phone " +
+                "has not answered $streak consecutive re-assert(s) with $stranded stranded " +
+                "send(s) — this device is almost certainly no longer in the account's " +
+                "device list. Surfacing the reconnect screen " +
+                "[up ${uptime()}, payloadQuiet=${payloadGap(now)}]",
+        )
+        _events.emit(SessionEvent.AuthExpired(AuthFailureReason.UNPAIRED))
+    }
+
+    /**
+     * Is this pushed frame Google's two-byte GAIA logout marker?
+     *
+     * MEASURED-FROM-SOURCE (mautrix-gmessages `pkg/libgm/event_handler.go`):
+     *
+     *     var hackyLoggedOutBytes = []byte{0x72, 0x00}
+     *     case gmproto.ActionType_GET_UPDATES:
+     *         if msg.DecryptedData == nil &&
+     *            bytes.Equal(msg.Message.UnencryptedData, hackyLoggedOutBytes) {
+     *             c.triggerEvent(&events.GaiaLoggedOut{})
+     *             return
+     *         }
+     *
+     * MEASURED (Jack, 26 Aug 16:17:42, phone-initiated unpair): exactly these two
+     * bytes arrived on a `GET_UPDATES` frame with no encrypted body and
+     * `stale=false`, **35 s ahead** of the stranded-send detector. Two independent
+     * parties reading the same frame the same way, plus our own capture.
+     *
+     * Deliberately NOT gated on [GMSessionProto.ACTION_GET_UPDATES], even though
+     * mautrix dispatches on it. Our own capture logged the bytes but not the action
+     * — the branch it took did not print one — so requiring action 16 would be
+     * asserting something we did not measure, and if the real frame carries no
+     * action field at all the gate would silently swallow the only signal we have.
+     * Matching on `encryptedData == null` plus the exact two-byte body is already
+     * specific enough to be safe, and [onGaiaLogoutSentinel] logs the action so the
+     * next capture settles it.
+     */
+    private fun isGaiaLogoutSentinel(msg: GMSessionProto.RpcMessageData): Boolean {
+        if (msg.encryptedData != null) return false
+        val unenc = msg.unencryptedData ?: return false
+        return unenc.size == 2 && unenc[0] == 0x72.toByte() && unenc[1] == 0.toByte()
+    }
+
+    /**
+     * Act on the logout sentinel.
+     *
+     * This is the ONLY detector in this file that is not an inference from silence,
+     * and that is why it is allowed to skip [UNPAIRED_CONFIDENCE_MS] entirely. The
+     * 20-minute floor exists to outlast a late echo on a device that is merely slow
+     * (MEASURED: 2 of Ben's 53 re-asserts echoed at +768 s and +884 s). There is no
+     * corresponding "slow" reading of a pushed logout marker: the account sent it.
+     *
+     * Two guards remain:
+     *  - `stale` — a replayed backlog frame can be an unpair we already recovered
+     *    from, so replaying it would raise the reconnect screen on a device that is
+     *    working. Same trap as the recovery-clear bug of 26 Aug, opposite direction.
+     *  - [GoogleMessagesConfig.logoutSentinelDrivesUi] — kill switch.
+     */
+    private suspend fun onGaiaLogoutSentinel(
+        msg: GMSessionProto.RpcMessageData,
+        stale: Boolean,
+    ) {
+        val now = System.currentTimeMillis()
+        // `action` is logged, not asserted on — see [isGaiaLogoutSentinel]. If it
+        // reads 16 across a few captures, the gate can be tightened later.
+        Log.e(
+            TAG,
+            "GAIA LOGOUT SENTINEL: Google pushed the two-byte logout marker (72 00) — " +
+                "the account has cut this device off [action=${msg.action} " +
+                "sessionId=${if (msg.sessionId.isEmpty()) "none" else "present"} " +
+                "up ${uptime()}, stale=$stale, payloadQuiet=${payloadGap(now)}]",
+        )
+        if (stale) {
+            Log.w(
+                TAG,
+                "logout sentinel arrived on the REPLAYED backlog — not acting on it. It may " +
+                    "be the unpair we have already recovered from; a live one will follow " +
+                    "if we really are gone.",
+            )
+            return
+        }
+        if (!GoogleMessagesConfig.logoutSentinelDrivesUi) {
+            Log.w(TAG, "logoutSentinelDrivesUi=false — logging only, absence detectors still apply")
+            return
+        }
+        surfaceUnpairedImmediately(
+            via = "logout-sentinel",
+            detail = "Google pushed the GAIA logout marker on a live frame — this is positive " +
+                "evidence from the account, not an absence, so it does not wait out the " +
+                "${UNPAIRED_CONFIDENCE_MS / 60_000}min confidence floor",
+        )
+    }
+
+    /**
+     * A frame on [GMSessionProto.ROUTE_PAIR_EVENT], which we used to return on before
+     * parsing or logging anything.
+     *
+     * mautrix-gmessages reads a `revoked` arm here and tears the session down. We do
+     * not yet know whether Google sends it to a GAIA-paired client at all, so the
+     * default is to log the shape and let the sentinel and the absence detectors do
+     * the deciding — see [GoogleMessagesConfig.pairEventDrivesUi].
+     */
+    private suspend fun handlePairEvent(rpc: GMSessionProto.IncomingRpc) {
+        val data = rpc.messageData
+        if (data == null) {
+            Log.w(TAG, "ROUTE_PAIR_EVENT with no messageData [up ${uptime()}]")
+            return
+        }
+        val evt = runCatching { GMSessionProto.parseRpcPairData(data) }.getOrElse { t ->
+            Log.w(TAG, "ROUTE_PAIR_EVENT failed to parse (${data.size} bytes): ${t.message}")
+            return
+        }
+        Log.w(
+            TAG,
+            "ROUTE_PAIR_EVENT: paired=${evt.paired} revoked=${evt.revoked} " +
+                "fields=${evt.fieldNumbers} (${data.size} bytes) [up ${uptime()}] " +
+                "— first time this route has ever been logged",
+        )
+        if (!evt.revoked) return
+        if (!GoogleMessagesConfig.pairEventDrivesUi) {
+            Log.w(
+                TAG,
+                "pair event says REVOKED but pairEventDrivesUi=false — not surfacing. If this " +
+                    "line appears in a capture from a real unpair, flip the flag.",
+            )
+            return
+        }
+        surfaceUnpairedImmediately(
+            via = "pair-event-revoked",
+            detail = "Google pushed a RevokePairData arm on the pairing route",
+        )
+    }
+
+    /**
+     * Raise the reconnect screen NOW, on positive pushed evidence.
+     *
+     * [maybeSurfaceUnpaired] is the inference-from-absence path and owns the streak
+     * and confidence thresholds. This is its counterpart for the cases where the
+     * account has actually told us, and it deliberately shares the same latches
+     * (`activeSessionGaveUp` / `gaveUpWasUnpaired`) so that the existing recovery
+     * paths — [SessionEvent.AuthRestored] on any live pushed frame, and the
+     * verify-before-success guard in `reauth()` — clear it exactly as they would
+     * clear an absence-driven one. No new state, no second surface.
+     */
+    private suspend fun surfaceUnpairedImmediately(via: String, detail: String) {
+        if (!GoogleMessagesConfig.unpairDetectionEnabled) {
+            Log.w(TAG, "UNPAIRED (via $via) but unpairDetectionEnabled=false — not surfacing")
+            return
+        }
+        if (activeSessionGaveUp) {
+            Log.w(TAG, "UNPAIRED (via $via) — reconnect screen already up, not re-raising")
+            return
+        }
+        activeSessionGaveUp = true
+        gaveUpWasUnpaired = true
+        Log.e(
+            TAG,
+            "UNPAIRED (via $via): $detail. Surfacing the reconnect screen " +
+                "[up ${uptime()}, payloadQuiet=${payloadGap(System.currentTimeMillis())}]",
+        )
+        _events.emit(SessionEvent.AuthExpired(AuthFailureReason.UNPAIRED))
+    }
+
     private fun scheduleAssertTick() {
         if (!assertTickPending.compareAndSet(false, true)) return
         val job = scope.launch {
@@ -1613,6 +2606,48 @@ internal class GoogleMessagesSessionClient(
     private fun streamGap(now: Long): String =
         if (lastStreamActivityMs == 0L) "no bytes yet on this stream"
         else "quiet ${(now - lastStreamActivityMs) / 1000}s"
+
+    /**
+     * How long since Google pushed anything that was not a keepalive.
+     *
+     * Loosely bounded above by [ACTIVE_SESSION_REASSERT_MS], because the re-assert
+     * echo is itself a payload — but only loosely, and the slack matters if anyone
+     * ever builds a watchdog on this. **MEASURED 25 Aug 2026, 33 h, 294 strict
+     * payload events: healthy max gap 47.5 min, not 30.** The re-assert tick can
+     * slip when the long-poll is not delivering I/O to drive it (observed spacing:
+     * median 30.1 min, max 61.0 min), and the gap stretches with it. So a threshold
+     * on THIS number must sit at 90 min or above; the tight, reliable signal is the
+     * per-re-assert echo timeout ([REASSERT_ECHO_CONFIRM_MS]), not a gap.
+     *
+     * For scale, the confirmed outage on this field device ran 5.9 h at zero.
+     */
+    /**
+     * One-line answer to "is the far end still there", for the `alive:` line.
+     *
+     * Everything here comes from the PAIRED PHONE, not from Google (see [onUserAlert]).
+     * MEASURED 26 Aug 2026, deliberate unpair on a dev device: account auth keeps
+     * working, sends keep returning 200, the stream keeps keepaliving at 9-10s, and
+     * Google never sends BROWSER_INACTIVE. The only observable is that the phone stops
+     * answering. Two customers lost 8 h and 15 h to a state in which every other field
+     * on the alive line read healthy.
+     *
+     * `answered=n/m` is the re-assert echo tally; a healthy device has n == m.
+     */
+    private fun phoneSummary(now: Long): String {
+        val ok = reassertsConfirmed.get()
+        val bad = reassertsUnconfirmed.get()
+        // "0/0" on a freshly paired session read exactly like the failure signature
+        // (MEASURED 26 Aug: alerts=3, payloadQuiet=0m, texts flowing, and the field still
+        // said answered=0/0). It is correct — the counters only move on a REASSERT echo
+        // wait, and a fresh pair registers rather than re-asserts — but a health field
+        // that looks alarming when everything is fine is a bad health field.
+        val answered = if (ok + bad == 0) "n/a-yet" else "$ok/${ok + bad}"
+        return "lastAnswer=${payloadGap(now)} alerts=${phoneAlerts.get()} answered=$answered"
+    }
+
+    private fun payloadGap(now: Long): String =
+        if (lastPayloadMs == 0L) "nothing pushed yet"
+        else "${(now - lastPayloadMs) / 60_000}m"
 
     /**
      * Ask Google to revoke THIS pairing, so it stops appearing in the phone's
@@ -1695,7 +2730,7 @@ internal class GoogleMessagesSessionClient(
             tachyonAuthToken = acct.tachyonAuthToken, ttl = 0L, // OmitTTL
             destRegB64 = destRegB64,
         )
-        var (code, _) = post(sendUrl, envelope)
+        var (code, body) = post(sendUrl, envelope, retryOn5xx = true)
         if (code == 401) {
             // This is the ONE RPC that does not go through sendDataRequest, so it
             // never had the 401 self-heal the others do — and that gap escalates.
@@ -1714,11 +2749,76 @@ internal class GoogleMessagesSessionClient(
                     tachyonAuthToken = acct2.tachyonAuthToken, ttl = 0L,
                     destRegB64 = destRegB64,
                 )
-                code = post(sendUrl, envelope2).first
+                val retry = post(sendUrl, envelope2, retryOn5xx = true)
+                code = retry.first
+                body = retry.second
             }
         }
-        if (code !in 200..299) Log.w(TAG, "setActiveSession rejected: HTTP $code")
+        if (code !in 200..299) {
+            Log.w(TAG, "setActiveSession rejected: HTTP $code")
+        } else {
+            // We discarded this for months. post() already logs the body on a non-2xx,
+            // so the ONE case never inspected was the 200 - which is exactly the case
+            // that turned out to be uninformative in the field: on an unpaired account
+            // this returns 200 and the phone never answers. Whether Google says anything
+            // useful here is UNKNOWN, and that is the argument for logging it: we have
+            // been reading "200" as "registered" without ever seeing what came back.
+            // Redacted and capped per rule 2.2.
+            Log.d(TAG, "setActiveSession HTTP $code body: ${redacted(body, 200)}")
+        }
         return code in 200..299
+    }
+
+    /**
+     * Drop DELETED rows out of a pushed batch while the phone is rebuilding its own
+     * SMS/MMS database.
+     *
+     * MEASURED-FROM-SOURCE, mautrix-gmessages CHANGELOG v26.05: *"Stopped handling
+     * message deletions during mobile SMS database sync, as the phone sometimes sends
+     * them incorrectly."* Their gate is `pkg/connector/handlegmessages.go:166-179`,
+     * driven by the same alerts we have been logging and ignoring.
+     *
+     * **The trade is deliberately asymmetric, and this is the whole argument for it:**
+     * a spurious deletion destroys a message from the user's history with no way to get
+     * it back, while a missed deletion leaves a message on screen that the phone thinks
+     * is gone. The second is recoverable on the next full sync; the first is not. When
+     * the two cannot be told apart — and during a rebuild they cannot — withholding is
+     * the only safe direction.
+     *
+     * A handset rebuilds its database on a restore, a SIM swap, an app-data clear and
+     * some OS updates, so this is rare but not exotic, and it lands hardest on exactly
+     * the customer who has just been told to reset something.
+     *
+     * [MOBILE_DB_SYNC_MAX_MS] is ours, not theirs: mautrix clears its flag only on the
+     * COMPLETE alert, so a COMPLETE that never arrives (the stream drops mid-rebuild,
+     * the app restarts) suppresses deletions for the life of the process. We cap it.
+     */
+    private fun withheldDeletions(
+        messages: List<GMSessionProto.GMMessage>,
+    ): List<GMSessionProto.GMMessage> {
+        val since = mobileDbSyncSinceMs
+        if (since == 0L) return messages
+        val syncingFor = System.currentTimeMillis() - since
+        if (syncingFor > MOBILE_DB_SYNC_MAX_MS) {
+            mobileDbSyncSinceMs = 0L
+            Log.w(
+                TAG,
+                "phone said it was rebuilding its SMS database ${syncingFor / 60_000}min ago " +
+                    "and never said COMPLETE — trusting deletions again rather than " +
+                    "withholding them forever",
+            )
+            return messages
+        }
+        val kept = messages.filterNot { it.isDeleted }
+        if (kept.size != messages.size) {
+            Log.w(
+                TAG,
+                "withheld ${messages.size - kept.size} deletion(s) — the phone has been " +
+                    "rebuilding its SMS database for ${syncingFor / 1000}s and its deletions " +
+                    "are not trustworthy while it does. They will re-arrive if they are real.",
+            )
+        }
+        return kept
     }
 
     private suspend fun ackBrowserPresence() {
@@ -1778,6 +2878,100 @@ internal class GoogleMessagesSessionClient(
                 longPollJob?.cancel()
                 longPollJob = scope.launch { longPollLoop() }
                 continue
+            }
+            // DETECTION ONLY — and MEASURED 25 Aug 2026, there may be nothing here to
+            // remediate, because the failure is not necessarily on this device.
+            //
+            // What the echo actually proves. Every UserAlertEvent in this protocol is
+            // PHONE telemetry — BROWSER_ACTIVE alongside MOBILE_BATTERY_RESTORED,
+            // MOBILE_WIFI_CONNECTION, MOBILE_DATA_CONNECTION, MOBILE_BATTERY_LOW (see
+            // GMSessionProto.alertName). So the echo does not mean "Google accepted our
+            // registration"; it means "the paired phone answered". On …9307 the whole
+            // alert family stopped inside the same 37 ms (07:35:06.137 / .174) and never
+            // returned across 6.6 h, a phone reboot and a fresh registration, while
+            // sends timed out with no echo and listContacts came back with the phone's
+            // encrypted section missing. The far end was dark; this device was fine.
+            //
+            // Which is why nothing is retried here. A stream rebuild changes nothing
+            // (long-polls #96/#97 opened fresh inside the outage and recovered nothing),
+            // and neither does re-registration (the 13:37 reboot registered from cold
+            // and the 14:07 re-assert still went unanswered). Escalating into a re-pair
+            // on this signal would burn a healthy link over a phone that is merely
+            // switched off. Name it, and let a human look at the phone. See OQ-18.
+            // ---- QUIET-PHONE WATCHDOG -------------------------------------------
+            //
+            // This is what answers "can we catch an unpair WITHOUT the user sending a
+            // text". Before it, the only passive probe was the 30-minute re-assert, so a
+            // user who received nothing and sent nothing could sit unpaired for a full
+            // half hour before the first question was even asked, and the two-strike
+            // rule pushed the warning past an hour.
+            //
+            // Now: if nothing has come from the phone for [PHONE_QUIET_PROBE_MS], ask
+            // early instead of waiting for the tick. The guards keep a healthy device
+            // from paying for it: skip while an echo is already outstanding, skip if we
+            // probed recently, skip if a re-assert is already due (the normal path
+            // handles it within seconds).
+            //
+            // NOTE the honest limit: this shortens the time to the first QUESTION, not
+            // the time to certainty. The 20-min [UNPAIRED_CONFIDENCE_MS] floor is set by
+            // the late-echo tail and is untouched. Net effect is ~30 min instead of
+            // ~60-75 min to a purely passive warning. The only thing that can break the
+            // floor is the positive device-list check in [probeDeviceList].
+            val phoneQuietFor =
+                if (lastPayloadMs == 0L) 0L else System.currentTimeMillis() - lastPayloadMs
+            if (longPollJob?.isActive == true &&
+                GoogleMessagesConfig.unpairDetectionEnabled &&
+                activeSessionEstablished &&
+                phoneQuietFor >= PHONE_QUIET_PROBE_MS &&
+                echoAwaitedSinceMs == 0L &&
+                !reassertDue() &&
+                System.currentTimeMillis() - lastQuietProbeMs >= PHONE_QUIET_PROBE_MS
+            ) {
+                lastQuietProbeMs = System.currentTimeMillis()
+                Log.w(
+                    TAG,
+                    "phone quiet for ${phoneQuietFor / 60_000}m (nothing pushed, nothing " +
+                        "sent) — probing the far end now rather than waiting for the " +
+                        "${ACTIVE_SESSION_REASSERT_MS / 60_000}min re-assert. This is the " +
+                        "passive path: it needs no text from the user",
+                )
+                reassertRequested = true
+                scheduleAssertTick()
+            }
+            // Fire the post-miss re-probe when it comes due. Cheap: two volatile reads on
+            // a 5s tick, and recheckDueAtMs is 0 on any healthy device.
+            val recheckAt = recheckDueAtMs
+            if (recheckAt != 0L && System.currentTimeMillis() >= recheckAt &&
+                longPollJob?.isActive == true
+            ) {
+                recheckDueAtMs = 0L
+                Log.w(TAG, "re-probing the far end after an unanswered re-assert")
+                reassertRequested = true
+                scheduleAssertTick()
+            }
+            val echoWait = echoAwaitedSinceMs
+            if (echoWait != 0L && !echoTimedOut &&
+                System.currentTimeMillis() - echoWait >= REASSERT_ECHO_CONFIRM_MS
+            ) {
+                echoTimedOut = true
+                val n = reassertsUnconfirmed.incrementAndGet()
+                Log.w(
+                    TAG,
+                    "re-assert UNCONFIRMED (#$n): no BROWSER_ACTIVE echo in " +
+                        "${REASSERT_ECHO_CONFIRM_MS / 1000}s — Google accepted the POST but the " +
+                        "PAIRED PHONE did not answer. Either it is offline/dark or we are no " +
+                        "longer the receive target; this line cannot tell those apart, so check " +
+                        "the phone before touching the link " +
+                        "[up ${uptime()}, payloadQuiet=${payloadGap(System.currentTimeMillis())}, " +
+                        "${inboundGap(System.currentTimeMillis())}, " +
+                        "${streamGap(System.currentTimeMillis())}]",
+                )
+                // The phone did not answer. Now ask GOOGLE, which does not require the
+                // phone to be awake — the one instrument that can tell "unpaired" from
+                // "phone in a drawer" without waiting out the 20-minute echo floor.
+                runCatching { probeDeviceList("after re-assert UNCONFIRMED") }
+                    .onFailure { Log.w(TAG, "device-list probe threw (continuing)", it) }
+                maybeSurfaceUnpaired()
             }
             if (longPollJob?.isActive == true &&
                 (!activeSessionEstablished || reassertDue())
@@ -1974,7 +3168,7 @@ internal class GoogleMessagesSessionClient(
         // exception that callers can only read as "refresh didn't work" — that
         // ambiguity is what let a signal drop escalate into an account wipe.
         val (code, respBody) = try {
-            post(GMPairingProto.REGISTER_REFRESH_URL, body)
+            post(GMPairingProto.REGISTER_REFRESH_URL, body, retryOn5xx = true)
         } catch (c: kotlinx.coroutines.CancellationException) {
             // Not a network failure — the session is being torn down. Must
             // propagate, or we'd both swallow the cancellation and poison
@@ -2079,29 +3273,61 @@ internal class GoogleMessagesSessionClient(
      *  thread (e.g. the new-message screen requesting contacts / starting a
      *  conversation), and okhttp's blocking execute() would otherwise throw
      *  NetworkOnMainThreadException. */
-    /** @return (httpStatusCode, responseBody). */
+    /**
+     * @param retryOn5xx retry a 5xx up to [POST_5XX_ATTEMPTS] times, one second apart.
+     *
+     * **Opt-in, and false by default, on purpose.** A 5xx does not tell us whether the
+     * server processed the request before it fell over, so a blind retry on
+     * `SendMessage` risks sending the user's text twice — worse than the failure it
+     * fixes. Only genuinely idempotent calls set this: `setActiveSession` (re-asserts
+     * the same registration; we call it on a timer anyway) and `RegisterRefresh`
+     * (mints a token, no side effect on the pairing).
+     *
+     * Why it exists at all: without it a single transient 502 on `setActiveSession`
+     * comes back as `code !in 200..299`, which the caller reads as a REJECTION —
+     * indistinguishable from Google refusing an unpaired device. It feeds
+     * `activeSessionRejects` and the unconfirmed streak, i.e. one bad minute at Google
+     * can push a perfectly healthy phone toward a "re-link" screen whose remedy mints
+     * a ghost registration (OQ-10). mautrix-gmessages retries its HTTP the same way.
+     *
+     * @return (httpStatusCode, responseBody).
+     */
     private suspend fun post(
         url: String,
         pbliteBody: String,
         client: OkHttpClient = httpRpc,
+        retryOn5xx: Boolean = false,
     ): Pair<Int, String> =
         withContext(Dispatchers.IO) {
-            val req = Request.Builder()
-                .url(url)
-                .post(pbliteBody.toRequestBody(GMPairingProto.CONTENT_TYPE_PBLITE.toMediaType()))
-                .applyRelayHeaders()
-                .build()
-            // NOT [http]: every caller of post() is a one-shot RPC that must
-            // return, and [http] deliberately has no read or call timeout. The
-            // long-poll builds its own call against [http].
-            client.newCall(req).execute().use { resp ->
-                updateCookiesFromResponse(resp)
-                val text = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    Log.w(TAG, "POST $url -> HTTP ${resp.code}: ${redacted(text, 200)}")
+            val attempts = if (retryOn5xx) POST_5XX_ATTEMPTS else 1
+            var last: Pair<Int, String> = 0 to ""
+            for (attempt in 1..attempts) {
+                val req = Request.Builder()
+                    .url(url)
+                    .post(pbliteBody.toRequestBody(GMPairingProto.CONTENT_TYPE_PBLITE.toMediaType()))
+                    .applyRelayHeaders()
+                    .build()
+                // NOT [http]: every caller of post() is a one-shot RPC that must
+                // return, and [http] deliberately has no read or call timeout. The
+                // long-poll builds its own call against [http].
+                last = client.newCall(req).execute().use { resp ->
+                    updateCookiesFromResponse(resp)
+                    val text = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) {
+                        Log.w(TAG, "POST $url -> HTTP ${resp.code}: ${redacted(text, 200)}")
+                    }
+                    resp.code to text
                 }
-                resp.code to text
+                if (last.first !in 500..599 || attempt == attempts) break
+                Log.w(
+                    TAG,
+                    "POST $url -> HTTP ${last.first} (attempt $attempt/$attempts) — server-side, " +
+                        "retrying in ${POST_5XX_BACKOFF_MS}ms. NOT a rejection: a 5xx says nothing " +
+                        "about whether this device is still paired.",
+                )
+                delay(POST_5XX_BACKOFF_MS)
             }
+            last
         }
 
     /**
@@ -2282,6 +3508,81 @@ internal class GoogleMessagesSessionClient(
          *  LIVE devices paired to one account would otherwise evict each other
          *  indefinitely, leaving both half-working. */
         private const val MAX_AUTO_RECLAIMS = 3
+
+        /**
+         * How long to wait for the BROWSER_ACTIVE echo that confirms a re-assert
+         * actually took effect, before logging the session as displaced.
+         *
+         * MEASURED (…9307, 44.9h, 87 re-asserts): 86 echoed within 0-10s, median
+         * ~2s, p100 10s. 30s is 3x the observed maximum and produces ZERO false
+         * positives on that corpus. The one re-assert that missed this window
+         * belonged to a device that had already stopped receiving.
+         */
+        private const val REASSERT_ECHO_CONFIRM_MS = 30_000L
+
+        /** Consecutive unanswered re-asserts before telling the user, absent a stranded
+         *  send to corroborate. 2, because 2 in a row never happened on a healthy
+         *  device and a single miss did (twice in 53, both late-not-missing). */
+        private const val UNPAIRED_CONFIRM_STREAK = 2
+
+        /** At most one extra probe per minute however many sends strand. */
+        private const val SEND_PROBE_DEBOUNCE_MS = 60_000L
+
+        /**
+         * How long the paired phone may be completely silent before we ask it a
+         * question out of band, instead of waiting for the
+         * [ACTIVE_SESSION_REASSERT_MS] tick.
+         *
+         * 11 minutes, chosen against measured healthy behaviour rather than by feel: on
+         * a healthy device the re-assert echo is itself a payload, and the re-assert
+         * spacing median is 30.1 min, so 11 min fires on a phone that has genuinely
+         * gone quiet well before the scheduled tick would.
+         *
+         * This shortens time-to-QUESTION. It does not shorten time-to-CERTAINTY; that
+         * is [UNPAIRED_CONFIDENCE_MS] and it is set by the protocol.
+         */
+        private const val PHONE_QUIET_PROBE_MS = 11 * 60_000L
+
+        /**
+         * Floor between device-list probes. A SignInGaia list call is heavier than a
+         * `setActiveSession` and it goes to a Registration endpoint, so it gets a real
+         * floor rather than a token one. Two minutes is far below any cadence we
+         * generate (fastest trigger is one unanswered re-assert per 5 min) and far
+         * above anything that could look like hammering.
+         */
+        private const val DEVICE_PROBE_DEBOUNCE_MS = 2 * 60_000L
+
+        /** Slack on top of [REASSERT_ECHO_CONFIRM_MS] for the manual check, covering the
+         *  assert tick's own scheduling and the 5 s ackLoop that flips `echoTimedOut`. */
+        private const val MANUAL_CHECK_SLACK_MS = 8_000L
+
+        /** How soon to re-probe after ONE unanswered re-assert, instead of waiting for
+         *  the next 30-minute tick. Only ever armed after a miss. */
+        private const val UNPAIR_RECHECK_MS = 5 * 60_000L
+
+        /**
+         * How long the phone must have been silent before repeated misses ALONE are
+         * allowed to warn the user.
+         *
+         * This is the floor on absence-based detection and it is set by the protocol,
+         * not by us: **MEASURED, 2 of Ben's 53 healthy re-asserts echoed LATE at +768 s
+         * and +884 s.** Anything shorter risks telling a working device it is unpaired,
+         * and the remedy we offer mints a ghost entry. 20 min clears the observed tail
+         * with margin. A stranded send bypasses this entirely, because that is evidence
+         * rather than the lack of it.
+         */
+        /** Attempts (not retries) for an idempotent POST that comes back 5xx.
+         *  Three is enough to ride out a single bad edge node without turning a real
+         *  Google outage into a request storm from every device we ship. */
+        /** Safety cap on the deletion-withholding window opened by
+         *  MOBILE_DATABASE_SYNC_STARTED. Google's own rebuilds are minutes, not hours;
+         *  this only exists so a lost COMPLETE alert cannot wedge the gate open. */
+        private const val MOBILE_DB_SYNC_MAX_MS = 60 * 60_000L
+
+        private const val POST_5XX_ATTEMPTS = 3
+        private const val POST_5XX_BACKOFF_MS = 1_000L
+
+        private const val UNPAIRED_CONFIDENCE_MS = 20 * 60_000L
         /** Whole-call ceiling for one-shot RPCs (send, ack, refresh, register).
          *  Generous, because a text the user typed is worth waiting for on a bad
          *  cell connection — but FINITE, which is the only property that
@@ -2328,6 +3629,18 @@ enum class AuthFailureReason {
      *  NEVER trigger a `store.clear()`: wiping cookies over a tunnel is how a
      *  working link gets destroyed by a four-minute signal drop. */
     NETWORK,
+    /**
+     * The phone no longer lists this device in Google Messages -> Settings -> Device
+     * Pairing, so nothing is routed here and nothing we send is acted on — while the
+     * cookies, the token and the receive stream all stay perfectly healthy.
+     *
+     * **MEASURED 25-26 Aug 2026 on two customer accounts, and reproduced by a
+     * deliberate unpair on a dev device.** Detected by the absence of the phone's
+     * BROWSER_ACTIVE answer to a re-assert, because Google never signals it:
+     * `BROWSER_INACTIVE` has never appeared in any capture.
+     */
+    UNPAIRED,
+
     /** Cause not specifically identified. */
     UNKNOWN,
 }

@@ -32,6 +32,10 @@ internal class GoogleMessagesNotifier(context: Context) {
 
     private data class HistoryLine(val sender: String, val body: String, val timeMs: Long)
 
+    /** True while a broken-link notification is showing. Gates the ONE full-screen
+     *  escalation per episode, and makes [clearLinkBroken] a no-op when nothing is up. */
+    @Volatile private var linkBrokenPosted = false
+
     fun ensureChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val mgr = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -158,6 +162,153 @@ internal class GoogleMessagesNotifier(context: Context) {
         )
     }
 
+    // =======================================================================
+    // Broken link — "you are not getting texts"
+    // =======================================================================
+
+    /**
+     * Tell the user their link is gone, loudly enough that they do not have to be
+     * looking at the app.
+     *
+     * ## Why this exists
+     *
+     * Until 26 Aug 2026 the only surface for a dead link was the in-app reconnect
+     * screen, raised off `SessionEvent.AuthExpired`. That is a screen you have to walk
+     * into. **MEASURED on two customers: 8 h and 15 h passed before either noticed**,
+     * and what they noticed was the silence, not the app. Detection speed is worth
+     * nothing if the finding waits in a screen nobody opens — so the same event now
+     * also posts a system notification with a **full-screen intent**, which on a flip
+     * phone puts the re-link screen in front of the user the way an incoming call would.
+     *
+     * ## Never on NETWORK
+     *
+     * [AuthFailureReason.NETWORK] is excluded, deliberately and permanently. It means
+     * we could not reach Google at all — a tunnel, a dead zone, airplane mode — and the
+     * credentials are almost certainly fine. Throwing a full-screen "re-link your phone"
+     * at someone driving through a valley would be worse than the problem this solves,
+     * and it is the same reasoning that keeps NETWORK away from `store.clear()`.
+     *
+     * ## Ongoing, not dismissible
+     *
+     * The condition persists until the user acts, so the notification does too
+     * (`setOngoing`). A swipe-away would leave someone believing they had dealt with it
+     * while their texts kept going nowhere.
+     *
+     * ## The full-screen intent is a bonus, not the mechanism
+     *
+     * Android 14+ restricts `USE_FULL_SCREEN_INTENT` to calling and alarm apps, and any
+     * OEM may suppress it. So the notification is built to stand on its own as an
+     * ordinary high-importance heads-up: title, body, tap target, screen wake. If the
+     * full-screen launch is dropped, the user still gets told. **INFERRED** that this
+     * device (older Android, normal install-time grant) will honour it; verify in the
+     * field rather than assuming.
+     */
+    fun notifyLinkBroken(reason: AuthFailureReason) {
+        if (reason == AuthFailureReason.NETWORK) {
+            android.util.Log.i(
+                TAG,
+                "link-broken notification SKIPPED for reason=NETWORK — a dead zone is not an unpair",
+            )
+            return
+        }
+        ensureLinkChannel()
+
+        val unpaired = reason == AuthFailureReason.UNPAIRED
+        val title = "Texts aren't syncing"
+        val body = if (unpaired) {
+            "This phone was unlinked from your Google account. Press to re-link."
+        } else {
+            "Your phone needs to sign in again. Press to re-link."
+        }
+
+        val tap = openReconnectIntent()
+        val builder = NotificationCompat.Builder(ctx, LINK_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setContentTitle(title)
+            .setContentText(body)
+            // The cover display reads contentTitle/contentText; BigTextStyle is for the
+            // main screen, where the second sentence is the part that tells the user
+            // what to DO.
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setCategory(NotificationCompat.CATEGORY_ERROR)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .setShowWhen(true)
+        if (tap != null) {
+            builder.setContentIntent(tap)
+            // Only escalate to full-screen ONCE per broken-link episode. Re-posting the
+            // same notification id is a silent update; re-arming the full-screen intent
+            // is not — it would relaunch the activity under the user every time the
+            // detector reconfirms, which on the absence path is every few minutes.
+            if (!linkBrokenPosted) builder.setFullScreenIntent(tap, true)
+        }
+
+        try {
+            nm.notify(LINK_NOTIFICATION_ID, builder.build())
+            android.util.Log.w(
+                TAG,
+                "link-broken notification posted (reason=$reason fullScreen=${!linkBrokenPosted && tap != null}) " +
+                    "— the user is now told without having to open the app",
+            )
+        } catch (_: SecurityException) {
+            // POST_NOTIFICATIONS not granted (Android 13+); silently skip.
+            android.util.Log.w(TAG, "link-broken notification blocked — POST_NOTIFICATIONS not granted")
+        }
+        if (!linkBrokenPosted) wakeScreen()
+        linkBrokenPosted = true
+    }
+
+    /** Take the broken-link notification down. Safe to call when none is showing. */
+    fun clearLinkBroken(reason: String) {
+        if (!linkBrokenPosted) return
+        linkBrokenPosted = false
+        runCatching { nm.cancel(LINK_NOTIFICATION_ID) }
+        android.util.Log.i(TAG, "link-broken notification cleared reason=$reason")
+    }
+
+    private fun ensureLinkChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val mgr = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (mgr.getNotificationChannel(LINK_CHANNEL_ID) != null) return
+        // A channel of its own, NOT the incoming-texts channel. Two reasons: a user who
+        // silences message notifications must still be told their messages have stopped
+        // arriving at all, and channel settings are immutable once created, so sharing
+        // one would lock this alert to whatever the texts channel was configured with.
+        val channel = NotificationChannel(
+            LINK_CHANNEL_ID,
+            "Sync problems",
+            NotificationManager.IMPORTANCE_HIGH,
+        ).apply {
+            description = "Tells you when this phone has stopped receiving texts"
+            enableVibration(true)
+            enableLights(true)
+            setShowBadge(true)
+            lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+        }
+        mgr.createNotificationChannel(channel)
+    }
+
+    private fun openReconnectIntent(): PendingIntent? {
+        // Same host activity the texts notifications open. It shows the reconnect
+        // screen on its own, because the repository has already flipped `authExpired`
+        // by the time this notification is posted — so there is no new route to add and
+        // no extra to pass.
+        val activityClass = GoogleMessagesConfig.messengerActivityClassName ?: return null
+        val intent = Intent().apply {
+            setClassName(ctx.packageName, activityClass)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        return PendingIntent.getActivity(
+            ctx,
+            LINK_NOTIFICATION_ID,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
     private fun openMessengerIntent(conversationId: String): PendingIntent? {
         // Target the host's messenger Activity by fully-qualified name (in the
         // host's own package) so this module needs no compile dependency on the
@@ -192,5 +343,11 @@ internal class GoogleMessagesNotifier(context: Context) {
         /** How long to hold the screen-wake lock (auto-releases). */
         private const val WAKE_MS = 5000L
         const val EXTRA_CONVERSATION_ID = "gmessages.conversation_id"
+
+        /** Separate from the texts channel on purpose — see [ensureLinkChannel]. */
+        private const val LINK_CHANNEL_ID = "gmessages_link_v1"
+
+        /** Well clear of [NOTIFICATION_ID_BASE] + the 16-bit conversation hash. */
+        private const val LINK_NOTIFICATION_ID = 4199
     }
 }

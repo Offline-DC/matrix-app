@@ -64,6 +64,106 @@ object GoogleMessagesConfig {
     var cookieRotationEnabled: Boolean = true
 
     /**
+     * Whether to tell the user when the paired phone stops answering — i.e. when this
+     * device has silently been removed from the account's device list.
+     *
+     * Kill switch for the 26 Aug 2026 unpair detection. Turning it off restores the
+     * previous behaviour, which is that the user finds out by noticing their texts
+     * stopped (8 h and 15 h on the two measured cases). Detection is inference from an
+     * ABSENCE, so if it ever false-alarms in the field this is the flag to flip while
+     * the thresholds are re-tuned.
+     */
+    var unpairDetectionEnabled: Boolean = true
+
+    /**
+     * Run the positive device-list probe ([GMDeviceListProbe]) — a `SignInGaia` mode-1
+     * call that asks GOOGLE whether our registration is still on the account, with no
+     * involvement from the paired phone.
+     *
+     * MEASURED-FROM-SOURCE: Google's own web client makes this exact call on every warm
+     * start, so it is ordinary client behaviour rather than something exotic. It mints
+     * no token and registers nothing. Off is the safe setting if it ever misbehaves.
+     */
+    var deviceListProbeEnabled: Boolean = true
+
+    /**
+     * Let the device-list probe's verdict raise the reconnect screen on its own.
+     *
+     * **Default false, deliberately.** It is UNKNOWN whether revoking a GAIA pairing is
+     * even visible in the registration list: `RegisterRefresh` returned HTTP 200 with a
+     * fresh token while the device was unpaired on 26 Aug, so a registration can outlive
+     * its pairing. Until a paired-vs-unpaired capture shows the entry disappearing or
+     * its `enabled` flag flipping, the probe logs and nothing more. Flipping this on
+     * before that diff exists would be the fifth time in this project that a mechanism
+     * was invented on top of a sound measurement — see `00_START_HERE.md` rule 2.1b.
+     *
+     * When the diff does confirm it, this is the single line that turns unpair detection
+     * from "20 minutes of absence" into "one round trip".
+     */
+    var deviceListProbeDrivesUi: Boolean = false
+
+    /**
+     * Let the two-byte GAIA logout sentinel (`72 00`) raise the reconnect screen the
+     * moment it arrives, bypassing every absence threshold.
+     *
+     * **Default true, and this one IS measured** — unlike [deviceListProbeDrivesUi],
+     * which stays off because its verdict was contradicted. Jack's 26 Aug 16:17:42
+     * capture: Google pushed `72 00` on a `GET_UPDATES` frame with `stale=false`
+     * **35 seconds before** the stranded-send detector reached the same conclusion, on a
+     * pairing he had just revoked from the phone. It is POSITIVE pushed evidence from
+     * the account itself, not an inference from silence, so it does not need — and must
+     * not wait out — [UNPAIRED_CONFIDENCE_MS].
+     *
+     * MEASURED-FROM-SOURCE: mautrix-gmessages calls the same bytes `hackyLoggedOutBytes`
+     * (`pkg/libgm/event_handler.go`) and fires `events.GaiaLoggedOut` on them, which is
+     * an independent party arriving at the same reading of the same frame.
+     *
+     * UNKNOWN whether it also fires for the SERVER-side silent revoke that actually hurt
+     * Ben and Alex, as opposed to the phone-initiated unpair we can reproduce. If it
+     * does not, the absence detectors are still the backstop and nothing here regresses.
+     * Turn this off if a healthy device is ever seen taking `72 00`.
+     */
+    var logoutSentinelDrivesUi: Boolean = true
+
+    /**
+     * Let a `revoked` arm on a [ROUTE_PAIR_EVENT] frame raise the reconnect screen.
+     *
+     * **Default false.** Unlike the logout sentinel this has never been seen in any of
+     * our captures — the route was returned on, unlogged, until 26 Aug, so we do not yet
+     * know whether Google sends it to a GAIA-paired client or only to a QR-paired one.
+     * It logs loudly either way; flip this on once one capture shows it arriving on a
+     * real unpair and not on a healthy device.
+     */
+    var pairEventDrivesUi: Boolean = false
+
+    /**
+     * Refuse to let a "decoy" frame — unencrypted body, no encrypted body — satisfy an
+     * in-flight RPC's response waiter.
+     *
+     * MEASURED-FROM-SOURCE: mautrix-gmessages does this unconditionally in cookie/GAIA
+     * mode, `pkg/libgm/session_handler.go:143-157`, with the comment *"Very hacky way to
+     * ignore weird messages that come before real responses."* They have shipped it for
+     * a long time, which is the best evidence available that it is safe.
+     *
+     * **THIS IS THE KILL SWITCH FOR THE RISKIEST CHANGE IN THE 26 AUG BATCH.** Flip it
+     * to `false` and rebuild if sends start showing "Not Delivered" on a healthy device.
+     *
+     * Why that is the failure mode to watch: `sendText` reads
+     * `resp.encryptedData?.let(::decrypt) ?: return true // assume ok if no body`, i.e.
+     * a SEND_MESSAGE response with no encrypted body is treated as SUCCESS today. If a
+     * decoy is what currently satisfies that waiter, then refusing it means the send
+     * either waits for the real response (the point of the change) or times out at 10 s
+     * and reports failure. On a healthy link the first should happen; if the second
+     * happens instead, the guard is wrong for our protocol and this flag turns it off
+     * without touching code.
+     *
+     * Note the change is not a regression in the unpaired case: reporting a send as
+     * failed when the phone never answered is correct, and §27.6 already established
+     * that "Not Delivered" is honest there.
+     */
+    var decoyGuardEnabled: Boolean = true
+
+    /**
      * Allow a rotation attempt when NO `__Secure-1PSIDTS` is held, to establish whether
      * `accounts.google.com/RotateCookies` will MINT one rather than only refresh one
      * (see [GMCookieRotation]).

@@ -8,4 +8,10 @@
     <!-- Briefly wakes the (cover) display when an incoming text arrives, so a
          new message lights the screen like the stock SMS app. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Puts the re-link screen in front of the user when this phone stops
+         receiving texts, instead of waiting for them to open the app. A normal
+         install-time permission on this device's Android level; on 14+ the system
+         may downgrade it to an ordinary heads-up notification, which the
+         notification is built to survive (see GoogleMessagesNotifier). -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 </manifest>

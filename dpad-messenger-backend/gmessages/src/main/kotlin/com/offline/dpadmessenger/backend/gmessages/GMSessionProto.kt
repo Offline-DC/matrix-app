@@ -57,6 +57,20 @@ internal object GMSessionProto {
     const val ALERT_BROWSER_INACTIVE_FROM_TIMEOUT = 7
     const val ALERT_BROWSER_INACTIVE_FROM_INACTIVITY = 8
 
+    /** The phone is rebuilding its own SMS/MMS database (restore, SIM swap, app
+     *  data clear, some OS updates).
+     *
+     *  MEASURED-FROM-SOURCE (mautrix-gmessages CHANGELOG v26.05): *"Stopped handling
+     *  message deletions during mobile SMS database sync, as the phone sometimes sends
+     *  them incorrectly."* Their gate is `pkg/connector/handlegmessages.go:166-179`.
+     *
+     *  We have known these three alert numbers by name since the alert table was
+     *  written and have never acted on them — every one lands in `onUserAlert`'s
+     *  `else -> Log.d(...)` branch. See [GoogleMessagesSessionClient] for the gate. */
+    const val ALERT_MOBILE_DB_SYNCING = 11
+    const val ALERT_MOBILE_DB_SYNC_COMPLETE = 12
+    const val ALERT_MOBILE_DB_SYNC_STARTED = 13
+
     /** True for every alert meaning "you are no longer the receive target". */
     fun isBrowserInactiveAlert(alert: Int): Boolean =
         alert == ALERT_BROWSER_INACTIVE ||
@@ -75,9 +89,9 @@ internal object GMSessionProto {
         ALERT_BROWSER_INACTIVE_FROM_TIMEOUT -> "BROWSER_INACTIVE_FROM_TIMEOUT"
         ALERT_BROWSER_INACTIVE_FROM_INACTIVITY -> "BROWSER_INACTIVE_FROM_INACTIVITY"
         9 -> "RCS_CONNECTION"
-        11 -> "MOBILE_DATABASE_SYNCING"
-        12 -> "MOBILE_DATABASE_SYNC_COMPLETE"
-        13 -> "MOBILE_DATABASE_SYNC_STARTED"
+        ALERT_MOBILE_DB_SYNCING -> "MOBILE_DATABASE_SYNCING"
+        ALERT_MOBILE_DB_SYNC_COMPLETE -> "MOBILE_DATABASE_SYNC_COMPLETE"
+        ALERT_MOBILE_DB_SYNC_STARTED -> "MOBILE_DATABASE_SYNC_STARTED"
         else -> "alert#" + alert
     }
 
@@ -162,6 +176,48 @@ internal object GMSessionProto {
             action = f[4]?.value?.toInt() ?: 0,
             unencryptedData = f[5]?.bytes,
             encryptedData = f[8]?.bytes,
+        )
+    }
+
+    /**
+     * RPCPairData (client.proto) — the payload of a [ROUTE_PAIR_EVENT] frame.
+     *
+     * MEASURED-FROM-SOURCE (mautrix-gmessages `pkg/libgm/gmproto/client.proto`):
+     *
+     *     message RPCPairData {
+     *       oneof event {
+     *         PairedData paired = 4;
+     *         RevokePairData revoked = 5;
+     *       }
+     *     }
+     *
+     * `pkg/libgm/pair.go` treats a `revoked` arm as "this pairing is gone" and
+     * tears the session down. It is the pushed counterpart to the two-byte GAIA
+     * logout sentinel, on the pairing route rather than the data route.
+     *
+     * We were dropping this entire route on the floor, unlogged: [handleRpc]
+     * returned on `bugleRoute != ROUTE_DATA_EVENT` before anything was parsed.
+     * UNKNOWN whether Google sends it to a GAIA-paired client at all — this
+     * exists so that the next capture answers the question instead of us
+     * guessing again (rule 2.1b: the absence we reasoned from may be an
+     * absence of logging).
+     *
+     * [fieldNumbers] is carried so an unrecognised arm still shows up in logs
+     * as a shape we can look up later, rather than as silence.
+     */
+    data class PairEvent(
+        val paired: Boolean,
+        val revoked: Boolean,
+        val fieldNumbers: List<Int>,
+    )
+
+    fun parseRpcPairData(bytes: ByteArray): PairEvent {
+        val nums = ArrayList<Int>()
+        forEachField(bytes) { nums.add(it.number) }
+        return PairEvent(
+            paired = nums.contains(4),
+            revoked = nums.contains(5),
+            fieldNumbers = nums,
         )
     }
 

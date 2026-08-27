@@ -52,6 +52,12 @@ fun GoogleMessagesReconnectScreen(
                 "in using a private/incognito window and close it right after, so " +
                 "your phone stays the only one holding the login.",
         )
+        AuthFailureReason.UNPAIRED -> Pair(
+            "This phone was unlinked",
+            "Your phone no longer lists this device under Messages > Settings > " +
+                "Device pairing, so texts stopped syncing. Press Re-link and sign in " +
+                "again to reconnect — refreshing on its own won't fix this one.",
+        )
         AuthFailureReason.NETWORK -> Pair(
             "No connection",
             "Couldn't reach Google to restore the link — this phone looks offline. " +

@@ -178,6 +178,21 @@ object GoogleMessagesRepository {
         CoroutineScope(Dispatchers.IO).launch { repo.adoptFreshCookies(cookies) }
     }
 
+    /**
+     * Debug Settings row -> "Check pairing now".
+     *
+     * Runs the real pairing check on demand — Google's registration list AND a live
+     * re-assert to the phone — so a broken link can be reproduced in ~30 s instead of
+     * waiting out the detector's 11-to-30-minute cadence. Returns a one-line summary for
+     * the toast; the full picture is in the log under `GMSession`.
+     *
+     * Returns a plain message rather than throwing when nothing is paired, because the
+     * caller is a button.
+     */
+    suspend fun checkPairingNow(): String =
+        (instance as? GoogleMessagesMessageRepository)?.checkPairingNow()
+            ?: "No live Google Messages session — nothing to check"
+
     /** Re-link WITHOUT re-pairing: refresh the token from stored cookies and
      *  resume, keeping the pairing + messages. Returns false if the cookies are
      *  dead (caller should fall back to a full re-pair). */
