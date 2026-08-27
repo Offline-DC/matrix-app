@@ -184,6 +184,40 @@ class GoogleMessagesAccountStore(context: Context) {
     // only our own local web identity — the pairing target (the phone) is
     // unaffected. Mirrors mautrix-gmessages' persisted SessionID.
 
+    /**
+     * The registration id GOOGLE says is ours — `SignInGaiaResponse` field 2.
+     *
+     * MEASURED-FROM-SOURCE (Google's live messagesweb bundle, 26 Aug 2026): the browser
+     * stores this as `bg_tachyon_registration_id` and uses it to find ITS OWN entry in
+     * the account's registration list, matching it against each item's field 1. It is a
+     * different value from our `messages-web-<hex>` device id (e.g. a run on 26 Aug had
+     * device id `messages-web-de7c7c80...` and registration id
+     * `e8b36f48-e5dc-4df0-b77c-b9c41325f22b`), which is why we now keep both: it is
+     * UNKNOWN which of the two the list keys on, and [GMDeviceListProbe] logs whichever
+     * one matched rather than assuming.
+     *
+     * Null on any install that paired before this was persisted. The probe falls back to
+     * the id in the live response, so that is degraded, not broken.
+     */
+    fun loadOwnRegistrationId(): String? = prefs.getString(KEY_OWN_REG_ID, null)
+
+    fun saveOwnRegistrationId(id: String) {
+        prefs.edit().putString(KEY_OWN_REG_ID, id).apply()
+    }
+
+    /**
+     * Overwrite the persisted web-device id.
+     *
+     * Added 27 Aug so we can adopt the id **Google issues** at `/web/config` instead of
+     * one we minted (OQ-28 / mechanism E). Every other path must keep using
+     * [getOrCreateDeviceSessionId] — a device id that changes is a new `messages-web-*`
+     * entry on the account (OQ-10), so this setter exists for exactly one caller and
+     * every use of it is logged at the call site.
+     */
+    fun saveDeviceSessionId(id: String) {
+        prefs.edit().putString(KEY_DEVICE_SESSION_ID, id).apply()
+    }
+
     fun getOrCreateDeviceSessionId(): String {
         prefs.getString(KEY_DEVICE_SESSION_ID, null)?.let { return it }
         val id = java.util.UUID.randomUUID().toString()
@@ -314,8 +348,33 @@ class GoogleMessagesAccountStore(context: Context) {
         }
     }
 
+    /**
+     * Wipe the stored account — but KEEP the web-device identity.
+     *
+     * **This is the fix for OQ-10, and the bug was here all along.**
+     * [getOrCreateDeviceSessionId] exists so that we register ONE
+     * `messages-web-<uuid>` with Google and reuse it forever, exactly as the browser
+     * reuses its `bg_tachyon_auth_device_id` in localStorage. A blanket
+     * `prefs.edit().clear()` threw that away, so **every re-link minted a brand-new web
+     * device and left the old registration behind as a ghost.**
+     *
+     * MEASURED 26 Aug 2026, one afternoon on Jack's device: three re-links produced three
+     * different device ids — `messages-web-de7c7c80…`, `…e1eaa817…`, `…8cc03ed6…` — and
+     * three separate registrations (`e8b36f48…`, `ac7c7588…`, `a774d644…`), all still
+     * listed. The account is at **31 web registrations**. Debug reinstalls were blamed
+     * for that (`00_START_HERE.md` rule 2.7); reinstalls contribute, but the re-link path
+     * is the engine, and it runs for real customers every time support says "re-link".
+     *
+     * The id is not a credential — it is a random UUID we generate — so keeping it across
+     * a logout leaks nothing, and a sign-in to a *different* Google account simply
+     * registers the same id under that account, which is what the browser does too.
+     */
     fun clear() {
+        val deviceSessionId = prefs.getString(KEY_DEVICE_SESSION_ID, null)
         prefs.edit().clear().apply()
+        if (deviceSessionId != null) {
+            prefs.edit().putString(KEY_DEVICE_SESSION_ID, deviceSessionId).apply()
+        }
     }
 
     private fun encode(b: ByteArray) = Base64.encodeToString(b, Base64.NO_WRAP)
@@ -348,6 +407,7 @@ class GoogleMessagesAccountStore(context: Context) {
         private const val KEY_GAIA_PAIRING_ATTEMPT = "gaiaPairingAttemptId"
         private const val KEY_LINK_TS = "linkTimestampMs"
         private const val KEY_DEVICE_SESSION_ID = "deviceSessionId"
+        private const val KEY_OWN_REG_ID = "ownRegistrationId"
         private const val KEY_ROT_LAST_ATTEMPT = "rotLastAttemptMs"
         private const val KEY_ROT_NEXT_DUE = "rotNextDueMs"
     }
