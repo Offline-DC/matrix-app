@@ -3,6 +3,7 @@ package com.offline.dpadmessenger.backend.gmessages.ui
 import android.widget.Toast
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -20,6 +21,7 @@ import com.offline.dpadmessenger.ui.util.TimeFormatPreference
 import com.offline.dpadmessenger.backend.gmessages.AuthFailureReason
 import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesAccountStore
 import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesConfig
+import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesNotifier
 import com.offline.dpadmessenger.backend.gmessages.GoogleMessagesRepository
 
 /**
@@ -377,6 +379,10 @@ fun GoogleMessagesApp(
         // across recompositions / resumes.
         val linkAgeDays: Int? = store.daysSinceLink()
         if (authExpired) {
+            // The page IS the alert now: take the "Texts aren't syncing" notification
+            // down as soon as it is on screen, and stop it being re-posted. Keyed on
+            // Unit so it fires once per entry into this branch, not per recomposition.
+            LaunchedEffect(Unit) { GoogleMessagesNotifier.onReconnectPageShown(context) }
             GoogleMessagesReconnectScreen(
                 onRelink = relink,
                 reason = authExpiredReason,

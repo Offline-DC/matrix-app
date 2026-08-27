@@ -164,6 +164,35 @@ object GoogleMessagesConfig {
     var decoyGuardEnabled: Boolean = true
 
     /**
+     * Take the "Texts aren't syncing" notification down as soon as the full-screen
+     * re-link page is actually on screen, and stop re-posting it for the rest of the
+     * episode.
+     *
+     * Jack's call, 27 Aug: *"drop the notification post for texts aren't syncing
+     * failure? Surfacing the full page screen is enough."* The page is the alert; a
+     * permanent shade entry sitting on top of it is noise.
+     *
+     * WARNING - the notification cannot simply be deleted. `setFullScreenIntent` is a
+     * property of that notification, so `nm.notify` IS what launches the page: remove
+     * the post and the page goes with it. So the post stays, and
+     * [GoogleMessagesNotifier.onReconnectPageShown] cancels it once the page rendered.
+     *
+     * **That ordering is what preserves the 26 Aug "nobody sees the warning" fix.**
+     * Android 14+ restricts `USE_FULL_SCREEN_INTENT` and any OEM may suppress it. Where
+     * it is suppressed the page never renders, so nothing cancels the notification and
+     * the user still gets an ordinary high-importance heads-up. The shade entry
+     * disappears exactly when it has been made redundant, and never otherwise.
+     *
+     * Flip to `false` for the previous behaviour: an ongoing notification that persists
+     * until the link is fixed.
+     *
+     * WARNING - **UNVERIFIED ON A DEVICE.** Written 27 Aug while the mechanism-E watch
+     * forbids installing to the dev device (day 7 approx 3 Sep). Confirm in the field
+     * that the page still appears and that the shade is empty afterwards.
+     */
+    var clearLinkNotifWhenPageShown: Boolean = true
+
+    /**
      * Allow a rotation attempt when NO `__Secure-1PSIDTS` is held, to establish whether
      * `accounts.google.com/RotateCookies` will MINT one rather than only refresh one
      * (see [GMCookieRotation]).

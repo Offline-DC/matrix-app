@@ -33,7 +33,12 @@ internal class GoogleMessagesNotifier(context: Context) {
     private data class HistoryLine(val sender: String, val body: String, val timeMs: Long)
 
     /** True while a broken-link notification is showing. Gates the ONE full-screen
-     *  escalation per episode, and makes [clearLinkBroken] a no-op when nothing is up. */
+     *  escalation per episode, and makes [clearLinkBroken] a no-op when nothing is up.
+     *
+     *  Deliberately SEPARATE from [linkPageSeen]. This one means "this episode has
+     *  already escalated", so taking the shade entry down must not reset it. If it did,
+     *  the next detector reconfirm - every few minutes on the absence path - would
+     *  re-arm the full-screen intent and relaunch the activity under the user. */
     @Volatile private var linkBrokenPosted = false
 
     fun ensureChannel() {
@@ -211,6 +216,19 @@ internal class GoogleMessagesNotifier(context: Context) {
             )
             return
         }
+        // The full-screen page has already been put in front of the user, so a shade
+        // entry on top of it is redundant - see
+        // [GoogleMessagesConfig.clearLinkNotifWhenPageShown]. Note this deliberately
+        // does NOT touch [linkBrokenPosted]: the episode stays latched, so the
+        // full-screen intent is never re-armed and the page never relaunches under them.
+        if (GoogleMessagesConfig.clearLinkNotifWhenPageShown && linkPageSeen) {
+            android.util.Log.i(
+                TAG,
+                "link-broken notification SUPPRESSED (reason=$reason) — the re-link page " +
+                    "has already been shown; the page is the alert",
+            )
+            return
+        }
         ensureLinkChannel()
 
         val unpaired = reason == AuthFailureReason.UNPAIRED
@@ -263,6 +281,12 @@ internal class GoogleMessagesNotifier(context: Context) {
 
     /** Take the broken-link notification down. Safe to call when none is showing. */
     fun clearLinkBroken(reason: String) {
+        // Reset this BEFORE the early return below. A page shown with no notification
+        // ever posted (the user opened the messenger themselves) leaves
+        // linkPageSeen=true while linkBrokenPosted=false; returning early first would
+        // strand it and suppress the notification for every later episode in this
+        // process.
+        linkPageSeen = false
         if (!linkBrokenPosted) return
         linkBrokenPosted = false
         runCatching { nm.cancel(LINK_NOTIFICATION_ID) }
@@ -349,5 +373,37 @@ internal class GoogleMessagesNotifier(context: Context) {
 
         /** Well clear of [NOTIFICATION_ID_BASE] + the 16-bit conversation hash. */
         private const val LINK_NOTIFICATION_ID = 4199
+
+        /** True once the full-screen re-link page has actually rendered this episode.
+         *  Companion-level because the UI has no handle on the notifier instance - it is
+         *  a private val of [GoogleMessagesMessageRepository]. Reset in
+         *  [clearLinkBroken], which is the only thing that ends an episode. */
+        @Volatile private var linkPageSeen = false
+
+        /**
+         * Called by the re-link page as it appears. Cancels the "Texts aren't syncing"
+         * notification and stops it being re-posted for the rest of this episode.
+         *
+         * Idempotent, so it is safe to call from a Compose effect. Does nothing when
+         * [GoogleMessagesConfig.clearLinkNotifWhenPageShown] is off.
+         *
+         * The ordering is the safety property: this runs only when the page really
+         * rendered, so on a device where the full-screen intent is suppressed nothing
+         * cancels the notification and it remains the surface that tells the user at all.
+         */
+        fun onReconnectPageShown(context: Context) {
+            if (!GoogleMessagesConfig.clearLinkNotifWhenPageShown) return
+            if (linkPageSeen) return
+            linkPageSeen = true
+            runCatching {
+                NotificationManagerCompat.from(context.applicationContext)
+                    .cancel(LINK_NOTIFICATION_ID)
+            }
+            android.util.Log.i(
+                TAG,
+                "re-link page shown — link-broken notification cleared and suppressed " +
+                    "for this episode (the page is the alert)",
+            )
+        }
     }
 }
