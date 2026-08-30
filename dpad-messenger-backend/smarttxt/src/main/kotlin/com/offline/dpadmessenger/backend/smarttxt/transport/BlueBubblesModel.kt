@@ -124,47 +124,6 @@ object Handles {
             else -> "+$digits"
         }
     }
-
-    // ---- relayed-SMS handle repair -------------------------------------------
-    //
-    // rustpush's `normalize_sms_handle` used to make E.164 out of a bare all-digit SMS
-    // handle by prefixing '+' and stopping there, so a carrier that delivers a
-    // national-format number ("4097821402") produced the bogus "+4097821402" — country
-    // code 40, Romania — and every chat with that person split in two. `canon` cannot
-    // undo it: its "10 bare digits get a +1" rule only fires on a handle with no '+'
-    // yet. See SMARTTXT_GREEN_SPLIT_THREAD_COUNTRY_CODE_20260830.md.
-    //
-    // Fixed at the source in our vendored rustpush (it now takes the country from the
-    // message's `co` field), so nothing NEW is damaged. These exist for one job only:
-    // the one-time repair of rooms an older build already wrote to disk. They can be
-    // deleted once no install reports "room repair: folding" any more.
-
-    /** True for a canon NANP number: "+1" followed by exactly ten digits. */
-    fun isNanpE164(canon: String): Boolean =
-        canon.startsWith("+1") && canon.length == 12 && canon.drop(2).all { it.isDigit() }
-
-    /** The bogus form `normalize_sms_handle` produces for a known-good NANP number:
-     *  "+18048334449" -> "+8048334449". Computing the damage forward from a number we
-     *  trust lets us match a mangled handle by equality instead of guessing backward. */
-    fun barePlusForm(canonE164: String): String? =
-        if (isNanpE164(canonE164)) "+" + canonE164.drop(2) else null
-
-    /** Re-qualify a handle that arrived as '+' plus a bare national number.
-     *
-     *  Deliberately narrow: fires only for a NANP account, on '+' plus exactly ten
-     *  digits in NANP shape (area and exchange codes start 2-9) — never a valid NANP
-     *  number, since those are '+1' plus ten. A legitimate ten-digit E.164 exists
-     *  elsewhere (Norway "+47…", Denmark "+45…") and cannot be told apart from a
-     *  dropped country code without a real libphonenumber, so everything else is
-     *  returned untouched. */
-    fun requalifyNational(canon: String, myCanon: String): String {
-        if (!isNanpE164(myCanon)) return canon
-        if (!canon.startsWith("+")) return canon
-        val digits = canon.drop(1)
-        if (digits.length != 10 || !digits.all { it.isDigit() }) return canon
-        if (digits[0] !in '2'..'9' || digits[3] !in '2'..'9') return canon
-        return "+1$digits"
-    }
 }
 
 /** SmartTxt services: blue (SmartTxt) vs green (SMS/RCS relayed). */
