@@ -461,12 +461,112 @@ internal class SmartTxtMessageRepository(
 
     // ---- persistence --------------------------------------------------------
 
+    /**
+     * One-time repair of green threads that an older build split in two.
+     *
+     * rustpush's `normalize_sms_handle` made E.164 out of a relayed SMS handle by
+     * prefixing '+' and stopping there, so a national-format number from the carrier
+     * ("4097821402") was stored as "+4097821402" — country code 40, Romania. Inbound
+     * messages keyed to that phantom address while the user's own outbound echoes,
+     * which arrive already in E.164, keyed to "+1…". One contact could end up spread
+     * across three rooms, and a reply typed into a phantom one was addressed to a
+     * number that does not exist. (SMARTTXT_GREEN_SPLIT_THREAD_COUNTRY_CODE_20260830.md)
+     *
+     * The native side no longer produces these, but rooms already on disk keep their
+     * bad ids forever — so without this the fix looks to the user like it did nothing.
+     * Runs on the restored snapshot before it is merged, so it is naturally once per
+     * load and costs nothing when there is nothing to repair (the common case).
+     *
+     * Merging, not just renaming: the correct room usually already exists — it holds
+     * the user's own sent messages — so a repaired room folds INTO it, messages deduped
+     * by guid, unread summed, mute honoured if either side had it.
+     */
+    private fun repairSplitSmsRooms(snap: SmartTxtStore.Snapshot): SmartTxtStore.Snapshot {
+        // Only a NANP account can be repaired: elsewhere a ten-digit E.164 is a real
+        // number and we would corrupt it. See Handles.requalifyNational.
+        val mine = runCatching { SmartTxtAccountStore(appContext).loadAccount()?.handles }
+            .getOrNull().orEmpty().map { Handles.canon(it) }
+        val myNanp = mine.firstOrNull { Handles.isNanpE164(it) } ?: return snap
+        val damagedSelf = mine.mapNotNull { Handles.barePlusForm(it) }.toSet()
+
+        // Returns `id` unchanged unless a handle in it is actually damaged. Rebuilding
+        // unconditionally would also silently re-canonicalise healthy rooms (casing,
+        // punctuation), which is a different migration and not one we want riding along.
+        fun repairId(id: String): String {
+            if (!ChatGuid.isGroup(id)) {
+                val ident = Handles.canon(ChatGuid.identifier(id))
+                val fixed = Handles.requalifyNational(ident, myNanp)
+                return if (fixed == ident) id else "${ChatGuid.service(id)};-;$fixed"
+            }
+            val ident = ChatGuid.identifier(id)
+            if (!ident.contains(',')) return id // gid-keyed: an opaque Apple id, not handles
+            val raw = ident.split(',').map { Handles.canon(it) }.filter { it.isNotEmpty() }
+            // The user's own number arrived damaged too, which is what made an inbound
+            // 1:1 MMS look like a group. Its damaged form in a member list is the tell.
+            val hadSelf = raw.any { it in damagedSelf }
+            val members = raw
+                .filterNot { it in damagedSelf || it in mine }
+                .map { Handles.requalifyNational(it, myNanp) }
+                .distinct()
+                .sorted()
+            if (!hadSelf && members == raw) return id // nothing in here was damaged
+            return when (members.size) {
+                0 -> id
+                1 -> "${ChatGuid.service(id)};-;${members.first()}"
+                else -> "${ChatGuid.service(id)};+;${members.joinToString(",")}"
+            }
+        }
+
+        val remap = (snap.rooms.map { it.id } + snap.messagesByRoom.keys).distinct()
+            .associateWith { repairId(it) }
+            .filter { (old, new) -> old != new }
+        if (remap.isEmpty()) return snap
+        Log.i(TAG, "room repair: folding ${remap.size} split SMS room(s) — $remap")
+
+        fun to(id: String) = remap[id] ?: id
+
+        // An already-correct room wins on metadata (it carries the contact name); a
+        // repaired room supplies it only when there was no correct room to fold into.
+        val roomsById = LinkedHashMap<String, Room>()
+        for (r in snap.rooms) {
+            val id = to(r.id)
+            val existing = roomsById[id]
+            roomsById[id] = when {
+                existing == null -> r.copy(id = id, isGroup = ChatGuid.isGroup(id))
+                r.id == id -> r.copy(isGroup = ChatGuid.isGroup(id)) // the real room
+                else -> existing
+            }
+        }
+
+        val messages = LinkedHashMap<String, LinkedHashMap<String, Message>>()
+        for ((room, list) in snap.messagesByRoom) {
+            val id = to(room)
+            val into = messages.getOrPut(id) { LinkedHashMap() }
+            list.forEach { into[it.id] = it.copy(roomId = id) }
+        }
+        val unread = LinkedHashMap<String, Int>()
+        for ((room, n) in snap.unreadByRoom) {
+            val id = to(room)
+            unread[id] = (unread[id] ?: 0) + n
+        }
+
+        return snap.copy(
+            rooms = roomsById.values.toList(),
+            messagesByRoom = messages.mapValues { (_, m) -> m.values.sortedBy { it.timestampMs } },
+            unreadByRoom = unread,
+            mutedRooms = snap.mutedRooms.map { to(it) }.toSet(),
+        )
+    }
+
     private suspend fun restoreFromCache() {
-        val snap = withContext(Dispatchers.IO) { cache.load() }
-        if (snap == null) {
+        val stored = withContext(Dispatchers.IO) { cache.load() }
+        if (stored == null) {
             Log.i(TAG, "cache restore: nothing stored (first run, or cleared)")
             return
         }
+        // Fold back any green thread an older build split in two, before the merge
+        // below writes those room ids into the live maps.
+        val snap = repairSplitSmsRooms(stored)
         writeLock.withLock {
             val cutoff = retentionCutoffMs()
             // Merge the cache UNDER whatever is already live instead of bailing when
