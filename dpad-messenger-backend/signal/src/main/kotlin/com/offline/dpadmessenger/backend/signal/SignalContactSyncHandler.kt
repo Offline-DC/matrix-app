@@ -64,10 +64,20 @@ class SignalContactSyncHandler(
             val serviceId = resolveServiceId(cd) ?: continue
             val name = preferredName(cd) ?: continue
             val phone = if (cd.hasNumber() && cd.number.isNotBlank()) cd.number else null
-            repository.updateContact(serviceId = serviceId, name = name, e164 = phone)
+            repository.updateContact(
+                serviceId = serviceId,
+                name = name,
+                e164 = phone,
+                source = NameSource.CONTACT_SYNC,
+            )
             applied++
         }
         Log.d(TAG, "contact sync: applied $applied name updates")
+        // Legacy path — modern primaries don't answer SyncMessage.Request
+        // {CONTACTS}, so this fires rarely or never. One line when it does,
+        // because a name arriving from here rather than Storage Service
+        // completely changes where to look.
+        SigNames.log("legacy contact sync: parsed ${entries.size} applied $applied")
     }
 
     /** Prefer the textual ACI; fall back to parsing the binary ACI; last resort phone number. */

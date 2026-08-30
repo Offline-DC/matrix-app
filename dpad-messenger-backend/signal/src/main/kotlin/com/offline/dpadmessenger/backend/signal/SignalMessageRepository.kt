@@ -40,6 +40,40 @@ import kotlinx.coroutines.launch
  * [SignalChatWebSocket] through `receiveIncoming` / the `applyIncoming*`
  * hooks. DM rooms only (`sig:dm:<serviceId>`); groups are not routed yet.
  */
+/**
+ * Where a stored contact name came from. Persisted with the name, and printed
+ * by the `SigNames` thread dump.
+ *
+ * This exists because [SignalMessageRepository.resolveDisplayName] returns any
+ * cached name immediately and never re-derives it — so a name that was wrong
+ * the first time survives relabelling, restarts and re-links, and every log line
+ * after that says only `source=cached`. Recording the ORIGIN at write time is
+ * what turns "this thread has the wrong name" into "this thread has the wrong
+ * name, and it arrived from <here>".
+ *
+ * [wire] is what gets persisted, so these strings are a storage format: rename a
+ * constant and old snapshots decode to [UNKNOWN]. Add cases freely.
+ */
+internal enum class NameSource(val wire: String) {
+    /** Storage Service ContactRecord — your saved name on the primary phone. */
+    STORAGE("storage"),
+    /** Legacy `SyncMessage.Contacts` blob. Modern primaries never send it. */
+    CONTACT_SYNC("contactsync"),
+    /** The device address book, matched on the last 7 digits of the number. */
+    ADDRESSBOOK("addressbook"),
+    /** The contact's own Signal profile name, decrypted with their profile key. */
+    PROFILE("profile"),
+    /** Inherited from a DIFFERENT recipient by [SignalMessageRepository.mergeRecipient]. */
+    MERGED("merged"),
+    /** Restored from a snapshot written before provenance was recorded. */
+    UNKNOWN("unknown");
+
+    companion object {
+        fun fromWire(w: String?): NameSource =
+            entries.firstOrNull { it.wire == w } ?: UNKNOWN
+    }
+}
+
 class SignalMessageRepository(
     private val account: SignalAccount,
     /** Optional outbound channel. Null in mock/unit-test paths where we
@@ -97,7 +131,15 @@ class SignalMessageRepository(
 
     /** Address book learned from contact sync, used by the "new chat" picker
      *  and to resolve a chosen phone number to a Signal ACI. */
-    private data class Contact(val name: String, val e164: String?)
+    private data class Contact(
+        val name: String,
+        val e164: String?,
+        /** WHERE this name came from. The single most useful fact when a thread
+         *  is wearing the wrong name: `resolveDisplayName` short-circuits on any
+         *  cached name, so without provenance every message just logs
+         *  `source=cached` and the trail ends there. */
+        val source: NameSource = NameSource.UNKNOWN,
+    )
     private val contactsByServiceId = java.util.concurrent.ConcurrentHashMap<String, Contact>()
     /** normalized phone number → serviceId (ACI). */
     private val numberToServiceId = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -211,7 +253,7 @@ class SignalMessageRepository(
         messagesByRoom.value = snap.messages
         userCache.value = snap.users + (account.aci to currentUser)
         snap.contacts.forEach { (sid, c) ->
-            contactsByServiceId[sid] = Contact(c.name, c.e164)
+            contactsByServiceId[sid] = Contact(c.name, c.e164, NameSource.fromWire(c.source))
             if (!c.e164.isNullOrBlank()) numberToServiceId[normalizeNumber(c.e164)] = sid
         }
         snap.groupMasterKeysB64.forEach { (roomId, b64) ->
@@ -242,7 +284,7 @@ class SignalMessageRepository(
             messages = messagesByRoom.value,
             users = userCache.value,
             contacts = contactsByServiceId.mapValues {
-                SignalMessageStore.PersistedContact(it.value.name, it.value.e164)
+                SignalMessageStore.PersistedContact(it.value.name, it.value.e164, it.value.source.wire)
             },
             groupMasterKeysB64 = groupMasterKeys.mapValues {
                 android.util.Base64.encodeToString(it.value, android.util.Base64.NO_WRAP)
@@ -694,15 +736,30 @@ class SignalMessageRepository(
         // the contact's Signal profile name (only possible if we hold a profile
         // key from an earlier message — Signal won't reveal it from a cold
         // number lookup) → finally the number itself.
-        val name = contactsByServiceId[serviceId]?.name
+        // Track WHICH leg produced the name, not just the name — otherwise
+        // persisting it below overwrites a known-good provenance with UNKNOWN.
+        var nameSource = NameSource.UNKNOWN
+        val cachedContact = contactsByServiceId[serviceId]
+        val name = cachedContact?.name?.also { nameSource = cachedContact.source }
             ?: userCache.value[serviceId]?.displayName
-            ?: localNameForNumber(destination)
-            ?: signalProfileNameFor(serviceId)
+            ?: localNameForNumber(destination)?.also { nameSource = NameSource.ADDRESSBOOK }
+            ?: signalProfileNameFor(serviceId)?.also { nameSource = NameSource.PROFILE }
             ?: destination
+        // User-initiated, so at most a line per new chat. Worth having: this is
+        // the other path that can weld a typed number onto the wrong recipient.
+        SigNames.log(
+            "startConversation typed=${SigNames.num(destination)} " +
+                "sid=${SigNames.sid(serviceId)} name=${SigNames.name(name)} src=${nameSource.wire}",
+        )
         // Persist the name → service id so the room header + picker show it and
         // future lookups resolve locally.
         if (name != destination) {
-            updateContact(serviceId = serviceId, name = name, e164 = normalizeNumber(destination))
+            updateContact(
+                serviceId = serviceId,
+                name = name,
+                e164 = normalizeNumber(destination),
+                source = nameSource,
+            )
         }
         return ensureDmRoom(serviceId, name)
     }
@@ -755,10 +812,34 @@ class SignalMessageRepository(
         val wantDigits = rawNumber.filter { it.isDigit() }.takeLast(7)
         if (wantDigits.isBlank()) return null
         return kotlinx.coroutines.withContext(Dispatchers.IO) {
-            SignalLocalContacts.read(ctx)
-                .firstOrNull { it.number.filter(Char::isDigit).takeLast(7) == wantDigits }
+            val rows = SignalLocalContacts.read(ctx)
+            val matches = rows.filter { it.number.filter(Char::isDigit).takeLast(7) == wantDigits }
+            val picked = matches.firstOrNull()
                 ?.name
                 ?.takeIf { it.isNotBlank() && it != rawNumber }
+            // The whole diagnosis for "Signal put someone else's name on this
+            // thread". A LAST-7-DIGIT compare throws the area code away, and
+            // one address-book CARD can carry several numbers — so `matches`
+            // > 1 means the only thing distinguishing two people was the part
+            // we discarded, and `firstOrNull` picked one of them by address
+            // book sort order. Names are reduced to initial+length; the ticket
+            // already carries the real ones.
+            SigNames.log(
+                buildString {
+                    append("addressbook lookup e164=").append(SigNames.num(rawNumber))
+                    append(" rows=").append(rows.size)
+                    append(" matches=").append(matches.size)
+                    append(" picked=").append(SigNames.name(picked))
+                    if (matches.size > 1) {
+                        append(" AMBIGUOUS[")
+                        append(matches.joinToString {
+                            SigNames.name(it.name) + "@" + SigNames.num(it.number)
+                        })
+                        append("]")
+                    }
+                },
+            )
+            picked
         }
     }
 
@@ -866,8 +947,15 @@ class SignalMessageRepository(
         android.util.Log.d("SignalRepo", "profile lookup $serviceId: launching (profileKey ${profileKey.size}b)")
         persistScope.launch {
             p.resolveName(serviceId, profileKey)?.let { name ->
-                android.util.Log.d("SignalRepo", "profile lookup $serviceId: applying name \"$name\"")
-                updateContact(serviceId, name, null)
+                // `SignalRepo` IS allow-listed in the launcher's rolling-logcat
+                // filterspec, so this line was shipping full contact names in
+                // support bundles — the very thing excluding `SigRepo` was
+                // meant to prevent. Redacted.
+                android.util.Log.d(
+                    "SignalRepo",
+                    "profile lookup ${SigNames.sid(serviceId)}: applying name ${SigNames.name(name)}",
+                )
+                updateContact(serviceId, name, null, NameSource.PROFILE)
             }
         }
     }
@@ -893,10 +981,27 @@ class SignalMessageRepository(
         e164: String?,
         profileKey: ByteArray?,
     ): String {
-        contactsByServiceId[serviceId]?.name?.takeIf { it.isNotBlank() }?.let { return it }
+        contactsByServiceId[serviceId]?.takeIf { it.name.isNotBlank() }?.let { cached ->
+            // The sticky branch. Once ANY source has written a name for this
+            // recipient we never look again — so a name that was wrong the
+            // first time survives relabelling the contact, restarting the app
+            // and re-linking. Seeing `source=cached` on every message from a
+            // mis-named thread is the confirmation that the bad name is
+            // persisted rather than being re-derived.
+            SigNames.log(
+                "resolve sid=${SigNames.sid(serviceId)} source=cached " +
+                    "name=${SigNames.name(cached.name)} e164=${SigNames.num(e164)} " +
+                    "cachedFrom=${cached.source.wire} cachedE164=${SigNames.num(cached.e164)}",
+            )
+            return cached.name
+        }
 
         e164?.let { localNameForNumber(it) }?.let { name ->
-            updateContact(serviceId, name, normalizeNumber(e164))
+            SigNames.log(
+                "resolve sid=${SigNames.sid(serviceId)} source=addressbook " +
+                    "name=${SigNames.name(name)} e164=${SigNames.num(e164)}",
+            )
+            updateContact(serviceId, name, normalizeNumber(e164), NameSource.ADDRESSBOOK)
             return name
         }
 
@@ -906,17 +1011,29 @@ class SignalMessageRepository(
                 p.resolveName(serviceId, profileKey)
             }
             if (!name.isNullOrBlank()) {
-                android.util.Log.d("SignalRepo", "profile lookup $serviceId: resolved \"$name\" before notify")
-                updateContact(serviceId, name, e164?.let { normalizeNumber(it) })
+                android.util.Log.d(
+                    "SignalRepo",
+                    "profile lookup ${SigNames.sid(serviceId)}: resolved ${SigNames.name(name)} before notify",
+                )
+                SigNames.log(
+                    "resolve sid=${SigNames.sid(serviceId)} source=profile " +
+                        "name=${SigNames.name(name)} e164=${SigNames.num(e164)}",
+                )
+                updateContact(serviceId, name, e164?.let { normalizeNumber(it) }, NameSource.PROFILE)
                 return name
             }
             // Not ready in time — return a placeholder now. The caller
             // (receiveIncoming) schedules the background resolve and refreshes
             // the notification once the real name lands.
-            android.util.Log.d("SignalRepo", "profile lookup $serviceId: not ready in ${PROFILE_RESOLVE_TIMEOUT_MS}ms — placeholder now")
+            android.util.Log.d("SignalRepo", "profile lookup ${SigNames.sid(serviceId)}: not ready in ${PROFILE_RESOLVE_TIMEOUT_MS}ms — placeholder now")
         }
 
-        return e164 ?: shortName(serviceId)
+        val fallback = e164 ?: shortName(serviceId)
+        SigNames.log(
+            "resolve sid=${SigNames.sid(serviceId)} " +
+                "source=${if (e164 != null) "e164" else "placeholder"} e164=${SigNames.num(e164)}",
+        )
+        return fallback
     }
 
     // ---- internal -----------------------------------------------------------
@@ -1075,8 +1192,23 @@ class SignalMessageRepository(
                 persistScope.launch {
                     val late = p.resolveName(senderServiceId, pk)
                     if (!late.isNullOrBlank()) {
-                        android.util.Log.d("SignalRepo", "profile lookup $senderServiceId: late resolve \"$late\" — refreshing notification")
-                        updateContact(senderServiceId, late, senderE164?.let { normalizeNumber(it) })
+                        // Redacted for the same reason as the other SignalRepo
+                        // profile lines: that tag IS in the rolling filterspec.
+                        android.util.Log.d(
+                            "SignalRepo",
+                            "profile lookup ${SigNames.sid(senderServiceId)}: late resolve " +
+                                "${SigNames.name(late)} — refreshing notification",
+                        )
+                        SigNames.log(
+                            "resolve sid=${SigNames.sid(senderServiceId)} source=profile-late " +
+                                "name=${SigNames.name(late)} e164=${SigNames.num(senderE164)}",
+                        )
+                        updateContact(
+                            senderServiceId,
+                            late,
+                            senderE164?.let { normalizeNumber(it) },
+                            NameSource.PROFILE,
+                        )
                         maybeNotifyIncoming(
                             conversationId = roomId,
                             title = late,
@@ -1468,7 +1600,12 @@ class SignalMessageRepository(
      * populated regardless, and `receiveIncoming` will read the cached
      * displayName when the first message lands.
      */
-    internal fun updateContact(serviceId: String, name: String, e164: String?) {
+    internal fun updateContact(
+        serviceId: String,
+        name: String,
+        e164: String?,
+        source: NameSource = NameSource.UNKNOWN,
+    ) {
         if (name.isBlank()) return
 
         // Canonicalize identity. Signal keys a conversation by a single merged
@@ -1492,6 +1629,14 @@ class SignalMessageRepository(
                     else -> serviceId                       // adopt the ACI/new id
                 }
                 val from = if (canonical == serviceId) prior else serviceId
+                // Two different service-ids claiming the same number. Normally
+                // the same person (provisional PNI vs. real ACI); if it is ever
+                // NOT, this line is where two people started sharing a thread.
+                SigNames.log(
+                    "number collision e164=${SigNames.num(e164)} " +
+                        "prior=${SigNames.sid(prior)} new=${SigNames.sid(serviceId)} " +
+                        "keeping=${SigNames.sid(canonical)}",
+                )
                 mergeRecipient(fromServiceId = from, toServiceId = canonical)
             }
         }
@@ -1507,7 +1652,19 @@ class SignalMessageRepository(
 
         // Record the address-book entry so the "new chat" picker can offer this
         // contact and resolve their number → ACI later.
-        contactsByServiceId[canonical] = Contact(name, e164)
+        // Log only an actual RENAME. A first-time write is silent on purpose:
+        // a Storage Service sync teaches hundreds of contacts at process start
+        // and none of them are interesting, whereas a recipient whose name
+        // CHANGES is always worth a line.
+        val prior = contactsByServiceId[canonical]
+        if (prior != null && prior.name != name) {
+            SigNames.log(
+                "rename sid=${SigNames.sid(canonical)} ${SigNames.name(prior.name)} -> " +
+                    "${SigNames.name(name)} e164=${SigNames.num(e164)} " +
+                    "src=${prior.source.wire}->${source.wire}",
+            )
+        }
+        contactsByServiceId[canonical] = Contact(name, e164, source)
         if (!e164.isNullOrBlank()) {
             numberToServiceId[normalizeNumber(e164)] = canonical
         }
@@ -1549,20 +1706,31 @@ class SignalMessageRepository(
     /** Diagnostic: log how every DM thread is currently keyed (service-id),
      *  its display name, message count, and any PNI→ACI alias in effect. This
      *  is what a submitted rolling log needs to show WHY a contact is split
-     *  across threads (PNI vs ACI vs an unpaired id) — grep `THREAD-DUMP`.
-     *  Contact names appear (that's the point of the diagnostic); message
-     *  BODIES never do. */
-    fun dumpThreadKeys() {
+     *  across threads, or why one thread is wearing another contact's name —
+     *  grep `THREAD-DUMP`.
+     *
+     *  Emitted under [SigNames], NOT [TAG]. This block used to print raw
+     *  contact names under `SigRepo`, which is exactly why `SigRepo` is kept
+     *  out of the launcher's rolling-logcat filterspec — so the one diagnostic
+     *  built for this bug could never reach a submitted bundle. Ids are
+     *  truncated and names reduced to initial+length, which is enough to see
+     *  the shape of the problem and carries no address book. Message BODIES
+     *  never appear here, and never did. */
+    fun dumpThreadKeys(reason: String = "manual") {
         val dms = rooms.value.filter { it.room.id.startsWith("sig:dm:") }
-        Log.i(TAG, "THREAD-DUMP: ${dms.size} DM threads, ${pniToAci.size} PNI->ACI aliases")
+        SigNames.log(
+            "THREAD-DUMP ($reason): ${dms.size} DM threads, ${pniToAci.size} PNI->ACI aliases",
+        )
         dms.forEach { rs ->
             val key = rs.room.id.removePrefix("sig:dm:")
             val count = messagesByRoom.value[rs.room.id]?.size ?: 0
-            val alias = pniToAci[key]?.let { " alias->$it" } ?: ""
-            Log.i(TAG, "THREAD-DUMP key=$key name='${rs.room.name}' msgs=$count$alias")
-        }
-        if (pniToAci.isNotEmpty()) {
-            Log.i(TAG, "THREAD-DUMP aliases: " + pniToAci.entries.joinToString { "${it.key}->${it.value}" })
+            val alias = pniToAci[key]?.let { " alias->" + SigNames.sid(it) } ?: ""
+            val contact = contactsByServiceId[key]
+            SigNames.log(
+                "THREAD-DUMP key=${SigNames.sid(key)} name=${SigNames.name(rs.room.name)} " +
+                    "contact=${SigNames.name(contact?.name)} e164=${SigNames.num(contact?.e164)} " +
+                    "src=${(contact?.source ?: NameSource.UNKNOWN).wire} msgs=$count$alias",
+            )
         }
     }
 
@@ -1612,7 +1780,11 @@ class SignalMessageRepository(
             profileKeyByServiceId.putIfAbsent(toServiceId, pk)
         }
         if (contactsByServiceId[toServiceId] == null && fromContact != null) {
-            contactsByServiceId[toServiceId] = fromContact
+            // Mark it MERGED rather than keeping the donor's provenance: this
+            // name did not come from a source that looked up THIS recipient, it
+            // was inherited wholesale from another one. A thread showing
+            // src=merged in the dump is the swap, caught in the act.
+            contactsByServiceId[toServiceId] = fromContact.copy(source = NameSource.MERGED)
         }
         // Repoint every number row that still resolves to the old id.
         numberToServiceId.entries
@@ -1660,9 +1832,10 @@ class SignalMessageRepository(
         // parallel session; archiving fromServiceId's session here would fully
         // close that gap once we expose an archive hook on the protocol store.
 
-        android.util.Log.d(
-            "SignalRepo",
-            "merged recipient $fromServiceId → $toServiceId (${fromMsgs.size} msg(s))",
+        SigNames.log(
+            "merge ${SigNames.sid(fromServiceId)} -> ${SigNames.sid(toServiceId)} " +
+                "msgs=${fromMsgs.size} nameFrom=${SigNames.name(fromContact?.name)} " +
+                "nameTo=${SigNames.name(contactsByServiceId[toServiceId]?.name)}",
         )
         saveSnapshot()
     }

@@ -507,7 +507,20 @@ class SignalChatWebSocket(
         val bin = sourceServiceIdBinary?.toByteArray() ?: return null
         return when (bin.size) {
             16 -> bytesToUuid(bin)
-            17 -> bytesToUuid(bin.copyOfRange(1, 17))  // strip PNI prefix
+            17 -> {
+                // ⚠️ This strips the PNI prefix and returns a BARE uuid, which
+                // is indistinguishable from an ACI everywhere downstream. The
+                // rest of the app represents a PNI as "PNI:<uuid>" — see
+                // SignalStorageService.applyContact, canonicalId(), isSelfId(),
+                // and updateContact()'s "never collapse a real ACI into a PNI"
+                // guard, which reads startsWith("PNI:") and therefore returns
+                // false for every PNI that entered through this function.
+                // Logged (not yet corrected) because adding the prefix here
+                // re-keys live rooms from `sig:dm:<uuid>` to `sig:dm:PNI:<uuid>`
+                // and needs a migration, not a one-liner.
+                SigNames.log("envelope source is a 17-byte PNI, returned UNPREFIXED as ${SigNames.sid(bytesToUuid(bin.copyOfRange(1, 17)))}")
+                bytesToUuid(bin.copyOfRange(1, 17))
+            }
             else -> null
         }
     }
@@ -935,7 +948,12 @@ class SignalChatWebSocket(
         val bin = destinationServiceIdBinary.toByteArray()
         return when (bin.size) {
             16 -> bytesToUuid(bin)
-            17 -> bytesToUuid(bin.copyOfRange(1, 17))  // strip PNI prefix
+            17 -> {
+                // Same unprefixed-PNI hazard as sourceServiceIdString(); see
+                // the note there.
+                SigNames.log("sync.sent destination is a 17-byte PNI, returned UNPREFIXED as ${SigNames.sid(bytesToUuid(bin.copyOfRange(1, 17)))}")
+                bytesToUuid(bin.copyOfRange(1, 17))
+            }
             else -> null
         }
     }

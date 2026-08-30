@@ -3,6 +3,7 @@ package com.offline.dpadmessenger.backend.signal
 import android.util.Base64
 import android.util.Log
 import com.google.protobuf.ByteString
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.whispersystems.signalservice.internal.storage.protos.ContactRecord
@@ -73,12 +74,36 @@ class SignalStorageService(
         var decryptFail = 0
         var noContact = 0
         var skipped = 0
+        var skippedBatches = 0
         var loggedSkipSample = false
         contactIds.chunked(READ_BATCH).forEach { batch ->
             val op = ReadOperation.newBuilder().apply {
                 batch.forEach { addReadKey(ByteString.copyFrom(it)) }
             }.build()
-            val itemsBytes = api.readStorageItems(authHeader, op.toByteArray()) ?: return@forEach
+            // One slow batch used to cost the entire sync. [SignalApi.readStorageItems]
+            // is documented "or null on error" and this call site is written for
+            // exactly that — skip the batch, keep going — but it only returns null
+            // on a non-2xx. A SocketTimeoutException out of okhttp's execute()
+            // propagated through this forEach and out of sync() altogether, so a
+            // single slow response lost all 2215 contacts AND meant the summary +
+            // thread dump below never ran. On a flip phone on cellular that is not
+            // an edge case; it is most of the time.
+            //
+            // CancellationException is rethrown on purpose. Catching it here would
+            // break structured concurrency and leave us hammering the remaining
+            // batches after the scope was already cancelled.
+            val itemsBytes = try {
+                api.readStorageItems(authHeader, op.toByteArray())
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                Log.w(TAG, "storage read failed for a batch of ${batch.size} record(s) — skipping", t)
+                null
+            }
+            if (itemsBytes == null) {
+                skippedBatches++
+                return@forEach
+            }
             val items = StorageItems.parseFrom(itemsBytes).itemsList
             itemsSeen += items.size
             items.forEach { item ->
@@ -117,12 +142,28 @@ class SignalStorageService(
         Log.d(
             TAG,
             "storage sync: manifestContacts=${contactIds.size} itemsReturned=$itemsSeen " +
-                "applied=$applied decryptFail=$decryptFail noContact=$noContact skippedNoNameOrAci=$skipped",
+                "applied=$applied decryptFail=$decryptFail noContact=$noContact " +
+                "skippedNoNameOrAci=$skipped skippedBatches=$skippedBatches",
+        )
+        // One aggregate line on the allow-listed diagnostic tag. The verbose
+        // per-stage breakdown above stays on `SignalStorage` (not captured);
+        // this is the part a support bundle needs — whether the account's saved
+        // names reached the device at all, which is the difference between "we
+        // never learned her name" and "we learned it and then overwrote it".
+        SigNames.log(
+            "storage sync manifestContacts=${contactIds.size} applied=$applied " +
+                "decryptFail=$decryptFail noContact=$noContact skippedNoNameOrAci=$skipped " +
+                "skippedBatches=$skippedBatches",
         )
         // Dump how every DM thread is keyed AFTER the sync merges — so a
         // submitted rolling log shows whether a contact is unified or still
-        // split, and by which ids. (SigRepo:D is allow-listed in the tail.)
-        repository.dumpThreadKeys()
+        // split, and by which ids. Emitted under `SigNames` (redacted), which
+        // IS allow-listed in the tail; it used to go to `SigRepo`, which is not.
+        // Reason names the outcome, so a bundle says at a glance whether the
+        // names in the dump are the whole account or only part of it.
+        repository.dumpThreadKeys(
+            if (skippedBatches > 0) "storage-sync-partial" else "storage-sync",
+        )
     }
 
     /** Map a ContactRecord onto the repository. Returns true if applied. */
@@ -152,7 +193,12 @@ class SignalStorageService(
         val system = listOf(c.systemGivenName, c.systemFamilyName).filter { it.isNotBlank() }.joinToString(" ")
         val profile = listOf(c.givenName, c.familyName).filter { it.isNotBlank() }.joinToString(" ")
         val name = system.ifBlank { profile }.ifBlank { e164 ?: return false }
-        repository.updateContact(serviceId = serviceId, name = name, e164 = e164)
+        repository.updateContact(
+            serviceId = serviceId,
+            name = name,
+            e164 = e164,
+            source = NameSource.STORAGE,
+        )
         return true
     }
 

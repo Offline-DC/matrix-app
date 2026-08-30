@@ -67,7 +67,14 @@ class SignalMessageStore(context: Context) {
     data class PersistedRoom(val room: Room, val unreadCount: Int)
 
     @Serializable
-    data class PersistedContact(val name: String, val e164: String? = null)
+    data class PersistedContact(
+        val name: String,
+        val e164: String? = null,
+        /** `NameSource.wire` — where this name came from. Defaulted so snapshots
+         *  written before provenance existed still decode (they land on
+         *  `NameSource.UNKNOWN`). */
+        val source: String? = null,
+    )
 
     @Serializable
     data class PersistedTimer(val seconds: Int, val version: Int)
