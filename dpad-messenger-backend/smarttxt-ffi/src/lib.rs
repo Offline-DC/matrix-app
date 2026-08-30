@@ -195,8 +195,8 @@ use attachment_stash::{
 
 mod group_identity;
 use group_identity::{
-    canon, effective_send_guid, group_sends_sms, members_csv, resolve_group_guid, send_identity,
-    updated_meta, GroupMeta,
+    canon, effective_send_guid, group_sends_sms, is_nanp_e164, members_csv, requalify_national,
+    resolve_group_guid, send_identity, updated_meta, GroupMeta,
 };
 
 // Send routing + handle reconciliation POLICY. Same reason as the two modules above:
@@ -2964,9 +2964,73 @@ fn note_if_identity_closed(err_dbg: &str) {
 /// Apple devices).
 const SYNC_WINDOW_MS: u64 = 3 * 24 * 60 * 60 * 1000; // 3 days
 
+/// Put back the country code rustpush drops from a relayed SMS/MMS.
+///
+/// `normalize_sms_handle` (rustpush `imessage/messages.rs`) makes E.164 out of a bare
+/// all-digit SMS handle by prefixing '+' and stopping there, so the national-format
+/// number a NANP carrier delivers for a domestic text — "4097821402" — arrives here as
+/// "+4097821402". Inbound keys to a room nobody else writes to while the user's own
+/// outbound echoes, which come back from the paired iPhone already qualified, key to
+/// "+1…": every green thread splits in two, and a reply sent from the phantom half goes
+/// to a number that does not exist. See
+/// `SMARTTXT_GREEN_SPLIT_THREAD_COUNTRY_CODE_20260830.md`.
+///
+/// Two handles have to be fixed, because the room key is built from both:
+///  - `from_handle`, which is what the arms below use as the effective `sender`, and
+///  - every entry of `conversation.participants`, which is what `counterparts` — and so
+///    the 1:1-vs-group decision — is computed from. A group MMS lists the user's own
+///    number in `re`, damaged the same way; repairing it lets the self-filter recognise
+///    it again, which is what stops a 1:1 MMS being keyed as a group.
+///
+/// Scoped as tightly as it can be: SMS/MMS only (iMessage handles are never mangled),
+/// NANP accounts only, and only handles that are '+' plus exactly ten digits, which is
+/// never a valid NANP number. See `group_identity.rs` for the known limitation this
+/// carries — it cannot distinguish a dropped country code from a real ten-digit foreign
+/// E.164, because rustpush has already discarded that information by this point.
+fn repair_relayed_sms_handles(msg: &mut MessageInst, my_handles: &[String]) {
+    if !matches!(&msg.message, Message::Message(n) if matches!(n.service, MessageType::SMS { .. })) {
+        return; // iMessage, receipts, tapbacks: nothing to do
+    }
+    let Some(my_nanp) = my_handles.iter().map(|h| canon(h)).find(|c| is_nanp_e164(c)) else {
+        return; // no NANP handle on this account: no country to infer, leave everything
+    };
+
+    let mut fixed: Vec<String> = Vec::new();
+    let mut repair = |h: &mut String| {
+        let c = canon(h);
+        let r = requalify_national(&c, &my_nanp);
+        if r != c {
+            fixed.push(format!("{c}→{r}"));
+            *h = to_handle(&r);
+        }
+    };
+
+    if let Message::Message(normal) = &mut msg.message {
+        if let MessageType::SMS { from_handle: Some(fh), .. } = &mut normal.service {
+            repair(fh);
+        }
+    }
+    if let Some(conv) = msg.conversation.as_mut() {
+        for p in conv.participants.iter_mut() {
+            repair(p);
+        }
+    }
+    if !fixed.is_empty() {
+        log::info!(
+            "sms handle repair: guid={} relay dropped the country code — {}",
+            msg.id,
+            fixed.join(", ")
+        );
+    }
+}
+
 /// Map a received rustpush `Message` to a relay-wire event and queue it.
 /// VERIFY: field access on the rustpush Message variants against your pinned rev.
-fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
+fn push_relay_event(mut msg: MessageInst, my_handles: &[String]) {
+    // Before anything reads a handle off this message: a relayed SMS/MMS may have
+    // arrived without its country code, which would key it to a phantom room and
+    // address any reply to a number that does not exist.
+    repair_relayed_sms_handles(&mut msg, my_handles);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

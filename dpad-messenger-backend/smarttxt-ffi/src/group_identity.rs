@@ -86,6 +86,60 @@ pub fn canon(handle: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------------
+// Relayed-SMS country-code repair
+//
+// rustpush's `normalize_sms_handle` builds E.164 out of a bare all-digit SMS handle by
+// prefixing '+' and stopping there. When the carrier delivers a domestic text in
+// NATIONAL format — which NANP carriers do — "4097821402" becomes "+4097821402", a
+// different number in a different country. Inbound then keys to a room nobody else
+// writes to, while the user's own outbound echoes arrive already qualified and key to
+// "+1…", so every green thread splits in two and a reply sent from the wrong half goes
+// to a number that does not exist.
+//
+// `canon` cannot undo it — its "10 bare digits get a +1" rule only fires on a handle
+// with no '+' yet — and it must not try, because it is context-free and this repair
+// needs to know which country the number was national to.
+//
+// KNOWN LIMITATION, accepted deliberately: by the time we see the handle, rustpush has
+// already discarded whether the '+' was on the wire or manufactured, so "+4097821402"
+// (a NANP number missing its country code) and "+4712345678" (a real Norwegian number)
+// are the same ten digits to us. This repairs both, which means an inbound text to a
+// US account from a country whose full E.164 is ten digits — Norway +47, Denmark +45,
+// some Swedish and Belgian numbers — gets misrouted the same way this bug misroutes
+// domestic ones. That trade is taken knowingly: the domestic case is constant for
+// affected users and the foreign case is rare for this product's userbase. The
+// information needed to do it exactly lives in rustpush's `from_raw`, which can see
+// whether `h` arrived with a '+' — fix it there if this limitation ever bites.
+
+/// True for a canon NANP number: "+1" followed by exactly ten digits.
+pub fn is_nanp_e164(canon_handle: &str) -> bool {
+    let Some(rest) = canon_handle.strip_prefix("+1") else { return false };
+    rest.len() == 10 && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Re-qualify a canon handle that arrived as '+' plus a bare national number.
+///
+/// Fires only when the account itself is NANP and the handle is '+' followed by exactly
+/// ten digits in NANP shape (area and exchange codes start 2-9) — never a valid NANP
+/// number, since those are '+1' plus ten. Everything else is returned untouched: emails,
+/// short codes, already-qualified numbers, and every handle on a non-NANP account.
+pub fn requalify_national(canon_handle: &str, my_canon: &str) -> String {
+    if !is_nanp_e164(my_canon) {
+        return canon_handle.to_string(); // no NANP account: no country to infer
+    }
+    let Some(digits) = canon_handle.strip_prefix('+') else { return canon_handle.to_string() };
+    if digits.len() != 10 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return canon_handle.to_string();
+    }
+    // NANP is NXX-NXX-XXXX: area and exchange codes never start with 0 or 1.
+    let ok = |i: usize| matches!(digits.as_bytes()[i], b'2'..=b'9');
+    if !ok(0) || !ok(3) {
+        return canon_handle.to_string();
+    }
+    format!("+1{digits}")
+}
+
 /// A group chat guid from Apple's stable group id: "iMessage;+;<gid>" (gid trimmed +
 /// lowercased so it keys identically however it's cased on the wire).
 pub fn group_guid_for(gid: &str) -> String {
@@ -230,6 +284,72 @@ mod tests {
         assert_eq!(canon("+1 (804) 833-4449"), "+18048334449"); // punctuation stripped
         assert_eq!(canon("18048334449"), "+18048334449"); // 11-digit leading 1
         assert_eq!(canon("mailto:Sav@ICLOUD.com"), "sav@icloud.com"); // email lowercased
+    }
+
+    // ---- relayed-SMS country-code repair -----------------------------------------
+    // Values from the 2026-08-30 bundle: account +14098932801, other party
+    // +14097821402, every inbound SMS arriving as "4097821402".
+
+    #[test]
+    fn canon_cannot_undo_a_manufactured_plus() {
+        assert_eq!(canon("4097821402"), "+14097821402");     // bare: canon handles it
+        assert_eq!(canon("tel:+4097821402"), "+4097821402"); // damaged: canon cannot
+    }
+
+    #[test]
+    fn nanp_shape() {
+        assert!(is_nanp_e164("+14098932801"));
+        assert!(!is_nanp_e164("+4098932801"));  // the damaged form
+        assert!(!is_nanp_e164("+4712345678"));  // Norway: 10 digits, genuinely E.164
+        assert!(!is_nanp_e164("sav@icloud.com"));
+    }
+
+    #[test]
+    fn requalify_repairs_the_logged_handles() {
+        let me = "+14098932801";
+        for (damaged, fixed) in [
+            ("+4097821402", "+14097821402"),
+            ("+4093324075", "+14093324075"),
+            ("+4094981936", "+14094981936"),
+            ("+4097900873", "+14097900873"),
+            ("+8324058464", "+18324058464"),
+            ("+4098932801", "+14098932801"), // the user's own number, damaged in `re`
+        ] {
+            assert_eq!(requalify_national(damaged, me), fixed, "{damaged}");
+        }
+    }
+
+    #[test]
+    fn requalify_leaves_everything_else_alone() {
+        let me = "+14098932801";
+        assert_eq!(requalify_national("+14097821402", me), "+14097821402"); // qualified
+        assert_eq!(requalify_national("sav@icloud.com", me), "sav@icloud.com");
+        assert_eq!(requalify_national("+30295", me), "+30295");             // short code
+        assert_eq!(requalify_national("+61607", me), "+61607");
+        assert_eq!(requalify_national("+0123456789", me), "+0123456789");   // bad area
+        assert_eq!(requalify_national("+4091234567", me), "+4091234567");   // bad exchange
+    }
+
+    #[test]
+    fn requalify_never_fires_for_a_non_nanp_account() {
+        let me = "+4712345678";
+        assert_eq!(requalify_national("+4798765432", me), "+4798765432");
+        assert_eq!(requalify_national("+4097821402", me), "+4097821402");
+    }
+
+    #[test]
+    fn known_limitation_is_documented_by_this_test() {
+        // A US account receiving from a real ten-digit Norwegian number is rewritten.
+        // This is the accepted cost of repairing at this layer; see the module comment.
+        assert_eq!(requalify_national("+4712345678", "+14098932801"), "+14712345678");
+    }
+
+    #[test]
+    fn repaired_inbound_keys_to_the_same_room_as_outbound() {
+        let me = "+14098932801";
+        let inbound = requalify_national(&canon("tel:+4097821402"), me);
+        assert_eq!(inbound, canon("tel:+14097821402"));
+        assert_eq!(format!("iMessage;-;{inbound}"), "iMessage;-;+14097821402");
     }
 
     #[test]
