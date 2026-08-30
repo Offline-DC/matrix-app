@@ -75,6 +75,11 @@ class SignalStorageService(
         var noContact = 0
         var skipped = 0
         var skippedBatches = 0
+        // How many records carry a user-set nickname. Deliberate user action, so
+        // it is rare and worth counting: a support capture where this ticks up
+        // by one after we asked someone to set a nickname is the confirmation
+        // that the repair actually reached the device.
+        var nicknamed = 0
         var loggedSkipSample = false
         contactIds.chunked(READ_BATCH).forEach { batch ->
             val op = ReadOperation.newBuilder().apply {
@@ -119,7 +124,10 @@ class SignalStorageService(
                 when {
                     record == null -> decryptFail++
                     !record.hasContact() -> noContact++
-                    applyContact(record.contact) -> applied++
+                    applyContact(record.contact) -> {
+                        applied++
+                        if (hasUserNickname(record.contact)) nicknamed++
+                    }
                     else -> {
                         skipped++
                         if (!loggedSkipSample) {
@@ -143,7 +151,7 @@ class SignalStorageService(
             TAG,
             "storage sync: manifestContacts=${contactIds.size} itemsReturned=$itemsSeen " +
                 "applied=$applied decryptFail=$decryptFail noContact=$noContact " +
-                "skippedNoNameOrAci=$skipped skippedBatches=$skippedBatches",
+                "skippedNoNameOrAci=$skipped skippedBatches=$skippedBatches nicknamed=$nicknamed",
         )
         // One aggregate line on the allow-listed diagnostic tag. The verbose
         // per-stage breakdown above stays on `SignalStorage` (not captured);
@@ -153,7 +161,7 @@ class SignalStorageService(
         SigNames.log(
             "storage sync manifestContacts=${contactIds.size} applied=$applied " +
                 "decryptFail=$decryptFail noContact=$noContact skippedNoNameOrAci=$skipped " +
-                "skippedBatches=$skippedBatches",
+                "skippedBatches=$skippedBatches nicknamed=$nicknamed",
         )
         // Dump how every DM thread is keyed AFTER the sync merges — so a
         // submitted rolling log shows whether a contact is unified or still
@@ -165,6 +173,13 @@ class SignalStorageService(
             if (skippedBatches > 0) "storage-sync-partial" else "storage-sync",
         )
     }
+
+    /** True when the user has explicitly named this person inside Signal —
+     *  either its own nickname field or the OS contact card's nickname. */
+    private fun hasUserNickname(c: ContactRecord): Boolean =
+        c.nickname.given.isNotBlank() ||
+            c.nickname.family.isNotBlank() ||
+            c.systemNickname.isNotBlank()
 
     /** Map a ContactRecord onto the repository. Returns true if applied. */
     private fun applyContact(c: ContactRecord): Boolean {
@@ -188,11 +203,34 @@ class SignalStorageService(
         // ACI-addressed sent transcripts don't spawn a second "Unknown" chat.
         if (aci != null && pni != null) repository.learnIdentityLink(aci, pni)
         val e164 = c.e164.takeIf { it.isNotBlank() }
-        // Name precedence mirrors Signal: your saved system-contact name, then
-        // the contact's own profile name, then the phone number.
+        // Name precedence mirrors Signal's own, top to bottom:
+        //
+        //   1. `nickname`       — what the user typed into Signal's "Nickname"
+        //                         field for this person. Deliberate, explicit,
+        //                         and the ONLY name they can set for someone who
+        //                         isn't in their address book.
+        //   2. `systemNickname` — the nickname field on the OS contact card.
+        //   3. system name      — the saved contact name on the primary phone.
+        //   4. profile name     — the name the contact chose for themselves.
+        //   5. the phone number.
+        //
+        // We used to start at (3), which quietly broke the one repair Signal
+        // offers its users. When an account carries a wrong ContactRecord — a
+        // stale record published by a device that has since been wiped, say —
+        // setting a nickname is how you correct it, and it is the only lever
+        // that works when the number isn't in your contacts at all. Reading
+        // only (3) and (4) meant a user could set that nickname, watch every
+        // other Signal client honour it, and still see the wrong name here.
+        val nickname = listOf(c.nickname.given, c.nickname.family)
+            .filter { it.isNotBlank() }
+            .joinToString(" ")
         val system = listOf(c.systemGivenName, c.systemFamilyName).filter { it.isNotBlank() }.joinToString(" ")
         val profile = listOf(c.givenName, c.familyName).filter { it.isNotBlank() }.joinToString(" ")
-        val name = system.ifBlank { profile }.ifBlank { e164 ?: return false }
+        val name = nickname
+            .ifBlank { c.systemNickname }
+            .ifBlank { system }
+            .ifBlank { profile }
+            .ifBlank { e164 ?: return false }
         repository.updateContact(
             serviceId = serviceId,
             name = name,
