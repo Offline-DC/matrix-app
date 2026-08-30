@@ -195,8 +195,8 @@ use attachment_stash::{
 
 mod group_identity;
 use group_identity::{
-    bare_plus_form, canon, effective_send_guid, group_sends_sms, is_nanp_e164, members_csv,
-    requalify_national, resolve_group_guid, send_identity, updated_meta, GroupMeta,
+    canon, effective_send_guid, group_sends_sms, members_csv, resolve_group_guid, send_identity,
+    updated_meta, GroupMeta,
 };
 
 // Send routing + handle reconciliation POLICY. Same reason as the two modules above:
@@ -2901,93 +2901,9 @@ fn note_if_identity_closed(err_dbg: &str) {
 /// Apple devices).
 const SYNC_WINDOW_MS: u64 = 3 * 24 * 60 * 60 * 1000; // 3 days
 
-/// Undo the country code rustpush drops from a relayed SMS/MMS.
-///
-/// `normalize_sms_handle` (rustpush `imessage/messages.rs`) makes E.164 out of a bare
-/// all-digit SMS handle by prefixing '+' and stopping there, so the national-format
-/// number a NANP carrier delivers for a domestic text — "4097821402" — becomes
-/// "+4097821402", which is Romania. The message keys to a room nobody else writes to:
-/// the user's own outbound echoes come back from the paired iPhone already in E.164 and
-/// key to "+1…", so every green thread splits in two, and a reply typed into the
-/// phantom half is addressed to a number that does not exist and is silently dropped by
-/// the carrier. (`SMARTTXT_GREEN_SPLIT_THREAD_COUNTRY_CODE_20260830.md`.)
-///
-/// The relay tells us the truth in the same payload: `fh` ("s:tel:+14097821402|…") is
-/// always the fully qualified handle, and rustpush surfaces it as
-/// `MessageType::SMS::from_handle`. So this repairs by EVIDENCE, not by guessing:
-///
-///  1. If `from_handle` and `msg.sender` canon to the same thing, the carrier gave us a
-///     country code and nothing here runs. That is the gate for everything below —
-///     we only ever touch a message we have proven arrived without one.
-///  2. The sender is replaced with `from_handle`. Exact.
-///  3. A participant equal to the damaged form of one of OUR OWN registered handles is
-///     replaced with that handle. Exact — the damage is computed forward from a number
-///     we already trust (`bare_plus_form`), never guessed backward. This is what stops
-///     an inbound group MMS listing the user as a member of her own conversation, which
-///     flipped `is_group` and gave a 1:1 photo its own phantom "group" room.
-///  4. Only what is left — the other members of a group MMS, who appear in no source we
-///     can check — falls to `requalify_national`, and only for a NANP account. Those
-///     handles came from the same PDU as the sender we just proved was national, so the
-///     inference is sound for the message at hand rather than a blanket rule.
-///
-/// Nothing here fires on iMessage traffic, on an undamaged relay message, or on a
-/// non-NANP account.
-fn repair_relayed_sms(msg: &mut MessageInst, my_handles: &[String]) {
-    // Only an inbound relayed SMS/MMS carries `from_handle`; iMessage and our own
-    // outbound never reach the arms below.
-    let truth = match &msg.message {
-        Message::Message(normal) => match &normal.service {
-            MessageType::SMS { from_handle: Some(fh), .. } if !fh.trim().is_empty() => to_handle(fh),
-            _ => return,
-        },
-        _ => return,
-    };
-    let truth_canon = canon(&truth);
-    let damaged_canon = canon(&msg.sender.clone().unwrap_or_default());
-    if damaged_canon.is_empty() || damaged_canon == truth_canon {
-        return; // the carrier sent a country code — nothing was lost, touch nothing
-    }
-
-    let my_canon: Vec<String> = my_handles.iter().map(|h| canon(h)).collect();
-    let my_nanp = my_canon.iter().find(|c| is_nanp_e164(c)).cloned().unwrap_or_default();
-    let mut repaired: Vec<String> = vec![format!("{damaged_canon}→{truth_canon}")];
-
-    msg.sender = Some(truth.clone());
-    if let Some(conv) = msg.conversation.as_mut() {
-        for p in conv.participants.iter_mut() {
-            let pc = canon(p);
-            if pc == damaged_canon {
-                *p = truth.clone(); // the sender, from `fh`
-                continue;
-            }
-            // One of ours, with its country code stripped: match on the damage we can
-            // compute from the handle we hold, so this stays exact.
-            if let Some(mine) = my_canon.iter().find(|m| bare_plus_form(m).as_deref() == Some(pc.as_str())) {
-                repaired.push(format!("{pc}→{mine} (self)"));
-                *p = to_handle(mine);
-                continue;
-            }
-            let fixed = requalify_national(&pc, &my_nanp);
-            if fixed != pc {
-                repaired.push(format!("{pc}→{fixed}"));
-                *p = to_handle(&fixed);
-            }
-        }
-    }
-    log::info!(
-        "sms handle repair: guid={} relay dropped the country code — {}",
-        msg.id,
-        repaired.join(", ")
-    );
-}
-
 /// Map a received rustpush `Message` to a relay-wire event and queue it.
 /// VERIFY: field access on the rustpush Message variants against your pinned rev.
-fn push_relay_event(mut msg: MessageInst, my_handles: &[String]) {
-    // Before anything reads a handle off this message: a relayed SMS/MMS may have
-    // arrived with the country code stripped, which would key it to a phantom room and
-    // address any reply to a number that does not exist.
-    repair_relayed_sms(&mut msg, my_handles);
+fn push_relay_event(msg: MessageInst, my_handles: &[String]) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

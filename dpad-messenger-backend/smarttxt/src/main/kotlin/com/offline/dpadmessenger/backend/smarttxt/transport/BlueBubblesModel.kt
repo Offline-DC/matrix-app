@@ -127,17 +127,17 @@ object Handles {
 
     // ---- relayed-SMS handle repair -------------------------------------------
     //
-    // MUST match `smarttxt-ffi/src/group_identity.rs` (is_nanp_e164 / bare_plus_form /
-    // requalify_national) for the same reason `canon` must: both sides key rooms.
+    // rustpush's `normalize_sms_handle` used to make E.164 out of a bare all-digit SMS
+    // handle by prefixing '+' and stopping there, so a carrier that delivers a
+    // national-format number ("4097821402") produced the bogus "+4097821402" — country
+    // code 40, Romania — and every chat with that person split in two. `canon` cannot
+    // undo it: its "10 bare digits get a +1" rule only fires on a handle with no '+'
+    // yet. See SMARTTXT_GREEN_SPLIT_THREAD_COUNTRY_CODE_20260830.md.
     //
-    // rustpush's `normalize_sms_handle` makes E.164 out of a bare all-digit SMS handle
-    // by prefixing '+' and stopping there, so a carrier that delivers a national-format
-    // number ("4097821402") yields the bogus "+4097821402" — country code 40, Romania.
-    // `canon` cannot undo it: its "10 bare digits get a +1" rule only fires on a handle
-    // with no '+' yet. See SMARTTXT_GREEN_SPLIT_THREAD_COUNTRY_CODE_20260830.md.
-    //
-    // The native side now repairs this at ingest, so these exist for one job: the
-    // one-time repair of rooms already written to disk by an older build.
+    // Fixed at the source in our vendored rustpush (it now takes the country from the
+    // message's `co` field), so nothing NEW is damaged. These exist for one job only:
+    // the one-time repair of rooms an older build already wrote to disk. They can be
+    // deleted once no install reports "room repair: folding" any more.
 
     /** True for a canon NANP number: "+1" followed by exactly ten digits. */
     fun isNanpE164(canon: String): Boolean =
