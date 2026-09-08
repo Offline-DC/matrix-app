@@ -15,8 +15,6 @@
 #
 set -euo pipefail
 
-export ANDROID_NDK_HOME=$(ls -d ~/Library/Android/sdk/ndk/* 2>/dev/null | sort -V | tail -1)
-
 CRATE_DIR="$(cd "$(dirname "$0")/../smarttxt-ffi" && pwd)"
 JNILIBS="$(cd "$(dirname "$0")/.." && pwd)/smarttxt/src/main/jniLibs"
 LIB_NAME="libsmarttxt_ffi.so"
