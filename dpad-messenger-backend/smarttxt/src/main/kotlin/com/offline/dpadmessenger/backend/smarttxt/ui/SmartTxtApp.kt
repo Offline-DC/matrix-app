@@ -46,6 +46,19 @@ fun SmartTxtApp(
     modifier: Modifier = Modifier,
     initialRoomId: String? = null,
     initialRoomKey: Any? = null,
+    /**
+     * Set by a host that owns what happens after first-run setup — today the
+     * launcher's onboarding, which shows its own "ur all set" screen.
+     *
+     * When non-null, pressing Continue on [HandlePickerScreen] calls this
+     * INSTEAD of opening the chat list. The handle choice is still persisted by
+     * the picker itself, so `handlesConfigured()` is true either way; only the
+     * in-memory gate is left closed, which keeps the picker on screen until the
+     * host tears the Activity down. Without that, the chat list composes and
+     * draws for a frame or two before the host can react — the user sees an
+     * empty inbox flash on their way to the done screen.
+     */
+    onSetupComplete: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     // Restore a previous sign-in on a fresh process BEFORE reading status, so a
@@ -88,7 +101,14 @@ fun SmartTxtApp(
 
     when {
         status == SmartTxtStatus.REGISTERED && !handlesConfigured ->
-            HandlePickerScreen(modifier = modifier, onContinue = { handlesConfigured = true })
+            HandlePickerScreen(
+                modifier = modifier,
+                onContinue = {
+                    // Hand off to the host when it asked for it; otherwise fall
+                    // through to the chats as normal. See [onSetupComplete].
+                    if (onSetupComplete != null) onSetupComplete() else handlesConfigured = true
+                },
+            )
 
         status == SmartTxtStatus.REGISTERED -> {
             // Build the repository OFF the main thread: create() triggers the heavy
