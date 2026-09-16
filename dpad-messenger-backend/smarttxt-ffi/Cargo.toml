@@ -95,6 +95,42 @@ rustpush = { path = "../../../rustpush", default-features = false, features = ["
 omnisette = { path = "../../../rustpush/third_party/apple-private-apis/omnisette", features = ["remote-anisette-v3"] }
 keystore = { path = "../../../rustpush/keystore" }
 
+<<<<<<< Updated upstream
+=======
+# --- FaceTime in-call media pipeline (facetime_av.rs) -----------------------
+# Ported from the BlueBubbles (MIT/Apache) Android rust core. Audio-only: mic
+# capture + speaker playback of the FaceTime relay's EVS/AAC streams, plus the
+# createAvc/destroyAvc/enableMicrophone JNI for FaceTimeInCallService. Video
+# receive is binned and camera send is disabled, so these are audio codecs +
+# Android audio/mediacodec bindings only.
+#
+# `evs` wraps the 3GPP EVS reference C codec (vendored under ./evs/c-code,
+# compiled by ./evs/build.rs via `cc`). `ndk` gives AAudio (AudioStream) +
+# MediaCodec + NativeWindow. Versions match the source tree so behaviour is
+# identical to the proven, on-device-tested implementation.
+#
+# All three are OPTIONAL, behind the `facetime-av` feature (default-on). They are
+# what sets this library's Android API floor: the `ndk` crate's AAudio bindings call
+# AAudioStreamBuilder_setUsage / _setContentType and AMediaCodec_setAsyncNotifyCallback,
+# all added in API 28. Android resolves every relocation at dlopen, so a device on
+# API 27 fails the WHOLE library on those symbols — `System.loadLibrary` throws and
+# iMessage is dead, not just FaceTime. The HIT slider is API 27, which is exactly
+# what happened there:
+#
+#   dlopen failed: cannot locate symbol "AAudioStreamBuilder_setContentType"
+#
+# Build without the feature for that handset:
+#
+#   FACETIME=0 ./scripts/build-rustpush-so.sh
+#
+# facetime_av.rs is the only user of any of these (and the only definer of
+# JNI_OnLoad, which caches nothing the rest of the crate reads), so dropping the
+# feature drops all 35 AAudio/AMediaCodec/ANativeWindow imports with it.
+evs = { path = "./evs", optional = true }
+ndk = { version = "0.9.0", features = ["media", "api-level-28", "audio"], optional = true }
+ringbuf = { version = "0.5.0", optional = true }
+
+>>>>>>> Stashed changes
 # Anchor quinn onto rustpush's vendored copy (0.11.7). This is NOT used by our own
 # code — it exists solely to unify the version. rustpush depends on the vendored
 # quinn directly, while `h3-quinn` (pulled transitively) depends on `quinn` from
@@ -107,6 +143,19 @@ keystore = { path = "../../../rustpush/keystore" }
 # when smarttxt-ffi is the build root, rustpush's dep table anchors nothing here,
 # so we must re-add the anchor ourselves. Keep in sync with rustpush/Cargo.toml.
 quinn = { path = "../../../rustpush/third_party/quinn/quinn" }
+
+[features]
+# On by default so an ordinary build is unchanged — API 28+ handsets (the TCL Flip 2
+# is API 30) keep FaceTime in-call audio exactly as before. Turn it OFF to lower this
+# library's floor to the app's own minSdk, which is what an API 27 device needs.
+default = ["facetime-av"]
+# Gates the MEDIA pipeline only. The five FaceTimeInCallService JNI entry points
+# are compiled either way -- from facetime_av.rs with the feature, from
+# facetime_av_stub.rs without it -- so a FACETIME=0 library exports the same
+# symbols as a FACETIME=1 one and can be dropped onto a handset in place of it.
+# Before that split, turning the feature off silently removed those five exports
+# and any FaceTime call ended in UnsatisfiedLinkError.
+facetime-av = ["evs", "ndk", "ringbuf"]
 
 [patch.crates-io]
 quinn = { path = "../../../rustpush/third_party/quinn/quinn" }

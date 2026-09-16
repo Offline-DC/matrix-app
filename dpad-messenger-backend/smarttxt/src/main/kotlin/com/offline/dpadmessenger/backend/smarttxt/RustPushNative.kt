@@ -31,7 +31,34 @@ object RustPushNative {
         Log.i(TAG, "libsmarttxt_ffi.so loaded — native SmartTxt path available")
         true
     } catch (t: Throwable) {
-        Log.i(TAG, "libsmarttxt_ffi.so not present — using relay/mock transport (${t.message})")
+        // This catch is the only record anywhere of WHY the engine is missing,
+        // and it used to log one INFO line saying "not present" for two very
+        // different failures. That cost a real diagnosis: downstream all you see
+        // is `nativeInit failed — native library not loaded` (SmartTxtRepository),
+        // a REJECTED library produces no dlopen/UnsatisfiedLinkError output of
+        // its own, and at INFO the whole thing is invisible in a filtered
+        // capture. So: log at ERROR, and say which of the two it is.
+        //
+        //   absent   — the .so never made it into the APK. The Rust build
+        //              (scripts/build-rustpush-so.sh) was skipped or died
+        //              partway; jniLibs ships as an empty .gitkeep dir, so the
+        //              app builds and runs fine without it. See
+        //              launcher/tools/doctor.sh.
+        //   rejected — it IS in the APK and the dynamic loader refused it: an
+        //              arm64 build against `abiFilters = armeabi-v7a`, or an
+        //              API-28 symbol (AAudio/AMedia, i.e. FACETIME=1) on an
+        //              API-27 handset. The linker's own complaint is in
+        //              `t.message` and nowhere else — log it verbatim.
+        val msg = t.message ?: t.toString()
+        val absent = msg.contains("couldn't find", ignoreCase = true) ||
+            msg.contains("not found", ignoreCase = true)
+        if (absent) {
+            Log.e(TAG, "libsmarttxt_ffi.so IS NOT IN THIS APK — Smart Txt has no engine. " +
+                "The native build was skipped or failed; rebuild it (see launcher/tools/doctor.sh). [$msg]")
+        } else {
+            Log.e(TAG, "libsmarttxt_ffi.so is present but the loader REJECTED it — " +
+                "read this message literally, it is the linker's: [$msg]", t)
+        }
         false
     }
 

@@ -202,6 +202,29 @@ use group_identity::{
 // Send routing + handle reconciliation POLICY. Same reason as the two modules above:
 // dependency-free so both decisions can be proved on the host (see policy-tests/) rather
 // than by trying to provoke an IDS failure on a handset at the exact moment of a send.
+<<<<<<< Updated upstream
+=======
+// FaceTime in-call audio pipeline + JNI (createAvc/destroyAvc/enableMicrophone
+// for FaceTimeInCallService). Self-contained: its JNI entry points are the only
+// surface, so nothing here needs to be `use`d. See facetime_av.rs.
+//
+// Behind a feature because it, alone, is what makes this library require API 28 —
+// its AAudio/MediaCodec imports don't exist on 27, and Android fails the whole
+// dlopen on them, so a FaceTime pipeline nobody asked for took iMessage down with
+// it on the HIT slider. See the `facetime-av` feature in Cargo.toml.
+#[cfg(feature = "facetime-av")]
+mod facetime_av;
+
+// Without the pipeline, the JNI entry points must STILL exist. Removing them with
+// the module traded a library that will not load for one that loads and then
+// throws UnsatisfiedLinkError the first time FaceTimeInCallService is touched --
+// which is how a FACETIME=0 build of this tree came to export five symbols fewer
+// than the shipped one, and why the .so could not be swapped onto a HIT. The
+// signalling surface is not the media pipeline; only the pipeline needs API 28.
+#[cfg(not(feature = "facetime-av"))]
+mod facetime_av_stub;
+
+>>>>>>> Stashed changes
 mod send_policy;
 use send_policy::{
     delivered_action, error_action, rate_limited_message, reconcile_action, route_for,
@@ -2835,6 +2858,36 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
                     // Read handles live from rustpush (get_handles = cheap local read)
                     // and pass them into the sync event handler — no cached self set.
                     let my_handles = client.identity.get_handles().await;
+<<<<<<< Updated upstream
+=======
+
+                    // Pipe a copy into the FaceTime client first. It reacts only to the
+                    // FaceTime topics and returns Ok(None) for everything else, so this
+                    // is cheap for ordinary iMessage traffic. Run it in its OWN task and
+                    // await it — same panic containment as the iMessage handle below (a
+                    // bad FaceTime frame surfaces as a JoinError, never aborts the
+                    // process or stalls the loop), and awaiting keeps FaceTime frames in
+                    // receive order. All outcomes are logged and swallowed.
+                    let ft = facetime.clone();
+                    let ft_msg = apns_msg.clone();
+                    match rt().spawn(async move { ft.handle(ft_msg).await }).await {
+                        Ok(Ok(Some(m))) => {
+                            log::info!("facetime recv: {m:?}");
+                            // Surface ring/join/leave/decline to the launcher so it
+                            // can drive its ringing screens and start the in-call
+                            // service once both sides are in the call.
+                            // Without the pipeline there is nothing to drive: no
+                            // in-call service, no ringing screen. The message is
+                            // still logged above, so the receive path is unchanged.
+                            #[cfg(feature = "facetime-av")]
+                            facetime_av::dispatch_ft_message(&m);
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => log::warn!("facetime handle error: {e:?}"),
+                        Err(join_err) => log::error!("facetime handle panicked: {join_err}"),
+                    }
+
+>>>>>>> Stashed changes
                     let client = client.clone();
                     let joined = rt().spawn(async move { client.handle(apns_msg).await }).await;
                     match joined {
