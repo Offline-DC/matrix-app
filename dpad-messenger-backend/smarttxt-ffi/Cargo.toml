@@ -63,15 +63,6 @@ rand = { version = "0.8.5", features = ["min_const_gen"] }
 # Keep this in sync with rustpush's Cargo.toml.
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 
-# The SECOND rustls: FaceTime's QUIC relay (vendored quinn) links the vendored
-# rustls at rustpush/third_party/rustls — aliased `rustls_psk` (package "rustls"
-# 0.23.28), exactly as rustpush/Cargo.toml aliases it. It's a distinct crate from
-# the crates.io `rustls` above, with its own process-global CryptoProvider, so
-# nativeInit must call `rustls_psk::crypto::ring::default_provider().install_default()`
-# too. Same path/package/version as rustpush's alias, so cargo unifies it to the
-# one crate instance the relay actually uses. `ring` (not aws-lc-rs) to match.
-rustls_psk = { package = "rustls", path = "../../../rustpush/third_party/rustls/rustls", default-features = false, features = ["logging", "std", "tls12", "ring"] }
-
 # --- OpenBubbles rustpush (ENABLED) ----------------------------------------
 # The phone runs rustpush for activation/APNs/auth/register/send. We use its
 # built-in `RelayConfig` so the device identity AND validation data both come from
@@ -103,37 +94,6 @@ rustpush = { path = "../../../rustpush", default-features = false, features = ["
 # (see build-smarttxt-so/action.yml). keystore did NOT move.
 omnisette = { path = "../../../rustpush/third_party/apple-private-apis/omnisette", features = ["remote-anisette-v3"] }
 keystore = { path = "../../../rustpush/keystore" }
-
-# --- FaceTime in-call media pipeline (facetime_av.rs) -----------------------
-# Ported from the BlueBubbles (MIT/Apache) Android rust core. Audio-only: mic
-# capture + speaker playback of the FaceTime relay's EVS/AAC streams, plus the
-# createAvc/destroyAvc/enableMicrophone JNI for FaceTimeInCallService. Video
-# receive is binned and camera send is disabled, so these are audio codecs +
-# Android audio/mediacodec bindings only.
-#
-# `evs` wraps the 3GPP EVS reference C codec (vendored under ./evs/c-code,
-# compiled by ./evs/build.rs via `cc`). `ndk` gives AAudio (AudioStream) +
-# MediaCodec + NativeWindow. Versions match the source tree so behaviour is
-# identical to the proven, on-device-tested implementation.
-evs = { path = "./evs" }
-ndk = { version = "0.9.0", features = ["media", "api-level-28", "audio"] }
-ringbuf = "0.5.0"
-
-# Anchor quinn onto rustpush's vendored copy (0.11.7). This is NOT used by our own
-# code — it exists solely to unify the version. rustpush depends on the vendored
-# quinn directly, while `h3-quinn` (pulled transitively) depends on `quinn` from
-# crates.io with a `^0.11.7` requirement. The `[patch.crates-io]` below only
-# SHADOWS the 0.11.7 entry in the crates.io source; it does not remove the newer
-# registry 0.11.11, which also satisfies `^0.11.7`. Without a dependency edge that
-# pins 0.11.7 into the graph, the resolver picks registry 0.11.11 for h3-quinn,
-# the patch is reported unused, and the build ends up with two incompatible quinns.
-# rustpush's own Cargo.toml does exactly this (a direct path dep PLUS the patch);
-# when smarttxt-ffi is the build root, rustpush's dep table anchors nothing here,
-# so we must re-add the anchor ourselves. Keep in sync with rustpush/Cargo.toml.
-quinn = { path = "../../../rustpush/third_party/quinn/quinn" }
-
-[patch.crates-io]
-quinn = { path = "../../../rustpush/third_party/quinn/quinn" }
 
 [build-dependencies]
 prost-build = { version = "0.12.0" }

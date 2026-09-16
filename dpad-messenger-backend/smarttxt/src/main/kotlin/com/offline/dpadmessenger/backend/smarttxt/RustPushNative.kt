@@ -206,39 +206,6 @@ object RustPushNative {
      *  Lets the composer show the right color before anything is sent. */
     external fun nativeIsIMessage(handle: String): Boolean
 
-    /** If [handle] is reachable on FaceTime, returns MY send handle (the "call as"
-     *  iMessage identity, e.g. "tel:+1…" or "mailto:…") to place the FaceTime call
-     *  from; returns "" when the target isn't on FaceTime, no client is up, or the
-     *  lookup fails. Lets the dialer offer "call as your iMessage number". */
-    external fun nativeFaceTimeSender(handle: String): String
-
-    /** Place (ring) a FaceTime audio call as [handle] to [recipient]. Creates +
-     *  rings the session; returns its guid ("" on failure). Blocks on the network,
-     *  so call off the main thread. Cancel a pending ring with [nativeLeaveFaceTime]. */
-    external fun nativeStartFaceTimeCall(handle: String, recipient: String): String
-
-    /** Leave / cancel the FaceTime session [guid] (abort a ring, or hang up a call
-     *  whose in-call service never started). No-op if unknown. */
-    external fun nativeLeaveFaceTime(guid: String)
-
-    /** Answer an incoming (ringing) FaceTime call [guid] by joining its session.
-     *  Returns the guid on success, "" on failure. Blocks on the network, so call
-     *  off the main thread; push the local interfaces first (as for placing). */
-    external fun nativeAnswerFaceTimeCall(guid: String): String
-
-    /** Decline an incoming (ringing) FaceTime call [guid]. No-op if unknown. */
-    external fun nativeDeclineFaceTimeCall(guid: String)
-
-    /** IDS handle of whoever is calling on session [guid] (first member that isn't
-     *  one of my handles), for labeling the incoming-call UI. "" if unknown. */
-    external fun nativeFaceTimeCallerHandle(guid: String): String
-
-    /** Set the device's local IPv4 interfaces on the FaceTime client (the QUIC relay
-     *  needs them; without them connecting a call panics). [interfacesCsv] is a
-     *  comma-separated list of dotted-quad addresses. Push before a call and on every
-     *  network change. Reading the interfaces is done Kotlin-side (FaceTimeInterfaces). */
-    external fun nativeSetFaceTimeInterfaces(interfacesCsv: String)
-
     /** Send a tapback using a BlueBubbles associatedMessageType code. */
     external fun nativeSendTapback(chatGuid: String, targetGuid: String, associatedMessageType: Int): Boolean
 
@@ -335,42 +302,6 @@ object RustPushNative {
      *  isn't loaded or the lookup fails, so we never wrongly show a green composer. */
     fun runCatchingNativeIsImessage(handle: String): Boolean =
         if (loaded) runCatching { nativeIsIMessage(handle) }.getOrDefault(true) else true
-
-    /** Null-safe FaceTime lookup: returns "" (no FaceTime option — just place a
-     *  normal call) when the `.so` isn't loaded, no client is up, or the lookup
-     *  throws. Non-empty is MY send handle to call as. Blocks on the native
-     *  runtime and hits the network, so call it off the main thread. */
-    fun runCatchingNativeFaceTimeSender(handle: String): String =
-        if (loaded) runCatching { nativeFaceTimeSender(handle) }.getOrDefault("") else ""
-
-    /** Null-safe [nativeStartFaceTimeCall]: "" when the `.so` isn't loaded or the
-     *  ring throws, so the caller falls back to a normal cellular call. */
-    fun runCatchingNativeStartFaceTimeCall(handle: String, recipient: String): String =
-        if (loaded) runCatching { nativeStartFaceTimeCall(handle, recipient) }.getOrDefault("") else ""
-
-    /** Null-safe [nativeLeaveFaceTime]: no-op when the `.so` isn't loaded. */
-    fun runCatchingNativeLeaveFaceTime(guid: String) {
-        if (loaded) runCatching { nativeLeaveFaceTime(guid) }
-    }
-
-    /** Null-safe [nativeAnswerFaceTimeCall]: "" when the `.so` isn't loaded or it
-     *  throws — the caller treats "" as "couldn't answer". */
-    fun runCatchingNativeAnswerFaceTimeCall(guid: String): String =
-        if (loaded) runCatching { nativeAnswerFaceTimeCall(guid) }.getOrDefault("") else ""
-
-    /** Null-safe [nativeDeclineFaceTimeCall]: no-op when the `.so` isn't loaded. */
-    fun runCatchingNativeDeclineFaceTimeCall(guid: String) {
-        if (loaded) runCatching { nativeDeclineFaceTimeCall(guid) }
-    }
-
-    /** Null-safe [nativeFaceTimeCallerHandle]: "" when the `.so` isn't loaded. */
-    fun runCatchingNativeFaceTimeCallerHandle(guid: String): String =
-        if (loaded) runCatching { nativeFaceTimeCallerHandle(guid) }.getOrDefault("") else ""
-
-    /** Null-safe [nativeSetFaceTimeInterfaces]: no-op when the `.so` isn't loaded. */
-    fun runCatchingNativeSetFaceTimeInterfaces(interfacesCsv: String) {
-        if (loaded) runCatching { nativeSetFaceTimeInterfaces(interfacesCsv) }
-    }
 
     /** Null-safe OpenBubbles import: returns an error JSON when the `.so` isn't
      *  loaded or the native call throws, so the migrator can fall back to setup. */

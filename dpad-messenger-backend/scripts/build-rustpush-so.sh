@@ -18,14 +18,7 @@ set -euo pipefail
 CRATE_DIR="$(cd "$(dirname "$0")/../smarttxt-ffi" && pwd)"
 JNILIBS="$(cd "$(dirname "$0")/.." && pwd)/smarttxt/src/main/jniLibs"
 LIB_NAME="libsmarttxt_ffi.so"
-# API 28, not 24: the FaceTime in-call media pipeline (facetime_av.rs) links
-# AAudio (`libaaudio.so`, added in API 26) and uses AMediaCodec's async notify
-# callback (added in API 28), so the .so must be built against the API-28 sysroot
-# or the link fails with `unable to find library -laaudio`. This matches the
-# `ndk = { features = ["api-level-28", ...] }` in smarttxt-ffi/Cargo.toml. The
-# whole smarttxt lib therefore now requires a device on API 28+; on older devices
-# `System.loadLibrary("smarttxt_ffi")` throws and the native path stays disabled.
-MIN_SDK="${MIN_SDK:-28}"
+MIN_SDK="${MIN_SDK:-24}"
 
 # rustpush lives here per smarttxt-ffi/Cargo.toml (`path = "../../../rustpush"`).
 RUSTPUSH_DIR="$(cd "$CRATE_DIR/../../../rustpush" 2>/dev/null && pwd || true)"

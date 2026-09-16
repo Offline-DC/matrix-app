@@ -1,7 +1,6 @@
 package com.offline.dpadmessenger.backend.smarttxt
 
 import android.content.Context
-import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import kotlinx.serialization.json.Json
@@ -130,23 +129,13 @@ class SmartTxtAccountStore(context: Context) {
      *  Cleared by [clear], so a wiped sign-out re-shows the picker. */
     fun handlesConfigured(): Boolean = prefs.getBoolean(KEY_HANDLES_CONFIGURED, false)
 
-    /**
-     * Persist the chosen sending handles + the default, and mark configured.
-     *
-     * `commit()`, not `apply()`, and deliberately. This runs on a rare, explicit
-     * user action — the picker, or the Settings row — and the launcher process is
-     * killed and restarted often enough on these handsets that an asynchronous
-     * write is a real way to lose the choice: `apply()` returns before the write
-     * lands, so a restart in that window leaves the old default in place and the
-     * user's change simply undone. The callers are already off the main thread.
-     */
+    /** Persist the chosen sending handles + the default, and mark configured. */
     fun saveHandleSelection(enabled: List<String>, default: String) {
-        val ok = prefs.edit()
+        prefs.edit()
             .putStringSet(KEY_ENABLED_HANDLES, enabled.toSet())
             .putString(KEY_DEFAULT_HANDLE, default)
             .putBoolean(KEY_HANDLES_CONFIGURED, true)
-            .commit()
-        if (!ok) Log.w(TAG, "saveHandleSelection: commit failed — default handle not persisted")
+            .apply()
     }
 
     /** The handle new messages are sent from (null until the picker is confirmed). */
@@ -155,7 +144,6 @@ class SmartTxtAccountStore(context: Context) {
     fun enabledHandles(): Set<String> = prefs.getStringSet(KEY_ENABLED_HANDLES, null) ?: emptySet()
 
     private companion object {
-        const val TAG = "SmartTxtAccountStore"
         const val SCHEMA_VERSION = 1
         const val KEY_SCHEMA_VERSION = "schemaVersion"
         const val KEY_MACOS_CONFIG = "macOsConfig"
