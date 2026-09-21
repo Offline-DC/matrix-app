@@ -83,6 +83,10 @@ class GMGaiaPairing(
     // listening for the phone to confirm for as long as it takes.
     @Volatile private var canceled = false
 
+    /** GaiaPairingResponseContainer.attestationRevision (field 9) from SERVER_INIT.
+     *  Absent means 0, which is the only revision that exists as of 2026-09-21. */
+    @Volatile private var serverAttestationRev = 0
+
     /** Human-readable reason for a failed [run] — surfaced to the user so a
      *  "phone never answered" reads correctly instead of "you didn't tap the
      *  emoji". Null on success or an explicit cancel. */
@@ -184,6 +188,22 @@ class GMGaiaPairing(
             // attestation challenge or nonce. We parse five of its eight fields and
             // have never looked at the rest.
             dumpContainer("SERVER_INIT response", sresp)
+
+            // Google's web client caps the attestation revision it will honour at 0
+            // (`T6a = a => { var b = Math.min(a, 0); if (b < a) throw X3a; return b }`,
+            // where X3a is CLIENT_ATTESTATION_REVISION_MISMATCH=35) and then refuses
+            // to finish. Mirror that: a server asking for revision 1 wants an
+            // attestation this build cannot produce, and pushing on would earn a 35
+            // from the server anyway -- after we had already shown the user an emoji.
+            serverAttestationRev = sresp.attestationRevision
+            if (serverAttestationRev > MAX_ATTESTATION_REVISION) {
+                Log.e(TAG, "server wants attestation revision $serverAttestationRev, " +
+                    "we implement $MAX_ATTESTATION_REVISION -- refusing before the emoji")
+                lastError = "Google has changed how pairing works and this launcher is " +
+                    "out of date. Please update the Dumb Down launcher, then try again."
+                return false
+            }
+
             if (sresp.data == null) {
                 Log.w(TAG, "SERVER_INIT has no ukey data")
                 lastError = "Your phone's pairing reply was empty. Try again."
@@ -488,22 +508,41 @@ class GMGaiaPairing(
         if (isInit) {
             w.int32(5, 1).int32(6, 1) // proposed verification + key-derivation v1
         }
-        // FIELD 8 -- privateAPIConfirmation. Absent from every request this codebase
-        // has ever sent, and absent from mautrix's client too (their protos carry the
-        // field; their `pair_google.go` does not set it). Google's enum gained
-        // CLIENT_ATTESTATION_MISSING=32 / _MISMATCH=33 / _REVISION_MISMATCH=35 in the
-        // same window, and 32 is what a customer hit on 2026-09-18.
+        // FIELD 8 -- privateAPIConfirmation, the "client attestation".
         //
-        // We do NOT know the correct value, so the default sends nothing and this
-        // changes no behaviour for anyone. See
-        // [GoogleMessagesConfig.pairingPrivateApiConfirmation] for what setting it buys.
-        GoogleMessagesConfig.pairingPrivateApiConfirmation
-            ?.takeIf { it.isNotEmpty() }
-            ?.let {
-                Log.w(TAG, "PROBE: sending privateAPIConfirmation (field 8, ${it.length} chars) " +
-                    "-- experiment only; watch for errCode 32 -> 33/35")
-                w.string(8, it)
+        // It is not a challenge, a nonce or a signature. It is a fixed legal notice
+        // the client has to echo back, and Google's web bundle sets it verbatim in
+        // the CLIENT_FINISHED path (messagesweb `mw_b`, read 2026-09-21):
+        //
+        //   if (_.Ep("FUroQb") && b.fU !== void 0) {
+        //     switch (b.fU) {
+        //       case 0: var f = "This is an undocumented API. ..."; break;
+        //       default: f = "";
+        //     }
+        //     _.p(e, 8, f);
+        //   }
+        //
+        // `b.fU` is the server's attestationRevision from SERVER_INIT field 9,
+        // already range-checked to 0 by the time we get here. `FUroQb` is a
+        // server-controlled flag; when Google turned it on, every client that did
+        // not send field 8 started getting CLIENT_ATTESTATION_MISSING=32 roughly
+        // half a second after CLIENT_FINISHED -- before the handset was contacted.
+        // That is the 2026-09-18 customer failure, exactly.
+        //
+        // CLIENT_INIT sends nothing here. The web client sets field 7 (the client's
+        // own attestation revision) to 0 via `_.ed(g, 7, _.Zb(0), 0)` -- a
+        // set-with-default, which proto3 omits from the wire. Writing an explicit
+        // varint 7 would make our bytes DIFFER from the web client's, so we don't.
+        if (!isInit && GoogleMessagesConfig.pairingSendPrivateApiConfirmation) {
+            val override = GoogleMessagesConfig.pairingPrivateApiConfirmation
+            val value = override ?: PRIVATE_API_CONFIRMATION
+            if (value.isNotEmpty()) {
+                Log.i(TAG, "attestation: field 8 set (${value.length} chars, " +
+                    "rev=$serverAttestationRev, " +
+                    "${if (override == null) "built-in" else "OVERRIDE"})")
+                w.string(8, value)
             }
+        }
         return w.toByteArray()
     }
 
@@ -563,6 +602,9 @@ class GMGaiaPairing(
         val unknownInt3: Int = 0,
         val sessionUuid: String? = null,
         val unknownBytes: ByteArray? = null,
+        /** attestationRevision=9 on SERVER_INIT: the revision of the client
+         *  attestation Google wants. Absent (=0) is the only value in the wild. */
+        val attestationRevision: Int = 0,
         /** Every field number actually present, for the census line. */
         val present: List<Int> = emptyList(),
         /** The container verbatim, so a failure can be dumped and re-decoded
@@ -572,7 +614,11 @@ class GMGaiaPairing(
 
     /** GaiaPairingResponseContainer { finishErrorType=1, finishErrorCode=2,
      *  unknownInt3=3, sessionUUID=4, data=5, confirmedVerificationCodeVersion=6,
-     *  confirmedKeyDerivationVersion=7, unknownBytes=8 }.
+     *  confirmedKeyDerivationVersion=7, unknownBytes=8, attestationRevision=9 }.
+     *
+     *  Field 9 is NOT in mautrix's proto; it is read out of Google's own web
+     *  bundle (`T6a(_.bv(g, 9))` in the CGP SERVER_INIT handler, messagesweb
+     *  `mw_b`, captured 2026-09-21).
      *
      *  Field numbers per mautrix `pkg/libgm/gmproto/authentication.proto`, read
      *  2026-09-19. Fields 3, 4 and 8 are new to this parser. */
@@ -587,6 +633,7 @@ class GMGaiaPairing(
             unknownInt3 = f[3]?.value?.toInt() ?: 0,
             sessionUuid = f[4]?.bytes?.toString(Charsets.UTF_8),
             unknownBytes = f[8]?.bytes,
+            attestationRevision = f[9]?.value?.toInt() ?: 0,
             present = f.keys.sorted(),
             raw = bytes,
         )
@@ -642,10 +689,15 @@ class GMGaiaPairing(
             15 ->
                 "Your phone wasn't waiting for a pairing confirmation$suffix. Open Google " +
                     "Messages on your phone, then try again."
+            // 32/33/35 are the client-attestation family. We now send field 8, so
+            // reaching any of them means Google moved the goalposts again rather
+            // than that the user did anything. Retrying cannot help in any of the
+            // three cases, so the copy must not invite it.
             32, 33, 35 ->
                 "Google turned down the pairing before your phone was asked$suffix. This is a " +
                     "change on Google's side rather than anything you did, and trying again " +
-                    "won't help. Please get in touch with support."
+                    "won't help. Please update the Dumb Down launcher, and get in touch with " +
+                    "support if that doesn't fix it."
             else ->
                 if (waitedMs < USER_TAP_FLOOR_MS) {
                     "Google rejected the pairing before your phone was asked$suffix. This isn't " +
@@ -700,6 +752,24 @@ class GMGaiaPairing(
         private const val USER_TAP_FLOOR_MS = 3_000L
 
         private const val HEX_DUMP_LIMIT = 512
+
+        /** Highest `GaiaPairingResponseContainer.attestationRevision` (field 9) this
+         *  build knows how to satisfy. Google's own web client caps at 0 and throws
+         *  CLIENT_ATTESTATION_REVISION_MISMATCH above it. */
+        private const val MAX_ATTESTATION_REVISION = 0
+
+        /**
+         * `GaiaPairingRequestContainer.privateAPIConfirmation` (field 8) for
+         * attestation revision 0. Copied byte-for-byte out of Google's messagesweb
+         * bundle on 2026-09-21; every character, including the trailing period, is
+         * part of the string the server compares against.
+         *
+         * Do not reflow, re-wrap or "fix" the punctuation in this constant.
+         */
+        internal const val PRIVATE_API_CONFIRMATION =
+            "This is an undocumented API. Use or access of undocumented Google APIs " +
+                "without express authorization is prohibited per the Google API Terms " +
+                "of Service (https://developers.google.com/terms)."
 
         private fun hex(b: ByteArray): String {
             val n = minOf(b.size, HEX_DUMP_LIMIT)
