@@ -30,6 +30,50 @@ object GoogleMessagesConfig {
     var messengerActivityClassName: String? = null
 
     /**
+     * Verbose protocol diagnostics on the GAIA pairing path (tag `GMGaiaPair`).
+     *
+     * Turns on: a field-by-field census plus a bounded hex dump of every
+     * `GaiaPairingRequestContainer` we send and every `GaiaPairingResponseContainer`
+     * we receive, and the `/web/config` cohort fingerprint.
+     *
+     * WHY IT EXISTS: on 2026-09-18 a customer's pairing was refused with
+     * `finishErrorType=3 finishErrorCode=32`, 520-690 ms after CLIENT_FINISHED --
+     * far too fast to have reached his handset. `32` is `CLIENT_ATTESTATION_MISSING`
+     * in Google's own enum, and `GaiaPairingRequestContainer` has grown a field 8,
+     * `privateAPIConfirmation`, that this codebase has never written. We cannot fix
+     * what we cannot see, and the only channel Google is talking to us through is
+     * the 42-byte response container we currently throw away.
+     *
+     * SAFE FOR SUPPORT CAPTURES. The dumps cover the pairing CONTAINER only. The
+     * tachyon auth token and the cookie jar live in the RPC envelope one level up
+     * and are never logged. Do not widen this to the envelope -- these logs get
+     * emailed.
+     *
+     * Default ON for the diagnostic build; flip to false to silence.
+     */
+    @Volatile
+    var pairingDiagnosticsEnabled: Boolean = true
+
+    /**
+     * EXPERIMENT -- value to send as `GaiaPairingRequestContainer.privateAPIConfirmation`
+     * (field 8). Null (the default) sends no field 8 at all, which is exactly what
+     * produced `CLIENT_ATTESTATION_MISSING`.
+     *
+     * The point is not that we know the right value -- we do not. It is that
+     * Google distinguishes `CLIENT_ATTESTATION_MISSING` (32) from
+     * `CLIENT_ATTESTATION_MISMATCH` (33) and `CLIENT_ATTESTATION_REVISION_MISMATCH`
+     * (35). Sending ANY non-empty string and watching 32 move to 33 or 35 proves
+     * three things in one attempt: that field 8 is the field being checked, that
+     * the server parses it, and that our container shape is otherwise acceptable.
+     * A code that stays at 32 means the check is looking somewhere else entirely.
+     *
+     * Set it to something obviously synthetic (e.g. "diag-probe") so a value that
+     * somehow sticks is recognisable later. Never ship a guess as a default.
+     */
+    @Volatile
+    var pairingPrivateApiConfirmation: String? = null
+
+    /**
      * Master switch for the `__Secure-1PSIDTS` keepalive (see [GMCookieRotation]).
      *
      * DEFAULT ON, on the strength of the 2026-06-12 field capture (Alex Browning),

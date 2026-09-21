@@ -337,6 +337,7 @@ class GMGaiaClient(context: Context) {
                 // The web config embeds the device id somewhere; log a chunk so
                 // we can pin its exact location, and grab the first UUID we see.
                 Log.i(TAG, "fetchConfig head: ${body.take(800)}")
+                logConfigFingerprint(body)
                 // Parse the documented path rather than scraping.
                 //
                 // MEASURED-FROM-SOURCE (`pkg/libgm/gmproto/config.proto:26-35`):
@@ -376,6 +377,47 @@ class GMGaiaClient(context: Context) {
                 uuid
             }
         }.getOrElse { Log.e(TAG, "fetchConfig threw", it); null }
+    }
+
+    /**
+     * Cohort fingerprint from `/web/config`, under [TAG_PAIR] so it reaches a
+     * customer's rolling capture.
+     *
+     * WHY: `CLIENT_ATTESTATION_MISSING` (32) is a SERVER-side refusal -- it came
+     * back 520-690 ms after CLIENT_FINISHED, far too fast to have reached the
+     * handset. So whatever selects one account and spares another is most likely a
+     * server-side flag, and root[7] of this config is the experiment-id array: the
+     * cohort this cookie jar is in. Diffing a failing customer's list against a
+     * working one's is the cheapest path to the flag that turns attestation on.
+     * root[1] dates the web build; a non-binary feature flag (one carrying a
+     * version string rather than 0/1) is a candidate attestation revision.
+     *
+     * REDACTION, deliberate: version, region, the two 32-hex ids, the experiment
+     * ids and the odd-shaped flags. NOT the API keys, NOT the OAuth client id,
+     * NOT the body. Widen this only after re-reading what a support bundle is.
+     */
+    private fun logConfigFingerprint(body: String) {
+        if (!GoogleMessagesConfig.pairingDiagnosticsEnabled) return
+        runCatching {
+            val root = PbLite.parse(body) as? PbLite.Node.Arr ?: return
+            val webServer = root[1].asStringOrNull()
+            val region = root[6].asStringOrNull()
+            val configId = root[10].asStringOrNull()
+            val experiments = (root[7] as? PbLite.Node.Arr)
+                ?.items?.mapNotNull { it.asLongOrNull() }.orEmpty()
+            Log.i(TAG_PAIR, "CONFIG webServer=$webServer region=$region " +
+                "configId=$configId experimentCount=${experiments.size}")
+            Log.i(TAG_PAIR, "CONFIG experiments=$experiments")
+            val odd = (root[2] as? PbLite.Node.Arr)
+                ?.items?.mapNotNull { it as? PbLite.Node.Arr }
+                ?.filter { it.items.size != 2 }
+                ?.map { flag ->
+                    flag.items.joinToString(",") { n ->
+                        n.asStringOrNull() ?: n.asLongOrNull()?.toString() ?: "null"
+                    }
+                }.orEmpty()
+            Log.i(TAG_PAIR, "CONFIG oddFlags=$odd")
+        }.onFailure { Log.w(TAG_PAIR, "CONFIG fingerprint failed: ${it.message}") }
     }
 
     // ---- Step 2: SignInGaia ------------------------------------------------
@@ -555,6 +597,16 @@ class GMGaiaClient(context: Context) {
         val destRegB64 = primary.first
         Log.i(TAG, "signInGaia: token=${token.size}b ttl=$ttl mobile=${mobile.sourceId} " +
             "dest=$destRegB64 (${primaries.size} primary of ${items2.size} devices)")
+        // Mirrored under the captured tag: no customer bundle has ever carried the
+        // device-list picture, so "was the handshake even routed to the right
+        // phone?" has never been answerable from a support report. Ids and counts
+        // only -- no token, no cookies.
+        Log.i(TAG_PAIR, "DEVICES n=${items2.size} primaries=${primaries.size} " +
+            "dest=$destRegB64 destUuid=${
+                runCatching {
+                    String(Base64.decode(destRegB64, Base64.DEFAULT), Charsets.UTF_8)
+                }.getOrNull() ?: "?"
+            }")
 
         val p = GMGaiaPairing(
             cookies = cookies,
@@ -715,6 +767,12 @@ class GMGaiaClient(context: Context) {
          *  of the routine hourly snapshot; these summary lines are safe there and
          *  are usually all support needs to triage a failed link. */
         internal const val TAG_RESULT = "GMPairResult"
+
+        /** The pairing tag. `GMGaia` is NOT in the launcher's rolling-logcat
+         *  filter (it carries the SignInGaia body, and therefore the tachyon
+         *  token), so anything support needs from this class has to be emitted
+         *  under a tag that IS captured. Secret-free lines only. */
+        internal const val TAG_PAIR = "GMGaiaPair"
         /** Process-wide so repeated retries read as #1..#n in one capture. */
         private val ATTEMPTS = AtomicInteger(0)
         private const val GDITTO = "GDitto"
