@@ -4840,7 +4840,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 /// message predates this feature has no service on record and replies to it go out as
 /// iMessage. For an MMS group that means the members who aren't on iMessage silently
 /// receive nothing (captured 2026-08-07 11:58: `IDS returned zero keys for participant
-/// tel:+12405754507`, sent anyway as command 100).
+/// tel:+15555550105`, sent anyway as command 100).
 ///
 /// BACKFILL ONLY: a group the native side has already observed keeps its observation.
 /// The seed is derived from a cache and can be stale; live traffic cannot be, so it

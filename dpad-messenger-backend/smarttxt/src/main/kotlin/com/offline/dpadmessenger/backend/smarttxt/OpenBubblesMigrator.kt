@@ -468,7 +468,7 @@ object OpenBubblesMigrator {
      * conversations — so whatever we choose here is a choice they never get asked
      * about. The old rule ("first tel:, else whatever's first") quietly got it wrong
      * for anyone whose vetted aliases are all email: a real device on 2026-08-05 had
-     * `[mailto:swagthug4lyfe@icloud.com, mailto:27jackstreet@gmail.com]` and had chosen
+     * `[mailto:alice@icloud.com, mailto:alice.backup@gmail.com]` and had chosen
      * the second, and the old rule would have started them sending from the first.
      *
      * Falls back to the old rule whenever the setting is missing or names an address

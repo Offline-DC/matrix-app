@@ -212,7 +212,7 @@ object GoogleMessagesConfig {
      *     -> Our request shape is wrong, independent of cookies.
      * ```
      *
-     * ANSWERED 17 Aug 2026, and the answer is NO. On jacknugent27@gmail.com the probe
+     * ANSWERED 17 Aug 2026, and the answer is NO. On example.user@gmail.com the probe
      * returned `HTTP 403` with a well-formed pblite body of
      * `[["identity.hfcr",2147483647],["di",44]]` — Int.MAX_VALUE, "never rotate".
      * RotateCookies will not MINT a freshness cookie for a caller lacking one; it only

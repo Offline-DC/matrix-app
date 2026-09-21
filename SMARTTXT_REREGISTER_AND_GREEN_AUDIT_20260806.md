@@ -330,13 +330,13 @@ never an empty list.
 `logs2/current.log:14676-14712`, verbatim, in order:
 
 ```
-11:05:14.015  IDS RX cmd=140 topic=com.apple.private.alloy.sms from=tel:+14436155415 … uuid=d4e1b580…
-11:05:14.035  recv msg: guid=D4E1B580-… sender=tel:+17202512766 … chat_guid=iMessage;-;+17202512766
-11:05:41.097  IMsgRepo: SMSFLAG send room=iMessage;-;+17202512766 tmp=… guessed=true (newest=true probe=true)
-11:05:41.345  W rustpush::ids::identity_manager: IDS returned zero keys for participant tel:+17202512766
-11:05:41.434  smarttxt_ffi: decide_route[tel:+17202512766]: on_imessage=false is_phone=true sms_active=true valid=[]
-11:05:41.434  smarttxt_ffi: nativeSendText: … is_sms=true from_handle=tel:+14436155415
-11:05:42.787  rustpush::imessage::aps_client: recieved [tel:+14436155415] confirmed sms send as success
+11:05:14.015  IDS RX cmd=140 topic=com.apple.private.alloy.sms from=tel:+15555550201 … uuid=d4e1b580…
+11:05:14.035  recv msg: guid=D4E1B580-… sender=tel:+15555550202 … chat_guid=iMessage;-;+15555550202
+11:05:41.097  IMsgRepo: SMSFLAG send room=iMessage;-;+15555550202 tmp=… guessed=true (newest=true probe=true)
+11:05:41.345  W rustpush::ids::identity_manager: IDS returned zero keys for participant tel:+15555550202
+11:05:41.434  smarttxt_ffi: decide_route[tel:+15555550202]: on_imessage=false is_phone=true sms_active=true valid=[]
+11:05:41.434  smarttxt_ffi: nativeSendText: … is_sms=true from_handle=tel:+15555550201
+11:05:42.787  rustpush::imessage::aps_client: recieved [tel:+15555550201] confirmed sms send as success
 ```
 
 Reading it:
@@ -350,7 +350,7 @@ Reading it:
    `probe=true` (the composer's `nativeIsIMessage` probe).
 4. The send was acknowledged by her iPhone as a successful SMS.
 
-**That green was correct.** `+17202512766` is not on iMessage.
+**That green was correct.** `+15555550202` is not on iMessage.
 
 Full route census for the capture: **18 `decide_route` decisions, 17 blue, 1 green** (the one above).
 Zero `decide_route … validate failed` lines — the error branch never fired.

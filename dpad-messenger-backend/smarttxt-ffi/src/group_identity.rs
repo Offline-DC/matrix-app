@@ -4,7 +4,7 @@
 //! `#[cfg(test)]` suite below (`cargo test` there), so the tests exercise the shipped
 //! source, not a copy.
 //!
-//! The core idea (see ABSINTHE/README + the sibs & sav bug): an iMessage group is
+//! The core idea (see ABSINTHE/README + the multi-member group-identity bug): an iMessage group is
 //! identified by Apple's stable group id — the plist `gid`, which rustpush surfaces as
 //! `ConversationData.sender_guid` — NOT by its member set. We key group chats as
 //! "iMessage;+;<gid>" and replay that gid (plus members + name) on every outbound so a
@@ -91,7 +91,7 @@ pub fn canon(handle: &str) -> String {
 //
 // rustpush's `normalize_sms_handle` builds E.164 out of a bare all-digit SMS handle by
 // prefixing '+' and stopping there. When the carrier delivers a domestic text in
-// NATIONAL format — which NANP carriers do — "4097821402" becomes "+4097821402", a
+// NATIONAL format — which NANP carriers do — "5555550612" becomes "+5555550612", a
 // different number in a different country. Inbound then keys to a room nobody else
 // writes to, while the user's own outbound echoes arrive already qualified and key to
 // "+1…", so every green thread splits in two and a reply sent from the wrong half goes
@@ -102,7 +102,7 @@ pub fn canon(handle: &str) -> String {
 // needs to know which country the number was national to.
 //
 // KNOWN LIMITATION, accepted deliberately: by the time we see the handle, rustpush has
-// already discarded whether the '+' was on the wire or manufactured, so "+4097821402"
+// already discarded whether the '+' was on the wire or manufactured, so "+5555550612"
 // (a NANP number missing its country code) and "+4712345678" (a real Norwegian number)
 // are the same ten digits to us. This repairs both, which means an inbound text to a
 // US account from a country whose full E.164 is ten digits — Norway +47, Denmark +45,
@@ -266,54 +266,54 @@ pub fn effective_send_guid(chat: &str, groups: &HashMap<String, GroupMeta>) -> S
 mod tests {
     use super::*;
 
-    // The five members from the real "sibs & sav" log.
+    // The five members from a real multi-person group log.
     fn sibs() -> Vec<String> {
         vec![
-            "+18048334449".into(),
-            "+18048336158".into(),
-            "+18048336200".into(),
-            "+18048339340".into(),
-            "+18048698183".into(),
+            "+15555550601".into(),
+            "+15555550602".into(),
+            "+15555550603".into(),
+            "+15555550604".into(),
+            "+15555550605".into(),
         ]
     }
 
     #[test]
     fn canon_normalizes_handles() {
-        assert_eq!(canon("tel:+18048334449"), "+18048334449");
-        assert_eq!(canon("8048334449"), "+18048334449"); // 10-digit US → +1
-        assert_eq!(canon("+1 (804) 833-4449"), "+18048334449"); // punctuation stripped
-        assert_eq!(canon("18048334449"), "+18048334449"); // 11-digit leading 1
-        assert_eq!(canon("mailto:Sav@ICLOUD.com"), "sav@icloud.com"); // email lowercased
+        assert_eq!(canon("tel:+15555550601"), "+15555550601");
+        assert_eq!(canon("5555550601"), "+15555550601"); // 10-digit US → +1
+        assert_eq!(canon("+1 (555) 555-0601"), "+15555550601"); // punctuation stripped
+        assert_eq!(canon("15555550601"), "+15555550601"); // 11-digit leading 1
+        assert_eq!(canon("mailto:Pat@ICLOUD.com"), "pat@icloud.com"); // email lowercased
     }
 
     // ---- relayed-SMS country-code repair -----------------------------------------
-    // Values from the 2026-08-30 bundle: account +14098932801, other party
-    // +14097821402, every inbound SMS arriving as "4097821402".
+    // Values from the 2026-08-30 bundle: account +15555550611, other party
+    // +15555550612, every inbound SMS arriving as "5555550612".
 
     #[test]
     fn canon_cannot_undo_a_manufactured_plus() {
-        assert_eq!(canon("4097821402"), "+14097821402");     // bare: canon handles it
-        assert_eq!(canon("tel:+4097821402"), "+4097821402"); // damaged: canon cannot
+        assert_eq!(canon("5555550612"), "+15555550612");     // bare: canon handles it
+        assert_eq!(canon("tel:+5555550612"), "+5555550612"); // damaged: canon cannot
     }
 
     #[test]
     fn nanp_shape() {
-        assert!(is_nanp_e164("+14098932801"));
-        assert!(!is_nanp_e164("+4098932801"));  // the damaged form
+        assert!(is_nanp_e164("+15555550611"));
+        assert!(!is_nanp_e164("+5555550611"));  // the damaged form
         assert!(!is_nanp_e164("+4712345678"));  // Norway: 10 digits, genuinely E.164
-        assert!(!is_nanp_e164("sav@icloud.com"));
+        assert!(!is_nanp_e164("pat@icloud.com"));
     }
 
     #[test]
     fn requalify_repairs_the_logged_handles() {
-        let me = "+14098932801";
+        let me = "+15555550611";
         for (damaged, fixed) in [
-            ("+4097821402", "+14097821402"),
-            ("+4093324075", "+14093324075"),
-            ("+4094981936", "+14094981936"),
-            ("+4097900873", "+14097900873"),
-            ("+8324058464", "+18324058464"),
-            ("+4098932801", "+14098932801"), // the user's own number, damaged in `re`
+            ("+5555550612", "+15555550612"),
+            ("+5555550613", "+15555550613"),
+            ("+5555550614", "+15555550614"),
+            ("+5555550615", "+15555550615"),
+            ("+5555550616", "+15555550616"),
+            ("+5555550611", "+15555550611"), // the user's own number, damaged in `re`
         ] {
             assert_eq!(requalify_national(damaged, me), fixed, "{damaged}");
         }
@@ -321,9 +321,9 @@ mod tests {
 
     #[test]
     fn requalify_leaves_everything_else_alone() {
-        let me = "+14098932801";
-        assert_eq!(requalify_national("+14097821402", me), "+14097821402"); // qualified
-        assert_eq!(requalify_national("sav@icloud.com", me), "sav@icloud.com");
+        let me = "+15555550611";
+        assert_eq!(requalify_national("+15555550612", me), "+15555550612"); // qualified
+        assert_eq!(requalify_national("pat@icloud.com", me), "pat@icloud.com");
         assert_eq!(requalify_national("+30295", me), "+30295");             // short code
         assert_eq!(requalify_national("+61607", me), "+61607");
         assert_eq!(requalify_national("+0123456789", me), "+0123456789");   // bad area
@@ -334,22 +334,22 @@ mod tests {
     fn requalify_never_fires_for_a_non_nanp_account() {
         let me = "+4712345678";
         assert_eq!(requalify_national("+4798765432", me), "+4798765432");
-        assert_eq!(requalify_national("+4097821402", me), "+4097821402");
+        assert_eq!(requalify_national("+5555550612", me), "+5555550612");
     }
 
     #[test]
     fn known_limitation_is_documented_by_this_test() {
         // A US account receiving from a real ten-digit Norwegian number is rewritten.
         // This is the accepted cost of repairing at this layer; see the module comment.
-        assert_eq!(requalify_national("+4712345678", "+14098932801"), "+14712345678");
+        assert_eq!(requalify_national("+4712345678", "+15555550611"), "+14712345678");
     }
 
     #[test]
     fn repaired_inbound_keys_to_the_same_room_as_outbound() {
-        let me = "+14098932801";
-        let inbound = requalify_national(&canon("tel:+4097821402"), me);
-        assert_eq!(inbound, canon("tel:+14097821402"));
-        assert_eq!(format!("iMessage;-;{inbound}"), "iMessage;-;+14097821402");
+        let me = "+15555550611";
+        let inbound = requalify_national(&canon("tel:+5555550612"), me);
+        assert_eq!(inbound, canon("tel:+15555550612"));
+        assert_eq!(format!("iMessage;-;{inbound}"), "iMessage;-;+15555550612");
     }
 
     #[test]
@@ -372,15 +372,15 @@ mod tests {
         // Same people, different formats/order/dupes → one stable key.
         let a = members_csv(&sibs());
         let b = members_csv(&vec![
-            "tel:+18048339340".into(),
-            "(804) 833-6200".into(),
-            "8048334449".into(),
-            "+18048336158".into(),
-            "+18048698183".into(),
-            "8048334449".into(), // dupe
+            "tel:+15555550604".into(),
+            "(555) 555-0603".into(),
+            "5555550601".into(),
+            "+15555550602".into(),
+            "+15555550605".into(),
+            "5555550601".into(), // dupe
         ]);
         assert_eq!(a, b);
-        assert_eq!(a, "+18048334449,+18048336158,+18048336200,+18048339340,+18048698183");
+        assert_eq!(a, "+15555550601,+15555550602,+15555550603,+15555550604,+15555550605");
     }
 
     #[test]
@@ -407,19 +407,19 @@ mod tests {
 
     #[test]
     fn updated_meta_learns_then_preserves_name() {
-        // First a named message establishes "sibs & sav".
-        let m1 = updated_meta(None, &sibs(), &Some("sibs & sav".into()));
-        assert_eq!(m1.cv_name.as_deref(), Some("sibs & sav"));
+        // First a named message establishes "the crew".
+        let m1 = updated_meta(None, &sibs(), &Some("the crew".into()));
+        assert_eq!(m1.cv_name.as_deref(), Some("the crew"));
         assert_eq!(m1.participants.len(), 5);
         // A LATER nameless message must NOT wipe the known name (the routing anchor).
         let m2 = updated_meta(Some(&m1), &sibs(), &None);
-        assert_eq!(m2.cv_name.as_deref(), Some("sibs & sav"));
+        assert_eq!(m2.cv_name.as_deref(), Some("the crew"));
         // A participant-less control message keeps the known members.
         let m3 = updated_meta(Some(&m2), &[], &None);
         assert_eq!(m3.participants.len(), 5);
         // A genuine rename is adopted.
-        let m4 = updated_meta(Some(&m3), &sibs(), &Some("sibs & sav 2".into()));
-        assert_eq!(m4.cv_name.as_deref(), Some("sibs & sav 2"));
+        let m4 = updated_meta(Some(&m3), &sibs(), &Some("the crew 2".into()));
+        assert_eq!(m4.cv_name.as_deref(), Some("the crew 2"));
     }
 
     #[test]
@@ -445,9 +445,9 @@ mod tests {
         // updated_meta runs on every inbound message. If it dropped is_sms, the group
         // would revert to blue the moment anyone renamed it or a member list arrived.
         let learned = GroupMeta { is_sms: Some(true), ..Default::default() };
-        let after = updated_meta(Some(&learned), &sibs(), &Some("sibs & sav".into()));
+        let after = updated_meta(Some(&learned), &sibs(), &Some("the crew".into()));
         assert_eq!(after.is_sms, Some(true));
-        assert_eq!(after.cv_name.as_deref(), Some("sibs & sav"));
+        assert_eq!(after.cv_name.as_deref(), Some("the crew"));
         // …and a group that has never been observed stays unknown, not false.
         let fresh = updated_meta(None, &sibs(), &None);
         assert_eq!(fresh.is_sms, None);
@@ -455,13 +455,13 @@ mod tests {
 
     #[test]
     fn send_identity_replays_real_gid_and_name() {
-        // THE FIX: sending to the gid-keyed "sibs & sav" replays the real gid + name +
+        // THE FIX: sending to the gid-keyed "the crew" replays the real gid + name +
         // members — NOT cv_name:None + a fresh random gid (the bug that forked the thread).
         let guid = "iMessage;+;c71a3485-5e0d-4974-8b3d-c55bf2edea8a";
-        let meta = GroupMeta { participants: sibs(), cv_name: Some("sibs & sav".into()), ..Default::default() };
+        let meta = GroupMeta { participants: sibs(), cv_name: Some("the crew".into()), ..Default::default() };
         let id = send_identity(guid, Some(&meta));
         assert_eq!(id.gid.as_deref(), Some("c71a3485-5e0d-4974-8b3d-c55bf2edea8a"));
-        assert_eq!(id.cv_name.as_deref(), Some("sibs & sav"));
+        assert_eq!(id.cv_name.as_deref(), Some("the crew"));
         assert_eq!(id.participant_addrs, sibs());
     }
 
@@ -489,7 +489,7 @@ mod tests {
         // A reply typed in an old member-keyed room redirects to the one known gid.
         let mut groups: HashMap<String, GroupMeta> = HashMap::new();
         let gid = "iMessage;+;c71a3485-5e0d-4974-8b3d-c55bf2edea8a";
-        groups.insert(gid.to_string(), GroupMeta { participants: sibs(), cv_name: Some("sibs & sav".into()), ..Default::default() });
+        groups.insert(gid.to_string(), GroupMeta { participants: sibs(), cv_name: Some("the crew".into()), ..Default::default() });
         let legacy = format!("iMessage;+;{}", members_csv(&sibs()));
         assert_eq!(effective_send_guid(&legacy, &groups), gid);
     }
@@ -506,7 +506,7 @@ mod tests {
     fn effective_send_guid_no_guess_when_ambiguous() {
         // Two groups with the SAME members → never guess; keep the legacy guid.
         let mut groups: HashMap<String, GroupMeta> = HashMap::new();
-        groups.insert("iMessage;+;gid-aaaa".into(), GroupMeta { participants: sibs(), cv_name: Some("sibs & sav".into()), ..Default::default() });
+        groups.insert("iMessage;+;gid-aaaa".into(), GroupMeta { participants: sibs(), cv_name: Some("the crew".into()), ..Default::default() });
         groups.insert("iMessage;+;gid-bbbb".into(), GroupMeta { participants: sibs(), cv_name: None, ..Default::default() });
         let legacy = format!("iMessage;+;{}", members_csv(&sibs()));
         assert_eq!(effective_send_guid(&legacy, &groups), legacy);
@@ -517,26 +517,26 @@ mod tests {
         let mut groups: HashMap<String, GroupMeta> = HashMap::new();
         groups.insert("iMessage;+;c71a3485".into(), GroupMeta { participants: sibs(), cv_name: None, ..Default::default() });
         assert_eq!(effective_send_guid("iMessage;+;c71a3485", &groups), "iMessage;+;c71a3485"); // already gid
-        assert_eq!(effective_send_guid("iMessage;-;+18048334449", &groups), "iMessage;-;+18048334449"); // 1:1
+        assert_eq!(effective_send_guid("iMessage;-;+15555550601", &groups), "iMessage;-;+15555550601"); // 1:1
     }
 
     #[test]
     fn end_to_end_receive_then_reply_threads_into_same_group() {
-        // Mirrors the log: receive a sibs & sav message (gid + name), then reply.
+        // Mirrors the log: receive a the crew message (gid + name), then reply.
         let gid = "C71A3485-5E0D-4974-8B3D-C55BF2EDEA8A";
         let mut by_members: HashMap<String, String> = HashMap::new();
 
         // INBOUND
         let guid = resolve_group_guid(Some(gid), &sibs(), &by_members);
-        let meta = updated_meta(None, &sibs(), &Some("sibs & sav".into()));
+        let meta = updated_meta(None, &sibs(), &Some("the crew".into()));
         by_members.insert(members_csv(&meta.participants), guid.clone());
 
         // OUTBOUND (reply)
         let id = send_identity(&guid, Some(&meta));
         // The reply carries the SAME gid it was received on, and the group's name —
-        // so Apple threads it into "sibs & sav", not a new members-only chat.
+        // so Apple threads it into "the crew", not a new members-only chat.
         assert_eq!(id.gid.as_deref(), Some(&group_ident(&guid)[..]));
         assert_eq!(group_guid_for(&id.gid.unwrap()), guid);
-        assert_eq!(id.cv_name.as_deref(), Some("sibs & sav"));
+        assert_eq!(id.cv_name.as_deref(), Some("the crew"));
     }
 }

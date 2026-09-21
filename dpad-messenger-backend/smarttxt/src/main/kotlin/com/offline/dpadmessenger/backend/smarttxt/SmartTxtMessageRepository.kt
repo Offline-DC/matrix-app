@@ -334,7 +334,7 @@ internal class SmartTxtMessageRepository(
             // silently defaulting the thread to blue. Observed 2026-08-07 16:49 on a
             // real migration: of three imported groups only one had ever received
             // anything, so `backfilled 1 group(s)` — and the all-Android group
-            // +12025039452,+18048336200 then failed NoValidTargets on every send while
+            // +15555550103,+15555550104 then failed NoValidTargets on every send while
             // the app itself knew better (`guessed=true (newest=true)` one line above
             // `is_sms=false`).
             //
@@ -2011,7 +2011,7 @@ internal class SmartTxtMessageRepository(
 
     /** Display form of a stored name/handle: drop the "tel:"/"mailto:" scheme so
      *  an unresolved contact reads as a plain number/email
-     *  ("tel:+12489046456" → "+12489046456"). Scheme-specific (unlike
+     *  ("tel:+15555550301" → "+15555550301"). Scheme-specific (unlike
      *  prettyHandle's substringAfter) so a real contact name containing a colon
      *  is left intact. */
     private fun stripScheme(s: String): String =
