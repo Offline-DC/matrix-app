@@ -55,20 +55,33 @@ object GoogleMessagesConfig {
     var pairingDiagnosticsEnabled: Boolean = true
 
     /**
-     * EXPERIMENT -- value to send as `GaiaPairingRequestContainer.privateAPIConfirmation`
-     * (field 8). Null (the default) sends no field 8 at all, which is exactly what
-     * produced `CLIENT_ATTESTATION_MISSING`.
+     * Master switch for `GaiaPairingRequestContainer.privateAPIConfirmation`
+     * (field 8) -- the client attestation Google's web client sends on
+     * CLIENT_FINISHED.
      *
-     * The point is not that we know the right value -- we do not. It is that
+     * ON by default, because OFF is what produced `CLIENT_ATTESTATION_MISSING`
+     * (error 3/32) for a customer on 2026-09-18: Google flipped its `FUroQb`
+     * flag on, and any client that omits field 8 is now refused ~500 ms after
+     * CLIENT_FINISHED, before the handset is ever contacted.
+     *
+     * Turn it OFF only to reproduce that failure deliberately. Pairing will not
+     * succeed with it off for as long as `FUroQb` stays on.
+     */
+    @Volatile
+    var pairingSendPrivateApiConfirmation: Boolean = true
+
+    /**
+     * Override for the field 8 string. Null (the default) sends the value copied
+     * out of Google's own messagesweb bundle, which is what you want.
+     *
+     * This exists to answer "did Google change the string?" without a rebuild.
      * Google distinguishes `CLIENT_ATTESTATION_MISSING` (32) from
-     * `CLIENT_ATTESTATION_MISMATCH` (33) and `CLIENT_ATTESTATION_REVISION_MISMATCH`
-     * (35). Sending ANY non-empty string and watching 32 move to 33 or 35 proves
-     * three things in one attempt: that field 8 is the field being checked, that
-     * the server parses it, and that our container shape is otherwise acceptable.
-     * A code that stays at 32 means the check is looking somewhere else entirely.
+     * `CLIENT_ATTESTATION_MISMATCH` (33), so a wrong-but-present value returns
+     * 33 and a missing one returns 32 -- meaning a single failed attempt tells
+     * you whether the string drifted or the field stopped being read at all.
      *
-     * Set it to something obviously synthetic (e.g. "diag-probe") so a value that
-     * somehow sticks is recognisable later. Never ship a guess as a default.
+     * Ignored when [pairingSendPrivateApiConfirmation] is false. An empty string
+     * is treated as "send nothing", same as turning the switch off.
      */
     @Volatile
     var pairingPrivateApiConfirmation: String? = null
