@@ -166,10 +166,7 @@ fun SmartTxtApp(
             when (migrate) {
                 null -> DuckLoadingIndicator(modifier = modifier, label = migrationLabel())
                 true -> MigrationScreen(modifier = modifier, onFallbackToSetup = { migrate = false })
-                else -> SmartTxtSetupScreen(
-                    modifier = modifier,
-                    notice = terminalFailure,
-                )
+                else -> SmartTxtSetupScreen(modifier = modifier, notice = terminalFailure)
             }
         }
     }

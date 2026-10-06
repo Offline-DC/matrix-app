@@ -92,13 +92,6 @@ interface SoftKeyBarHost {
 
     fun bind(binding: SoftKeyBinding)
     fun unbind(binding: SoftKeyBinding)
-
-    /**
-     * Take the whole bar off screen (true) or put it back (false). See
-     * [HideSoftKeys]. Defaulted to a no-op so hosts that can't hide a bar —
-     * the demo app, previews — keep compiling untouched.
-     */
-    fun setHidden(hidden: Boolean) = Unit
 }
 
 /** Set by the host. Null means no real bar — [SoftKeys] draws the in-app row. */
@@ -125,35 +118,6 @@ fun SoftKeys(
         if (host.nativeActive) return
     }
     SoftKeyBarContent(left, center, right, modifier)
-}
-
-/**
- * Hide the soft-key bar entirely for as long as the caller is composed, and
- * put it back when it leaves. For a screen with nothing to press — Smart Txt's
- * "activating smart txt..." page — where an empty black strip would only eat
- * screen space.
- *
- * It also claims the bar with an empty binding first, so the previous screen's
- * labels can't linger on it (for the frame before the hide lands, or on a
- * host that can't hide). The launcher's host maps this onto its NavBarController
- * .setVisible, which restores the bar and forces its labels back through on
- * show, so the next screen's keys appear normally.
- *
- * A host with no real bar draws nothing here: the in-app row only exists where
- * a screen calls [SoftKeys], and this doesn't.
- */
-@Composable
-fun HideSoftKeys() {
-    val host = LocalSoftKeyBar.current ?: return
-    DisposableEffect(host) {
-        val empty = SoftKeyBinding(labels = listOf(null, null, null), action = { null })
-        host.bind(empty)
-        host.setHidden(true)
-        onDispose {
-            host.setHidden(false)
-            host.unbind(empty)
-        }
-    }
 }
 
 /**

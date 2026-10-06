@@ -51,7 +51,6 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.offline.dpadmessenger.data.RoomSummary
 import androidx.compose.ui.platform.LocalFocusManager
 import com.offline.dpadmessenger.focus.dpadRow
@@ -127,18 +126,6 @@ fun RoomListScreen(
     // attempt instead of stacking one moveFocus per press. See handOffFocus.
     val handOffJob = remember { mutableStateOf<Job?>(null) }
 
-    // Tell an onboarding host that the room list is the screen on top, so it
-    // may treat OK as "continue" — and stop the moment a thread or settings
-    // replaces it (the NavHost disposes this destination). See
-    // LocalOnboardingContinue.
-    val onboardingContinue = com.offline.dpadmessenger.ui.components.LocalOnboardingContinue.current
-    if (onboardingContinue != null) {
-        androidx.compose.runtime.DisposableEffect(onboardingContinue) {
-            onboardingContinue.showing = true
-            onDispose { onboardingContinue.showing = false }
-        }
-    }
-
     Scaffold(
         // Soft keys: the two hardware buttons under the screen. "settings" is the
         // profile/cog in the header, "new" is what the floating compose button
@@ -150,18 +137,10 @@ fun RoomListScreen(
         // in-app row here, which is why it belongs in bottomBar rather than
         // floating over the content.
         bottomBar = {
-            // End of onboarding (see LocalOnboardingContinue): one centre
-            // "continue" instead of "settings" / "new". Label only — the host
-            // Activity turns OK into continue, because on the empty welcome
-            // page there may be no focused node for a Compose handler to hear it.
-            if (onboardingContinue != null) {
-                SoftKeys(center = SoftKey("continue"))
-            } else {
-                SoftKeys(
-                    left = SoftKey("settings") { onSettingsClick() },
-                    right = onNewMessage?.let { SoftKey("new", it) },
-                )
-            }
+            SoftKeys(
+                left = SoftKey("settings") { onSettingsClick() },
+                right = onNewMessage?.let { SoftKey("new", it) },
+            )
         },
         topBar = {
             CompactTopBar(
@@ -500,10 +479,6 @@ private fun EmptyState(padding: PaddingValues) {
     // the SmartTxt skin; the others get a neutral welcome. (smarttxt is the only
     // per-app signal the shared library carries — see DpadMessengerColors.)
     val smarttxt = LocalDpadMessengerColors.current.smarttxt
-    if (smarttxt) {
-        SmartTxtWelcome(padding)
-        return
-    }
     Box(
         modifier = Modifier.fillMaxSize().padding(padding),
         contentAlignment = Alignment.Center,
@@ -513,7 +488,7 @@ private fun EmptyState(padding: PaddingValues) {
             modifier = Modifier.padding(horizontal = 32.dp),
         ) {
             Text(
-                "No conversations yet",
+                if (smarttxt) "Welcome to Smart Txt 2.0!" else "No conversations yet",
                 style = MaterialTheme.typography.titleMedium,
                 textAlign = TextAlign.Center,
             )
@@ -525,99 +500,5 @@ private fun EmptyState(padding: PaddingValues) {
                 textAlign = TextAlign.Center,
             )
         }
-    }
-}
-
-/**
- * Smart Txt's empty inbox — "welcome to smart txt!" (Figma "onboarding - 23",
- * dumb product design node 50:26293). The first thing a new Smart Txt user
- * sees after choosing which number/email new conversations start from.
- *
- * Under the existing "Messages" bar: the title (Helvetica Now Display Extra
- * Bold, at the launcher onboarding's 34sp rather than Figma's 28), the body in
- * Medium 16/17.6 with the voice-to-text tip, and the hand-drawn speech bubble
- * (96×90, ic_smart_txt_bubble — the launcher's asset, copied into this
- * library's drawable-nodpi along with the two Display fonts, since a library
- * can't reach the app's resources). Left-aligned and top-anchored like the
- * onboarding pages, replacing the centred "Welcome to Smart Txt 2.0!" copy.
- *
- * Signal and Google Messages keep their neutral "No conversations yet".
- * The soft keys ("settings" / "new") are the room list's own and unchanged.
- */
-@Composable
-private fun SmartTxtWelcome(padding: PaddingValues) {
-    val extraBold = androidx.compose.ui.text.font.FontFamily(
-        androidx.compose.ui.text.font.Font(
-            com.offline.dpadmessenger.R.font.helvetica_now_display_extrabold,
-            androidx.compose.ui.text.font.FontWeight.ExtraBold,
-        )
-    )
-    val medium = androidx.compose.ui.text.font.FontFamily(
-        androidx.compose.ui.text.font.Font(
-            com.offline.dpadmessenger.R.font.helvetica_now_display_medium,
-            androidx.compose.ui.text.font.FontWeight.Medium,
-        )
-    )
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            // Bottom only. The Scaffold's top inset (the "Messages" bar) is
-            // already applied once by the Column that hosts this screen (see
-            // "The top inset is applied once here"); padding by all of
-            // `padding` here added the bar's height a second time and put the
-            // title ~36dp lower than Figma's 52dp from the top.
-            .padding(bottom = padding.calculateBottomPadding())
-            .padding(horizontal = 12.dp),
-    ) {
-        // Explicit break, as in Figma 50:26294: "welcome to / smart txt!".
-        // Left to wrap, the handset's wider screen fit it all on one line.
-        Text(
-            "welcome to\nsmart txt!",
-            style = androidx.compose.ui.text.TextStyle(
-                fontFamily = extraBold,
-                fontWeight = androidx.compose.ui.text.font.FontWeight.ExtraBold,
-                // 34/34, the same as every other Smart Txt setup title (the
-                // launcher onboarding's size). Figma 50:26293 sets this one at
-                // 28/28; it was matched for a while, but having the last setup
-                // page's title smaller than the rest read as inconsistent.
-                fontSize = 34.sp,
-                lineHeight = 34.sp,
-                color = androidx.compose.ui.graphics.Color(0xFF14140C), // light/text-strong
-            ),
-            // 14dp under the 36dp "Messages" bar (top 50). Figma has 16dp
-            // (top 52), tightened by 2dp on review on the 4058W. 216dp wide in
-            // Figma (12dp gutters).
-            modifier = Modifier.fillMaxWidth().padding(top = 14.dp),
-        )
-        Text(
-            "ur messages will show up here as u receive them. " +
-                "press and hold the * key (bottom left) for voice-to-text.",
-            style = androidx.compose.ui.text.TextStyle(
-                fontFamily = medium,
-                fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
-                fontSize = 16.sp,
-                lineHeight = 17.6.sp,
-                color = androidx.compose.ui.graphics.Color(0xFF575757), // light/text-weak
-            ),
-            // Figma: body top 117 = title bottom (108) + 9dp.
-            modifier = Modifier.fillMaxWidth().padding(top = 9.dp),
-        )
-        androidx.compose.foundation.Image(
-            painter = androidx.compose.ui.res.painterResource(com.offline.dpadmessenger.R.drawable.ic_smart_txt_bubble),
-            contentDescription = null,
-            contentScale = androidx.compose.ui.layout.ContentScale.Fit,
-            modifier = Modifier
-                .align(Alignment.CenterHorizontally)
-                // Figma: bubble top 199 = body bottom (117 + 4 × 17.6 ≈ 187) + 12dp.
-                .padding(top = 12.dp)
-                // 1.3× Figma's 96×90 (125×117dp), the same enlargement as the
-                // launcher's "set up smart txt" bubble (BUBBLE_SCALE), so the
-                // bubble reads at the same size across onboarding and here; at
-                // Figma's size it looked small next to the text on the 4058W.
-                // ic_smart_txt_bubble is 288×270px, still more than this needs.
-                // size() is clamped by the Column, so on a short screen or a
-                // large font setting it shrinks (Fit) rather than overflowing.
-                .size(width = 96.dp * 1.3f, height = 90.dp * 1.3f),
-        )
     }
 }
