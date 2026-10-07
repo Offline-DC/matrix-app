@@ -116,7 +116,7 @@ inside libsignal's native `net` stack).
 
 ## PNI first-contact delivery — RESOLVED (verified on-device)
 
-A cold send to `+12489046456` (CDSI: `aci=null pni=PNI:e20ffa63…`) went through
+A cold send to `+15555550301` (CDSI: `aci=null pni=PNI:e20ffa63…`) went through
 end-to-end. Decisive log lines:
 ```
 refreshed prekey bundle for PNI:e20ffa63… (2 device(s))

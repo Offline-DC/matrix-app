@@ -47,7 +47,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * cookies out from under the bridge. We go further because that advice does not fit a
  * phone: there is no browser left to keep the session warm after the QR is scanned.
  *
- * Verified 2026-08-17 on `jacknugent27@gmail.com`: `POST accounts.google.com/
+ * Verified 2026-08-17 on `example.user@gmail.com`: `POST accounts.google.com/
  * RotateCookies` returns `200` + `[["identity.hfcr",600],["di",N]]` and
  * `Set-Cookie` for BOTH `__Secure-1PSIDTS` and `__Secure-3PSIDTS`, including for a
  * caller that holds neither (the mint / bootstrap case). It also MINTS, not just
@@ -115,7 +115,7 @@ object GMCookieRotation {
      *  returns on a request it is refusing for some OTHER reason — here, our Android
      *  User-Agent — not a verdict about the account. The byte-identical request sent
      *  with [GMPairingProto.WEB_USER_AGENT] returns 200 + `hfcr=600` and mints both
-     *  freshness cookies. Both observed 17 Aug 2026 on jacknugent27@gmail.com.
+     *  freshness cookies. Both observed 17 Aug 2026 on example.user@gmail.com.
      *
      *  So treat it as "we asked wrongly", never as "this session cannot rotate", and
      *  do NOT latch on it. */

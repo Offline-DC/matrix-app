@@ -73,7 +73,7 @@ internal class SmartTxtNotifier(context: Context) {
             // disagreed for the SAME person — the room name resolves via
             // contactName() ?: prettyHandle() while the sender uses the user map's
             // displayName. A short code rendered "+97854: 97854" (one prettified,
-            // one raw) and a saved contact rendered "noah: +15616762279" (one
+            // one raw) and a saved contact rendered "sam: +15555550102" (one
             // resolved, one not). Both are 1:1 chats; string inequality is simply
             // not the same question as "is this a group".
             .setConversationTitle(title.takeIf { isGroup })

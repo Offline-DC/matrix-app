@@ -7,7 +7,7 @@ import java.io.File
  * Reads a single string setting out of OpenBubbles' Flutter preferences.
  *
  * The one we want is `defaultHandle` — the address OpenBubbles sends new messages
- * from ("start messages from" in its UI), e.g. `tel:+14049801785` or
+ * from ("start messages from" in its UI), e.g. `tel:+15555550101` or
  * `mailto:you@icloud.com`. Same scheme-prefixed shape Smart Txt uses, so it maps
  * across without conversion.
  *
