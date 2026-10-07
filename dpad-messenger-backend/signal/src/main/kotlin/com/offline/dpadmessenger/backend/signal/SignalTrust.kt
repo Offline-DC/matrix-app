@@ -43,9 +43,12 @@ object SignalTrust {
 
     private const val TAG = "SignalTrust"
 
-    /** Bundled TLS provider, or null when it is unavailable on this device. */
+    /** Bundled TLS provider, or null when it is unavailable on this device.
+     *  On Android, Conscrypt omits its TrustManagerFactory unless asked (so a
+     *  globally installed copy never silently replaces the system's); we use
+     *  the provider directly, so ask for it. */
     private val bundledTls: Provider? by lazy {
-        runCatching { Conscrypt.newProvider() }
+        runCatching { Conscrypt.newProviderBuilder().provideTrustManager(true).build() }
             .onSuccess {
                 val v = Conscrypt.version()
                 Log.i(TAG, "TLS via bundled Conscrypt ${v.major()}.${v.minor()}.${v.patch()}")
