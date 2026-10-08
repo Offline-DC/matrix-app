@@ -586,8 +586,11 @@ private fun SignInPage(
             .fillMaxSize()
             .background(PageWhite)
             // OK while nothing editable has focus (or an IME let it through).
+            // On the eye (not a text box) OK is never the IME's, even if its
+            // window is still up: TCL's stock keyboard keeps one showing, and
+            // deferring here left the eye's OK dead on phones without TT9.
             .onPreviewKeyEvent { e ->
-                if (!e.isOk() || imeShowing()) return@onPreviewKeyEvent false
+                if (!e.isOk() || (imeShowing() && !eyeFocused)) return@onPreviewKeyEvent false
                 if (e.type == KeyEventType.KeyDown && e.nativeKeyEvent.repeatCount == 0) onOk()
                 true // swallow the KeyUp too, so it can't act on a field
             }
@@ -667,12 +670,30 @@ private fun SignInPage(
         Spacer(Modifier.height(12.dp))
     }
 
+    // The way out sends a real Back press through the Activity's dispatcher,
+    // so it does exactly what the hardware Back key does on this page --
+    // whatever that is for the host. In the launcher's SmartTxtActivity there
+    // is no handler on the sign-in page, so it closes Smart Txt.
+    //  - During device setup (LocalOnboardingContinue is non-null only then)
+    //    it is soft-right "skip": the launcher then shows "skip sign in?" to
+    //    confirm, so leaving here skips the sign-in and moves setup forward.
+    //  - Opened from All Apps it is soft-left "back": it just closes Smart Txt
+    //    and returns to where the user came from, like every other app.
+    // Hidden while signing in: leaving mid-request would drop a sign-in
+    // that may already be registering with Apple.
+    val inOnboarding = com.offline.dpadmessenger.ui.components.LocalOnboardingContinue.current != null
+    val backDispatcher = androidx.activity.compose.LocalOnBackPressedDispatcherOwner.current
+        ?.onBackPressedDispatcher
     com.offline.dpadmessenger.ui.navbar.SoftKeys(
+        left = if (inOnboarding || signingIn || backDispatcher == null) null
+        else com.offline.dpadmessenger.ui.navbar.SoftKey("back") { backDispatcher.onBackPressed() },
         center = when {
             signingIn -> com.offline.dpadmessenger.ui.navbar.SoftKey("signing in\u2026")
             eyeFocused -> com.offline.dpadmessenger.ui.navbar.SoftKey(if (passwordVisible) "hide" else "show") { onOk() }
             else -> com.offline.dpadmessenger.ui.navbar.SoftKey("sign in") { onOk() }
         },
+        right = if (!inOnboarding || signingIn || backDispatcher == null) null
+        else com.offline.dpadmessenger.ui.navbar.SoftKey("skip") { backDispatcher.onBackPressed() },
     )
 }
 
@@ -693,6 +714,63 @@ private fun rememberImeShowing(): () -> Boolean {
                 ?.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime()) == true
         }
     }
+}
+
+/**
+ * How long an OK handed to the IME waits for the IME to use it (type a symbol
+ * or candidate, or fire Next / Done) before it counts as a plain OK. TT9
+ * commits a picked symbol on the key-down itself, well inside this; long
+ * enough for a slow commit on a busy phone, short enough that sign-in still
+ * feels like it answered the press.
+ */
+private const val IME_OK_GRACE_MS = 400L
+
+/**
+ * Makes an OK that a text box handed to the IME still count when the IME
+ * does nothing with it.
+ *
+ * Why OK is handed over at all: while the IME has a window up, OK may be the
+ * IME's -- TT9 picks the highlighted symbol with it, and acting on it here
+ * once signed in with an "@" that was never typed. Why that is not enough:
+ * "its window is up" is not "it is choosing something". TCL's stock iQQi
+ * keyboard (what a phone has until Dumb TT9 is installed and made default)
+ * keeps a window up the whole time a box is focused and ignores OK, so every
+ * OK was handed over and lost -- sign-in and 2FA "verify" could not be
+ * pressed at all (test 4058W, 2026-10-08).
+ *
+ * So [handOver] gives the IME [IME_OK_GRACE_MS]; if by then the text is
+ * unchanged (no symbol or candidate committed) and nobody called [cancel]
+ * (the box's onValueChange and its Next / Done action do), the OK runs here.
+ * Rejected: dropping the hand-over, which brings the "@" bug back; and
+ * detecting the keyboard by package name, which fixes iQQi and leaves the
+ * next keyboard that behaves the same way broken.
+ */
+private class ImeOkFallback(private val scope: kotlinx.coroutines.CoroutineScope) {
+    private var job: kotlinx.coroutines.Job? = null
+
+    fun handOver(currentValue: () -> String, onOk: () -> Unit) {
+        val before = currentValue()
+        cancel()
+        job = scope.launch {
+            delay(IME_OK_GRACE_MS)
+            if (currentValue() == before) {
+                android.util.Log.i("SmartTxtSignIn", "IME did nothing with OK in ${IME_OK_GRACE_MS}ms — taking it as OK")
+                job = null
+                onOk()
+            }
+        }
+    }
+
+    fun cancel() {
+        job?.cancel()
+        job = null
+    }
+}
+
+@Composable
+private fun rememberImeOkFallback(): ImeOkFallback {
+    val scope = rememberCoroutineScope()
+    return remember(scope) { ImeOkFallback(scope) }
 }
 
 private fun androidx.compose.ui.input.key.KeyEvent.isOk(): Boolean =
@@ -737,6 +815,12 @@ private fun SignInField(
     trailing: (@Composable () -> Unit)? = null,
 ) {
     var focused by remember { mutableStateOf(false) }
+
+    // An OK handed to the IME that it does nothing with still acts -- see
+    // ImeOkFallback. Without it, a keyboard that keeps its window up (TCL's
+    // stock iQQi, i.e. any phone without Dumb TT9) left sign-in unstartable.
+    val currentValue by androidx.compose.runtime.rememberUpdatedState(value)
+    val imeOkFallback = rememberImeOkFallback()
     // Fixed box height (sp, so it tracks font scale), and the offset from the
     // box's top to the field's top that puts the middle of lowercase letters
     // on the box's centre line. Both from sp, so they scale together.
@@ -749,15 +833,15 @@ private fun SignInField(
         Text(label, style = SignInBody, modifier = Modifier.fillMaxWidth())
         androidx.compose.foundation.text.BasicTextField(
             value = value,
-            onValueChange = onValueChange,
+            onValueChange = { imeOkFallback.cancel(); onValueChange(it) },
             singleLine = true,
             textStyle = SignInInput,
             cursorBrush = androidx.compose.ui.graphics.SolidColor(InkStrong),
             visualTransformation = if (hidden) PasswordVisualTransformation() else VisualTransformation.None,
             keyboardOptions = KeyboardOptions(keyboardType = keyboardType, imeAction = imeAction),
             keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-                onNext = { onImeAction() },
-                onDone = { onImeAction() },
+                onNext = { imeOkFallback.cancel(); onImeAction() },
+                onDone = { imeOkFallback.cancel(); onImeAction() },
             ),
             modifier = Modifier
                 .fillMaxWidth()
@@ -769,7 +853,10 @@ private fun SignInField(
                     // symbol, not sign in. Seen on device — picking "@" from
                     // the T9 symbols fired a sign-in with the "@" never typed.
                     if (imeShowing()) {
-                        android.util.Log.i("SmartTxtSignIn", "OK left to the IME (its window is showing)")
+                        if (e.type == KeyEventType.KeyDown && e.nativeKeyEvent.repeatCount == 0) {
+                            android.util.Log.i("SmartTxtSignIn", "OK left to the IME (its window is showing)")
+                            imeOkFallback.handOver({ currentValue }, onOk)
+                        }
                         return@onInterceptKeyBeforeSoftKeyboard false
                     }
                     if (e.type == KeyEventType.KeyDown && e.nativeKeyEvent.repeatCount == 0) onOk()
@@ -1037,6 +1124,10 @@ private fun TwoFactorPage(
     val imeShowing = rememberImeShowing()
     val complete = code.length == 6
     val onOk: () -> Unit = { if (complete && !resending) onVerify() }
+    // Same fallback as the sign-in boxes (ImeOkFallback): with a keyboard
+    // that keeps its window up, "verify" was otherwise unreachable.
+    val currentCode by androidx.compose.runtime.rememberUpdatedState(code)
+    val imeOkFallback = rememberImeOkFallback()
 
     Column(
         modifier = Modifier
@@ -1080,7 +1171,7 @@ private fun TwoFactorPage(
 
         androidx.compose.foundation.text.BasicTextField(
             value = code,
-            onValueChange = { if (!resending) onCodeChange(it) },
+            onValueChange = { imeOkFallback.cancel(); if (!resending) onCodeChange(it) },
             singleLine = true,
             // Not disabled while resending: a disabled field drops focus, and
             // nothing would put it back when the new code request lands.
@@ -1088,7 +1179,7 @@ private fun TwoFactorPage(
                 keyboardType = KeyboardType.NumberPassword,
                 imeAction = androidx.compose.ui.text.input.ImeAction.Done,
             ),
-            keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { onOk() }),
+            keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { imeOkFallback.cancel(); onOk() }),
             // The cells draw the digits; the field's own text is never shown.
             textStyle = SignInInput.copy(color = androidx.compose.ui.graphics.Color.Transparent),
             cursorBrush = androidx.compose.ui.graphics.SolidColor(androidx.compose.ui.graphics.Color.Transparent),
@@ -1096,7 +1187,14 @@ private fun TwoFactorPage(
                 .fillMaxWidth()
                 .focusRequester(codeFr)
                 .onInterceptKeyBeforeSoftKeyboard { e ->
-                    if (!e.isOk() || imeShowing()) return@onInterceptKeyBeforeSoftKeyboard false
+                    if (!e.isOk()) return@onInterceptKeyBeforeSoftKeyboard false
+                    if (imeShowing()) {
+                        if (e.type == KeyEventType.KeyDown && e.nativeKeyEvent.repeatCount == 0) {
+                            android.util.Log.i("SmartTxtSignIn", "2FA: OK left to the IME (its window is showing)")
+                            imeOkFallback.handOver({ currentCode }, onOk)
+                        }
+                        return@onInterceptKeyBeforeSoftKeyboard false
+                    }
                     if (e.type == KeyEventType.KeyDown && e.nativeKeyEvent.repeatCount == 0) onOk()
                     true
                 },
