@@ -107,6 +107,17 @@ internal object SmartTxtLogExporter {
             } catch (t: Throwable) {
                 Log.w(TAG, "meta.txt failed", t)
             }
+            // Durable event history (not a logcat capture, so no holes) — SmartTxtEvents.
+            try {
+                val events = SmartTxtEvents.file(context)
+                if (events.exists()) {
+                    zip.putNextEntry(ZipEntry("events.txt"))
+                    FileInputStream(events).use { it.copyTo(zip) }
+                    zip.closeEntry()
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "events.txt failed", t)
+            }
             val files = ringDir
                 ?.listFiles { f -> f.isFile && f.name.endsWith(".log") }
                 ?.sortedBy { it.lastModified() }
@@ -140,6 +151,9 @@ internal object SmartTxtLogExporter {
             append("capturedAtMs=").append(System.currentTimeMillis()).append('\n')
             appendMemoryContext(context)
             appendLogVolume()
+            // What the Smart Txt state IS right now (identity, login files, signed-in
+            // mismatch, push, clock, network) — see SmartTxtDiagSnapshot.
+            append(SmartTxtDiagSnapshot.build(context))
             appendReadingGuide()
         }
     }
@@ -230,6 +244,15 @@ internal object SmartTxtLogExporter {
         append("#   '[ring] logcat reader respawned' to see exactly where.\n")
         append("# a bundle that simply STOPS mid-drain is the old failure: the process was\n")
         append("#   low-memory-killed, so check the launcher's system logcat for lowmemorykiller\n")
+        append("# '# state' above         — Smart Txt state AT EXPORT. Check first:\n")
+        append("#   signedInMismatch=YES  — UI says signed in, native has no registration\n")
+        append("#     (sends go nowhere). Fix: Log out, or Diagnostics > smart txt deep reset.\n")
+        append("#   identitySha12         — maps to a qr_codes row (QR codes are shared).\n")
+        append("#   keystoreAliases       — >1 activation: alias = state survived a sign-out.\n")
+        append("#   net.tcp ...:5223 FAIL — can't reach Apple push; APS errors are network,\n")
+        append("#     not a refusal. ok + APSConnectError in the ring = Apple refused us.\n")
+        append("# events.txt              — durable history (no holes): REGISTER_*, PUSH_CERT_*,\n")
+        append("#   SIGN_OUT, COLD_START status, CLOCK_JUMP (time changed under us), BOOT.\n")
     }
 
     /** Launcher's cached IMEI when present (shared prefs, same package at

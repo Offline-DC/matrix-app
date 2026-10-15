@@ -128,6 +128,7 @@ object SmartTxtRepository {
             else -> SmartTxtStatus.UNREGISTERED
         }
         Log.i(TAG, "restoreStatus → ${_status.value}")
+        SmartTxtEvents.record(appContext, "COLD_START", "status=${_status.value}")
 
         // CHECK REGISTRATION HEALTH ON EVERY COLD START. There used to be a 12h
         // WorkManager job here re-running the whole register flow; it duplicated
@@ -179,6 +180,7 @@ object SmartTxtRepository {
                 "user to sign in again, keeping history.",
         )
         val message = "Apple signed this device out of iMessage. Sign in again to keep sending."
+        SmartTxtEvents.record(context, "REGISTER_TERMINAL", error)
         _nativeError.value = message
         // PERSIST before tearing down. signOutKeepingHistory only flips an in-memory
         // StateFlow; the cold-start gate is isRegistered(), which reads lastRegisteredMs
@@ -379,11 +381,13 @@ object SmartTxtRepository {
             store.markRegistered(account.lastRegisteredMs)
             connectInBackground(appContext)
             _status.value = SmartTxtStatus.REGISTERED
+            SmartTxtEvents.record(appContext, "REGISTER_OK", "handles=${result.handles.size}")
             RegistrationResult.Success(account)
         }
         is RegisterResult.Failure -> {
             _status.value = SmartTxtStatus.UNREGISTERED
             Log.w(TAG, "registration failed: ${result.message}")
+            SmartTxtEvents.record(appContext, "REGISTER_FAIL", result.message)
             RegistrationResult.Failure(result.message)
         }
     }
@@ -834,6 +838,7 @@ object SmartTxtRepository {
                     store.markRegistered(updated.lastRegisteredMs)
                     _status.value = SmartTxtStatus.REGISTERED
                     Log.i(TAG, "fixConnection: recovered")
+                    SmartTxtEvents.record(appContext, "REREGISTER_OK", "handles=${updated.handles.size}")
                     RegistrationResult.Success(updated)
                 }
             }
@@ -842,6 +847,7 @@ object SmartTxtRepository {
                 // actually said rather than on our own user-facing copy.
                 lastReregisterRaw.set(r.raw)
                 Log.w(TAG, "fixConnection: re-register failed: ${r.message}")
+                SmartTxtEvents.record(appContext, "REREGISTER_FAIL", r.message)
                 RegistrationResult.Failure(r.message)
             }
         }
@@ -889,6 +895,7 @@ object SmartTxtRepository {
             // os_config.plist) is kept so a fresh registration still validates via NAC.
             RustPushNative.runCatchingNativeLogout()
             SmartTxtAccountStore(context.applicationContext).clear()
+            SmartTxtEvents.record(context, "SIGN_OUT", "wipe=true (Log out)")
             _status.value = SmartTxtStatus.UNREGISTERED
         }
     }
@@ -910,6 +917,7 @@ object SmartTxtRepository {
     internal fun setPushCertRejected(context: Context, rejected: Boolean) {
         if (_pushCertRejected.value == rejected) return
         Log.w(TAG, "pushCertRejected → $rejected")
+        SmartTxtEvents.record(context, if (rejected) "PUSH_CERT_REJECTED" else "PUSH_CERT_OK", "")
         _pushCertRejected.value = rejected
         // The notification is the PRIMARY surface, not the dialog: this failure happens
         // while the app is closed (the push connection lives in the launcher process),
@@ -924,6 +932,7 @@ object SmartTxtRepository {
     fun signOutKeepingHistory(context: Context) {
         shutdown(context, wipe = false)
         _status.value = SmartTxtStatus.UNREGISTERED
+        SmartTxtEvents.record(context, "SIGN_OUT", "keepHistory=true")
     }
 
     /**
