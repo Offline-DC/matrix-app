@@ -396,6 +396,40 @@ fun DpadComposer(
                         // Pre-IME key handler: act on DPAD before the text
                         // field consumes events for cursor movement.
                         .onPreviewKeyEvent { event ->
+                            // HIT hardware arrows (slide-out QWERTY and keypad D-pad): inside the text they move the
+                            // cursor one character per press (we move it ourselves and consume
+                            // the key — returning false is not enough, because Compose's text
+                            // field treats a DPAD-source arrow as focus navigation and jumps to
+                            // "+"/send even with the cursor mid-text). At the very start / end
+                            // a fresh press falls through to the rules below, so "<" still
+                            // reaches "+" and ">" still reaches send; a HELD key stops at the
+                            // edge instead of flying out of the field. Never runs off the HIT
+                            // (isFromHitHardwareKeys is false there), so the TCL is untouched.
+                            if ((event.key == Key.DirectionLeft || event.key == Key.DirectionRight) &&
+                                isFromHitHardwareKeys(event)
+                            ) {
+                                // Key-ups carry no navigation; swallow them so a release after
+                                // the cursor reaches an end can't be read as "leave the field".
+                                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent true
+                                val left = event.key == Key.DirectionLeft
+                                val sel = fieldValue.selection
+                                val len = fieldValue.text.length
+                                val atEdge = sel.collapsed &&
+                                    (if (left) sel.start == 0 else sel.start >= len)
+                                val isRepeat = event.nativeKeyEvent.repeatCount != 0
+                                if (!atEdge || isRepeat) {
+                                    if (!atEdge) {
+                                        val pos = if (left) {
+                                            if (sel.collapsed) sel.start - 1 else sel.min
+                                        } else {
+                                            if (sel.collapsed) sel.end + 1 else sel.max
+                                        }
+                                        fieldValue = fieldValue.copy(selection = TextRange(pos.coerceIn(0, len)))
+                                    }
+                                    return@onPreviewKeyEvent true
+                                }
+                                // fresh press at the edge: fall through and leave the field
+                            }
                             if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                             if (event.nativeKeyEvent.repeatCount != 0) return@onPreviewKeyEvent false
                             when (event.key) {
@@ -832,3 +866,26 @@ private val TextFieldValueSaver = androidx.compose.runtime.saveable.Saver<TextFi
         )
     },
 )
+
+/**
+ * True when [event] comes from one of the HIT's own keyboards: the slide-out
+ * QWERTY (`mtk-kpd`) or the keypad/D-pad (`aw9523-key`).
+ *
+ * Matched by input-device name and gated to the HIT (same test the Dumb Keys
+ * keyboard uses for its slider layers), so no other handset -- the TCL included --
+ * is ever affected, even one whose keypad happens to use the same driver name.
+ * Events injected by an IME (VIRTUAL_KEYBOARD device id) are excluded.
+ */
+private val HIT_KEY_DEVICES = setOf("mtk-kpd", "aw9523-key")
+
+private val IS_HIT: Boolean = listOf(
+    android.os.Build.MODEL, android.os.Build.DEVICE, android.os.Build.MANUFACTURER,
+).any { (it ?: "").uppercase().startsWith("HIT") }
+
+private fun isFromHitHardwareKeys(event: androidx.compose.ui.input.key.KeyEvent): Boolean {
+    if (!IS_HIT) return false
+    val native = event.nativeKeyEvent
+    if (native.deviceId == android.view.KeyCharacterMap.VIRTUAL_KEYBOARD) return false
+    val device = native.device ?: return false
+    return !device.isVirtual && device.name in HIT_KEY_DEVICES
+}
