@@ -2,6 +2,7 @@ package com.offline.dpadmessenger.backend.smarttxt
 
 import android.util.Base64
 import android.util.Log
+import androidx.annotation.VisibleForTesting
 import com.offline.dpadmessenger.backend.smarttxt.absinthe.AbsintheStub
 import com.offline.dpadmessenger.backend.smarttxt.absinthe.AbsintheUnavailableException
 import com.offline.dpadmessenger.backend.smarttxt.relay.RelayException
@@ -284,105 +285,6 @@ class RustPushBridge(
         }
     }
 
-    /**
-     * Convert a raw native error — often deeply-nested Rust Debug output like
-     * `ErrorGettingAnisette(WsError(Http(Response { status: 400, … })))` — into a short,
-     * human-readable message that still names the failing stage and any HTTP status, so
-     * it stays useful for debugging without dumping raw Rust at the user. Callers log the
-     * raw string separately, so nothing is lost for deep debugging.
-     */
-    private fun humanizeLoginError(raw: String?): String {
-        val r = raw?.trim().orEmpty()
-        if (r.isEmpty()) return "Sign-in failed. Please try again."
-        val lower = r.lowercase()
-        val status = Regex("""status:\s*(\d{3})""").find(r)?.groupValues?.getOrNull(1)
-        val httpHint = if (status != null) " (server returned HTTP $status)" else ""
-        // Order matters: most specific first. In particular the timeout and
-        // network checks sit ABOVE the generic "2fa" check, because a 2FA-time
-        // timeout ("2FA verification timed out …") also contains "2fa" and would
-        // otherwise be mislabeled as a wrong code. The IDS-code checks below rely
-        // on the FFI now formatting rustpush errors with Display (not Debug), so
-        // the "(6001)"/"(6004)"/"(6005)"/"(6009)" suffixes are actually present.
-        return when {
-            // A genuinely wrong 2FA code — distinct from a 2FA-time timeout/network
-            // drop, which fall through to the timeout/connection branches below.
-            lower.contains("bad 2fa code") ->
-                "That verification code didn't work. Request a new code and try again."
-            lower.contains("anisette") || lower.contains("provision") ->
-                "Couldn't reach the activation server$httpHint. This is usually a temporary " +
-                    "server-side problem — wait a moment and try again."
-            lower.contains("timed out") || lower.contains("timeout") ->
-                "The server took too long to respond$httpHint. Check your connection and try again."
-            lower.contains("apns") || lower.contains("connect failed") ||
-                lower.contains("connection refused") || lower.contains("os error 111") ->
-                "Couldn't connect to Apple's servers. Check your internet connection and try again."
-            // IDS registration errors. rustpush embeds the numeric code in its
-            // Display text, e.g. "Registration Error … (6005)".
-            lower.contains("rate-limit") || lower.contains("rate limit") ||
-                lower.contains("temporarily disabled") || lower.contains("(6009)") ->
-                // Says DEVICE because that is what Apple rejects here — but do NOT
-                // promise the customer that their other devices are fine. That claim
-                // was in this string until Aug 2026 and it is not reliably true: a
-                // customer in 6009 lost iMessage on his iPhone and Mac as well, so
-                // the copy was reassuring him about something he could see was false
-                // while he sat in a total outage. State what we know, promise nothing
-                // about blast radius.
-                //
-                // Deliberately does NOT say "try again". rustpush's own text for this
-                // condition (error.rs:38) warns that "trying to reconfigure or
-                // re-install to 'fix' the rate limit will result in being temporarily
-                // blocked" — retrying is the one action that makes it worse, so the
-                // copy steers away from it rather than inviting it.
-                //
-                // Deliberately omits Apple's apple.co/IMFT-mac escalation. rustpush
-                // pairs that link with "Do not mention you are using OpenBubbles";
-                // routing paying customers to Apple support with an instruction to
-                // conceal what they are running is not something we should build into
-                // a product flow, and at fleet scale it draws attention to every
-                // handset rather than resolving one. Keep it as an internal support
-                // option, not app copy: support@dumb.co walks the customer through
-                // filing with Apple person-to-person, so we can judge each case
-                // instead of shipping one blanket instruction to the whole fleet.
-                //
-                // The "wait and try again" wording this replaced was actively
-                // harmful and contradicted the paragraph above it. Observed in the
-                // field (Aug 2026): a customer in 6009 read "try again", tapped
-                // Settings -> Re-register now three times in 77s, and every tap
-                // preempted rustpush's backoff and re-hit an already-flagged
-                // account. Copy here must steer AWAY from retrying.
-                "Apple has paused iMessage registration for this device. Re-registering " +
-                    "again makes the pause last longer, so please don't retry. Email " +
-                    "support@dumb.co and we'll help you get it lifted with Apple."
-            lower.contains("(6001)") ->
-                "iMessage can't register while Advanced Data Protection or Contact Key Verification " +
-                    "is on. Turn both off in your Apple Account settings, then try again."
-            lower.contains("(6005)") ->
-                "Apple couldn't verify your account (6005). Wait a moment and sign in again; if it " +
-                    "keeps happening, re-run device setup."
-            lower.contains("(6004)") ->
-                "Apple asked us to try again (6004). Wait a moment and sign in again."
-            lower.contains("bad credentials") || lower.contains("needslogin") ||
-                lower.contains("-20101") || lower.contains("authentication failed") ->
-                "Your Apple ID or password is incorrect. Check them and try again."
-            lower.contains("2fa") || lower.contains("two-factor") || lower.contains("two factor") ||
-                lower.contains("verification code") ->
-                "That verification code didn't work. Request a new code and try again."
-            lower.contains("nac") || lower.contains("validation") ->
-                "Couldn't verify this device with Apple$httpHint. Try again in a moment."
-            lower.contains("dumb") || lower.contains("os_config") || lower.contains("device identity") ->
-                "This device isn't fully set up for iMessage yet. Reopen the app to finish device " +
-                    "setup, then try again."
-            lower.contains("locked") ->
-                "This Apple ID appears to be locked. Unlock it at appleid.apple.com, then try again."
-            status != null ->
-                "The server returned an error (HTTP $status). This is usually server-side — try again shortly."
-            else -> {
-                val tail = r.take(120).replace(Regex("""\s+"""), " ")
-                "Sign-in failed. (Technical detail: $tail)"
-            }
-        }
-    }
-
     /** Parse the `{"handles":[…]}` / `{"error":…}` JSON from `nativeRegister`. */
     private fun parseRegisterResult(appleId: String, resultJson: String): RegistrationResult {
         val obj = json.parseToJsonElement(resultJson).jsonObject
@@ -507,6 +409,141 @@ class RustPushBridge(
         /** True once `libsmarttxt_ffi.so` is bundled and loads. Auto-detected —
          *  no manual flag to flip. */
         val NATIVE_AVAILABLE: Boolean get() = RustPushNative.loaded
+
+        /**
+         * Convert a raw native error — often deeply-nested Rust Debug output like
+         * `ErrorGettingAnisette(WsError(Http(Response { status: 400, … })))` — into a short,
+         * human-readable message that still names the failing stage and any HTTP status, so
+         * it stays useful for debugging without dumping raw Rust at the user. Callers log the
+         * raw string separately, so nothing is lost for deep debugging.
+         *
+         * Lives on the companion (it reads no instance state) so the mapping can be pinned
+         * by a plain JVM test — [RustPushBridgeLoginErrorTest] — without constructing a
+         * bridge, which would need the native library.
+         */
+        @VisibleForTesting
+        internal fun humanizeLoginError(raw: String?): String {
+            val r = raw?.trim().orEmpty()
+            if (r.isEmpty()) return "Sign-in failed. Please try again."
+            val lower = r.lowercase()
+            val status = Regex("""status:\s*(\d{3})""").find(r)?.groupValues?.getOrNull(1)
+            val httpHint = if (status != null) " (server returned HTTP $status)" else ""
+            // Order matters: most specific first. In particular the timeout and
+            // network checks sit ABOVE the generic "2fa" check, because a 2FA-time
+            // timeout ("2FA verification timed out …") also contains "2fa" and would
+            // otherwise be mislabeled as a wrong code. The IDS-code checks below rely
+            // on the FFI now formatting rustpush errors with Display (not Debug), so
+            // the "(6001)"/"(6004)"/"(6005)"/"(6009)" suffixes are actually present.
+            return when {
+                // A genuinely wrong 2FA code — distinct from a 2FA-time timeout/network
+                // drop, which fall through to the timeout/connection branches below.
+                lower.contains("bad 2fa code") ->
+                    "That verification code didn't work. Request a new code and try again."
+                lower.contains("anisette") || lower.contains("provision") ->
+                    "Couldn't reach the activation server$httpHint. This is usually a temporary " +
+                        "server-side problem — wait a moment and try again."
+                lower.contains("timed out") || lower.contains("timeout") ->
+                    "The server took too long to respond$httpHint. Check your connection and try again."
+                // Oct 2026: four customers (Connor and three others) could not sign in, and
+                // every one of them had a handset clock that was off by hours to a day. Apple
+                // refuses the APS connect when the clock is wrong, which surfaces from
+                // rustpush as `register: APS not ready! token` (or an APSConnectError), and
+                // until now that fell through to the "Technical detail" fallback below —
+                // meaningless to the customer, so each one emailed support. Jack reproduced
+                // it by setting his own clock wrong. This branch sits ABOVE the generic
+                // "apns"/"connect failed" branch on purpose: "aps" is not a substring of
+                // "apns", but the reverse ordering would be a trap for anyone adding an
+                // "aps" check later. Copy is from Jack's Oct 19 support reply, shortened.
+                // (Claudette card: "Smart Txt sign-in error should say the phone clock may
+                // be wrong (APS not ready)".)
+                //
+                // Three spellings of the same refusal: `APS not ready! token` is
+                // rustpush's APSNotReady Display text (error.rs:155); `Aps connection
+                // failed. You need to re-setup your device…` is APSConnectError's
+                // Display text (error.rs:40), which is what the FFI's `{e}` formatting
+                // actually emits; `APSConnectError(2)` is its Debug form, seen in logs
+                // and in exception messages that were built with `{e:?}`. Note the
+                // Display form says "connection failed", not "connect failed", so the
+                // branch below would NOT have caught it.
+                // Jack, 2026-10-21: keep the copy handset-agnostic (no Settings path — the
+                // TCL and the HIT label it differently) and keep the raw detail on the
+                // card, the way the fallback does, so support can still tell this refusal
+                // apart from the others when a customer reads the screen back.
+                lower.contains("aps not ready") || lower.contains("aps connection failed") ||
+                    lower.contains("apsconnecterror") ->
+                    "This is usually because the phone's date or time is wrong. In Settings, " +
+                        "set the date & time to be correct, then restart your phone and try " +
+                        "again. (Technical detail: ${technicalTail(r)})"
+                lower.contains("apns") || lower.contains("connect failed") ||
+                    lower.contains("connection refused") || lower.contains("os error 111") ->
+                    "Couldn't connect to Apple's servers. Check your internet connection and try again."
+                // IDS registration errors. rustpush embeds the numeric code in its
+                // Display text, e.g. "Registration Error … (6005)".
+                lower.contains("rate-limit") || lower.contains("rate limit") ||
+                    lower.contains("temporarily disabled") || lower.contains("(6009)") ->
+                    // Says DEVICE because that is what Apple rejects here — but do NOT
+                    // promise the customer that their other devices are fine. That claim
+                    // was in this string until Aug 2026 and it is not reliably true: a
+                    // customer in 6009 lost iMessage on his iPhone and Mac as well, so
+                    // the copy was reassuring him about something he could see was false
+                    // while he sat in a total outage. State what we know, promise nothing
+                    // about blast radius.
+                    //
+                    // Deliberately does NOT say "try again". rustpush's own text for this
+                    // condition (error.rs:38) warns that "trying to reconfigure or
+                    // re-install to 'fix' the rate limit will result in being temporarily
+                    // blocked" — retrying is the one action that makes it worse, so the
+                    // copy steers away from it rather than inviting it.
+                    //
+                    // Deliberately omits Apple's apple.co/IMFT-mac escalation. rustpush
+                    // pairs that link with "Do not mention you are using OpenBubbles";
+                    // routing paying customers to Apple support with an instruction to
+                    // conceal what they are running is not something we should build into
+                    // a product flow, and at fleet scale it draws attention to every
+                    // handset rather than resolving one. Keep it as an internal support
+                    // option, not app copy: support@dumb.co walks the customer through
+                    // filing with Apple person-to-person, so we can judge each case
+                    // instead of shipping one blanket instruction to the whole fleet.
+                    //
+                    // The "wait and try again" wording this replaced was actively
+                    // harmful and contradicted the paragraph above it. Observed in the
+                    // field (Aug 2026): a customer in 6009 read "try again", tapped
+                    // Settings -> Re-register now three times in 77s, and every tap
+                    // preempted rustpush's backoff and re-hit an already-flagged
+                    // account. Copy here must steer AWAY from retrying.
+                    "Apple has paused iMessage registration for this device. Re-registering " +
+                        "again makes the pause last longer, so please don't retry. Email " +
+                        "support@dumb.co and we'll help you get it lifted with Apple."
+                lower.contains("(6001)") ->
+                    "iMessage can't register while Advanced Data Protection or Contact Key Verification " +
+                        "is on. Turn both off in your Apple Account settings, then try again."
+                lower.contains("(6005)") ->
+                    "Apple couldn't verify your account (6005). Wait a moment and sign in again; if it " +
+                        "keeps happening, re-run device setup."
+                lower.contains("(6004)") ->
+                    "Apple asked us to try again (6004). Wait a moment and sign in again."
+                lower.contains("bad credentials") || lower.contains("needslogin") ||
+                    lower.contains("-20101") || lower.contains("authentication failed") ->
+                    "Your Apple ID or password is incorrect. Check them and try again."
+                lower.contains("2fa") || lower.contains("two-factor") || lower.contains("two factor") ||
+                    lower.contains("verification code") ->
+                    "That verification code didn't work. Request a new code and try again."
+                lower.contains("nac") || lower.contains("validation") ->
+                    "Couldn't verify this device with Apple$httpHint. Try again in a moment."
+                lower.contains("dumb") || lower.contains("os_config") || lower.contains("device identity") ->
+                    "This device isn't fully set up for iMessage yet. Reopen the app to finish device " +
+                        "setup, then try again."
+                lower.contains("locked") ->
+                    "This Apple ID appears to be locked. Unlock it at appleid.apple.com, then try again."
+                status != null ->
+                    "The server returned an error (HTTP $status). This is usually server-side — try again shortly."
+                else -> "Sign-in failed. (Technical detail: ${technicalTail(r)})"
+            }
+        }
+
+        /** The raw error, shortened and single-line, for a "(Technical detail: …)" suffix. */
+        private fun technicalTail(raw: String): String =
+            raw.take(120).replace(Regex("""\s+"""), " ")
     }
 }
 
