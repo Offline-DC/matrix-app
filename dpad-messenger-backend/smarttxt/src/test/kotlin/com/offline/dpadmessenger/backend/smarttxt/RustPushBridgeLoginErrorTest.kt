@@ -24,42 +24,44 @@ import org.junit.Test
 class RustPushBridgeLoginErrorTest {
 
     private val clockMessage =
-        "This is usually because the phone's date or time is wrong. Go to Settings > " +
-            "Phone settings > Date & time and turn on automatic date & time. If it's " +
-            "already on, set the date and time by hand to match your smartphone. Then " +
-            "restart the phone and sign in again."
+        "This is usually because the phone's date or time is wrong. In Settings, " +
+            "set the date & time to be correct, then restart your phone and try again."
+
+    private fun clockMessageFor(raw: String) = "$clockMessage (Technical detail: $raw)"
 
     @Test
-    fun `APS not ready maps to the clock message`() {
-        assertEquals(clockMessage, RustPushBridge.humanizeLoginError("register: APS not ready! token"))
+    fun `APS not ready maps to the clock message, with the raw detail kept`() {
+        assertEquals(
+            clockMessageFor("register: APS not ready! token"),
+            RustPushBridge.humanizeLoginError("register: APS not ready! token"),
+        )
     }
 
     @Test
     fun `APSConnectError maps to the clock message`() {
-        assertEquals(clockMessage, RustPushBridge.humanizeLoginError("APSConnectError(2)"))
+        assertEquals(clockMessageFor("APSConnectError(2)"), RustPushBridge.humanizeLoginError("APSConnectError(2)"))
     }
 
     @Test
     fun `the Display form of APSConnectError maps to the clock message too`() {
         // What the FFI's `{e}` formatting actually emits (rustpush error.rs:40) —
         // the Debug form above is what shows up in logs and exception messages.
-        assertEquals(
-            clockMessage,
-            RustPushBridge.humanizeLoginError(
-                "register: Aps connection failed. You need to re-setup your device. " +
-                    "Go to Settings -> Change Apple Hardware. For self-hosted users, have " +
-                    "your hardware code ready. (2)",
-            ),
-        )
+        val raw = "register: Aps connection failed. You need to re-setup your device. " +
+            "Go to Settings -> Change Apple Hardware. For self-hosted users, have " +
+            "your hardware code ready. (2)"
+        // The detail is capped at 120 characters, like the generic fallback's.
+        assertEquals(clockMessageFor(raw.take(120)), RustPushBridge.humanizeLoginError(raw))
     }
 
     @Test
-    fun `the clock message is not the raw technical-detail fallback`() {
-        // The complaint on the card is that the customer saw the raw rustpush text. Pin
-        // that the new mapping neither leaks it nor leaves the generic fallback in place.
+    fun `the clock message leads with the advice and keeps the raw text for support`() {
+        // The complaint on the card is that the customer saw ONLY the raw rustpush text.
+        // Jack's call (2026-10-21): say what to do first, handset-agnostic, and keep the raw
+        // text after it so support can still recognise the refusal.
         val shown = RustPushBridge.humanizeLoginError("register: APS not ready! token")
-        assertTrue(shown, !shown.contains("APS not ready"))
-        assertTrue(shown, !shown.contains("Technical detail"))
+        assertTrue(shown, shown.startsWith("This is usually because the phone's date or time is wrong."))
+        assertTrue(shown, !shown.contains("Phone settings"))
+        assertTrue(shown, shown.endsWith("(Technical detail: register: APS not ready! token)"))
     }
 
     @Test

@@ -465,12 +465,15 @@ class RustPushBridge(
                 // and in exception messages that were built with `{e:?}`. Note the
                 // Display form says "connection failed", not "connect failed", so the
                 // branch below would NOT have caught it.
+                // Jack, 2026-10-21: keep the copy handset-agnostic (no Settings path — the
+                // TCL and the HIT label it differently) and keep the raw detail on the
+                // card, the way the fallback does, so support can still tell this refusal
+                // apart from the others when a customer reads the screen back.
                 lower.contains("aps not ready") || lower.contains("aps connection failed") ||
                     lower.contains("apsconnecterror") ->
-                    "This is usually because the phone's date or time is wrong. Go to Settings > " +
-                        "Phone settings > Date & time and turn on automatic date & time. If it's " +
-                        "already on, set the date and time by hand to match your smartphone. Then " +
-                        "restart the phone and sign in again."
+                    "This is usually because the phone's date or time is wrong. In Settings, " +
+                        "set the date & time to be correct, then restart your phone and try " +
+                        "again. (Technical detail: ${technicalTail(r)})"
                 lower.contains("apns") || lower.contains("connect failed") ||
                     lower.contains("connection refused") || lower.contains("os error 111") ->
                     "Couldn't connect to Apple's servers. Check your internet connection and try again."
@@ -534,12 +537,13 @@ class RustPushBridge(
                     "This Apple ID appears to be locked. Unlock it at appleid.apple.com, then try again."
                 status != null ->
                     "The server returned an error (HTTP $status). This is usually server-side — try again shortly."
-                else -> {
-                    val tail = r.take(120).replace(Regex("""\s+"""), " ")
-                    "Sign-in failed. (Technical detail: $tail)"
-                }
+                else -> "Sign-in failed. (Technical detail: ${technicalTail(r)})"
             }
         }
+
+        /** The raw error, shortened and single-line, for a "(Technical detail: …)" suffix. */
+        private fun technicalTail(raw: String): String =
+            raw.take(120).replace(Regex("""\s+"""), " ")
     }
 }
 
