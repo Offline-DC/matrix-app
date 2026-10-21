@@ -853,8 +853,10 @@ object SmartTxtRepository {
         }
     }
 
-    /** Failures no amount of retrying will fix — they need the user to do something. */
-    private fun isTerminalFailure(message: String): Boolean {
+    /** Failures no amount of retrying will fix — they need the user to do something.
+     *  Internal so [RustPushBridgeLoginErrorTest] can pin the classification. */
+    @androidx.annotation.VisibleForTesting
+    internal fun isTerminalFailure(message: String): Boolean {
         if (message == NOT_SIGNED_IN_MESSAGE ||
             message == NATIVE_MISSING_MESSAGE ||
             message == IDENTITY_MISSING_MESSAGE
@@ -877,7 +879,16 @@ object SmartTxtRepository {
             m.contains("temporarily disabled") ||        // error.rs:51 - iMessage access pulled
             m.contains("trusted phone number") ||        // error.rs:65 - needs the user
             m.contains("failed to authenticate") ||      // error.rs:63 - needs the user
-            (m.contains("registration error") && m.contains("6005"))
+            (m.contains("registration error") && m.contains("6005")) ||
+            // Oct 2026: Apple refusing the APS connect is, in practice, a handset
+            // clock that is hours or a day off (four customers in one week), which
+            // no retry fixes and only the user can — so Settings -> Re-register
+            // must say so, through the humanised message, instead of "still
+            // reconnecting in the background" forever. error.rs:155 and :40.
+            // (Claudette card: "Smart Txt sign-in error should say the phone
+            // clock may be wrong (APS not ready)".)
+            m.contains("aps not ready") ||
+            m.contains("aps connection failed")
     }
 
     @Synchronized
