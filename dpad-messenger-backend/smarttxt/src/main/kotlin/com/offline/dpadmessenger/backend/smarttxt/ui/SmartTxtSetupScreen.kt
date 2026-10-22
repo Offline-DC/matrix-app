@@ -57,7 +57,9 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -269,7 +271,12 @@ fun SmartTxtSetupScreen(
                     onRetry = { error = null },
                 )
             } else {
-                AutoFocus(appleIdFr)
+                // Coming back to a filled-in form (retry after a failed sign-in,
+                // or backing out of the 2FA / security-key page), the password
+                // is what usually needs fixing, so focus starts in the password
+                // box, with the cursor at the end of it (see SignInField). A
+                // fresh form, with no password yet, starts at the Apple ID.
+                AutoFocus(if (password.isNotEmpty()) passwordFr else appleIdFr)
                 SignInPage(
                     appleId = appleId,
                     onAppleIdChange = { appleId = it; error = null },
@@ -536,8 +543,9 @@ private val SignInError = androidx.compose.ui.text.TextStyle(
  *    whichever field has focus. While signing in the centre label reads
  *    "signing in…" and OK does nothing (no second registration).
  *  - **Show/hide (eye) icon** inside the password box, not in the Figma
- *    frame: Right from the password box lands on it, OK toggles (the
- *    navbar centre reads "show" / "hide" while it has focus), Left returns.
+ *    frame: Right from the end of the password lands on it (before the end,
+ *    Right moves the cursor), OK toggles (the navbar centre reads "show" /
+ *    "hide" while it has focus), Left returns.
  *  - **BasicTextField, not OutlinedTextField.** Material's field has a 56dp
  *    minimum height; the design's box is 27dp.
  *  - **Focus is shown on the box** — the stroke turns the brand blue
@@ -821,6 +829,21 @@ private fun SignInField(
     // stock iQQi, i.e. any phone without Dumb TT9) left sign-in unstartable.
     val currentValue by androidx.compose.runtime.rememberUpdatedState(value)
     val imeOkFallback = rememberImeOkFallback()
+
+    // The cursor is kept here, not left to the String overload of
+    // BasicTextField. That overload starts every new field with the cursor at
+    // the front, and this form is a new field each time it comes back: after a
+    // failed sign-in, "retry" puts the form back with the password still in
+    // the box but the cursor before its first character. Right from the
+    // password box goes to the eye, so the user couldn't move into the text at
+    // all, and anything typed from the Dumb Down app (pasted at the cursor) went
+    // in front of what was already there. So the cursor starts at the end of
+    // what's in the box, and a change made from outside the field puts it at
+    // the end again.
+    var fieldState by remember { mutableStateOf(TextFieldValue(value, TextRange(value.length))) }
+    val fieldValue = if (fieldState.text == value) fieldState
+        else TextFieldValue(value, TextRange(value.length))
+    val currentSelection by androidx.compose.runtime.rememberUpdatedState(fieldValue.selection)
     // Fixed box height (sp, so it tracks font scale), and the offset from the
     // box's top to the field's top that puts the middle of lowercase letters
     // on the box's centre line. Both from sp, so they scale together.
@@ -832,8 +855,13 @@ private fun SignInField(
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text(label, style = SignInBody, modifier = Modifier.fillMaxWidth())
         androidx.compose.foundation.text.BasicTextField(
-            value = value,
-            onValueChange = { imeOkFallback.cancel(); onValueChange(it) },
+            value = fieldValue,
+            onValueChange = { new ->
+                fieldState = new
+                // Only a change to the text is the caller's business; the
+                // cursor moving (D-pad Left / Right) is the field's own.
+                if (new.text != currentValue) { imeOkFallback.cancel(); onValueChange(new.text) }
+            },
             singleLine = true,
             textStyle = SignInInput,
             cursorBrush = androidx.compose.ui.graphics.SolidColor(InkStrong),
@@ -867,9 +895,13 @@ private fun SignInField(
                     when {
                         e.key == Key.DirectionDown && onDown != null -> { onDown(); true }
                         e.key == Key.DirectionUp && onUp != null -> { onUp(); true }
-                        // Right: password → eye. Moving the cursor inside the
-                        // box isn't needed — text arrives from the Dumb Down app.
-                        e.key == Key.DirectionRight && onRight != null -> { onRight(); true }
+                        // Right: password → eye, but only from the end of the
+                        // text. Before the end, Right moves the cursor (the field
+                        // handles that itself), so the user can go back and forth
+                        // through the password with Left / Right to fix it.
+                        e.key == Key.DirectionRight && onRight != null &&
+                            currentSelection.collapsed &&
+                            currentSelection.end >= currentValue.length -> { onRight(); true }
                         else -> false
                     }
                 },
