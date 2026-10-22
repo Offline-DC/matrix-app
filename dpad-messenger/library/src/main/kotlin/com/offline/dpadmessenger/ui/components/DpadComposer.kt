@@ -433,6 +433,20 @@ fun DpadComposer(
                             if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                             if (event.nativeKeyEvent.repeatCount != 0) return@onPreviewKeyEvent false
                             when (event.key) {
+                                // HIT: OK sends, as on the TCL. On the TCL the keyboard (Dumb
+                                // Keys) turns OK into the field's Send action itself and the
+                                // key never reaches us. With the HIT's slider open the keyboard
+                                // steps aside and passes every key straight to the app, so OK
+                                // (and the QWERTY's Enter) arrived here as plain key events that
+                                // a text field does nothing with -- people had to tab over to
+                                // the send button. Send if there is something to send; an empty
+                                // field swallows the press rather than complaining. HIT hardware
+                                // keys only, so the TCL path is untouched.
+                                Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> {
+                                    if (!isFromHitHardwareKeys(event)) return@onPreviewKeyEvent false
+                                    if (fieldValue.text.isNotBlank() || pendingAttachmentUri != null) submit()
+                                    true
+                                }
                                 Key.DirectionUp -> {
                                     // Only leave the field for the messages above
                                     // when the cursor is on the FIRST line —
