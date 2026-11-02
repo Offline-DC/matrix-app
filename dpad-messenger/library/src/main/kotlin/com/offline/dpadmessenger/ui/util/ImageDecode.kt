@@ -53,9 +53,10 @@ fun putCachedImage(key: String, bitmap: ImageBitmap) { bitmapCache.put(key, bitm
  * Tries the platform [ImageDecoder] first on API 28+ — it covers more formats
  * than the legacy [BitmapFactory] path, notably **HEIF/HEIC** (the format
  * iPhones send), plus WebP and animated stills. Falls back to BitmapFactory on
- * older builds or if ImageDecoder throws. Returns null when the device simply
- * can't decode the bytes (e.g. an HEIC on hardware with no HEVC/HEIF decoder),
- * so callers can show a clear "can't preview" state instead of spinning forever.
+ * older builds or if ImageDecoder throws, and after that to [HeicDecode] (HEIC
+ * through the HEVC video decoder, for Android 8.1 which has no HEIF decoder).
+ * Returns null when the device simply can't decode the bytes, so callers can
+ * show a clear "can't preview" state instead of spinning forever.
  *
  * @param maxEdge target size for the longer edge in px; <=0 disables downscale.
  */
@@ -85,7 +86,7 @@ fun decodeDownscaled(path: String, maxEdge: Int): ImageBitmap? {
         // else fall through to BitmapFactory
     }
 
-    return runCatching {
+    val viaFactory = runCatching {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(path, bounds)
         var sample = 1
@@ -94,4 +95,10 @@ fun decodeDownscaled(path: String, maxEdge: Int): ImageBitmap? {
         val opts = BitmapFactory.Options().apply { inSampleSize = sample }
         BitmapFactory.decodeFile(path, opts)?.asImageBitmap()
     }.getOrNull()
+    if (viaFactory != null) return viaFactory
+
+    // Last resort: a HEIC on a phone with no HEIF image decoder (Android 8.1,
+    // the HIT). The platform decoders above have said no; this one goes through
+    // the phone's HEVC *video* decoder instead. See HeicDecode.
+    return runCatching { HeicDecode.decode(file, maxEdge)?.asImageBitmap() }.getOrNull()
 }
