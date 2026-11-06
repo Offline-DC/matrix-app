@@ -651,12 +651,43 @@ private fun VideoPlayer(path: String, handle: VideoHandle) {
         Text(text = "Can't play this video on this device.", color = Color.White)
         return
     }
+    // HIT only: a video the phone can't decode (iPhone HDR = 10-bit HEVC) is
+    // converted once to plain H.264 first -- see HitVideoConvert. Everywhere else
+    // this is the original path, at once, and nothing below changes.
+    var progress by remember(path) { mutableStateOf(0f) }
+    // Only true once a real conversion starts; the quick "does it need one?" check
+    // shows nothing, so ordinary videos open the way they always did.
+    var converting by remember(path) { mutableStateOf(false) }
+    val playPath by produceState<String?>(
+        initialValue = if (com.offline.dpadmessenger.ui.util.HitVideoConvert.IS_HIT) null else path,
+        key1 = path,
+    ) {
+        if (value == null) {
+            value = com.offline.dpadmessenger.ui.util.HitVideoConvert.playablePath(path) { p ->
+                converting = true
+                progress = p
+            } ?: run { failed = true; null }
+        }
+    }
+    val source = playPath
+    if (source == null) {
+        if (!converting) return
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            CircularProgressIndicator(color = Color.White)
+            Text(
+                text = if (progress > 0f) "preparing video… ${(progress * 100).toInt()}%" else "preparing video…",
+                color = Color.White,
+                modifier = Modifier.padding(top = 12.dp),
+            )
+        }
+        return
+    }
     val context = LocalContext.current
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = {
             VideoView(context).apply {
-                setVideoPath(path)
+                setVideoPath(source)
                 // No MediaController. The stock seek-bar overlay wants a touch
                 // drag on a handset that has no touch to give it, and it sat over
                 // the bottom of the picture duplicating a control the nav bar now
