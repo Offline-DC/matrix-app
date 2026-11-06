@@ -1,0 +1,11 @@
+The files lib*_hit.so in src/main/jniLibs/armeabi-v7a/ are FFmpeg (https://ffmpeg.org),
+version n6.1.2, licensed under the GNU Lesser General Public License version 2.1 or later
+(https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html).
+
+They are unmodified FFmpeg source, built as separate shared libraries with the
+configure line in build-hitvideo.sh (hevc decoder, mov demuxer and swscale only, no
+GPL or nonfree components). The corresponding source is FFmpeg tag n6.1.2:
+https://github.com/FFmpeg/FFmpeg/tree/n6.1.2
+
+This software uses code of FFmpeg licensed under the LGPLv2.1 and its source can be
+downloaded from https://ffmpeg.org/.
