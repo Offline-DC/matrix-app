@@ -155,7 +155,7 @@ fun FullscreenMediaViewer(
             contentAlignment = Alignment.Center,
         ) {
             when {
-                isVideo -> VideoPlayer(path, video)
+                isVideo -> VideoPlayer(path, video, keyFocus)
                 else -> ImageContent(path, zoom)
             }
         }
@@ -645,7 +645,7 @@ private class VideoHandle {
 }
 
 @Composable
-private fun VideoPlayer(path: String, handle: VideoHandle) {
+private fun VideoPlayer(path: String, handle: VideoHandle, viewerFocus: FocusRequester) {
     var failed by remember { mutableStateOf(false) }
     if (failed) {
         Text(text = "Can't play this video on this device.", color = Color.White)
@@ -687,6 +687,15 @@ private fun VideoPlayer(path: String, handle: VideoHandle) {
         modifier = Modifier.fillMaxSize(),
         factory = {
             VideoView(context).apply {
+                // The viewer's key handling (OK = play/pause) only sees keys while
+                // its own Column is focused. A VideoView is focusable by default
+                // and takes focus when it is added, and on the HIT it is added
+                // AFTER the viewer asked for focus (the player waits for the
+                // "preparing video" step). OK then went to the chat screen
+                // underneath, which closed the viewer (Jack, 2026-11-05). So the
+                // view never takes focus, and the viewer asks for it again below.
+                isFocusable = false
+                isFocusableInTouchMode = false
                 setVideoPath(source)
                 // No MediaController. The stock seek-bar overlay wants a touch
                 // drag on a handset that has no touch to give it, and it sat over
@@ -702,5 +711,10 @@ private fun VideoPlayer(path: String, handle: VideoHandle) {
             }
         },
     )
+    // Once the player view exists, put the keypad back on the viewer (see above).
+    LaunchedEffect(source) {
+        withFrameNanos {}
+        runCatching { viewerFocus.requestFocus() }
+    }
     DisposableEffect(Unit) { onDispose { handle.detach() } }
 }
