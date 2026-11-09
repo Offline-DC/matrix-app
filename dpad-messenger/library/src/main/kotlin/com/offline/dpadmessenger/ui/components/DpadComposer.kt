@@ -164,8 +164,16 @@ fun DpadComposer(
         if (fieldAttached && autoFocusOnAttach) {
             runCatching { fieldFr.requestFocus() }
             // Defensively hide the IME in case Compose auto-opened it.
-            delay(100)
-            keyboard?.hide()
+            //
+            // Not on the HIT. There Dumb Keys shows its bar the moment a text
+            // box takes focus (1.3-beta2), so this hide made the bar flash and
+            // vanish, and the user had to type a letter to get it back
+            // (2026-11-09). The TCL keeps the hide: its keyboard never showed
+            // itself on focus, and Back-in-one-press relies on nothing being up.
+            if (!IS_HIT) {
+                delay(100)
+                keyboard?.hide()
+            }
         }
     }
     // Focus goes on the inner BasicTextField directly so the user sees the
@@ -195,7 +203,8 @@ fun DpadComposer(
             onSend(payload)
         }
         fieldValue = TextFieldValue("")
-        keyboard?.hide()
+        // Same HIT exception as above: the bar stays up between messages.
+        if (!IS_HIT) keyboard?.hide()
         // Keep focus on the inner field after send. The IME stays hidden
         // because we just called hide(); next Back goes straight to nav.
         runCatching { fieldFr.requestFocus() }
