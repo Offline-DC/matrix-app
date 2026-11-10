@@ -512,6 +512,16 @@ fn init_logger() {
             log::error!("backtrace:\n{}", std::backtrace::Backtrace::force_capture());
             default_hook(info);
         }));
+        // Once per process, the first time any JNI entry runs: says in logcat that
+        // the native library is up, and which build of it. Added 2026-11-10 as the
+        // deliberate "something in the .so changed" for testing the launcher's
+        // delta updates (launcher: update/delta/ApkPatch.kt): every patch tested
+        // until then was between releases whose native libraries were byte for
+        // byte identical, so the case where a patch has to carry a rebuilt
+        // libsmarttxt_ffi.so had never been exercised. Harmless to keep: one INFO
+        // line per process start, and a handy first thing to look for in a log.
+        // Inside the Once on purpose: init_logger runs on EVERY JNI call.
+        log::info!("smarttxt-ffi loaded (native build marker 2026-11-10)");
     });
 }
 
