@@ -174,7 +174,8 @@ class SignalMessageRepository(
 
     override val currentUser: User = User(
         id = account.aci,
-        displayName = account.phoneNumber,
+        // A numberless account has no phone number to show.
+        displayName = account.phoneNumber.ifBlank { "Me" },
         avatarColor = "#3A76F0",  // Signal blue
     )
 
