@@ -20,10 +20,25 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import org.signal.libsignal.metadata.InvalidMetadataMessageException
+import org.signal.libsignal.metadata.ProtocolDuplicateMessageException
+import org.signal.libsignal.metadata.ProtocolException
+import org.signal.libsignal.metadata.ProtocolInvalidKeyException
+import org.signal.libsignal.metadata.ProtocolInvalidKeyIdException
+import org.signal.libsignal.metadata.ProtocolInvalidMessageException
+import org.signal.libsignal.metadata.ProtocolNoSessionException
+import org.signal.libsignal.metadata.ProtocolUntrustedIdentityException
 import org.signal.libsignal.metadata.SealedSessionCipher
 import org.signal.libsignal.metadata.SelfSendException
+import org.signal.libsignal.protocol.InvalidKeyException
+import org.signal.libsignal.protocol.InvalidKeyIdException
+import org.signal.libsignal.protocol.InvalidMessageException
+import org.signal.libsignal.protocol.NoSessionException
 import org.signal.libsignal.protocol.SignalProtocolAddress
 import org.signal.libsignal.protocol.SessionCipher
+import org.signal.libsignal.protocol.UntrustedIdentityException
+import org.signal.libsignal.protocol.message.CiphertextMessage
+import org.signal.libsignal.protocol.message.DecryptionErrorMessage
 import org.signal.libsignal.protocol.groups.GroupSessionBuilder
 import org.signal.libsignal.protocol.message.PreKeySignalMessage
 import org.signal.libsignal.protocol.message.SenderKeyDistributionMessage
@@ -94,6 +109,16 @@ class SignalChatWebSocket(
      * first try gets another shot.
      */
     var onSocketConnected: (() -> Unit)? = null
+
+    /**
+     * Called when an inbound message failed to decrypt and the sender should
+     * be asked to resend it (a Signal retry receipt). Wire it to
+     * [SignalSender.sendRetryReceipt]; runs on the socket thread, so the
+     * callback must hand the network call off to a coroutine.
+     */
+    var onDecryptionError: ((senderServiceId: String, error: DecryptionErrorMessage) -> Unit)? = null
+
+    private val retryLimiter = RetryReceiptLimiter()
 
     private var socket: WebSocket? = null
 
@@ -478,7 +503,25 @@ class SignalChatWebSocket(
             // Common causes: stale identity, missing prekey on first
             // contact, server replay. Log loudly so we can iterate, but
             // don't tear the socket down.
-            Log.w(TAG, "decrypt failed for envelope from $sourceServiceId", t)
+            // Prefix only: these lines ship in diag uploads (*:W).
+            Log.w(TAG, "decrypt failed for envelope from ${SigNames.sid(sourceServiceId)}.${env.sourceDeviceId}", t)
+            // Unsealed only: a sealed envelope's decrypt errors are handled in
+            // decryptSealedSender; anything reaching here from the sealed
+            // branch came from dispatch, not decryption.
+            val ciphertextType = when (env.type) {
+                SignalServiceProtos.Envelope.Type.PREKEY_MESSAGE -> CiphertextMessage.PREKEY_TYPE
+                SignalServiceProtos.Envelope.Type.DOUBLE_RATCHET -> CiphertextMessage.WHISPER_TYPE
+                else -> null
+            }
+            if (ciphertextType != null && isRetryableDecryptError(t) && !sourceServiceId.isNullOrEmpty()) {
+                requestResend(
+                    env = env,
+                    sender = sourceServiceId,
+                    senderDevice = if (env.hasSourceDeviceId()) env.sourceDeviceId else 1,
+                    originalContent = env.content.toByteArray(),
+                    ciphertextType = ciphertextType,
+                )
+            }
             return
         }
 
@@ -1183,6 +1226,12 @@ class SignalChatWebSocket(
 
         // libsignal accepts exactly one trust root per validator instance —
         // walk the rotation list until one accepts the sender cert.
+        //
+        // Only a sender-cert failure (InvalidMetadataMessageException) means
+        // "try the next root". Once a root accepts the cert, any error is from
+        // the INNER message (untrusted identity, missing session/prekey,
+        // duplicate…), is the same under every root, and is final.
+        var lastCertError: Throwable? = null
         for (validator in SignalTrustRoots.productionValidators) {
             try {
                 val result = cipher.decrypt(validator, cipherBody, timestamp)
@@ -1202,15 +1251,114 @@ class SignalChatWebSocket(
                 // Echo of our own sent message via sync — not an error.
                 Log.d(TAG, "sealed sender: SelfSend echo — dropping")
                 return null
-            } catch (t: Throwable) {
-                // Try the next trust root before giving up. Only the LAST
-                // failure surfaces as a warning.
-                if (validator === SignalTrustRoots.productionValidators.last()) {
-                    Log.w(TAG, "sealed sender decrypt failed against all trust roots", t)
+            } catch (certError: InvalidMetadataMessageException) {
+                // Sender cert not signed by this root (or outer layer bad):
+                // try the next root.
+                lastCertError = certError
+            } catch (dup: ProtocolDuplicateMessageException) {
+                // Already decrypted this one (server redelivery). Signal ignores these.
+                Log.w(TAG, "sealed sender: duplicate message from ${who(dup)} — ignoring")
+                return null
+            } catch (e: ProtocolException) {
+                // Inner decrypt failed. Name the sender (8-char prefix) so a
+                // diag upload shows WHICH contact is affected.
+                Log.w(TAG, "sealed sender decrypt failed (from ${who(e)})", e)
+                if (isRetryableDecryptError(e)) {
+                    val usmc = e.unidentifiedSenderMessageContent.orElse(null)
+                    if (usmc != null && e.sender != null) {
+                        requestResend(
+                            env = env,
+                            sender = e.sender,
+                            senderDevice = e.senderDevice,
+                            originalContent = usmc.content,
+                            ciphertextType = usmc.type,
+                        )
+                    }
                 }
+                return null
+            } catch (t: Throwable) {
+                Log.w(TAG, "sealed sender decrypt failed", t)
+                return null
             }
         }
+        Log.w(TAG, "sealed sender decrypt failed against all trust roots", lastCertError)
         return null
+    }
+
+    private fun who(e: ProtocolException): String = "${SigNames.sid(e.sender)}.${e.senderDevice}"
+
+    /**
+     * The decrypt failures Signal-Android answers with a retry receipt
+     * (`MessageDecryptor.buildResultForDecryptionFailure`). Duplicates,
+     * bad metadata, legacy/invalid versions and self-sends are just dropped.
+     */
+    private fun isRetryableDecryptError(t: Throwable): Boolean = when (t) {
+        is ProtocolInvalidKeyIdException,
+        is ProtocolInvalidKeyException,
+        is ProtocolUntrustedIdentityException,
+        is ProtocolNoSessionException,
+        is ProtocolInvalidMessageException,
+        is InvalidKeyIdException,
+        is InvalidKeyException,
+        is UntrustedIdentityException,
+        is NoSessionException,
+        is InvalidMessageException -> true
+        else -> false
+    }
+
+    /**
+     * Ask the sender to resend a message we failed to decrypt (Signal's retry
+     * receipt — see [SignalSender.sendRetryReceipt]). We still ack the
+     * envelope, exactly like Signal: an un-acked envelope is redelivered on
+     * every reconnect and would loop forever. The retry receipt is what gets
+     * the message back.
+     *
+     * Skipped, like Signal-Android: messages from our own account (sync from
+     * the primary; Signal does a session reset there instead), messages sent
+     * to our PNI, and anything past [retryLimiter]'s budget.
+     */
+    private fun requestResend(
+        env: SignalServiceProtos.Envelope,
+        sender: String,
+        senderDevice: Int,
+        originalContent: ByteArray,
+        ciphertextType: Int,
+    ) {
+        val callback = onDecryptionError ?: return
+        val who = "${SigNames.sid(sender)}.$senderDevice"
+        if (sender.equals(account.aci, ignoreCase = true)) {
+            Log.i(TAG, "decrypt error on a message from our own account ($who) — no retry receipt")
+            return
+        }
+        val dest = env.destinationServiceId.orEmpty()
+        val destBinaryIsPni = env.hasDestinationServiceIdBinary() &&
+            env.destinationServiceIdBinary.size() == 17 &&
+            env.destinationServiceIdBinary.byteAt(0).toInt() == 0x01
+        val ourPni = account.pni?.removePrefix("PNI:")
+        if (destBinaryIsPni || dest.startsWith("PNI:") ||
+            (ourPni != null && dest.removePrefix("PNI:").equals(ourPni, ignoreCase = true))
+        ) {
+            Log.i(TAG, "decrypt error on a message to our PNI ($who) — no retry receipt")
+            return
+        }
+        if (!env.hasClientTimestamp()) {
+            Log.w(TAG, "decrypt error from $who has no client timestamp — can't request a resend")
+            return
+        }
+        if (!retryLimiter.tryAcquire(sender)) {
+            Log.w(TAG, "decrypt error from $who — retry-receipt budget used up, not asking again")
+            return
+        }
+        val error = try {
+            DecryptionErrorMessage.forOriginalMessage(
+                originalContent, ciphertextType, env.clientTimestamp, senderDevice,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "could not build retry receipt for $who", t)
+            return
+        }
+        Log.i(TAG, "requesting resend from $who for ts=${env.clientTimestamp}")
+        callback(sender, error)
     }
 
     /**

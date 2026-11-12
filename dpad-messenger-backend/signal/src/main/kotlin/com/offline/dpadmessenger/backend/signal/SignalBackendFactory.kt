@@ -41,6 +41,14 @@ class SignalBackendFactory : BackendFactory {
         // request only rate-limited (429) the /v2/keys/<own-aci> endpoint.
         // Contact names come from profile fetch (SignalProfiles) instead.
         val socket = SignalChatWebSocket(context, account, repo)
+        // A message we couldn't decrypt → ask the sender to resend it
+        // (Signal retry receipt). Network call, so off the socket thread.
+        socket.onDecryptionError = { senderId, error ->
+            backgroundScope.launch {
+                runCatching { sender.sendRetryReceipt(senderId, error) }
+                    .onFailure { Log.w("SignalRetryReceipt", "retry receipt to ${SigNames.sid(senderId)} failed", it) }
+            }
+        }
         socket.connect()
         return repo
     }

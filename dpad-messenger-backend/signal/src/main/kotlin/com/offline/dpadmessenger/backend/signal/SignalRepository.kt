@@ -56,6 +56,14 @@ object SignalRepository {
         // Let the sender echo each conversation's disappearing-messages timer.
         sender.conversationTimerLookup = repo::expireTimerFor
         val sock = SignalChatWebSocket(appContext, account, repo)
+        // A message we couldn't decrypt → ask the sender to resend it
+        // (Signal retry receipt). Network call, so off the socket thread.
+        sock.onDecryptionError = { senderId, error ->
+            scope.launch {
+                runCatching { sender.sendRetryReceipt(senderId, error) }
+                    .onFailure { Log.w("SignalRetryReceipt", "retry receipt to ${SigNames.sid(senderId)} failed", it) }
+            }
+        }
         // NOTE: we deliberately do NOT request contact sync here. Modern Signal
         // primaries don't answer SyncMessage.Request{CONTACTS}, so the request
         // only hammered the rate-limited /v2/keys/<own-aci> endpoint (HTTP 429),

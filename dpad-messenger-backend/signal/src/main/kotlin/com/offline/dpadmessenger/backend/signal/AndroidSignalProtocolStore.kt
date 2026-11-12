@@ -2,6 +2,7 @@ package com.offline.dpadmessenger.backend.signal
 
 import android.content.Context
 import android.util.Base64
+import android.util.Log
 import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.IdentityKeyPair
 import org.signal.libsignal.protocol.SignalProtocolAddress
@@ -76,11 +77,31 @@ class AndroidSignalProtocolStore(
         identityKey: IdentityKey,
         direction: IdentityKeyStore.Direction,
     ): Boolean {
-        // Trust-on-first-use. A safer client surfaces a verification prompt
-        // when a peer's identity changes; we just log the new fingerprint
-        // and accept it so message flow isn't blocked.
-        val stored = prefs.getIdentity(addressKey(address)) ?: return true
-        return stored.contentEquals(identityKey.serialize())
+        // Always trust, and log when the key changed.
+        //
+        // We used to return false for a changed key. libsignal checks this
+        // BEFORE saveIdentity(), so a contact who reinstalled Signal / got a
+        // new phone was rejected with UntrustedIdentityException on every
+        // message, forever, and the stored key never updated (field report
+        // 2026-11-11: all messages from one contact silently dropped).
+        //
+        // This matches Signal's own clients:
+        //  - RECEIVING: Signal-Desktop `SignalProtocolStore.isTrustedIdentity`
+        //    and Signal-Android `SignalBaseIdentityKeyStore` return true
+        //    unconditionally.
+        //  - SENDING: they block only when the user had manually VERIFIED the
+        //    old safety number (or for a few seconds after a change, pending
+        //    a UI prompt). This device has no safety-number UI and the primary
+        //    owns verification, so there is nothing to block on.
+        val stored = prefs.getIdentity(addressKey(address))
+        if (stored != null && !stored.contentEquals(identityKey.serialize())) {
+            Log.i(
+                TAG,
+                "identity changed for ${SigNames.sid(address.name)}.${address.deviceId} " +
+                    "($direction) — trusting new key",
+            )
+        }
+        return true
     }
 
     override fun getIdentity(address: SignalProtocolAddress): IdentityKey? {
@@ -177,11 +198,39 @@ class AndroidSignalProtocolStore(
         prefs.putSession(addressKey(address), record.serialize())
     }
 
-    override fun containsSession(address: SignalProtocolAddress): Boolean =
-        prefs.hasSession(addressKey(address))
+    /**
+     * A session we can SEND on. Same definition as Signal-Android
+     * `TextSecureSessionStore.containsSession`: a stored record whose current
+     * state has a sender chain. An archived record (see [archiveSession]) is
+     * kept on disk so late messages on the old session still decrypt, but it
+     * no longer counts, so the next send builds a fresh session from a bundle.
+     */
+    override fun containsSession(address: SignalProtocolAddress): Boolean {
+        val bytes = prefs.getSession(addressKey(address)) ?: return false
+        return runCatching { SessionRecord(bytes).hasSenderChain() }.getOrDefault(false)
+    }
 
     override fun deleteSession(address: SignalProtocolAddress) {
         prefs.removeSession(addressKey(address))
+    }
+
+    /**
+     * Retire the current session state for [address] without deleting it, like
+     * Signal-Android `TextSecureSessionStore.archiveSession`. Used when the
+     * server tells us a device is stale (HTTP 409/410) or the recipient's
+     * registration id / identity key no longer match our session — i.e. they
+     * reinstalled or re-registered.
+     */
+    fun archiveSession(address: SignalProtocolAddress) {
+        val key = addressKey(address)
+        val bytes = prefs.getSession(key) ?: return
+        val record = runCatching { SessionRecord(bytes) }.getOrNull()
+        if (record == null) {
+            prefs.removeSession(key)
+            return
+        }
+        record.archiveCurrentState()
+        prefs.putSession(key, record.serialize())
     }
 
     override fun deleteAllSessions(name: String) {
@@ -223,6 +272,11 @@ class AndroidSignalProtocolStore(
 
     private fun addressKey(address: SignalProtocolAddress): String =
         "${address.name}.${address.deviceId}"
+
+    private companion object {
+        /** Kept at INFO in the launcher's rolling-log filterspec. */
+        const val TAG = "SignalStore"
+    }
 }
 
 /** Convenience accessor for libsignal's [Curve]-decoded identity private key. */
