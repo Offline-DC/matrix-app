@@ -75,7 +75,7 @@ pub struct HardwareConfig {
 }
 
 /// NAC validation server (also serves anisette v3). Public host, https.
-pub const NAC_BASE_URL: &str = "https://hw.openbubbles.app";
+pub const NAC_BASE_URL: &str = "https://dumbco-nacserver-e6e6dc9eeaec.herokuapp.com";
 
 /// Where the raw hardware-config body is read from when not supplied inline —
 /// the OpenBubbles dumb file. Overridable at runtime with `SMARTTXT_DUMB_PATH`.
