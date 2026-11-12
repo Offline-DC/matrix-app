@@ -247,7 +247,9 @@ class NativeRustPushTransport(
                         _events.emit(TransportEvent.SyncActivityChanged(false))
                     }
                 }.onFailure {
-                    Log.w(TAG, "poll parse failed: ${it.message}")
+                    // The type only: a JSON exception's message can quote the poll
+                    // payload it choked on, and that can include message text.
+                    Log.w(TAG, "poll parse failed: ${it.javaClass.simpleName}")
                     // A parse failure tells us nothing about queue depth; fall back to the
                     // idle cadence rather than hot-looping on a payload that keeps failing.
                     if (signal.active) {
@@ -295,6 +297,11 @@ class NativeRustPushTransport(
                     val rejected = obj["rejected"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: false
                     Log.w(TAG, "PUSH CERT rejected=$rejected")
                     _events.emit(TransportEvent.PushCertRejected(rejected))
+                }
+                RelayProtocol.P_SMS_ACTIVATION -> {
+                    val enabled = obj["enabled"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: false
+                    Log.i(TAG, "SMS activation enabled=$enabled")
+                    _events.emit(TransportEvent.SmsActivationChanged(enabled))
                 }
                 RelayProtocol.P_NEW_MESSAGE -> obj["message"]?.let {
                     messages.add(json.decodeFromJsonElement(RelayMessage.serializer(), it))

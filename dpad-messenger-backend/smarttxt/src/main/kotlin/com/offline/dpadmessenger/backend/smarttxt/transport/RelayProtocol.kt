@@ -56,6 +56,12 @@ object RelayProtocol {
      *  appear to work — nothing is ever delivered. Only the user can fix it. */
     const val P_PUSH_CERT_REJECTED = "push_cert_rejected"
 
+    /** Text Message Forwarding is on or off for this device. Queued by the native
+     *  side with `enabled` when Apple's EnableSmsActivation (IDS command 145)
+     *  toggles it, when a forwarded SMS proves forwarding is live, and on every
+     *  start while the saved state says on. Repeats are expected and harmless. */
+    const val P_SMS_ACTIVATION = "sms_activation"
+
     const val T_ACK = "ack"
 
     /** Lenient JSON shared by all transports (forward-compatible with relay

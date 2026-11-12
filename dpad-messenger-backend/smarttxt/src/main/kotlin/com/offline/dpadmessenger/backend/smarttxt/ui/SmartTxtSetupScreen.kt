@@ -70,6 +70,10 @@ import com.offline.dpadmessenger.backend.smarttxt.SmartTxtRepository
 import com.offline.dpadmessenger.backend.smarttxt.SmartTxtStatus
 import com.offline.dpadmessenger.backend.smarttxt.MacOSConfig
 import com.offline.dpadmessenger.backend.smarttxt.RegistrationResult
+import com.offline.dpadmessenger.backend.smarttxt.SmartTxtConfig
+import com.offline.dpadmessenger.backend.smarttxt.SmartTxtLogin
+import com.offline.dpadmessenger.backend.smarttxt.SmartTxtLoginAck
+import com.offline.dpadmessenger.backend.smarttxt.SmartTxtLoginBridge
 import com.offline.dpadmessenger.ui.components.DpadButton
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -99,8 +103,13 @@ import kotlinx.coroutines.launch
  * (Figma "onboarding - 17"). The iCloud "a Mac is signing in" explanation
  * lives in the launcher's onboarding instead, on its "head's up" screen
  * before Smart Txt is launched.
+ *
+ * WAITING is where Smart Txt now opens: the Apple ID and password are typed on
+ * the iPhone (Dumb Down 6.3) and arrive as a `smart_txt_login` through
+ * SmartTxtLoginBridge, so the flip shows no form. CREDENTIALS is the form
+ * itself, reached only through "login manually".
  */
-private enum class SignInStep { CREDENTIALS, TWO_FACTOR, FSA, REGISTERING, SUCCESS }
+private enum class SignInStep { WAITING, CREDENTIALS, TWO_FACTOR, FSA, REGISTERING, SUCCESS }
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
@@ -115,11 +124,26 @@ fun SmartTxtSetupScreen(
     val scope = rememberCoroutineScope()
     val status by SmartTxtRepository.status.collectAsState()
 
-    var step by remember { mutableStateOf(SignInStep.CREDENTIALS) }
+    var step by remember { mutableStateOf(SignInStep.WAITING) }
 
-    // TEST-ONLY dev pre-fill so sign-in can be tapped through without retyping.
-    // REMOVE before any real release — these are live credentials in the APK/source.
+    // Set by "login manually" on the waiting page, and never cleared while this
+    // screen is up: from then on it is today's sign-in form, and a login from
+    // the iPhone is refused. While false, the sign-in in progress (if any) was
+    // started by the iPhone, so it reports each turn back with an ack and a
+    // failure returns to the waiting page rather than the form.
+    var manual by remember { mutableStateOf(false) }
+
     var appleId by remember { mutableStateOf("") }
+    // True once a sign-in with the current Apple ID and password has failed, or
+    // been backed out of on the 2FA page: setup's auto sign-in then waits for
+    // one of them to change. Cleared by any edit to either box. See
+    // autoSignInAction.
+    var autoSignInHeld by remember { mutableStateOf(false) }
+    // Whether each box's last change was a whole value from the smartphone
+    // (Type Sync), not a key press. Setup's auto sign-in acts only on whole
+    // values. See autoSignInAction.
+    var appleIdWhole by remember { mutableStateOf(false) }
+    var passwordWhole by remember { mutableStateOf(false) }
     var password by remember { mutableStateOf("") }
 
     var twoFactorCode by remember { mutableStateOf("") }
@@ -161,7 +185,30 @@ fun SmartTxtSetupScreen(
         step = SignInStep.SUCCESS
     }
 
-    fun startRegistration() {
+    // Where a failed or abandoned sign-in goes back to.
+    fun homeStep() = if (manual) SignInStep.CREDENTIALS else SignInStep.WAITING
+
+    // Tell the iPhone how its login is going. Only for a sign-in the iPhone
+    // started: on the manual route nobody on the iPhone is waiting for one.
+    fun ack(ackStatus: String) {
+        if (manual) return
+        android.util.Log.i("SmartTxtSignIn", "smart_txt_login_ack $ackStatus")
+        SmartTxtConfig.companionSender?.sendLoginAck(ackStatus)
+    }
+
+    // The sign-in coroutine, while one is running (including the moments after
+    // a 2FA back-out while the native login unwinds). An iPhone login that
+    // arrives then must not start a second one.
+    var registration by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+
+    // False when it refused to start (an empty box), so a caller that answers
+    // the iPhone can say so.
+    fun startRegistration(): Boolean {
+        if (!canSignIn(appleId, password)) {
+            // Never contact Apple with an empty box (see canSignIn).
+            android.util.Log.i("SmartTxtSignIn", "sign-in not started: Apple ID or password is empty")
+            return false
+        }
         error = null
         cancelledByUser = false
         twoFactorCode = ""
@@ -171,11 +218,11 @@ fun SmartTxtSetupScreen(
         // Dispatchers.IO: the native login blocks the calling thread; keep it OFF
         // the main thread so the UI stays responsive (Compose state writes are
         // safe from a background thread).
-        scope.launch(Dispatchers.IO) {
+        registration = scope.launch(Dispatchers.IO) {
             val result = SmartTxtRepository.register(
                 context = context,
                 config = MacOSConfig.placeholder(),
-                appleId = appleId.trim().ifBlank { "demo@icloud.com" },
+                appleId = appleId.trim(),
                 password = password,
                 twoFactorProvider = {
                     // Login succeeded and Apple wants a code: go STRAIGHT to the 2FA
@@ -187,6 +234,7 @@ fun SmartTxtSetupScreen(
                     twoFactorCode = ""
                     signingIn = false
                     step = SignInStep.TWO_FACTOR
+                    ack(SmartTxtLoginAck.NEEDS_2FA)
                     deferred.await()
                 },
                 fsaProvider = { challenge ->
@@ -215,10 +263,22 @@ fun SmartTxtSetupScreen(
                     } else if (cancelledByUser) {
                         cancelledByUser = false
                         android.util.Log.i("SmartTxtSignIn", "2FA backed out by the user — no error page (${result.message})")
+                        step = homeStep()
+                        // The flip is back on the waiting page, so the iPhone has
+                        // to leave "enter code on ur dumbphone" too.
+                        ack(SmartTxtLoginAck.FAILED)
+                    } else if (manual) {
+                        error = result.message
+                        // Don't let setup's auto sign-in send these same values
+                        // again; see autoSignInAction (the "password loop").
+                        autoSignInHeld = true
                         step = SignInStep.CREDENTIALS
                     } else {
-                        error = result.message
-                        step = SignInStep.CREDENTIALS
+                        // iPhone route: no error page on the flip. The person is
+                        // looking at the iPhone, which goes back to its form.
+                        android.util.Log.i("SmartTxtSignIn", "iPhone sign-in failed: ${result.message}")
+                        step = SignInStep.WAITING
+                        ack(SmartTxtLoginAck.FAILED)
                     }
                 }
                 is RegistrationResult.Success -> {
@@ -227,6 +287,97 @@ fun SmartTxtSetupScreen(
                     step = SignInStep.SUCCESS
                 }
             }
+        }
+        return true
+    }
+
+    // A login typed on the iPhone (smart_txt_login, decrypted by the launcher).
+    // Never logs the Apple ID or password.
+    fun onIphoneLogin(login: SmartTxtLogin) {
+        val action = iphoneLoginAction(
+            signedIn = step == SignInStep.SUCCESS,
+            manual = manual,
+            signInRunning = registration?.isActive == true,
+            onTwoFactor = step == SignInStep.TWO_FACTOR,
+            onSecurityKey = step == SignInStep.FSA,
+        )
+        android.util.Log.i("SmartTxtSignIn", "iPhone login → $action (step=$step)")
+        // Refusals are sent directly, not via ack(), which stays quiet on the
+        // manual route. Resends tell the iPhone again where things stand, in
+        // case the first answer was lost; see iphoneLoginAction.
+        when (action) {
+            IphoneLoginAction.REFUSE_SIGNED_IN ->
+                SmartTxtConfig.companionSender?.sendLoginAck(SmartTxtLoginAck.ALREADY_SIGNED_IN)
+            IphoneLoginAction.REFUSE_MANUAL ->
+                SmartTxtConfig.companionSender?.sendLoginAck(SmartTxtLoginAck.MANUAL)
+            IphoneLoginAction.RESEND_NEEDS_2FA -> ack(SmartTxtLoginAck.NEEDS_2FA)
+            IphoneLoginAction.RESEND_SIGNING_IN -> ack(SmartTxtLoginAck.SIGNING_IN)
+            IphoneLoginAction.IGNORE -> Unit
+            IphoneLoginAction.START -> {
+                appleId = login.appleId
+                password = login.password
+                // An empty Apple ID or password starts nothing, so the iPhone
+                // must not be told "logging in" (10 Nov review).
+                ack(if (startRegistration()) SmartTxtLoginAck.SIGNING_IN else SmartTxtLoginAck.FAILED)
+            }
+        }
+    }
+
+    // Listen for iPhone logins for as long as this screen is up. While nothing
+    // is listening, SmartTxtLoginBridge answers `failed` itself.
+    LaunchedEffect(Unit) {
+        SmartTxtLoginBridge.logins.collect { onIphoneLogin(it) }
+    }
+
+    // Launcher device setup (2026-11-04 redesign): tell the launcher which page
+    // is up, so it can cover the ones with nothing to press with its Figma
+    // pages, and — since those pages draw no keys — move from the Apple ID box
+    // to the password box and start the sign-in by itself once the smartphone
+    // has typed both in over type sync. The smartphone no longer tells the user
+    // to press anything here. Outside setup, nothing changes.
+    val inOnboarding = com.offline.dpadmessenger.ui.components.LocalOnboardingContinue.current != null
+    // Leaving this screen ends what it published: without this the last page
+    // (often CREDENTIALS) outlived it, so the next pass's launcher read a stale
+    // "set up smart txt" and told the iPhone "smart txt ready" while Smart Txt
+    // was still loading, then never again once the form really came up
+    // (the value didn't change). F6/F39/F74, 2026-11-06.
+    DisposableEffect(Unit) {
+        onDispose { SmartTxtOnboardingPage.current.value = null }
+    }
+    LaunchedEffect(step, signingIn, error, inOnboarding) {
+        SmartTxtOnboardingPage.current.value = if (!inOnboarding) null else when {
+            step == SignInStep.CREDENTIALS && error != null -> SmartTxtOnboardingPage.FAILED
+            // Waiting for the smartphone: the waiting page (the login arrives
+            // as smart_txt_login), or the form after "login manually".
+            (step == SignInStep.WAITING || step == SignInStep.CREDENTIALS) && !signingIn ->
+                SmartTxtOnboardingPage.CREDENTIALS
+            step == SignInStep.TWO_FACTOR -> SmartTxtOnboardingPage.TWO_FACTOR
+            step == SignInStep.FSA -> SmartTxtOnboardingPage.SECURITY_KEY
+            else -> SmartTxtOnboardingPage.SIGNING_IN
+        }
+    }
+    LaunchedEffect(appleId, password, step, signingIn, error, inOnboarding, autoSignInHeld, appleIdWhole, passwordWhole) {
+        when (autoSignInAction(
+            inSetup = inOnboarding,
+            onForm = step == SignInStep.CREDENTIALS,
+            signingIn = signingIn,
+            showingError = error != null,
+            heldAfterFailure = autoSignInHeld,
+            appleIdBlank = appleId.isBlank(),
+            passwordEmpty = password.isEmpty(),
+            appleIdWhole = appleIdWhole,
+            passwordWhole = passwordWhole,
+        )) {
+            AutoSignInAction.FOCUS_PASSWORD -> {
+                delay(ONBOARDING_FIELD_SETTLE_MS)
+                runCatching { passwordFr.requestFocus() }
+            }
+            AutoSignInAction.SIGN_IN -> {
+                // A paste arrives whole; the pause only lets a slow relay finish.
+                delay(ONBOARDING_SIGN_IN_SETTLE_MS)
+                startRegistration()
+            }
+            AutoSignInAction.NOTHING -> Unit
         }
     }
 
@@ -248,11 +399,24 @@ fun SmartTxtSetupScreen(
     // The sign-in page paints its own white background edge to edge and uses
     // the launcher onboarding's 12dp gutter; every other step keeps this
     // screen's original 24/12dp padding until it is redesigned too.
-    val outer = if (step == SignInStep.CREDENTIALS || step == SignInStep.TWO_FACTOR ||
-        step == SignInStep.REGISTERING) modifier.fillMaxSize()
+    val outer = if (step == SignInStep.WAITING || step == SignInStep.CREDENTIALS ||
+        step == SignInStep.TWO_FACTOR || step == SignInStep.REGISTERING) modifier.fillMaxSize()
         else modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 12.dp)
     Box(modifier = outer) {
         when (step) {
+            // Where Smart Txt opens: the Apple ID and password come from the
+            // iPhone, so there is nothing to type here. The centre key (or OK)
+            // is the way to the form. See WaitingPage.
+            SignInStep.WAITING -> WaitingPage(
+                signingIn = signingIn,
+                notice = notice,
+                onLoginManually = {
+                    android.util.Log.i("SmartTxtSignIn", "login manually chosen")
+                    manual = true
+                    step = SignInStep.CREDENTIALS
+                },
+            )
+
             // Figma "onboarding - 17" (dumb product design, node 50:26205):
             // white page, "sign in to smart txt", a line pointing the user at the
             // Dumb Down app (which types into these boxes over TypeSync), two
@@ -279,9 +443,9 @@ fun SmartTxtSetupScreen(
                 AutoFocus(if (password.isNotEmpty()) passwordFr else appleIdFr)
                 SignInPage(
                     appleId = appleId,
-                    onAppleIdChange = { appleId = it; error = null },
+                    onAppleIdChange = { appleIdWhole = arrivedWhole(appleId, it); appleId = it; error = null; autoSignInHeld = false },
                     password = password,
-                    onPasswordChange = { password = it; error = null },
+                    onPasswordChange = { passwordWhole = arrivedWhole(password, it); password = it; error = null; autoSignInHeld = false },
                     appleIdFr = appleIdFr,
                     passwordFr = passwordFr,
                     signingIn = signingIn,
@@ -295,7 +459,7 @@ fun SmartTxtSetupScreen(
             // component), navbar "resend" / "verify". See TwoFactorPage.
             SignInStep.TWO_FACTOR -> {
                 AutoFocus(twoFactorFr)
-                TwoFactorPage(
+                if (inOnboarding) OnboardingTwoFactorPage(
                     code = twoFactorCode,
                     onCodeChange = { new ->
                         twoFactorCode = new.filter { it.isDigit() }.take(6)
@@ -323,8 +487,52 @@ fun SmartTxtSetupScreen(
                     onBack = {
                         val deferred = pending2fa
                         pending2fa = null
-                        if (deferred != null) cancelledByUser = true
-                        step = SignInStep.CREDENTIALS
+                        if (deferred != null) {
+                            cancelledByUser = true
+                            // Hold setup's auto sign-in until a box changes. Set
+                            // here, with the step, so it never sees the form
+                            // unheld: before, it sent the same Apple ID and
+                            // password to Apple again 0.8 s later, and every
+                            // Back brought a new 2FA prompt (10 Nov review).
+                            autoSignInHeld = true
+                        }
+                        step = homeStep()
+                        // Cancel the registration coroutine's await.
+                        deferred?.complete(null)
+                    },
+                ) else TwoFactorPage(
+                    code = twoFactorCode,
+                    onCodeChange = { new ->
+                        twoFactorCode = new.filter { it.isDigit() }.take(6)
+                        error = null
+                    },
+                    codeFr = twoFactorFr,
+                    resending = resending || signingIn,
+                    onVerify = {
+                        if (twoFactorCode.length == 6 && pending2fa != null) {
+                            val deferred = pending2fa
+                            pending2fa = null
+                            step = SignInStep.REGISTERING
+                            deferred?.complete(twoFactorCode)
+                        }
+                    },
+                    onResend = {
+                        val deferred = pending2fa
+                        if (deferred != null && !resending) {
+                            resending = true
+                            twoFactorCode = ""
+                            pending2fa = null
+                            deferred.complete(null)
+                        }
+                    },
+                    onBack = {
+                        val deferred = pending2fa
+                        pending2fa = null
+                        if (deferred != null) {
+                            cancelledByUser = true
+                            autoSignInHeld = true // as on the setup 2FA page above
+                        }
+                        step = homeStep()
                         // Cancel the registration coroutine's await.
                         deferred?.complete(null)
                     },
@@ -533,6 +741,87 @@ private val SignInError = androidx.compose.ui.text.TextStyle(
     fontFamily = DisplayExtraBold, fontWeight = FontWeight.ExtraBold,
     fontSize = 14.sp, lineHeight = 18.2.sp, color = InkStrong,
 )
+
+/**
+ * The page Smart Txt opens on: "set up smart txt" and a line pointing the
+ * person at the Dumb Down app, where they type their Apple ID and password
+ * (6.3, "sync ur iMessage"). The login arrives over Type Sync and the sign-in
+ * starts by itself; this page has nothing to type into. Same white page,
+ * title and body as SignInPage.
+ *
+ * Keys. OK (DPAD_CENTER) = "login manually", the way to today's form when the
+ * iPhone route doesn't work. It uses SignInErrorPage's armed pattern: it fires
+ * on the key-up of a press that went down on this page, so an OK held over
+ * from the screen before can't open the form. The centre soft key shows the
+ * label, as on every screen. Back is left alone, as on SignInPage: the host
+ * decides (during device setup the launcher asks "skip sign in?").
+ *
+ * While a sign-in from the iPhone is running the centre reads "signing in…",
+ * OK does nothing, and back / skip are hidden, as on SignInPage: leaving then
+ * would drop a sign-in that may already be registering with Apple.
+ */
+@Composable
+private fun WaitingPage(
+    signingIn: Boolean,
+    /** Why the user was signed out, if they didn't choose it — see SmartTxtSetupScreen. */
+    notice: String?,
+    onLoginManually: () -> Unit,
+) {
+    val pageFr = remember { FocusRequester() }
+    var armed by remember { mutableStateOf(false) }
+    AutoFocus(pageFr)
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(PageWhite)
+            .focusRequester(pageFr)
+            .focusable()
+            .onPreviewKeyEvent { e ->
+                when {
+                    e.isOk() && e.type == KeyEventType.KeyDown -> {
+                        if (e.nativeKeyEvent.repeatCount == 0) armed = true
+                        true
+                    }
+                    e.isOk() && e.type == KeyEventType.KeyUp -> {
+                        if (armed && !signingIn) onLoginManually()
+                        armed = false
+                        true
+                    }
+                    else -> false
+                }
+            }
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 12.dp),
+    ) {
+        Text("set up smart txt", style = SignInTitle, modifier = Modifier.padding(top = 20.dp))
+        Text(
+            "open the Dumb Down app on ur smartphone and type ur Apple ID and password there. " +
+                "smart txt will sign in here by itself.",
+            style = SignInBody,
+            modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+        )
+        // Moved here from the sign-in form, which the person no longer sees
+        // first; SignInPage still shows it too, for the manual route.
+        if (notice != null) {
+            Text(notice, style = SignInError, modifier = Modifier.fillMaxWidth().padding(top = 12.dp))
+        }
+        Spacer(Modifier.height(12.dp))
+    }
+
+    // Same keys as SignInPage, with "login manually" where "sign in" was.
+    val inOnboarding = com.offline.dpadmessenger.ui.components.LocalOnboardingContinue.current != null
+    val backDispatcher = androidx.activity.compose.LocalOnBackPressedDispatcherOwner.current
+        ?.onBackPressedDispatcher
+    com.offline.dpadmessenger.ui.navbar.SoftKeys(
+        left = if (inOnboarding || signingIn || backDispatcher == null) null
+        else com.offline.dpadmessenger.ui.navbar.SoftKey("back") { backDispatcher.onBackPressed() },
+        center = if (signingIn) com.offline.dpadmessenger.ui.navbar.SoftKey("signing in…")
+        else com.offline.dpadmessenger.ui.navbar.SoftKey("login manually") { onLoginManually() },
+        right = if (!inOnboarding || signingIn || backDispatcher == null) null
+        else com.offline.dpadmessenger.ui.navbar.SoftKey("skip") { backDispatcher.onBackPressed() },
+    )
+}
 
 /**
  * The credentials form.
@@ -1160,15 +1449,31 @@ private fun TwoFactorPage(
     // that keeps its window up, "verify" was otherwise unreachable.
     val currentCode by androidx.compose.runtime.rememberUpdatedState(code)
     val imeOkFallback = rememberImeOkFallback()
+    // Back is the flip's delete key: it clears the last digit, and only on an
+    // empty box (and a fresh press, so holding it to clear can't overshoot)
+    // does it leave the page. Caught before the keyboard as well as on the
+    // page: Dumb TT9 takes Back as its own delete, which never reached this
+    // box, so a wrong digit could not be fixed (4058W, 6 Nov). Same rule as
+    // the setup page's OnboardingTwoFactorPage.
+    val onBackKey: (androidx.compose.ui.input.key.KeyEvent) -> Boolean = { e ->
+        if (e.key != Key.Back) false else {
+            if (e.type == KeyEventType.KeyDown) {
+                when (backKeyAction(code.length, e.nativeKeyEvent.repeatCount)) {
+                    BackKeyAction.DELETE_DIGIT -> if (!resending) onCodeChange(code.dropLast(1))
+                    BackKeyAction.LEAVE_PAGE -> onBack()
+                    BackKeyAction.NOTHING -> Unit
+                }
+            }
+            true
+        }
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(PageWhite)
             .onPreviewKeyEvent { e ->
-                if (e.type == KeyEventType.KeyDown && e.key == Key.Back) {
-                    onBack(); return@onPreviewKeyEvent true
-                }
+                if (e.key == Key.Back) return@onPreviewKeyEvent onBackKey(e)
                 if (!e.isOk() || imeShowing()) return@onPreviewKeyEvent false
                 if (e.type == KeyEventType.KeyDown && e.nativeKeyEvent.repeatCount == 0) onOk()
                 true
@@ -1219,6 +1524,7 @@ private fun TwoFactorPage(
                 .fillMaxWidth()
                 .focusRequester(codeFr)
                 .onInterceptKeyBeforeSoftKeyboard { e ->
+                    if (e.key == Key.Back) return@onInterceptKeyBeforeSoftKeyboard onBackKey(e)
                     if (!e.isOk()) return@onInterceptKeyBeforeSoftKeyboard false
                     if (imeShowing()) {
                         if (e.type == KeyEventType.KeyDown && e.nativeKeyEvent.repeatCount == 0) {
@@ -1396,3 +1702,13 @@ private fun SpeechBubble(
             ),
     )
 }
+
+/**
+ * Setup: how long after the Apple ID lands before the password box takes focus.
+ * Zero: the smartphone sends each value whole, and the redesign's 6.4 sends the
+ * password only ~0.2 s after the Apple ID (seen on the 4058W, 5 Nov). At 400 ms
+ * the password was typed onto the end of the Apple ID, unmasked.
+ */
+private const val ONBOARDING_FIELD_SETTLE_MS = 0L
+/** Setup: how long after the password lands before signing in by itself. */
+private const val ONBOARDING_SIGN_IN_SETTLE_MS = 800L

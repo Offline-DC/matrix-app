@@ -12,7 +12,6 @@ import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -102,7 +101,7 @@ internal object SmartTxtLogExporter {
         ZipOutputStream(FileOutputStream(dest).buffered()).use { zip ->
             try {
                 zip.putNextEntry(ZipEntry("meta.txt"))
-                zip.write(buildMeta(context).toByteArray())
+                zip.write(LogSafe.scrub(buildMeta(context)).toByteArray())
                 zip.closeEntry()
             } catch (t: Throwable) {
                 Log.w(TAG, "meta.txt failed", t)
@@ -112,7 +111,7 @@ internal object SmartTxtLogExporter {
                 val events = SmartTxtEvents.file(context)
                 if (events.exists()) {
                     zip.putNextEntry(ZipEntry("events.txt"))
-                    FileInputStream(events).use { it.copyTo(zip) }
+                    copyScrubbed(events, zip)
                     zip.closeEntry()
                 }
             } catch (t: Throwable) {
@@ -125,7 +124,7 @@ internal object SmartTxtLogExporter {
             for (file in files) {
                 try {
                     zip.putNextEntry(ZipEntry(file.name))
-                    FileInputStream(file).use { it.copyTo(zip) }
+                    copyScrubbed(file, zip)
                     zip.closeEntry()
                     logCount++
                 } catch (t: Throwable) {
@@ -134,6 +133,24 @@ internal object SmartTxtLogExporter {
             }
         }
         return logCount
+    }
+
+    /**
+     * Copy a log file into the zip line by line through [LogSafe.scrubForExport],
+     * not byte for byte: ring segments written by builds before the 9 Nov fix are
+     * kept for days and still hold full Apple IDs and message text (the old debug
+     * message dumps). Scrubbing here cleans them, whatever build wrote them.
+     */
+    private fun copyScrubbed(file: File, zip: ZipOutputStream) {
+        val out = zip.bufferedWriter() // not closed: closing would close the zip
+        file.bufferedReader().useLines { lines ->
+            for (line in lines) {
+                val kept = LogSafe.scrubForExport(line) ?: continue
+                out.write(kept)
+                out.write("\n")
+            }
+        }
+        out.flush()
     }
 
     private fun buildMeta(context: Context): String {
