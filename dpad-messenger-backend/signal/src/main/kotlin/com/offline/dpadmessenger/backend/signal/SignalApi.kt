@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalSerializationApi::class)
+
 package com.offline.dpadmessenger.backend.signal
 
 import android.content.Context
@@ -5,6 +7,8 @@ import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -45,21 +49,24 @@ class SignalApi(
      * [ConfirmDeviceRequest]) instead of in the path. See mautrix-signal
      * `pkg/signalmeow/provisioning.go::confirmDevice`.
      *
-     * Auth: HTTP Basic with the user's phone-number as username and the
-     * password chosen by us (and committed to in this request body).
+     * Auth: HTTP Basic `<username>:<password>`, where the password is the one
+     * chosen by us and committed by this call. Signal-Server ignores the
+     * username here (the account is identified by the verification code);
+     * we send the ACI like Signal-Desktop does, which also works for accounts
+     * that have no phone number.
      *
      * On success the server returns a JSON body with the assigned
      * `deviceId`; we plumb that back so the caller can persist it on
      * the [SignalAccount].
      */
     suspend fun confirmDevice(
-        phoneNumber: String,
+        username: String,
         password: String,
         @Suppress("UNUSED_PARAMETER") provisioningCode: String,  // now lives in body
         body: ConfirmDeviceRequest,
     ): ConfirmDeviceResponse = withContext(Dispatchers.IO) {
         val authHeader = "Basic " + Base64.encodeToString(
-            "$phoneNumber:$password".toByteArray(),
+            "$username:$password".toByteArray(),
             Base64.NO_WRAP,
         )
         val json = JSON.encodeToString(body)
@@ -780,16 +787,23 @@ data class ConfirmDeviceRequest(
     val verificationCode: String,
     val accountAttributes: AccountAttributes,
     val aciSignedPreKey: SignedPreKeyJson,
-    val pniSignedPreKey: SignedPreKeyJson,
+    /** Null (and omitted from the JSON, as Signal-Desktop does) when the
+     *  account has no PNI. Signal-Server rejects PNI prekeys for such an
+     *  account with 422, and requires them otherwise. */
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
+    val pniSignedPreKey: SignedPreKeyJson? = null,
     val aciPqLastResortPreKey: SignedPreKeyJson,
-    val pniPqLastResortPreKey: SignedPreKeyJson,
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
+    val pniPqLastResortPreKey: SignedPreKeyJson? = null,
 )
 
 @Serializable
 data class AccountAttributes(
     val fetchesMessages: Boolean = true,
     val registrationId: Int,
-    val pniRegistrationId: Int,
+    /** Omitted for an account with no PNI (Signal-Desktop does the same). */
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
+    val pniRegistrationId: Int? = null,
     val name: String? = null,
     val capabilities: Capabilities = Capabilities(),
 )
@@ -826,6 +840,15 @@ data class Capabilities(
     val attachmentBackfill: Boolean = true,
     val spqr: Boolean = true,
     val usernameChangeSyncMessage: Boolean = true,
+    /**
+     * Must be true to link to an account with NO phone number / PNI:
+     * Signal-Server `DeviceController.linkDevice` answers 409 "Missing required
+     * device capability" otherwise. Signal-Desktop sets it exactly when the
+     * account has no number (`optionalPhoneNumber: !hasE164`), so we do too.
+     * `false` is dropped by the server (`DeviceCapabilityAdapter` keeps only
+     * true entries), so sending it for normal accounts changes nothing.
+     */
+    val optionalPhoneNumber: Boolean = false,
 )
 
 @Serializable

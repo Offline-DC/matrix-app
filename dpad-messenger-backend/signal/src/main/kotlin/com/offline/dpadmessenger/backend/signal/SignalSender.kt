@@ -17,6 +17,8 @@ import org.signal.libsignal.protocol.groups.GroupCipher
 import org.signal.libsignal.protocol.groups.GroupSessionBuilder
 import org.signal.libsignal.protocol.kem.KEMPublicKey
 import org.signal.libsignal.protocol.message.CiphertextMessage
+import org.signal.libsignal.protocol.message.DecryptionErrorMessage
+import org.signal.libsignal.protocol.message.PlaintextContent
 import org.signal.libsignal.protocol.state.PreKeyBundle
 import org.whispersystems.signalservice.internal.push.SignalServiceProtos
 import java.util.Optional
@@ -583,7 +585,7 @@ class SignalSender(
         val sealed = SealedSessionCipher(
             protocolStore,
             UUID.fromString(account.aci),
-            account.phoneNumber,
+            localE164(),
             account.deviceId,
         )
         val blob = sealed.multiRecipientEncrypt(addresses, usmc)
@@ -709,54 +711,133 @@ class SignalSender(
         timestamp: Long,
         cert: SenderCertificate,
     ) {
-        val bundle = getRecipientBundleCached(recipientServiceId)
-        // No devices means there's nothing to deliver to — sending an empty
-        // message list still returns 2xx from the server, which would surface
-        // as a misleading "sent" check on a message nobody received. Fail loud
-        // instead so the bubble shows as failed. (Seen with PNI-only recipients
-        // whose prekeys aren't fetchable by phone-number identity.)
-        if (bundle.devices.isEmpty()) {
-            throw RuntimeException("no prekey devices for $recipientServiceId — message not delivered")
-        }
-        val identityKey = IdentityKey(Base64.decode(bundle.identityKey, Base64.NO_WRAP), 0)
-        bundle.devices.forEach { dev ->
-            bootstrapSessionIfNeeded(recipientServiceId, dev, identityKey)
-        }
         val padded = padPlaintext(content.toByteArray())
         val cipher = SealedSessionCipher(
             protocolStore,
             UUID.fromString(account.aci),
-            /* localE164 = */ account.phoneNumber,
+            /* localE164 = */ localE164(),
             account.deviceId,
         )
-        val outgoing = bundle.devices.map { dev ->
-            val destAddress = SignalProtocolAddress(recipientServiceId, dev.deviceId)
-            val encrypted = cipher.encrypt(destAddress, cert, padded)
-            OutgoingMessage(
-                type = ENVELOPE_TYPE_UNIDENTIFIED_SENDER,
-                destinationDeviceId = dev.deviceId,
-                destinationRegistrationId = dev.registrationId,
-                content = Base64.encodeToString(encrypted, Base64.NO_WRAP),
-            )
+        sendToRecipientDevices(recipientServiceId, timestamp, what = "send") { devices ->
+            devices.map { dev ->
+                val destAddress = SignalProtocolAddress(recipientServiceId, dev.deviceId)
+                val encrypted = cipher.encrypt(destAddress, cert, padded)
+                OutgoingMessage(
+                    type = ENVELOPE_TYPE_UNIDENTIFIED_SENDER,
+                    destinationDeviceId = dev.deviceId,
+                    // From the SESSION, not the bundle — see sendToRecipientDevices.
+                    destinationRegistrationId = cipher.getRemoteRegistrationId(destAddress),
+                    content = Base64.encodeToString(encrypted, Base64.NO_WRAP),
+                )
+            }
         }
-        Log.d(TAG, "sending to $recipientServiceId — ${outgoing.size} device message(s)")
-        val result = api.sendMessage(
-            login = login,
-            password = password,
-            recipientServiceId = recipientServiceId,
-            body = SendMessageRequest(messages = outgoing, timestamp = timestamp),
-        )
-        if (!result.isSuccess) {
+    }
+
+    /**
+     * Ask [senderServiceId] to resend a message we could not decrypt — a
+     * Signal "retry receipt". Same as Signal-Android
+     * `SignalServiceMessageSender.sendRetryReceipt`: the [DecryptionErrorMessage]
+     * goes out unencrypted as a `PLAINTEXT_CONTENT` envelope (a broken session
+     * can't be trusted to carry it), to all of the sender's devices; only the
+     * device named inside the error acts on it. That device looks the message
+     * up by timestamp, archives its session with us, and resends on a fresh
+     * one. Not urgent (no push wake-up), like Signal.
+     */
+    suspend fun sendRetryReceipt(senderServiceId: String, error: DecryptionErrorMessage) {
+        val body = Base64.encodeToString(PlaintextContent(error).serialize(), Base64.NO_WRAP)
+        sendToRecipientDevices(
+            senderServiceId,
+            timestamp = System.currentTimeMillis(),
+            what = "retry-receipt",
+            urgent = false,
+        ) { devices ->
+            devices.map { dev ->
+                val address = SignalProtocolAddress(senderServiceId, dev.deviceId)
+                OutgoingMessage(
+                    type = ENVELOPE_TYPE_PLAINTEXT_CONTENT,
+                    destinationDeviceId = dev.deviceId,
+                    destinationRegistrationId = SessionCipher(protocolStore, address).remoteRegistrationId,
+                    content = body,
+                )
+            }
+        }
+        Log.i(TAG, "retry receipt sent to ${SigNames.sid(senderServiceId)}.${error.deviceId} for ts=${error.timestamp}")
+    }
+
+    /**
+     * Shared `PUT /v1/messages/<recipient>` loop with Signal's device-mismatch
+     * recovery (Signal-Android `SignalServiceMessageSender.sendMessage`):
+     *
+     *  1. Make sure we have a sendable session with every device in the
+     *     (cached) bundle.
+     *  2. [build] the per-device messages. Each carries the registration id
+     *     stored in OUR SESSION with that device. When a contact reinstalls
+     *     Signal their registration id changes, so the server answers 410 for
+     *     that device instead of silently delivering a message encrypted for a
+     *     session the new install doesn't have.
+     *  3. On 409/410: archive the sessions for extra/stale devices, drop the
+     *     cached bundle, and go again. The rebuilt session comes from a fresh
+     *     bundle carrying the contact's new identity key, which
+     *     [AndroidSignalProtocolStore.isTrustedIdentity] now accepts.
+     */
+    private suspend fun sendToRecipientDevices(
+        recipientServiceId: String,
+        timestamp: Long,
+        what: String,
+        urgent: Boolean = true,
+        build: (List<DevicePreKeyBundle>) -> List<OutgoingMessage>,
+    ) {
+        var attempt = 0
+        while (true) {
+            val bundle = getRecipientBundleCached(recipientServiceId)
+            // No devices means there's nothing to deliver to — sending an empty
+            // message list still returns 2xx from the server, which would surface
+            // as a misleading "sent" check on a message nobody received. Fail loud
+            // instead so the bubble shows as failed. (Seen with PNI-only recipients
+            // whose prekeys aren't fetchable by phone-number identity.)
+            if (bundle.devices.isEmpty()) {
+                throw RuntimeException("no prekey devices for $recipientServiceId — message not delivered")
+            }
+            val identityKey = IdentityKey(Base64.decode(bundle.identityKey, Base64.NO_WRAP), 0)
+            bundle.devices.forEach { dev ->
+                bootstrapSessionIfNeeded(recipientServiceId, dev, identityKey)
+            }
+            val outgoing = build(bundle.devices)
+            Log.d(TAG, "$what to $recipientServiceId — ${outgoing.size} device message(s)")
+            val result = api.sendMessage(
+                login = login,
+                password = password,
+                recipientServiceId = recipientServiceId,
+                body = SendMessageRequest(messages = outgoing, timestamp = timestamp, urgent = urgent),
+            )
+            if (result.isSuccess) return
             // A 401 means our device credentials are no longer valid — almost
             // always because the device was unlinked from the primary phone.
             // Surface it as a distinct type so the repository can prompt a
             // re-link instead of just silently failing the send.
             if (result.httpStatus == 401) {
-                throw SignalAuthException("send failed HTTP 401: ${result.rawBody}")
+                throw SignalAuthException("$what failed HTTP 401: ${result.rawBody}")
             }
-            throw RuntimeException("send failed HTTP ${result.httpStatus}: ${result.rawBody}")
+            val mismatch = DeviceMismatch.parse(result.httpStatus, result.rawBody)
+            if (mismatch == null || attempt >= MAX_DEVICE_MISMATCH_RETRIES) {
+                throw RuntimeException("$what failed HTTP ${result.httpStatus}: ${result.rawBody}")
+            }
+            attempt++
+            Log.i(
+                TAG,
+                "$what to ${SigNames.sid(recipientServiceId)}: HTTP ${result.httpStatus} " +
+                    "missing=${mismatch.missing} extra=${mismatch.extra} stale=${mismatch.stale} " +
+                    "— archiving + refetching keys (retry $attempt/$MAX_DEVICE_MISMATCH_RETRIES)",
+            )
+            mismatch.toArchive.forEach {
+                protocolStore.archiveSession(SignalProtocolAddress(recipientServiceId, it))
+            }
+            invalidateRecipientBundle(recipientServiceId)
         }
     }
+
+    /** Our E.164 for sealed-sender certs, or null for a numberless account. */
+    private fun localE164(): String? = account.phoneNumber.ifBlank { null }
 
     /**
      * Send a `SyncMessage.Sent` transcript to our own ACI. The Signal
@@ -829,7 +910,7 @@ class SignalSender(
         val cipher = SealedSessionCipher(
             protocolStore,
             UUID.fromString(account.aci),
-            account.phoneNumber,
+            localE164(),
             account.deviceId,
         )
         val outgoing = otherDevices.map { dev ->
@@ -898,7 +979,7 @@ class SignalSender(
         val cipher = SealedSessionCipher(
             protocolStore,
             UUID.fromString(account.aci),
-            account.phoneNumber,
+            localE164(),
             account.deviceId,
         )
         val outgoing = otherDevices.map { dev ->
@@ -979,7 +1060,7 @@ class SignalSender(
         val cipher = SealedSessionCipher(
             protocolStore,
             UUID.fromString(account.aci),
-            account.phoneNumber,
+            localE164(),
             account.deviceId,
         )
         val outgoing = otherDevices.map { dev ->
@@ -1061,7 +1142,7 @@ class SignalSender(
         val cipher = SealedSessionCipher(
             protocolStore,
             UUID.fromString(account.aci),
-            account.phoneNumber,
+            localE164(),
             account.deviceId,
         )
         val outgoing = otherDevices.map { dev ->
@@ -1128,7 +1209,6 @@ class SignalSender(
             fresh
         }
 
-    @Suppress("unused")
     private fun invalidateRecipientBundle(recipientServiceId: String) {
         cachedRecipientBundles.remove(recipientServiceId)
     }
@@ -1235,6 +1315,10 @@ class SignalSender(
         private const val OWN_BUNDLE_TTL_MS = 5L * 60 * 1000             // 5 minutes
         private const val RECIPIENT_BUNDLE_TTL_MS = 5L * 60 * 1000       // 5 minutes
         private const val ENVELOPE_TYPE_UNIDENTIFIED_SENDER = 6
+        /** Envelope.Type.PLAINTEXT_CONTENT — retry receipts only. */
+        private const val ENVELOPE_TYPE_PLAINTEXT_CONTENT = 8
+        /** Signal-Android retries a send up to 4 times on 409/410; 3 rebuilds is plenty here. */
+        private const val MAX_DEVICE_MISMATCH_RETRIES = 3
         private const val PADDING_GRANULE = 159
         /** Above this many other members, prefer the SenderKey multi-recipient
          *  send (one PUT) over per-member fan-out (N PUTs). */
