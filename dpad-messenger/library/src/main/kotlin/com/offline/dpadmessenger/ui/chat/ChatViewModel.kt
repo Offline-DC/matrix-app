@@ -136,10 +136,10 @@ class ChatViewModel(
         val imagePath = parent.attachment
             ?.takeIf { it.kind == com.offline.dpadmessenger.data.AttachmentKind.IMAGE }
             ?.localPath?.takeIf { java.io.File(it).exists() }
+        // No sender id or resolved name, as in startReply (10 Nov review).
         android.util.Log.d(
             "ChatUI",
-            "reply-quote parent=$replyToId sender=${parent.senderId} " +
-                "outgoing=${parent.isOutgoing} resolved=$resolved thumb=${imagePath != null}",
+            "reply-quote parent=$replyToId outgoing=${parent.isOutgoing} thumb=${imagePath != null}",
         )
         return com.offline.dpadmessenger.ui.components.ReplyParentSnippet(
             senderName = resolved,
@@ -160,11 +160,11 @@ class ChatViewModel(
     fun closeMessageSheet() { _selectedMessage.value = null }
 
     fun startReply(message: Message) {
+        // No sender id or name: for Smart Txt the id is the sender's address
+        // (an email or number), and the name is a contact's (9 Nov review).
         android.util.Log.d(
             "ChatUI",
-            "reply-banner target=${message.id} sender=${message.senderId} " +
-                "outgoing=${message.isOutgoing} " +
-                "resolved=${if (message.isOutgoing) "You" else senderName(message.senderId)}",
+            "reply-banner target=${message.id} outgoing=${message.isOutgoing}",
         )
         _editTarget.value = null
         _replyTarget.value = message

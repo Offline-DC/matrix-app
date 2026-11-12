@@ -1,7 +1,6 @@
 package com.offline.dpadmessenger.backend.smarttxt
 
 import android.content.Context
-import android.util.Log
 import com.offline.dpadmessenger.backend.core.MediaCache
 import com.offline.dpadmessenger.backend.smarttxt.transport.ChatGuid
 import com.offline.dpadmessenger.backend.smarttxt.transport.Handles
@@ -572,6 +571,14 @@ internal class SmartTxtMessageRepository(
                 // this only raises a flag; the user decides.
                 Log.w(TAG, "push cert rejected=${e.rejected}")
                 SmartTxtRepository.setPushCertRejected(appContext, e.rejected)
+            }
+            is TransportEvent.SmsActivationChanged -> {
+                // Tell the iPhone, so it can move past its forwarding screen (6.7).
+                // Nothing goes out for "off": there is no sms_forwarding_off, and
+                // the iPhone has no screen for it.
+                Log.i(TAG, "sms activation enabled=${e.enabled}")
+                SmartTxtLoginBridge.setSmsForwardingOn(e.enabled)
+                if (e.enabled) SmartTxtConfig.companionSender?.sendSmsForwardingOn()
             }
         }
     }
@@ -2218,4 +2225,23 @@ internal class SmartTxtMessageRepository(
         // real service, not here.
         private const val MAX_MESSAGES_PER_ROOM = 300
     }
+}
+
+/**
+ * Every log line from this file goes out with email addresses masked
+ * ([LogSafe.maskEmails]). Room / chat ids embed the DM counterpart's address
+ * ("iMessage;-;someone@…"), and the contact-index samples are contacts'
+ * addresses; masking here covers all of them, and any line added later, without
+ * touching each call (9 Nov review; owner: no email in full in the logs).
+ * Shadows android.util.Log for this file only.
+ */
+private object Log {
+    fun d(tag: String, msg: String): Int = android.util.Log.d(tag, LogSafe.maskEmails(msg))
+    fun d(tag: String, msg: String, t: Throwable?): Int = android.util.Log.d(tag, LogSafe.maskEmails(msg), t)
+    fun i(tag: String, msg: String): Int = android.util.Log.i(tag, LogSafe.maskEmails(msg))
+    fun i(tag: String, msg: String, t: Throwable?): Int = android.util.Log.i(tag, LogSafe.maskEmails(msg), t)
+    fun w(tag: String, msg: String): Int = android.util.Log.w(tag, LogSafe.maskEmails(msg))
+    fun w(tag: String, msg: String, t: Throwable?): Int = android.util.Log.w(tag, LogSafe.maskEmails(msg), t)
+    fun e(tag: String, msg: String): Int = android.util.Log.e(tag, LogSafe.maskEmails(msg))
+    fun e(tag: String, msg: String, t: Throwable?): Int = android.util.Log.e(tag, LogSafe.maskEmails(msg), t)
 }

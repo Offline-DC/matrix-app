@@ -237,6 +237,12 @@ sealed class TransportEvent {
      *  that reads as "my texts send but nobody ever replies". */
     data class PushCertRejected(val rejected: Boolean) : TransportEvent()
 
+    /** Text Message Forwarding for this device is on ([enabled] true) or off. Fires
+     *  when the iPhone toggles it (Apple's EnableSmsActivation), when a forwarded SMS
+     *  proves forwarding is live, and on every start while the saved state says on,
+     *  so the same value can arrive again; repeats are expected and harmless. */
+    data class SmsActivationChanged(val enabled: Boolean) : TransportEvent()
+
     data object AuthExpired : TransportEvent()
 }
 

@@ -10,7 +10,9 @@ recommendations to review, not applied changes.
 
 > **Since updated.** The measurements below describe the logger as it was when this
 > was written: one flat `LevelFilter::Info` with no per-target directives. It is now
-> a global ceiling of `Debug` plus an `env_logger` filter that holds the catch-all at
+> a global ceiling of `Info` (it was `Debug` until 9 Nov, for a temporary message-body
+> directive that was removed because it logged message text) plus an `env_logger`
+> filter that holds the catch-all at
 > `Info` and pins `rustpush::util` / `rustpush::aps` to `Warn`, so the two floods
 > below are silenced at the source rather than dropped downstream. `SmartTxtLogRing`
 > still filters them from older captures. Read the ratios as the case for that change,
