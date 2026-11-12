@@ -1696,9 +1696,14 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     relay_code: JString,
 ) -> jboolean {
     init_logger();
-    // ANISETTE-URL-CHECK: log the anisette v3 server this .so was compiled with, at
-    // INFO so it shows in `adb logcat -s smarttxt_ffi` on every launch (no sign-in needed).
-    log::info!("anisette: configured server = {}", omnisette::DEFAULT_ANISETTE_URL_V3);
+    // Point anisette at Dumb.Co's self-hosted anisette v3 server. omnisette reads
+    // SMARTTXT_ANISETTE_URL_V3 and only falls back to its compiled default if unset
+    // — same env-override pattern smarttxt-ffi already uses for SMARTTXT_DUMB_PATH.
+    std::env::set_var("SMARTTXT_ANISETTE_URL_V3", "https://ream-jump-siren.ngrok-free.dev");
+    // ANISETTE-URL-CHECK: log the EFFECTIVE anisette v3 server at INFO so it shows in
+    // `adb logcat -s smarttxt_ffi` on every launch (no sign-in needed).
+    log::info!("anisette: configured server = {}",
+        std::env::var("SMARTTXT_ANISETTE_URL_V3").unwrap_or_else(|_| omnisette::DEFAULT_ANISETTE_URL_V3.to_string()));
     // The rustls stack (reqwest) needs a process crypto provider; ring is bundled.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
