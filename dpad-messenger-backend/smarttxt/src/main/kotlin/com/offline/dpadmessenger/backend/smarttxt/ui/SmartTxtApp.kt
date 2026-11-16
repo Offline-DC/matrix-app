@@ -4,6 +4,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -59,6 +60,12 @@ fun SmartTxtApp(
      * empty inbox flash on their way to the done screen.
      */
     onSetupComplete: (() -> Unit)? = null,
+    /**
+     * Device setup only: a new value shows the send-from choice (6.4) again,
+     * fresh and pickable, after the user already picked. The launcher bumps it
+     * when the iPhone goes back from 6.10 to 6.9. 0, the default, never resets.
+     */
+    pickerResetKey: Int = 0,
 ) {
     val context = LocalContext.current
     // Restore a previous sign-in on a fresh process BEFORE reading status, so a
@@ -98,8 +105,25 @@ fun SmartTxtApp(
             }
         }
     }
+    // A back to 6.4 reopens the gate too. The pick saved the choice, so a status
+    // change since then may have re-read the store above and closed it.
+    LaunchedEffect(pickerResetKey) {
+        if (pickerResetKey != 0) handlesConfigured = false
+    }
 
     when {
+        status == SmartTxtStatus.REGISTERED && !handlesConfigured &&
+            com.offline.dpadmessenger.ui.components.LocalOnboardingContinue.current != null ->
+            // Launcher device setup: Figma "onboarding (dp) - 6.4 / 6.5". Keyed so a
+            // back from the iPhone shows it again unpicked ([pickerResetKey]).
+            key(pickerResetKey) {
+                OnboardingHandlePicker(
+                    onContinue = {
+                        if (onSetupComplete != null) onSetupComplete() else handlesConfigured = true
+                    },
+                )
+            }
+
         status == SmartTxtStatus.REGISTERED && !handlesConfigured ->
             HandlePickerScreen(
                 modifier = modifier,
@@ -158,6 +182,13 @@ fun SmartTxtApp(
             // the same identity for the same Apple ID just earns another 6005, so the
             // migration path would loop and silently mask the real problem.
             val terminalFailure = remember { SmartTxtAccountStore(context).terminalFailure() }
+
+            // A send-from page (HANDLES) left published by an earlier pass in this
+            // process would keep the launcher's "set up smart txt" cover off the
+            // loading page below. Cleared here, not when the picker goes (see
+            // OnboardingHandlePicker); SmartTxtSetupScreen publishes its own page
+            // once it is up (10 Nov review).
+            LaunchedEffect(Unit) { SmartTxtOnboardingPage.current.value = null }
 
             var migrate by remember { mutableStateOf<Boolean?>(null) } // null=checking
             LaunchedEffect(Unit) {

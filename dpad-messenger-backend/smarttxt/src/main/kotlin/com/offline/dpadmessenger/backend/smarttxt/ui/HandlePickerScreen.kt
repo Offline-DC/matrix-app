@@ -49,7 +49,7 @@ import com.offline.dpadmessenger.ui.navbar.SoftKeys
 import kotlinx.coroutines.delay
 
 /** "tel:+1…" → "+1…", "mailto:x@y" → "x@y". */
-private fun prettyHandle(h: String): String = h.removePrefix("tel:").removePrefix("mailto:")
+internal fun prettyHandle(h: String): String = h.removePrefix("tel:").removePrefix("mailto:")
 
 /** The pill's text and the menu rows: Helvetica Now Display Extra Bold 14/18.2. */
 private val HandleText = TextStyle(

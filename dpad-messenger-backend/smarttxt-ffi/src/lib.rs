@@ -102,9 +102,36 @@ use omnisette::{default_provider, DefaultAnisetteProvider};
 
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 static STATE: OnceCell<Mutex<AppState>> = OnceCell::new();
-/// Bumped every time a new receive loop starts; older loops see the mismatch and
-/// exit, so a recover's fresh loop replaces the dead one instead of doubling up.
+/// Bumped every time a new receive loop starts, and on sign-out (nativeLogout);
+/// older loops see the mismatch and stop taking messages, so a recover's fresh loop
+/// replaces the dead one instead of doubling up, and a signed-out registration's loop
+/// stops. A loop that is already waiting on a message when a NEWER loop starts still
+/// handles that one: only [`SIGNOUT_GEN`] makes it drop it.
 static RECV_GEN: AtomicU64 = AtomicU64::new(0);
+/// Bumped only by nativeLogout, under `st()`. A receive loop that sees it change while
+/// it waited for a message drops that message and stops: after sign-out nothing of the
+/// abandoned registration may be handled (10 Nov review). A client build checks it too,
+/// against the value its caller took with the registration it builds (nativeConnect's
+/// resume snapshot, the start of nativeRegister), and gives up if a sign-out came since.
+///
+/// The cost, accepted: nativeLogout can't tell an explicit Log out from the logout at
+/// the start of a sign-in (both follow nativeDisconnect), so on a keep-history
+/// re-sign-in, messages sent to the old registration while the user signs in again are
+/// not handled on the flip. The iPhone still has them. Handling them would put one
+/// account's messages into whichever account signs in after an explicit Log out;
+/// telling the two apart needs a flag from Kotlin (10 Nov review).
+static SIGNOUT_GEN: AtomicU64 = AtomicU64::new(0);
+/// Bumped under `st()` whenever the registration that `sms_active` belongs to is given
+/// up: nativeLogout, and nativeRegister making a new registration. A receive loop
+/// takes it with the registration it is built for (nativeConnect's resume snapshot,
+/// nativeRegister's clear), and its sms_active writers (the toggle in
+/// push_relay_event, mark_sms_forwarding_proven, the startup re-announce) check it
+/// under the same lock, so only the loop of the current registration can set
+/// forwarding on or off. Not [`RECV_GEN`]: a newer loop for the SAME registration (a
+/// reconnect) must not make the old one drop Apple's toggle, and the old loop of a
+/// replaced registration must be stopped from writing before the new loop starts
+/// (10 Nov review).
+static SMS_GEN: AtomicU64 = AtomicU64::new(0);
 /// True once the paired iPhone has enabled Text Message Forwarding for this device
 /// (received as `Message::EnableSmsActivation`). Gates green (SMS) sends; persisted
 /// to `<dir>/sms_active` so it survives restarts (the iPhone won't re-announce it).
@@ -198,6 +225,26 @@ use group_identity::{
     canon, effective_send_guid, group_sends_sms, is_nanp_e164, members_csv, requalify_national,
     resolve_group_guid, send_identity, updated_meta, GroupMeta,
 };
+
+// Log-safe text (emails masked, encoded blobs collapsed) for every line the
+// logger writes. Std only, so its tests run on the host (see log-safe-tests/).
+mod log_safe;
+use log_safe::{log_handle, log_handles, scrub_log_line};
+
+/// A sign-in step's name for the log. `{:?}` of LoginState printed its contents
+/// too: the security-key (FSA) challenge and the SMS-verify body (9 Nov review).
+fn login_state_name(s: &LoginState) -> &'static str {
+    match s {
+        LoginState::LoggedIn => "LoggedIn",
+        LoginState::NeedsDevice2FA => "NeedsDevice2FA",
+        LoginState::Needs2FAVerification => "Needs2FAVerification",
+        LoginState::NeedsSMS2FA => "NeedsSMS2FA",
+        LoginState::NeedsSMS2FAVerification(_) => "NeedsSMS2FAVerification",
+        LoginState::NeedsFSAVerification(_) => "NeedsFSAVerification",
+        LoginState::NeedsExtraStep(_) => "NeedsExtraStep",
+        LoginState::NeedsLogin => "NeedsLogin",
+    }
+}
 
 // Send routing + handle reconciliation POLICY. Same reason as the two modules above:
 // dependency-free so both decisions can be proved on the host (see policy-tests/) rather
@@ -418,9 +465,16 @@ fn block_on_timeout<T>(
 /// (e.g. a keystore `get_key` on an unreadable entry) into an `Err(String)`. Both
 /// `nativeConnect` (resume) and `nativeRegister` build the client OUTSIDE
 /// `block_on_timeout`, so without this a panic there unwinds across JNI and hangs the UI.
-fn build_client_guarded(users: Vec<IDSUser>, identity: IDSNGMIdentity) -> Result<(), String> {
+/// `sms_gen` and `signout_gen` are the [`SMS_GEN`] and [`SIGNOUT_GEN`] the caller took
+/// with `users` and `identity`.
+fn build_client_guarded(
+    users: Vec<IDSUser>,
+    identity: IDSNGMIdentity,
+    sms_gen: u64,
+    signout_gen: u64,
+) -> Result<(), String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt().block_on(build_client_and_receive(users, identity))
+        rt().block_on(build_client_and_receive(users, identity, sms_gen, signout_gen))
     })) {
         Ok(r) => r,
         Err(_) => Err("client build panicked (internal error — see the RUST PANIC line in logs). Please try signing in again.".to_string()),
@@ -469,25 +523,43 @@ fn init_logger() {
         b.filter(None, log::LevelFilter::Info);
         b.filter(Some("rustpush::util"), log::LevelFilter::Warn);
         b.filter(Some("rustpush::aps"), log::LevelFilter::Warn);
-        // TEMPORARY, for chasing an iMessage payload bug: the `debug!("xml: …")`
-        // calls in rustpush's imessage/messages.rs (lines ~306 and ~2574).
-        //
-        // Each of these logs a whole XML message body, so a catch-up replay emits
-        // one large String per message — the same allocation churn the util/aps
-        // lines above were silenced to avoid. Fine for a debugging session on a
-        // handset somebody is watching; take it back out before shipping, or move
-        // it behind a runtime switch if it turns out to be wanted permanently.
-        b.filter(Some("rustpush::imessage::messages"), log::LevelFilter::Debug);
+        // rustpush's icloud-auth crate (crate name `icloud_auth`) logs Apple's whole
+        // /auth JSON at Info ("Got gsa auth extras …", icloud_auth::client) on the
+        // SMS 2FA path: the security-key (FSA) challenge, the trusted phone numbers
+        // and recovery URLs that carry the Apple ID. Its warn/error lines still come
+        // through (10 Nov review).
+        b.filter(Some("icloud_auth"), log::LevelFilter::Warn);
+        // The TEMPORARY `rustpush::imessage::messages => Debug` directive that
+        // stood here (for chasing an iMessage payload bug, "take it back out
+        // before shipping") is gone: its `debug!` lines logged whole message
+        // bodies — the text people send ("sending: Ok(Dictionary({"t": …") and
+        // the XML — into the log that "report" emails to the team. Found in the
+        // 9 Nov device test; the owner: "Fix it". Message text is never logged.
         b.build()
     };
     android_logger::init_once(
         android_logger::Config::default()
-            // Debug, not Info: the ceiling has to clear the highest level any
-            // directive above asks for, or that directive is dead letter. Policy
-            // still lives in the filter — see the note above.
-            .with_max_level(log::LevelFilter::Debug)
+            // Info: no directive above asks for more. To chase something at
+            // debug, raise this AND name the module (see the note above) — and
+            // never for a module that logs message text.
+            .with_max_level(log::LevelFilter::Info)
             .with_filter(filter)
-            .with_tag("SmartTxtRust"),
+            .with_tag("SmartTxtRust")
+            // Every line, ours and rustpush's, goes out scrubbed
+            // (log_safe::scrub_log_line: emails masked, blobs collapsed): rustpush logs the sender and
+            // recipients of every send and receive in full ("IDS TARGETS
+            // mailto:…", "IDS RX … to=mailto:…"), and [log_handle] only covered
+            // our own lines (9 Nov test: the Apple ID 7 times in one send).
+            // Same "module: message" shape as android_logger's default.
+            // `fmt::write`, not `to_string()`: a Display impl returning Err must
+            // not be able to panic inside the logger (9 Nov review). The
+            // collapse of hex/base64 blobs is what keeps message bodies out:
+            // rustpush logs every send's plist as `raw: body <hex>`.
+            .format(|f, record| {
+                let mut msg = String::new();
+                let _ = std::fmt::write(&mut msg, *record.args());
+                write!(f, "{}: {}", record.module_path().unwrap_or(""), scrub_log_line(&msg))
+            }),
     );
     // Install a panic hook ONCE that routes Rust panics through `log` (→ logcat).
     // The default hook writes to stderr, which Android discards — so a panic on a
@@ -1511,21 +1583,25 @@ fn load_remote_config(dir: &str) -> Option<MacOSConfigRemote> {
             // Both values are re-decoded here with the real schema so the log PROVES
             // which one the header carries instead of just printing it.
             match cfg.rom_and_io_mac_hex() {
+                // The values themselves are hardware identifiers of this phone's Mac
+                // identity, so only whether they match is logged, never the values
+                // (9 Nov review: the log is emailed to the team on "report").
                 Some((rom_f11, mac_f2)) if rom_hex == rom_f11 && rom_f11 != mac_f2 => log::info!(
-                    "ROM_CHECK ✅ X-Apple-I-ROM={rom_hex} = dumb field 11 (rom). Field 2 \
-                     (io_mac_address)={mac_f2} is a DIFFERENT value and is correctly NOT used. \
-                     This matches OpenBubbles."
+                    "ROM_CHECK ✅ X-Apple-I-ROM = dumb field 11 (rom, {} hex chars). Field 2 \
+                     (io_mac_address) is a DIFFERENT value and is correctly NOT used. \
+                     This matches OpenBubbles.",
+                    rom_hex.len()
                 ),
-                Some((rom_f11, mac_f2)) if rom_hex == rom_f11 => log::info!(
-                    "ROM_CHECK ✅ X-Apple-I-ROM={rom_hex} = dumb field 11 (rom). Field 2 is \
-                     identical ({mac_f2}) on this device, so the old mapping was inert here — \
+                Some((rom_f11, _mac_f2)) if rom_hex == rom_f11 => log::info!(
+                    "ROM_CHECK ✅ X-Apple-I-ROM = dumb field 11 (rom). Field 2 is \
+                     identical on this device, so the old mapping was inert here — \
                      the header is right either way."
                 ),
                 Some((rom_f11, mac_f2)) => log::error!(
-                    "ROM_CHECK ❌ X-Apple-I-ROM={rom_hex} does NOT match dumb field 11 \
-                     ({rom_f11}); field 2 (io_mac_address) is {mac_f2}. The rom/io_mac mapping \
-                     has REGRESSED — X-Apple-I-ROM will disagree with the NAC-signed \
-                     validation data on every login."
+                    "ROM_CHECK ❌ X-Apple-I-ROM does NOT match dumb field 11 (rom); it {} \
+                     field 2 (io_mac_address). The rom/io_mac mapping has REGRESSED — \
+                     X-Apple-I-ROM will disagree with the NAC-signed validation data on every login.",
+                    if rom_hex == mac_f2 { "equals" } else if rom_f11.is_empty() { "can't be compared with" } else { "matches neither field 11 nor" }
                 ),
                 None => log::warn!(
                     "ROM_CHECK: couldn't re-decode the dumb for the rom/io_mac comparison \
@@ -1533,9 +1609,9 @@ fn load_remote_config(dir: &str) -> Option<MacOSConfigRemote> {
                 ),
             }
             log::info!(
-                "IDENTITY: product={} build={} macos={} proto={} rom={} (dumb field 11) udid_len={}",
+                "IDENTITY: product={} build={} macos={} proto={} rom_len={} (dumb field 11) udid_len={}",
                 cfg.inner.product_name, cfg.inner.os_build_num, cfg.version,
-                cfg.protocol_version, rom_hex,
+                cfg.protocol_version, rom_hex.len(),
                 cfg.udid.as_deref().unwrap_or("").len(),
             );
             log::info!("nativeInit: identity built FROM THE DUMB ({} B) — os_config.plist not required", body.len());
@@ -1562,6 +1638,11 @@ fn load_remote_config(dir: &str) -> Option<MacOSConfigRemote> {
 
 /// Log a field-by-field comparison of the dumb-derived config vs os_config.plist, so the
 /// dumb parse can be confirmed correct before os_config.plist is dropped for good.
+///
+/// The hardware identity fields (serial, MLB, ROM, device id, client UDID) identify this
+/// user's registration, and this log is emailed to the team, so only whether they match
+/// and their lengths are logged, never the values (10 Nov review). The rest (product
+/// name, build, versions, user agent) are the same on every flip and stay readable.
 fn compare_configs(from_dumb: &MacOSConfigRemote, from_plist: &MacOSConfigRemote) {
     let cmp = |name: &str, a: String, b: String| {
         if a == b {
@@ -1570,19 +1651,30 @@ fn compare_configs(from_dumb: &MacOSConfigRemote, from_plist: &MacOSConfigRemote
             log::warn!("config-verify: {name} MISMATCH — dumb={a:?} os_config={b:?}");
         }
     };
+    let cmp_id = |name: &str, a: String, b: String| {
+        if a == b {
+            log::info!("config-verify: {name} MATCH ({} chars)", a.len());
+        } else {
+            log::warn!(
+                "config-verify: {name} MISMATCH — dumb {} chars, os_config {} chars",
+                a.len(),
+                b.len()
+            );
+        }
+    };
     let rd: Vec<u8> = from_dumb.inner.rom.clone().into();
     let rp: Vec<u8> = from_plist.inner.rom.clone().into();
     cmp("product_name", from_dumb.inner.product_name.clone(), from_plist.inner.product_name.clone());
-    cmp("serial", from_dumb.inner.platform_serial_number.clone(), from_plist.inner.platform_serial_number.clone());
+    cmp_id("serial", from_dumb.inner.platform_serial_number.clone(), from_plist.inner.platform_serial_number.clone());
     cmp("build", from_dumb.inner.os_build_num.clone(), from_plist.inner.os_build_num.clone());
-    cmp("mlb", from_dumb.inner.mlb.clone(), from_plist.inner.mlb.clone());
-    cmp("rom", dbg_hex(&rd), dbg_hex(&rp));
+    cmp_id("mlb", from_dumb.inner.mlb.clone(), from_plist.inner.mlb.clone());
+    cmp_id("rom", dbg_hex(&rd), dbg_hex(&rp));
     cmp("version", from_dumb.version.clone(), from_plist.version.clone());
     cmp("protocol_version", from_dumb.protocol_version.to_string(), from_plist.protocol_version.to_string());
-    cmp("device_id", from_dumb.device_id.clone(), from_plist.device_id.clone());
+    cmp_id("device_id", from_dumb.device_id.clone(), from_plist.device_id.clone());
     cmp("icloud_ua", from_dumb.icloud_ua.clone(), from_plist.icloud_ua.clone());
     cmp("aoskit_version", from_dumb.aoskit_version.clone(), from_plist.aoskit_version.clone());
-    cmp("udid", from_dumb.udid.clone().unwrap_or_default(), from_plist.udid.clone().unwrap_or_default());
+    cmp_id("udid", from_dumb.udid.clone().unwrap_or_default(), from_plist.udid.clone().unwrap_or_default());
 }
 
 // =============================================================================
@@ -1673,6 +1765,7 @@ fn dbg_log_protobuf(tag: &str, mut buf: &[u8]) {
 /// the 5-byte OABS header, and log every protobuf field of the `HwInfo` body. Purely
 /// observational — nothing depends on the result yet; it exists so the dumb's fields can
 /// be identified before deriving `HardwareConfig` from it (and dropping os_config.plist).
+#[allow(dead_code)]
 fn dbg_log_dumb(dir: &str) {
     use base64::Engine;
     let path = Path::new(dir).join("dumb");
@@ -1719,10 +1812,10 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     // relay fallback, ever.
     let _ = (&relay_host, &relay_code);
 
-    // Diagnostic: dump the dumb file's HwInfo protobuf fields to logcat, so its hardware
-    // identity (serial/model/build/mlb/rom) can be mapped and os_config.plist eventually
-    // dropped. Observational only — nothing here consumes the result yet.
-    dbg_log_dumb(&dir);
+    // (dbg_log_dumb, which dumped the dumb file's HwInfo fields — serial, MLB, ROM —
+    // on every start, is no longer called: those are reusable hardware identifiers and
+    // this log is emailed to the team on "report" (9 Nov review). Call it by hand in a
+    // debugging build if the field mapping ever needs re-checking.)
 
     init_keystore_persisted(&dir);
 
@@ -1817,13 +1910,18 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         log::info!("nativeConnect: already connected — reusing");
         return JNI_TRUE;
     }
-    let (os_config, dir, resume_users, resume_identity) = {
+    // The generations are taken here, with the registration they belong to: a sign-out
+    // while APNs connects below (a second or more) then stops the build of what is by
+    // then an abandoned registration (10 Nov review).
+    let (os_config, dir, resume_users, resume_identity, sms_gen, signout_gen) = {
         let s = st();
         (
             s.os_config.clone(),
             s.files_dir.clone(),
             s.users.clone(),
             s.identity.clone(),
+            SMS_GEN.load(Ordering::SeqCst),
+            SIGNOUT_GEN.load(Ordering::SeqCst),
         )
     };
     let Some(os_config) = os_config else {
@@ -1872,7 +1970,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     // and just log it; the UI can re-drive registration.
     if !resume_users.is_empty() {
         if let Some(identity) = resume_identity {
-            if let Err(e) = build_client_guarded(resume_users, identity) {
+            if let Err(e) = build_client_guarded(resume_users, identity, sms_gen, signout_gen) {
                 log::error!("nativeConnect: client build (resume) failed: {e}");
             }
         }
@@ -1935,11 +2033,14 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 }
 
 /// Full LOGOUT: wipe every trace of the current login so the NEXT sign-in is fresh —
-/// no OpenBubbles/migrated resume. Resets the in-memory [`AppState`] to default
-/// (keeping ONLY the device identity `os_config` + `files_dir`) and deletes the
+/// no OpenBubbles/migrated resume. Bumps [`RECV_GEN`], [`SIGNOUT_GEN`] and
+/// [`SMS_GEN`] so the running receive loop stops, a client build in flight gives up,
+/// and neither can write sms_active, resets the in-memory [`AppState`] to default (keeping ONLY the device
+/// identity `os_config` + `files_dir`), clears [`SMS_ACTIVE`] and deletes the
 /// persisted login files (config.plist, keystore.plist, creds.json, id_cache.plist,
-/// anisette/). The device identity (`dumb` + `os_config.plist`) is intentionally KEPT
-/// so a fresh registration still validates through the NAC server (no relay). Called on
+/// sms_active), all under the `st()` lock. The device identity (`dumb` +
+/// `os_config.plist`) and anisette/ are intentionally KEPT so a fresh registration
+/// still validates through the NAC server (no relay) without re-provisioning. Called on
 /// explicit logout AND at the start of a fresh sign-in, so a stale/dangling session
 /// (e.g. OpenBubbles' push keypair whose private half lived in its un-transferable
 /// keystore) can never block `nativeConnect` with KeyNotFound.
@@ -1949,15 +2050,25 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     _class: JClass,
 ) {
     init_logger();
-    let dir = {
-        let mut s = st();
-        let files_dir = s.files_dir.clone();
-        let os_config = s.os_config.clone();
-        *s = AppState::default(); // drop connection/client/users/identity/account/creds/handles/…
-        s.files_dir = files_dir.clone();
-        s.os_config = os_config; // keep the device identity in memory
-        files_dir
-    };
+    // All of this runs under ONE st() lock: the generation bumps, the state reset, and
+    // clearing SMS_ACTIVE and the files. The receive loop's sms_active writers (the
+    // toggle in push_relay_event, mark_sms_forwarding_proven) check SMS_GEN under the
+    // same lock, so a message mid-decrypt now either lands before this and is wiped
+    // here, or after this and is dropped (10 Nov review).
+    let mut s = st();
+    // Supersede the running receive loop FIRST. It holds its own clones of the old
+    // connection and client, so without this it keeps handling the abandoned
+    // registration's traffic after sign-out and could set sms_active again (a
+    // forwarded SMS, Apple's toggle) before the next sign-in reads it (9 Nov review).
+    // SIGNOUT_GEN also makes it drop a message it was already waiting on.
+    RECV_GEN.fetch_add(1, Ordering::SeqCst);
+    SIGNOUT_GEN.fetch_add(1, Ordering::SeqCst);
+    SMS_GEN.fetch_add(1, Ordering::SeqCst);
+    let dir = s.files_dir.clone();
+    let os_config = s.os_config.clone();
+    *s = AppState::default(); // drop connection/client/users/identity/account/creds/handles/…
+    s.files_dir = dir.clone();
+    s.os_config = os_config; // keep the device identity in memory
     // Delete only LOGIN-level files. Do NOT touch anisette/: the anisette machine identity
     // (adi_pb + keychain_identifier) is DEVICE-level, not tied to the Apple ID login. Wiping
     // it forces a brand-new provisioning round-trip on every sign-in — which both wastes the
@@ -1965,14 +2076,55 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     // re-provisions) and makes login fail whenever provisioning has any hiccup. Keeping it
     // means a re-login reuses the already-provisioned identity and SKIPS provisioning
     // entirely (RemoteAnisetteProviderV3 only provisions when !is_provisioned()).
-    for f in ["config.plist", "keystore.plist", "creds.json", "id_cache.plist"] {
+    // "sms_active" too: Text Message Forwarding is switched on per REGISTRATION on the
+    // iPhone, and a sign-in makes a new one. Kept, it made the next sign-in claim
+    // forwarding was on for a registration the iPhone never authorised, so green sends
+    // went out to nowhere and the iPhone's 6.8 could be told "allowed" falsely
+    // (9 Nov forwarding investigation).
+    SMS_ACTIVE.store(false, Ordering::SeqCst);
+    for f in ["config.plist", "keystore.plist", "creds.json", "id_cache.plist", "sms_active"] {
         match std::fs::remove_file(Path::new(&dir).join(f)) {
             Ok(()) => log::info!("nativeLogout: deleted {f}"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => log::warn!("nativeLogout: couldn't delete {f}: {e}"),
         }
     }
+    drop(s);
     log::info!("nativeLogout: login state cleared (device identity dumb + os_config + anisette KEPT for fresh sign-in)");
+}
+
+/// Forget Text Message Forwarding for a registration Apple has ended, WITHOUT a logout.
+///
+/// For Apple's 6005 sign-out (Kotlin's `SmartTxtRepository.signOutKeepingHistory`), which
+/// keeps the login files so the re-sign-in reuses the identity and the history survives.
+/// It used to keep `sms_active` too. Then a network change before the re-sign-in rebuilt
+/// the client for the dead registration (`ensureClientUp` → `nativeConnect` resumes from
+/// the saved users), its startup re-announce queued "on" with no poll loop to drain it,
+/// and the re-sign-in handed that "on" to Kotlin before nativeRegister's OFF — so the
+/// iPhone was told forwarding was on for a registration it never authorised (11 Nov
+/// review). Forwarding is per registration, and the next sign-in makes a new one, so
+/// this clears what nativeLogout clears for forwarding and nothing else: [`SMS_GEN`]
+/// goes up (a receive loop or client build in flight can't write it back), `SMS_ACTIVE`
+/// and the `sms_active` file go, and so does any undelivered `sms_activation`. One
+/// `st()` lock, like the other sms_active writers.
+#[no_mangle]
+pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushNative_nativeClearSmsForwarding(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    init_logger();
+    let mut s = st();
+    SMS_GEN.fetch_add(1, Ordering::SeqCst);
+    SMS_ACTIVE.store(false, Ordering::SeqCst);
+    let dir = s.files_dir.clone();
+    match std::fs::remove_file(sms_active_path(&dir)) {
+        Ok(()) => log::info!("nativeClearSmsForwarding: deleted sms_active"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("nativeClearSmsForwarding: couldn't delete sms_active: {e}"),
+    }
+    let dropped = s.inbound.drop_sms_activations();
+    drop(s);
+    log::info!("SMS_FORWARDING: cleared for the signed-out registration (dropped {dropped} queued sms_activation)");
 }
 
 // =============================================================================
@@ -2017,7 +2169,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             // (e.g. "Your Apple ID or password was entered incorrectly. (-20101)").
             // `{e:?}` would collapse that to `AuthSrpWithMessage(-20101, "…")`.
             .map_err(|e| format!("login_email_pass: {e}"))?;
-        log::info!("login_email_pass → {state:?}");
+        log::info!("login_email_pass → {}", login_state_name(&state));
 
         // Returns (status_json, sms_body, fsa_challenge_json).
         // status = "logged_in" | "needs_2fa" | "needs_fsa".
@@ -2055,7 +2207,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
                         let sms = match account.send_sms_2fa_to_devices(1).await.map_err(|e| format!("send_sms_2fa: {e}"))? {
                             LoginState::NeedsSMS2FAVerification(body) => Some(body),
                             other => {
-                                log::warn!("send_sms_2fa unexpected: {other:?}");
+                                log::warn!("send_sms_2fa unexpected: {}", login_state_name(&other));
                                 None
                             }
                         };
@@ -2133,7 +2285,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         } else {
             account.verify_2fa(code).await.map_err(|e| format!("verify_2fa: {e}"))?
         };
-        log::info!("2FA verify → {verified:?}");
+        log::info!("2FA verify → {}", login_state_name(&verified));
         match verified {
             LoginState::LoggedIn | LoginState::NeedsExtraStep(_) => {}
             LoginState::NeedsLogin => {
@@ -2141,7 +2293,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
                 // re-run SRP to collect it (the harness' PET trick).
                 account.login_email_pass(&apple, &pw_hash).await.map_err(|e| format!("post-2fa re-login: {e}"))?;
             }
-            other => return Err(format!("unexpected 2FA result: {other:?}")),
+            other => return Err(format!("unexpected 2FA result: {}", login_state_name(&other))),
         }
         if account.get_pet().is_none() {
             return Err("no PET after 2FA — registration would fail".to_string());
@@ -2199,7 +2351,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
 
     let result = block_on_timeout(45, "FSA verification timed out — Apple didn't respond", async move {
         let verified = account.verify_security_key(body).await.map_err(|e| format!("verify_security_key: {e}"))?;
-        log::info!("FSA verify → {verified:?}");
+        log::info!("FSA verify → {}", login_state_name(&verified));
         match verified {
             LoginState::LoggedIn | LoginState::NeedsExtraStep(_) => {}
             LoginState::NeedsLogin => {
@@ -2207,7 +2359,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
                 // issuing a PET, so re-run SRP to collect it.
                 account.login_email_pass(&apple, &pw_hash).await.map_err(|e| format!("post-fsa re-login: {e}"))?;
             }
-            other => return Err(format!("unexpected FSA result: {other:?}")),
+            other => return Err(format!("unexpected FSA result: {}", login_state_name(&other))),
         }
         if account.get_pet().is_none() {
             return Err("no PET after FSA — registration would fail".to_string());
@@ -2242,14 +2394,24 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     // Serialised against nativeReregister — see REGISTER_LOCK. Taken before `st()` is
     // touched so a queued caller doesn't hold the state mutex while it waits.
     let _register_guard = lock_recovering(&REGISTER_LOCK, "nativeRegister");
-    let (os_config, connection, account, dir) = {
+    // SIGNOUT_GEN is taken with the login: a sign-out while this registers (up to two
+    // minutes) means the registration is no longer wanted (10 Nov review).
+    let (os_config, connection, account, dir, signout_gen) = {
         let mut s = st();
-        (s.os_config.clone(), s.connection.clone(), s.account.take(), s.files_dir.clone())
+        (
+            s.os_config.clone(),
+            s.connection.clone(),
+            s.account.take(),
+            s.files_dir.clone(),
+            SIGNOUT_GEN.load(Ordering::SeqCst),
+        )
     };
     let (Some(os_config), Some(connection), Some(account)) = (os_config, connection, account) else {
         return out(&mut env, err_json("not logged in — call nativeAuthenticate first"));
     };
     log::info!("nativeRegister: begin (IDS auth + activation; validation data comes from the NAC server)");
+    // Kept for the save below: `connection` moves into the registration future.
+    let reg_connection = connection.clone();
 
     let result = block_on_timeout(120, "Registration timed out — anisette/Apple/NAC server didn't respond", async move {
         // OpenBubbles emits a liveness/postdata beacon after login and BEFORE asking
@@ -2327,14 +2489,61 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         }
     };
 
-    // Persist for warm-start resume, then build the client + receive loop.
-    {
-        let push = rt().block_on(async {
-            st().connection.as_ref().unwrap().state.read().await.clone()
-        });
-        save_saved(&dir, &SavedState { push, users: users.clone(), identity: identity.clone() });
-    }
-    if let Err(e) = build_client_guarded(users, identity) {
+    // A NEW registration was just made (fresh identity above), so it starts with
+    // forwarding OFF: the iPhone switches Text Message Forwarding on per registration.
+    // Kotlin skips nativeLogout when the APNs socket is already up, so without this the
+    // client build below would load the previous registration's sms_active and tell the
+    // iPhone forwarding is on (10 Nov review). Under st(), like nativeLogout's clear.
+    // SMS_GEN goes up with it: the old registration's receive loop stays current until
+    // the new loop starts below (seconds: client build, handle reconcile), and a
+    // forwarded SMS or toggle it handles meanwhile must not write sms_active back.
+    // And an sms_activation OFF is queued, once any the old loop queued are dropped: Kotlin's
+    // smsForwardingOn, which the launcher re-sends to the iPhone as sms_forwarding_on,
+    // is reset only by that event or by Kotlin's own logout, which this path skips.
+    // Kotlin sends the iPhone nothing for off (10 Nov review).
+    //
+    // The push state saved with this registration is read from the connection
+    // `register` ran on, without st(). Read from st() it is None after a disconnect (a
+    // network change rebuilding APNs) or a sign-out while this registered, and the
+    // unwrap that was here then panicked with the STATE lock held (10 Nov review).
+    let push = rt().block_on(async { reg_connection.state.read().await.clone() });
+    let sms_gen = {
+        let mut s = st();
+        if SIGNOUT_GEN.load(Ordering::SeqCst) != signout_gen {
+            None
+        } else {
+            let sms_gen = SMS_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+            SMS_ACTIVE.store(false, Ordering::SeqCst);
+            match std::fs::remove_file(sms_active_path(&dir)) {
+                Ok(()) => log::info!("nativeRegister: new registration — cleared the previous sms_active"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!("nativeRegister: couldn't delete sms_active: {e}"),
+            }
+            // Drop any "on" the old registration queued and Kotlin hasn't polled yet, so
+            // this OFF is the only forwarding event left. Behind it, the stale "on" was
+            // still handed over first, and Kotlin told the iPhone `sms_forwarding_on` for
+            // a registration it never authorised (11 Nov review: a client resumed by a
+            // network change after Apple's 6005 sign-out, with no poll loop to drain it).
+            let dropped = s.inbound.drop_sms_activations();
+            if dropped > 0 {
+                log::info!("nativeRegister: new registration — dropped {dropped} queued sms_activation from the previous one");
+            }
+            s.queue_event(serde_json::json!({ "type": "sms_activation", "enabled": false }));
+            // Persisted for warm-start resume under the same lock and sign-out check:
+            // nativeLogout deletes config.plist under this lock, so a Log out can't
+            // land in between and leave this abandoned registration on disk for the
+            // next start to resume (10 Nov review).
+            save_saved(&dir, &SavedState { push, users: users.clone(), identity: identity.clone() });
+            Some(sms_gen)
+        }
+    };
+    let Some(sms_gen) = sms_gen else {
+        log::warn!("nativeRegister: signed out while registering — this registration is dropped");
+        return out(&mut env, err_json("Signed out while signing in. Please sign in again."));
+    };
+
+    // Build the client + receive loop.
+    if let Err(e) = build_client_guarded(users, identity, sms_gen, signout_gen) {
         log::error!("nativeRegister: client build failed: {e}");
         return out(&mut env, err_json(e));
     }
@@ -2346,7 +2555,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
             None => vec![],
         }
     });
-    log::info!("REGISTERED with iMessage ✅ handles={handles:?}");
+    log::info!("REGISTERED with iMessage ✅ handles={:?}", log_handles(&handles));
     out(&mut env, serde_json::json!({ "handles": handles }).to_string())
 }
 
@@ -2385,7 +2594,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     });
     match result {
         Ok(handles) => {
-            log::info!("nativeReregister: ✅ re-registered handles={handles:?}");
+            log::info!("nativeReregister: ✅ re-registered handles={:?}", log_handles(&handles));
             out(&mut env, serde_json::json!({ "ok": true, "handles": handles }).to_string())
         }
         Err(e) => {
@@ -2496,8 +2705,9 @@ fn spawn_startup_summary(client: &Arc<IMClient>, my_gen: u64) {
             };
             let handles = client.identity.get_handles().await;
             let regstate = regstate_payload(&client).await;
+            let shown = log_handles(&handles);
             log::info!(
-                "STARTUP: (emit {}/2, +{delay_s}s) reconcile={} | handles={handles:?} | \
+                "STARTUP: (emit {}/2, +{delay_s}s) reconcile={} | handles={shown:?} | \
                  regstate={regstate} | sms_active={} | gen={my_gen}",
                 i + 1,
                 get_reconcile_verdict(),
@@ -2683,7 +2893,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
         return out(&mut env, err_json("iMessage isn't connected right now."));
     };
     let handles = rt().block_on(async move { reconcile_handles(&client).await });
-    log::info!("nativeReconcileHandles: handles={handles:?}");
+    log::info!("nativeReconcileHandles: handles={:?}", log_handles(&handles));
     out(&mut env, serde_json::json!({ "ok": true, "handles": handles }).to_string())
 }
 
@@ -2777,11 +2987,34 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     if ok { JNI_TRUE } else { JNI_FALSE }
 }
 
+/// Err when a sign-out came after a client build's caller took `signout_gen`. Called
+/// with `st()` held: nativeLogout bumps [`SIGNOUT_GEN`] under that lock, so a sign-out
+/// can't land between the check and what the caller does next under the same lock.
+fn not_signed_out_since(signout_gen: u64) -> Result<(), String> {
+    if SIGNOUT_GEN.load(Ordering::SeqCst) == signout_gen {
+        Ok(())
+    } else {
+        Err("signed out while the client was being built".to_string())
+    }
+}
+
 /// Build the IMClient from registered users + identity and spawn the APNs receive
 /// loop that drains inbound messages onto `AppState.inbound` as relay-wire JSON.
-async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity) -> Result<(), String> {
+///
+/// `my_sms_gen` and `my_signout_gen` are the [`SMS_GEN`] and [`SIGNOUT_GEN`] the caller
+/// took with `users` and `identity` (nativeConnect's resume snapshot; nativeRegister's
+/// start and its sms_active clear). If a sign-out comes after that, the registration
+/// was given up: the build stops with an Err, and nothing is published, re-announced
+/// or started for it (10 Nov review).
+async fn build_client_and_receive(
+    users: Vec<IDSUser>,
+    identity: IDSNGMIdentity,
+    my_sms_gen: u64,
+    my_signout_gen: u64,
+) -> Result<(), String> {
     let (os_config, connection, dir) = {
         let s = st();
+        not_signed_out_since(my_signout_gen)?;
         (s.os_config.clone(), s.connection.clone(), s.files_dir.clone())
     };
     let os_config = os_config.ok_or("no os_config")?;
@@ -2810,18 +3043,61 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
     // OB-style handle reconciliation: publish the client, then reregister if IDS is
     // vending handles we haven't registered (possible != registered). Handles are read
     // live from rustpush (get_handles) wherever needed — nothing is cached.
-    st().client = Some(client.clone());
+    {
+        let mut s = st();
+        not_signed_out_since(my_signout_gen)?;
+        s.client = Some(client.clone());
+    }
     let _ = reconcile_handles(&client).await;
-    // Restore whether SMS forwarding was previously enabled by the iPhone.
-    SMS_ACTIVE.store(load_sms_active(&dir), Ordering::SeqCst);
+    // Restore whether SMS forwarding was previously enabled by the iPhone, and say so
+    // again on every start, as the toggle would: Apple sends the toggle only
+    // on a change, so a flip restarted while the iPhone waits on 6.7 would otherwise
+    // never confirm forwarding it already has. Kotlin turns this into
+    // sms_forwarding_on to the iPhone, which only acts on it during setup.
+    // Loaded, stored and queued under one st() lock with the SMS_GEN check, like the
+    // other sms_active writers: a sign-out or a new registration during this build has
+    // cleared sms_active, and that must not be undone here (10 Nov review).
+    {
+        let mut s = st();
+        if SMS_GEN.load(Ordering::SeqCst) == my_sms_gen {
+            let sms_on = load_sms_active(&dir);
+            SMS_ACTIVE.store(sms_on, Ordering::SeqCst);
+            if sms_on {
+                log::info!("SMS_FORWARDING: on from a previous session — telling the iPhone again");
+                s.queue_event(serde_json::json!({ "type": "sms_activation", "enabled": true }));
+            }
+        }
+    }
 
     // Bump the generation so any older receive loop (e.g. one left over from a
     // closed identity after a recover) exits when it sees the mismatch, and this
     // fresh loop takes over. VERIFY: the subscribe/handle surface moves between
     // rustpush revisions — mirrors the imessage-register engine receive pattern.
-    let my_gen = RECV_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    //
+    // Subscribe BEFORE the bump, and hand the receiver to the loop below, so every
+    // message broadcast once the old loop can see the new generation also reaches this
+    // loop. The old loop stops taking messages at the bump but still handles the one it
+    // was waiting on (only a sign-out makes it drop that): on a new registration made on
+    // this same connection, a message for the OLD registration decrypts only there. A
+    // message both loops see decrypts only with the identity it was sent to, and a
+    // Message/React handled twice is caught by `seen_guids`. Still not covered: a
+    // message already queued in the old loop's receiver before this subscribe, behind a
+    // slow decrypt, reaches neither loop (10 Nov review).
+    //
+    // On `connection` from the top, the one the client was built on. Read again from
+    // st() it is None after a sign-out or a disconnect during the build, and the unwrap
+    // that was here then panicked with the STATE lock held, poisoning it for every later
+    // JNI call (10 Nov review).
+    let mut sub = connection.messages_cont.subscribe();
+    // The bump is made under st() with the sign-out check, so a sign-out during
+    // reconcile_handles above ends the build here, and one after it bumps RECV_GEN past
+    // this loop's and its watchers' generation.
+    let my_gen = {
+        let _s = st();
+        not_signed_out_since(my_signout_gen)?;
+        RECV_GEN.fetch_add(1, Ordering::SeqCst) + 1
+    };
     spawn_regstate_watcher(client.clone(), my_gen);
-    let connection = st().connection.clone().unwrap();
     // Log-only; see the fn doc. Same generation guard as the regstate watcher so a
     // recover's fresh watcher replaces this one instead of doubling up.
     spawn_apsstate_watcher(connection.clone(), my_gen);
@@ -2830,12 +3106,19 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
     // log ring attaches and has never once appeared in a captured bundle.
     spawn_startup_summary(&client, my_gen);
     rt().spawn(async move {
-        let mut sub = connection.messages_cont.subscribe();
         loop {
             if RECV_GEN.load(Ordering::SeqCst) != my_gen {
-                break; // superseded by a newer loop (a recover)
+                break; // superseded by a newer loop (a recover, a new registration) or sign-out
             }
-            match sub.recv().await {
+            let received = sub.recv().await;
+            // Checked AFTER the await, for sign-out only: a loop parked in recv() at
+            // sign-out must not handle one more message of the abandoned registration.
+            // A newer loop alone is no reason to drop the message: it may be one only
+            // this loop's identity can decrypt (10 Nov review).
+            if SIGNOUT_GEN.load(Ordering::SeqCst) != my_signout_gen {
+                break;
+            }
+            match received {
                 Ok(apns_msg) => {
                     // Handle each message in its OWN task so a panic inside rustpush
                     // is contained (surfaced as a JoinError, not a process abort) —
@@ -2848,7 +3131,7 @@ async fn build_client_and_receive(users: Vec<IDSUser>, identity: IDSNGMIdentity)
                     let client = client.clone();
                     let joined = rt().spawn(async move { client.handle(apns_msg).await }).await;
                     match joined {
-                        Ok(Ok(Some(msg))) => push_relay_event(msg, &my_handles),
+                        Ok(Ok(Some(msg))) => push_relay_event(msg, &my_handles, my_sms_gen),
                         Ok(Ok(None)) => {}
                         Ok(Err(e)) => {
                             let dbg = format!("{e:?}");
@@ -2973,7 +3256,11 @@ fn repair_relayed_sms_handles(msg: &mut MessageInst, my_handles: &[String]) {
 
 /// Map a received rustpush `Message` to a relay-wire event and queue it.
 /// VERIFY: field access on the rustpush Message variants against your pinned rev.
-fn push_relay_event(mut msg: MessageInst, my_handles: &[String]) {
+///
+/// `sms_gen` is the [`SMS_GEN`] the handling receive loop took when its client was
+/// built. The sms_active writes below check it under `st()` and are dropped if that
+/// registration has since been signed out or replaced by a new one.
+fn push_relay_event(mut msg: MessageInst, my_handles: &[String], sms_gen: u64) {
     // Before anything reads a handle off this message: a relayed SMS/MMS may have
     // arrived without its country code, which would key it to a phantom room and
     // address any reply to a number that does not exist.
@@ -2990,10 +3277,25 @@ fn push_relay_event(mut msg: MessageInst, my_handles: &[String]) {
     st().ingest.touch(now);
     // The paired iPhone toggling Text Message Forwarding for this device on/off.
     if let Message::EnableSmsActivation(enabled) = &msg.message {
+        log::info!(
+            "SMS_FORWARDING: the paired iPhone switched Text Message Forwarding {} for this device \
+             (Apple EnableSmsActivation)",
+            if *enabled { "ON" } else { "OFF" }
+        );
+        // Checked and written under ONE st() lock, the one nativeLogout and
+        // nativeRegister bump SMS_GEN and clear sms_active under: a toggle for a
+        // registration that was signed out or replaced while it was being decrypted
+        // must not write sms_active back or queue the event into the fresh state. A
+        // newer loop for the same registration doesn't bump SMS_GEN, so its toggles,
+        // OFF included, still land (10 Nov review).
+        let mut s = st();
+        if SMS_GEN.load(Ordering::SeqCst) != sms_gen {
+            log::info!("SMS_FORWARDING: toggle dropped — it was for a registration since signed out or replaced");
+            return;
+        }
         SMS_ACTIVE.store(*enabled, Ordering::SeqCst);
-        let dir = st().files_dir.clone();
-        save_sms_active(&dir, *enabled);
-        st().queue_event(serde_json::json!({ "type": "sms_activation", "enabled": *enabled }));
+        save_sms_active(&s.files_dir, *enabled);
+        s.queue_event(serde_json::json!({ "type": "sms_activation", "enabled": *enabled }));
         return;
     }
     // ---- Outbound receipts: did the message we sent actually arrive? ----------
@@ -3028,6 +3330,9 @@ fn push_relay_event(mut msg: MessageInst, my_handles: &[String]) {
             from_self,
             sent_ok,
         );
+        // (No "forwarding proven" here: green sends are blocked while SMS_ACTIVE is
+        // false, so a 146 seen then can only be a replay of an older send, and it
+        // could override the iPhone switching forwarding OFF — 9 Nov review.)
         match action {
             ReceiptAction::MarkDelivered => {
                 let rec = before.expect("tracked");
@@ -3488,9 +3793,7 @@ fn push_relay_event(mut msg: MessageInst, my_handles: &[String]) {
         // still turns it back OFF explicitly via EnableSmsActivation(false).
         if service == "SMS" && !SMS_ACTIVE.load(Ordering::SeqCst) {
             log::info!("inbound SMS observed — enabling SMS forwarding for outgoing sends");
-            SMS_ACTIVE.store(true, Ordering::SeqCst);
-            let dir = st().files_dir.clone();
-            save_sms_active(&dir, true);
+            mark_sms_forwarding_proven("a forwarded SMS arrived", sms_gen);
         }
 
         // Learn which of MY handles this 1:1 iMessage thread transmits from, so a
@@ -4272,6 +4575,29 @@ fn save_sms_active(dir: &str, on: bool) {
     let _ = std::fs::write(sms_active_path(dir), if on { "1" } else { "0" });
 }
 
+/// Forwarding is evidently live for this registration without Apple's toggle
+/// message having reached us (it is sent only on a CHANGE, and after a re-setup the
+/// iPhone may address an older registration of this flip). Record it and raise the
+/// same event the toggle would, so Kotlin tells the iPhone (sms_forwarding_on) and
+/// its 6.7 can move on with real proof (9 Nov forwarding investigation).
+///
+/// `sms_gen` is the [`SMS_GEN`] the handling receive loop took when its client was
+/// built. Like the toggle in [`push_relay_event`], the check and the writes share one
+/// `st()` lock with nativeLogout's and nativeRegister's sms_active clear, so a message
+/// for a registration signed out or replaced while it was being decrypted can't turn
+/// forwarding back on (10 Nov review).
+fn mark_sms_forwarding_proven(why: &str, sms_gen: u64) {
+    let mut s = st();
+    if SMS_GEN.load(Ordering::SeqCst) != sms_gen {
+        log::info!("SMS_FORWARDING: not recorded ({why}) — it was for a registration since signed out or replaced");
+        return;
+    }
+    log::info!("SMS_FORWARDING: live for this device — {why}");
+    SMS_ACTIVE.store(true, Ordering::SeqCst);
+    save_sms_active(&s.files_dir, true);
+    s.queue_event(serde_json::json!({ "type": "sms_activation", "enabled": true }));
+}
+
 /// Where an outgoing message goes, decided per-recipient (auto-detect): iMessage
 /// if the number/email is registered on iMessage, else green SMS through the
 /// paired iPhone — or a user-facing reason to block the send.
@@ -4435,7 +4761,7 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     handle: JString<'l>,
 ) {
     let h = jstr(&mut env, &handle);
-    log::info!("nativeSetSendHandle: {h}");
+    log::info!("nativeSetSendHandle: {}", log_handle(&h));
     st().send_handle = h;
 }
 
@@ -4460,7 +4786,13 @@ pub extern "system" fn Java_com_offline_dpadmessenger_backend_smarttxt_RustPushN
     let members: Vec<String> =
         csv.split(',').map(|s| canon(s)).filter(|s| !s.is_empty()).collect();
     let cv_name = if name.trim().is_empty() { None } else { Some(name) };
-    log::info!("nativeRegisterGroup: chat={chat} members={members:?} name={cv_name:?}");
+    // The group name is user-authored: redacted like the receive path's cv_name, never
+    // logged as written (10 Nov review).
+    let cv_name_redacted = cv_name
+        .as_deref()
+        .map(rustpush::redact_text)
+        .unwrap_or_else(|| "none".to_string());
+    log::info!("nativeRegisterGroup: chat={chat} members={members:?} name={cv_name_redacted}");
     remember_group_meta(&chat, &members, &cv_name);
 }
 

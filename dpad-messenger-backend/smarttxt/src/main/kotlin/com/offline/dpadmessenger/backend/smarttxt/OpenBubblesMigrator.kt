@@ -419,7 +419,7 @@ object OpenBubblesMigrator {
             }
             val handles = login.optJSONArray("handles")?.let { a -> List(a.length()) { a.getString(it) } }.orEmpty()
             val appleId = login.optString("appleId", "")
-            Log.i(TAG, "  handles=$handles appleId=${appleId.ifBlank { "(none)" }}")
+            Log.i(TAG, "  handles=${handles.map(LogSafe::maskEmails)} appleId=${if (appleId.isBlank()) "(none)" else LogSafe.maskEmails(appleId)}")
 
             // ══ PHASE 3 — full success: stamp REGISTERED + pre-fill handles + go live.
             val store = SmartTxtAccountStore(app)
@@ -487,7 +487,7 @@ object OpenBubblesMigrator {
             ?: ObFlutterPrefs.string(xml, KEY_DEFAULT_HANDLE)?.takeIf { it.isNotBlank() }
         if (raw == null) {
             Log.w(TAG, "  send-from: no defaultHandle in OpenBubbles' settings " +
-                "(pb=${pb.length()}B xml=${xml.length()}B) — using $fallback")
+                "(pb=${pb.length()}B xml=${xml.length()}B) — using ${LogSafe.maskEmails(fallback)}")
             return fallback
         }
         // Exact first; then compare canonically, so a difference in how the address is
@@ -495,11 +495,11 @@ object OpenBubblesMigrator {
         val match = handles.firstOrNull { it.equals(raw, ignoreCase = true) }
             ?: handles.firstOrNull { Handles.canon(it) == Handles.canon(raw) }
         if (match == null) {
-            Log.w(TAG, "  send-from: OpenBubbles used '$raw', which is not among the " +
-                "migrated handles $handles — using $fallback")
+            Log.w(TAG, "  send-from: OpenBubbles used '${LogSafe.maskEmails(raw)}', which is not among the " +
+                "migrated handles ${handles.map(LogSafe::maskEmails)} — using ${LogSafe.maskEmails(fallback)}")
             return fallback
         }
-        Log.i(TAG, "  send-from: carried OpenBubbles' '$raw' → $match (post-login picker skipped)")
+        Log.i(TAG, "  send-from: carried OpenBubbles' '${LogSafe.maskEmails(raw)}' → ${LogSafe.maskEmails(match)} (post-login picker skipped)")
         return match
     }
 
@@ -532,7 +532,8 @@ object OpenBubblesMigrator {
             Log.w(TAG, "  ⚠ keystore decrypt unavailable — import uses fresh identity + re-registers")
         Log.i(TAG, "  staging dir before import:\n${listDir(stage)}")
         val raw = RustPushNative.runCatchingNativeImportOpenBubbles(stage.absolutePath, app.filesDir.absolutePath)
-        Log.i(TAG, "  nativeImportOpenBubbles → $raw")
+        // Masked: this JSON carries the full Apple ID and every handle.
+        Log.i(TAG, "  nativeImportOpenBubbles → ${LogSafe.maskEmails(raw)}")
         val res = JSONObject(raw)
         if (!res.optBoolean("ok", false)) {
             Log.w(TAG, "  login import failed: ${res.optString("error", "unknown")} — routing to manual sign-in")

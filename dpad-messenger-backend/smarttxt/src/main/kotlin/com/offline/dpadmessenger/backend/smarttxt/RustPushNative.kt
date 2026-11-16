@@ -89,6 +89,11 @@ object RustPushNative {
      *  the NAC server. Safe to call before every fresh sign-in. */
     external fun nativeLogout()
 
+    /** Forget Text Message Forwarding for a registration Apple ended, keeping the login:
+     *  clears the native `sms_active` state and drops any undelivered `sms_activation`.
+     *  See [runCatchingNativeClearSmsForwarding]. */
+    external fun nativeClearSmsForwarding()
+
     // ---- Apple ID authentication (GrandSlam + 2FA) --------------------------
     // rustpush needs an authenticated Apple ID (GSA token -> IDS auth cert)
     // BEFORE registration. Two-step so the UI can prompt for the 2FA code Apple
@@ -295,7 +300,32 @@ object RustPushNative {
     /** Null-safe logout: no-op when the `.so` isn't loaded. Clears native login state
      *  so the next sign-in is fresh (device identity kept). */
     fun runCatchingNativeLogout() {
+        // Forwarding belongs to the registration being abandoned (the native side
+        // clears its own copy too).
+        SmartTxtLoginBridge.setSmsForwardingOn(false)
         if (loaded) runCatching { nativeLogout() }
+    }
+
+    /**
+     * Null-safe: forget Text Message Forwarding without logging out, for Apple's 6005
+     * sign-out ([SmartTxtRepository.signOutKeepingHistory]), which keeps the login so the
+     * re-sign-in reuses the identity and keeps the history.
+     *
+     * Why it is needed (11 Nov review): that sign-out used to leave both copies of
+     * "forwarding on" standing — [SmartTxtLoginBridge.smsForwardingOn] here, and the
+     * native `sms_active`. The launcher re-sends `sms_forwarding_on` from the flag when
+     * the iPhone's 6.7 appears, so the iPhone could be told forwarding was on before the
+     * re-sign-in's own OFF arrived. And a network change before that re-sign-in rebuilds
+     * the client for the dead registration, whose startup re-announce queued a fresh "on".
+     * Forwarding is per registration and the re-sign-in makes a new one, so both are
+     * cleared here, exactly as [runCatchingNativeLogout] clears them.
+     *
+     * `runCatching` also covers a `.so` older than this call (UnsatisfiedLinkError): the
+     * Kotlin flag is cleared either way.
+     */
+    fun runCatchingNativeClearSmsForwarding() {
+        SmartTxtLoginBridge.setSmsForwardingOn(false)
+        if (loaded) runCatching { nativeClearSmsForwarding() }
     }
 
     /** Null-safe iMessage check: defaults to true (iMessage/blue) when the `.so`

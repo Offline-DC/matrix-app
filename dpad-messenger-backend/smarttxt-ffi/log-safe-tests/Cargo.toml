@@ -1,0 +1,13 @@
+# Host-only test harness for log_safe.rs (email masking + blob collapsing for every
+# native log line). It compiles the SAME file the FFI crate ships and runs its
+# #[cfg(test)] suite on the host — std only, no Android NDK / rustpush needed.
+# Run: `cargo test` from this directory. Isolated workspace, like identity-tests/.
+[package]
+name = "log-safe-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]

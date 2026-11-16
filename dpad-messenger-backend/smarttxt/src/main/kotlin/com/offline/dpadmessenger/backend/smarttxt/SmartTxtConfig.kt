@@ -90,6 +90,19 @@ object SmartTxtConfig {
     @Volatile
     var fsaChallengeSender: FsaChallengeSender? = null
 
+    // ---- iPhone login + forwarding, back to the companion phone -------------
+
+    /**
+     * Host-provided sink for `smart_txt_login_ack` and `sms_forwarding_on`,
+     * sent to the paired iPhone over the launcher's Type Sync socket. Null when
+     * the host hasn't wired it (mock/tests): the iPhone then just gets no
+     * answers. Set by the launcher in `DumbDownApp.onCreate` next to
+     * [fsaChallengeSender]. The other direction -- the login itself -- comes in
+     * through [SmartTxtLoginBridge.deliverLogin].
+     */
+    @Volatile
+    var companionSender: SmartTxtCompanionSender? = null
+
     /**
      * Intent extra key carrying the conversation id when the host messenger
      * Activity is opened from an incoming-message notification. Public so the

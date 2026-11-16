@@ -136,9 +136,10 @@ internal object SmartTxtLogRing {
         // lifecycle lines ("Resource Identity: preparing/generating/final error").
         // Those are `debug!` in rustpush's util.rs, and smarttxt-ffi's init_logger
         // holds `rustpush::util` to Warn, so they never reach logcat at all — this
-        // filter never saw them. (The global ceiling there is Debug now, so it is
-        // the per-target directive doing the work, not the ceiling; opting util in
-        // is a one-line change there, at the cost of the mutex flood.)
+        // filter never saw them. (The global ceiling there is Info since 9 Nov;
+        // opting util in to debug means raising the ceiling AND naming the module
+        // there, at the cost of the mutex flood — never for a module that logs
+        // message text.)
         // For registration health, prefer the REGSTATE lines and rustpush's own
         // info-level "Reregistering in N seconds", both of which are already captured.
         // logcat prints "--------- beginning of <buffer>" on stdout every time
@@ -478,7 +479,11 @@ internal object SmartTxtLogRing {
                     continue
                 }
                 keptLines++
-                writeLine(line + "\n")
+                // Scrubbed on the way in (emails masked, payload blobs collapsed),
+                // so the ring and every "report" built from it never hold an email
+                // address in full or a message body, whichever tag logged it
+                // (owner, 2026-11-06 / 9 Nov).
+                writeLine(LogSafe.scrub(line) + "\n")
             }
         }
         if (anchor != null && linesThisSpawn == 0) {

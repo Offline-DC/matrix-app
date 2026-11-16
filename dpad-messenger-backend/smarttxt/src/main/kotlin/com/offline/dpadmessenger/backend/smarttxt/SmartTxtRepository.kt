@@ -942,6 +942,11 @@ object SmartTxtRepository {
 
     fun signOutKeepingHistory(context: Context) {
         shutdown(context, wipe = false)
+        // After the shutdown, so no poll is left to hand Kotlin an "on" behind the clear.
+        // The login stays, but Text Message Forwarding belonged to the registration Apple
+        // just ended: a stale "on" would let the launcher tell the iPhone forwarding is on
+        // before the re-sign-in's new registration has it (11 Nov review).
+        RustPushNative.runCatchingNativeClearSmsForwarding()
         _status.value = SmartTxtStatus.UNREGISTERED
         SmartTxtEvents.record(context, "SIGN_OUT", "keepHistory=true")
     }
