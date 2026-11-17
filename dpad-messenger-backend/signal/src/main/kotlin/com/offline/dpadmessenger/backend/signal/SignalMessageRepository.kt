@@ -724,13 +724,29 @@ class SignalMessageRepository(
         // Canonicalize to the ACI when we've learned the PNI↔ACI pairing (from
         // Storage Service), so a chat started by typing a number addresses the
         // same recipient our other devices use — no PNI/ACI thread split.
+        val local = resolveServiceIdForNumber(destination)
+        if (local == null) {
+            // Not known locally → CDSI. SignalContactDiscovery logs its own
+            // "cdsi ~1234 result=…" line with the reason.
+            SigNames.log("startConversation typed=${SigNames.num(destination)} local=miss → cdsi")
+        }
         val serviceId = canonicalId(
-            resolveServiceIdForNumber(destination)
+            local
                 ?: discovery?.resolveAci(destination)?.also { aci ->
                     // Remember the mapping so future taps + receipts resolve locally.
                     numberToServiceId[normalizeNumber(destination)] = aci
                 }
-                ?: return null,
+                ?: run {
+                    // Was silent: the picker only says "Couldn't start a conversation",
+                    // so without this line a support log can't tell "not on Signal" /
+                    // "number not E.164-able" / "CDSI failed" apart (SignalCDSI logs the why).
+                    SigNames.log(
+                        "startConversation FAILED typed=${SigNames.num(destination)} " +
+                            "discovery=${if (discovery == null) "absent" else "miss"} " +
+                            "(UI shows \"Couldn't start a conversation\")",
+                    )
+                    return null
+                },
         )
         // Show a real name rather than a bare number, in priority order: a name
         // we already know for this service id → the device address-book name →
