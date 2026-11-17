@@ -730,7 +730,16 @@ class SignalMessageRepository(
                     // Remember the mapping so future taps + receipts resolve locally.
                     numberToServiceId[normalizeNumber(destination)] = aci
                 }
-                ?: return null,
+                ?: run {
+                    // Was silent: the picker only says "Couldn't start a conversation",
+                    // so without this line a support log can't tell "not on Signal" /
+                    // "number not E.164-able" / "CDSI failed" apart (SignalCDSI logs the why).
+                    SigNames.log(
+                        "startConversation FAILED typed=${SigNames.num(destination)} " +
+                            "discovery=${if (discovery == null) "absent" else "miss"}",
+                    )
+                    return null
+                },
         )
         // Show a real name rather than a bare number, in priority order: a name
         // we already know for this service id → the device address-book name →

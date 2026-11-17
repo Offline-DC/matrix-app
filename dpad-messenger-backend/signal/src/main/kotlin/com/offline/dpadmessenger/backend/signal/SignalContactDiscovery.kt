@@ -5,7 +5,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.signal.libsignal.net.CdsiLookupRequest
 import org.signal.libsignal.net.Network
-import java.util.Collections
 import java.util.Optional
 import java.util.concurrent.ConcurrentHashMap
 
@@ -51,8 +50,21 @@ class SignalContactDiscovery(
 
     /** norm E.164 → ACI (uuid string). */
     private val cache = ConcurrentHashMap<String, String>()
-    /** Numbers we looked up and that are NOT on Signal — don't ask CDSI again. */
-    private val notFound = Collections.synchronizedSet(mutableSetOf<String>())
+    /**
+     * Numbers CDSI definitively answered "not on Signal" for → when we learned
+     * that. Only a real "no entry" answer lands here — a failed lookup (auth fetch failed, network
+     * error, rate limit) must NOT, or one transient failure makes every retry
+     * for that contact fail instantly with "Couldn't start a conversation"
+     * until the app process dies. Entries expire after [NOT_FOUND_TTL_MS] so a
+     * contact who joins Signal later becomes reachable without a restart.
+     */
+    private val notFound = ConcurrentHashMap<String, Long>()
+
+    private sealed interface Lookup {
+        data class Found(val serviceId: String) : Lookup
+        object NotOnSignal : Lookup
+        object Failed : Lookup
+    }
 
     /**
      * Resolve [rawNumber] to a Signal ACI, or null if the number isn't on
@@ -64,11 +76,26 @@ class SignalContactDiscovery(
             return null
         }
         cache[e164]?.let { return it }
-        if (e164 in notFound) return null
+        notFound[e164]?.let { at ->
+            if (System.currentTimeMillis() - at < NOT_FOUND_TTL_MS) return null
+            notFound.remove(e164)
+        }
 
-        val serviceId = lookup(e164)
-        if (serviceId != null) {
-            cache[e164] = serviceId
+        val serviceId = when (val result = lookup(e164)) {
+            is Lookup.Found -> result.serviceId
+            Lookup.NotOnSignal -> {
+                notFound[e164] = System.currentTimeMillis()
+                Log.d(TAG, "no Signal account for $e164")
+                return null
+            }
+            Lookup.Failed -> {
+                // Not cached: the next tap retries CDSI instead of failing instantly.
+                Log.w(TAG, "discovery for $e164 failed — not caching, next attempt retries")
+                return null
+            }
+        }
+        cache[e164] = serviceId
+        run {
             // NB: a "PNI:<uuid>" here is NOT an ACI — it's a phone-number
             // identity for an account that restricts number-discoverability, so
             // CDSI withheld the ACI. We can still address it (same account), but
@@ -80,22 +107,21 @@ class SignalContactDiscovery(
             } else {
                 Log.d(TAG, "discovered $e164 → aci=$serviceId")
             }
-        } else {
-            notFound.add(e164)
-            Log.d(TAG, "no Signal account for $e164")
         }
         return serviceId
     }
 
     /**
      * The single CDSI round-trip. Isolated so the version-sensitive libsignal
-     * surface is in one place. Returns the ACI uuid string, or null.
+     * surface is in one place. Distinguishes a definitive "not on Signal"
+     * from a lookup that simply didn't complete.
      */
-    private suspend fun lookup(e164: String): String? {
-        val auth = api.getCdsiAuth(login, password)
+    private suspend fun lookup(e164: String): Lookup {
+        val auth = runCatching { api.getCdsiAuth(login, password) }
+            .getOrElse { Log.w(TAG, "CDSI auth fetch threw", it); null }
         if (auth == null) {
             Log.w(TAG, "CDSI auth fetch failed")
-            return null
+            return Lookup.Failed
         }
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -128,7 +154,7 @@ class SignalContactDiscovery(
                         ?.value
                 if (entry == null) {
                     Log.d(TAG, "CDSI $e164 → registered? NO (no entry)")
-                    return@runCatching null
+                    return@runCatching Lookup.NotOnSignal
                 }
 
                 // Prefer the ACI (bare UUID, matching how we key rooms). If CDSI
@@ -138,10 +164,11 @@ class SignalContactDiscovery(
                 val aci = entry.aci?.getRawUUID()?.toString()
                 val pni = entry.pni?.toServiceIdString()
                 Log.d(TAG, "CDSI $e164 → aci=${aci ?: "null"} pni=${pni ?: "null"}")
-                aci ?: pni
+                val id = aci ?: pni
+                if (id != null) Lookup.Found(id) else Lookup.NotOnSignal
             }.getOrElse {
                 Log.w(TAG, "CDSI lookup for $e164 failed", it)
-                null
+                Lookup.Failed
             }
         }
     }
@@ -168,5 +195,7 @@ class SignalContactDiscovery(
     companion object {
         private const val TAG = "SignalCDSI"
         private const val USER_AGENT = "DPADMessenger/0.1"
+        /** How long a definitive "not on Signal" answer is trusted. */
+        private const val NOT_FOUND_TTL_MS = 10 * 60 * 1000L
     }
 }
