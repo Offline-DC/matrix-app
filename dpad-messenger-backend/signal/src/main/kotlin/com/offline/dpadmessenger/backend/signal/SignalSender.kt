@@ -68,6 +68,11 @@ class SignalSender(
     private val login = "${account.aci}.${account.deviceId}"
     private val password = account.password
 
+    /** Our ACI protocol address. libsignal ≥0.93 requires it for 1:1
+     *  SessionCipher/SessionBuilder (it's bound into the message MAC). Sends
+     *  always go out from our ACI, like Signal-Android's localProtocolAddress. */
+    private val localAddress = SignalProtocolAddress(account.aci, account.deviceId)
+
     // SenderKey state (in-memory, per process). distributionId per group +
     // the set of members we've already shipped our SKDM to this session.
     private val groupDistributionIds = ConcurrentHashMap<String, UUID>()
@@ -565,7 +570,7 @@ class SignalSender(
 
         // SenderKey: stable distributionId per group, create our SKDM, and make
         // sure every member has it (so their GroupCipher can decrypt).
-        val selfAddress = SignalProtocolAddress(account.aci, account.deviceId)
+        val selfAddress = localAddress
         val distributionId = groupDistributionIds.getOrPut(groupIdB64) { UUID.randomUUID() }
         val skdm = GroupSessionBuilder(protocolStore).create(selfAddress, distributionId)
         distributeSenderKey(groupIdB64, target.revision, skdm, recipients, timestamp, cert)
@@ -756,7 +761,7 @@ class SignalSender(
                 OutgoingMessage(
                     type = ENVELOPE_TYPE_PLAINTEXT_CONTENT,
                     destinationDeviceId = dev.deviceId,
-                    destinationRegistrationId = SessionCipher(protocolStore, address).remoteRegistrationId,
+                    destinationRegistrationId = SessionCipher(protocolStore, localAddress, address).remoteRegistrationId,
                     content = body,
                 )
             }
@@ -1285,7 +1290,7 @@ class SignalSender(
             kyberPub,
             kyberSig,
         )
-        SessionBuilder(protocolStore, address).process(bundle)
+        SessionBuilder(protocolStore, address, localAddress).process(bundle)
         Log.d(TAG, "bootstrapped session with $recipientServiceId.${dev.deviceId}")
     }
 
