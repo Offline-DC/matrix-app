@@ -63,7 +63,8 @@ class SignalContactDiscovery(
     private sealed interface Lookup {
         data class Found(val serviceId: String) : Lookup
         object NotOnSignal : Lookup
-        object Failed : Lookup
+        /** [why] is a short, number-free reason for the support log. */
+        data class Failed(val why: String) : Lookup
     }
 
     /**
@@ -71,26 +72,52 @@ class SignalContactDiscovery(
      * Signal (or discovery failed). Cached.
      */
     suspend fun resolveAci(rawNumber: String): String? {
+        // Every outcome below logs one redacted SigNames line ("cdsi ~1234 …").
+        // SigNames:I is in the launcher's rolling-logcat filter, so a submitted
+        // bundle shows exactly why a new chat did or didn't open — no launcher
+        // change needed. The SignalCDSI lines stay for adb (they carry the full
+        // number, so they're DEBUG and never reach the rolling capture).
+        val masked = SigNames.num(rawNumber)
         val e164 = toE164(rawNumber) ?: run {
             Log.d(TAG, "can't normalize '$rawNumber' to E.164 — skipping discovery")
+            SigNames.log("cdsi $masked result=not-e164 digits=${rawNumber.count(Char::isDigit)}")
             return null
         }
-        cache[e164]?.let { return it }
+        cache[e164]?.let {
+            SigNames.log("cdsi $masked result=found src=cache sid=${SigNames.sid(it)}")
+            return it
+        }
         notFound[e164]?.let { at ->
-            if (System.currentTimeMillis() - at < NOT_FOUND_TTL_MS) return null
+            val ageS = (System.currentTimeMillis() - at) / 1000
+            if (ageS * 1000 < NOT_FOUND_TTL_MS) {
+                SigNames.log("cdsi $masked result=not-on-signal src=cache ageS=$ageS")
+                return null
+            }
             notFound.remove(e164)
         }
 
-        val serviceId = when (val result = lookup(e164)) {
-            is Lookup.Found -> result.serviceId
+        val startedMs = System.currentTimeMillis()
+        val result = lookup(e164)
+        val tookMs = System.currentTimeMillis() - startedMs
+        val serviceId = when (result) {
+            is Lookup.Found -> {
+                SigNames.log(
+                    "cdsi $masked result=found src=network sid=${SigNames.sid(result.serviceId)} ms=$tookMs",
+                )
+                result.serviceId
+            }
             Lookup.NotOnSignal -> {
                 notFound[e164] = System.currentTimeMillis()
                 Log.d(TAG, "no Signal account for $e164")
+                SigNames.log("cdsi $masked result=not-on-signal src=network ms=$tookMs cachedForS=${NOT_FOUND_TTL_MS / 1000}")
                 return null
             }
-            Lookup.Failed -> {
+            is Lookup.Failed -> {
                 // Not cached: the next tap retries CDSI instead of failing instantly.
-                Log.w(TAG, "discovery for $e164 failed — not caching, next attempt retries")
+                // (Before this fix a failure was cached as not-on-signal for the life
+                // of the process — a bundle showing repeated src=network failed lines
+                // for one number, rather than src=cache, confirms the fix is live.)
+                SigNames.log("cdsi $masked result=failed why=${result.why} ms=$tookMs retryable=true")
                 return null
             }
         }
@@ -117,11 +144,14 @@ class SignalContactDiscovery(
      * from a lookup that simply didn't complete.
      */
     private suspend fun lookup(e164: String): Lookup {
+        var authError: Throwable? = null
         val auth = runCatching { api.getCdsiAuth(login, password) }
-            .getOrElse { Log.w(TAG, "CDSI auth fetch threw", it); null }
+            .getOrElse { authError = it; null }
         if (auth == null) {
-            Log.w(TAG, "CDSI auth fetch failed")
-            return Lookup.Failed
+            Log.w(TAG, "CDSI auth fetch failed", authError)
+            return Lookup.Failed(
+                if (authError == null) "auth-null" else "auth-${authError!!.javaClass.simpleName}",
+            )
         }
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -167,8 +197,12 @@ class SignalContactDiscovery(
                 val id = aci ?: pni
                 if (id != null) Lookup.Found(id) else Lookup.NotOnSignal
             }.getOrElse {
-                Log.w(TAG, "CDSI lookup for $e164 failed", it)
-                Lookup.Failed
+                // Redacted: this is WARN, so it lands in the rolling capture.
+                Log.w(TAG, "CDSI lookup for ${SigNames.num(e164)} failed", it)
+                // Unwrap ExecutionException from the future's .get() so the log
+                // names the real cause (rate limit, network, protocol).
+                val cause = (it as? java.util.concurrent.ExecutionException)?.cause ?: it
+                Lookup.Failed("cdsi-${cause.javaClass.simpleName}")
             }
         }
     }
