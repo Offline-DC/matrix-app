@@ -305,9 +305,16 @@ class SignalProvisioningClient(
         //    `+` and `/` for us when assembling the query string.
         //  • Use ONLY `uuid=` (no `address=` alias). Extra unknown params
         //    can cause stricter parsers to reject the URL.
-        //  • `capabilities=` query key MUST be present, even with an empty
-        //    value, to advertise this device's backup support. We send empty
-        //    since we don't yet support the AEP-encrypted backup flow.
+        //  • `capabilities=` is a comma-separated list the PRIMARY reads
+        //    before linking (Signal-Android `LinkDeviceViewModel
+        //    .onQrCodeScanned`). We send `nopni,nopni2` = "can link to an
+        //    account with no phone number / PNI", exactly what Signal-Desktop
+        //    (`Provisioner.preload.ts`) and Signal-Android's own linked-device
+        //    flow (`ProvisioningSocket.Mode.Link`) send. Without `nopni2`, a
+        //    primary whose account has no PNI shows "this device is too old /
+        //    update Signal" and refuses to link (field report 2026-11-11).
+        //    We do NOT send `backup5` (Link & Sync history transfer): we don't
+        //    implement the backup-import flow.
         val address = ProvisioningProtos.ProvisioningAddress.parseFrom(uuidBytes)
         val pub = ephemeralKeys?.publicKey?.serialize() ?: return
         val pubB64 = Base64.encodeToString(pub, Base64.NO_WRAP)  // STANDARD alphabet, with padding
@@ -316,7 +323,7 @@ class SignalProvisioningClient(
             .authority("linkdevice")
             .appendQueryParameter("uuid", address.address)
             .appendQueryParameter("pub_key", pubB64)
-            .appendQueryParameter("capabilities", "")
+            .appendQueryParameter("capabilities", LINK_CAPABILITIES)
             .build()
             .toString()
         Log.d("SignalProvisioning", "QR URL: $url")
@@ -411,21 +418,38 @@ class SignalProvisioningClient(
     private suspend fun registerDevice(msg: ProvisioningProtos.ProvisionMessage): SignalAccount {
         val password = generateRandomPassword()
         val registrationId = SignalKeys.generateRegistrationId()
-        val pniRegistrationId = SignalKeys.generateRegistrationId()
+        val aci = msg.aciString()
+
+        // Numberless accounts. Because the QR advertises `nopni2`, a primary
+        // whose account has no phone number links us with NO PNI identity keys
+        // and NO number. Signal-Server then REQUIRES that we (a) send no PNI
+        // prekeys (else 422) and (b) claim `optionalPhoneNumber` (else 409) —
+        // `DeviceController.linkDevice`. Signal-Desktop
+        // (`AccountManager.preload.ts` / `WebAPI.linkDevice`) branches the same
+        // way on `hasE164`; Signal-Android's primary sends the PNI key pair
+        // only when it has one (`pniIdentityKeyPairOrNull`).
+        val hasPni = !msg.pniIdentityKeyPublic.isEmpty && !msg.pniIdentityKeyPrivate.isEmpty
+        val number = if (msg.hasNumber()) msg.number else ""
+        Log.i(TAG, "provision message: hasPni=$hasPni hasNumber=${number.isNotBlank()}")
 
         val aciIdentity = SignalKeys.deriveIdentityKeyPair(
             publicKeyBytes = msg.aciIdentityKeyPublic.toByteArray(),
             privateKeyBytes = msg.aciIdentityKeyPrivate.toByteArray(),
         )
-        val pniIdentity = SignalKeys.deriveIdentityKeyPair(
-            publicKeyBytes = msg.pniIdentityKeyPublic.toByteArray(),
-            privateKeyBytes = msg.pniIdentityKeyPrivate.toByteArray(),
-        )
+        val pniIdentity = if (hasPni) {
+            SignalKeys.deriveIdentityKeyPair(
+                publicKeyBytes = msg.pniIdentityKeyPublic.toByteArray(),
+                privateKeyBytes = msg.pniIdentityKeyPrivate.toByteArray(),
+            )
+        } else {
+            null
+        }
+        val pniRegistrationId = if (hasPni) SignalKeys.generateRegistrationId() else null
 
         val aciSignedPreKey = SignalKeys.generateSignedPreKey(aciIdentity, SignalKeys.generateKeyId())
-        val pniSignedPreKey = SignalKeys.generateSignedPreKey(pniIdentity, SignalKeys.generateKeyId())
+        val pniSignedPreKey = pniIdentity?.let { SignalKeys.generateSignedPreKey(it, SignalKeys.generateKeyId()) }
         val aciKyberPreKey = SignalKeys.generateKyberPreKey(aciIdentity, SignalKeys.generateKeyId())
-        val pniKyberPreKey = SignalKeys.generateKyberPreKey(pniIdentity, SignalKeys.generateKeyId())
+        val pniKyberPreKey = pniIdentity?.let { SignalKeys.generateKyberPreKey(it, SignalKeys.generateKeyId()) }
 
         // Name this linked device so the primary shows "Dumbphone 2" in
         // Settings → Linked Devices instead of "Unnamed Device". The name is an
@@ -439,19 +463,22 @@ class SignalProvisioningClient(
             registrationId = registrationId,
             pniRegistrationId = pniRegistrationId,
             name = encryptedName,
+            capabilities = Capabilities(optionalPhoneNumber = !hasPni),
         )
         val request = ConfirmDeviceRequest(
             verificationCode = msg.provisioningCode,
             accountAttributes = attributes,
             aciSignedPreKey = aciSignedPreKey.json,
-            pniSignedPreKey = pniSignedPreKey.json,
+            pniSignedPreKey = pniSignedPreKey?.json,
             aciPqLastResortPreKey = aciKyberPreKey.json,
-            pniPqLastResortPreKey = pniKyberPreKey.json,
+            pniPqLastResortPreKey = pniKyberPreKey?.json,
         )
 
-        // Auth uses phone-number + our newly-chosen password — the server
-        // commits both atomically with the device registration. After this
-        // call we authenticate as <aci>.<deviceId> on the chat WebSocket.
+        // Basic auth = <ACI>:<our new password>. The server ignores the
+        // username on this endpoint (the account comes from the verification
+        // code; only the password is kept), and Signal-Desktop always sends the
+        // ACI here. Using the ACI means a numberless account works too. After
+        // this call we authenticate as <aci>.<deviceId> on the chat WebSocket.
         //
         // Robustness: if the server rejects the request AND we attached an
         // encrypted device name, retry once WITHOUT the name. The device-name
@@ -459,7 +486,7 @@ class SignalProvisioningClient(
         // case the device shows "Unnamed Device" but the user can still link.
         val response = try {
             api.confirmDevice(
-                phoneNumber = msg.number,
+                username = aci,
                 password = password,
                 provisioningCode = msg.provisioningCode,
                 body = request,
@@ -468,7 +495,7 @@ class SignalProvisioningClient(
             if (encryptedName == null) throw t
             Log.w(TAG, "confirmDevice failed WITH device name; retrying without it", t)
             api.confirmDevice(
-                phoneNumber = msg.number,
+                username = aci,
                 password = password,
                 provisioningCode = msg.provisioningCode,
                 body = request.copy(accountAttributes = attributes.copy(name = null)),
@@ -480,9 +507,9 @@ class SignalProvisioningClient(
         // peers who establish sessions using our uploaded public bundles.
         protocolPrefs?.apply {
             putSignedPreKey(aciSignedPreKey.json.keyId, aciSignedPreKey.record.serialize())
-            putSignedPreKey(pniSignedPreKey.json.keyId, pniSignedPreKey.record.serialize())
+            pniSignedPreKey?.let { putSignedPreKey(it.json.keyId, it.record.serialize()) }
             putKyberPreKey(aciKyberPreKey.json.keyId, aciKyberPreKey.record.serialize())
-            putKyberPreKey(pniKyberPreKey.json.keyId, pniKyberPreKey.record.serialize())
+            pniKyberPreKey?.let { putKyberPreKey(it.json.keyId, it.record.serialize()) }
         }
 
         // ACI one-time prekeys — persist privates locally + upload publics so
@@ -499,7 +526,7 @@ class SignalProvisioningClient(
         }
         runCatching {
             api.uploadPreKeys(
-                login = "${msg.aciString()}.${response.deviceId}",
+                login = "$aci.${response.deviceId}",
                 password = password,
                 identity = "aci",
                 body = PreKeyUploadRequest(
@@ -523,20 +550,27 @@ class SignalProvisioningClient(
         }.onFailure { Log.w(TAG, "ACI prekey upload failed (non-fatal)", it) }
 
         return SignalAccount(
-            aci = msg.aciString(),
-            pni = msg.pniString() ?: response.pni,
-            phoneNumber = msg.number,
+            aci = aci,
+            // Null for a numberless account. Only trust the server's PNI when
+            // we actually got PNI keys; otherwise we'd claim a PNI we can't use.
+            pni = if (hasPni) msg.pniString() ?: response.pni else null,
+            phoneNumber = number,
             deviceId = response.deviceId,
             password = password,
             identityKeyPairBase64 = Base64.encodeToString(aciIdentity.serialize(), Base64.NO_WRAP),
             profileKeyBase64 = Base64.encodeToString(msg.profileKey.toByteArray(), Base64.NO_WRAP),
             registrationId = registrationId,
-            pniRegistrationId = pniRegistrationId,
-            pniIdentityKeyPairBase64 = Base64.encodeToString(pniIdentity.serialize(), Base64.NO_WRAP),
+            pniRegistrationId = pniRegistrationId ?: 0,
+            pniIdentityKeyPairBase64 = pniIdentity?.let { Base64.encodeToString(it.serialize(), Base64.NO_WRAP) } ?: "",
             // Root secret for the Storage Service key (contact/recipient sync).
             // Modern Signal ships the AEP; keep it so we can derive the master +
             // storage keys later. Absent on very old primaries — that's fine.
             accountEntropyPool = if (msg.hasAccountEntropyPool()) msg.accountEntropyPool else "",
+            authCredentialSaltBase64 = if (msg.hasAuthCredentialSalt()) {
+                Base64.encodeToString(msg.authCredentialSalt.toByteArray(), Base64.NO_WRAP)
+            } else {
+                ""
+            },
         )
     }
 
@@ -545,6 +579,8 @@ class SignalProvisioningClient(
 
     companion object {
         private const val TAG = "SignalProvisioning"
+        /** QR `capabilities=`. See onUuidReceived. */
+        internal const val LINK_CAPABILITIES = "nopni,nopni2"
         // Plain provisioning path — matches Signal-Android / mautrix-signal.
         // Do NOT append `?agent=…`: the server issues an address to any opened
         // socket, but tags an unrecognized agent and can refuse to *route* the

@@ -112,7 +112,7 @@ dependencies {
     // wasn't recognized by libsignal-android 0.46.x — it would error with
     // "protobuf encoding was invalid" inside SealedSessionCipher. The
     // post-0.7x releases include the new envelope parser.
-    api("org.signal:libsignal-android:0.86.5")
+    api("org.signal:libsignal-android:0.93.2")
 
     // OkHttp for both the provisioning WebSocket and the authenticated
     // chat WebSocket. Signal's clients use a similar low-level approach.

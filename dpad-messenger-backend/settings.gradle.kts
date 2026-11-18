@@ -14,6 +14,14 @@ dependencyResolutionManagement {
         // matrix-rust-sdk Kotlin bindings ship via Maven Central, but pre-release
         // builds sometimes go to GitHub Packages. If you bump to a snapshot,
         // add that repo here.
+
+        // libsignal: Signal stopped publishing to Maven Central after 0.86.5;
+        // newer releases are only on Signal's own repo. Scoped to org.signal so
+        // nothing else resolves from it. The launcher (composite build) needs
+        // the same entry in ITS settings — it resolves :signal's libsignal dep.
+        maven("https://build-artifacts.signal.org/libraries/maven/") {
+            content { includeGroup("org.signal") }
+        }
     }
 }
 

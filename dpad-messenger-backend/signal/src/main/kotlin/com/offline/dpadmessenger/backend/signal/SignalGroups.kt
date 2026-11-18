@@ -186,11 +186,20 @@ class SignalGroups(
         }.onFailure { Log.w(TAG, "group send token build failed", it) }.getOrNull()
     }
 
+    @Volatile private var loggedNoPni = false
+
     private suspend fun fetchGroupState(masterKey: ByteArray, gid: String): GroupInfo? =
         withContext(Dispatchers.IO) {
             val serverParams = serverPublicParams ?: return@withContext null
             val pniStr = account.pni ?: run {
-                Log.w(TAG, "no PNI on account — cannot build group auth credential")
+                // Numberless account (linked via `nopni2`). Group auth for these
+                // needs `receiveAuthCredentialWithoutPni` + the stored
+                // authCredentialSalt, which libsignal-android 0.86.5 lacks.
+                // Known limitation: groups don't load. Say so once, not per fetch.
+                if (!loggedNoPni) {
+                    loggedNoPni = true
+                    Log.i(TAG, "account has no PNI (numberless) — groups unavailable until libsignal adds AuthCredentialWithoutPni")
+                }
                 return@withContext null
             }
             try {

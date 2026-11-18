@@ -4,11 +4,9 @@ import android.Manifest
 import android.content.ContentUris
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
-import android.util.Size
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -52,12 +50,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import com.offline.dpadmessenger.ui.navbar.SoftKey
 import com.offline.dpadmessenger.ui.navbar.SoftKeys
+import com.offline.dpadmessenger.ui.util.decodeUriDownscaled
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -284,7 +282,7 @@ private fun MediaCell(
         initialValue = com.offline.dpadmessenger.ui.util.cachedImageByKey(item.uri),
         item.uri,
     ) {
-        value = loadThumbnail(context, item.uri)
+        value = loadThumbnail(context, item.uri, item.isVideo)
     }
     Box(
         contentAlignment = Alignment.Center,
@@ -378,22 +376,20 @@ private suspend fun queryRecentMedia(context: Context, limit: Int = 300): List<P
         items
     }
 
-/** Decode a small thumbnail for [uriStr]. Uses MediaStore's fast thumbnailer
- *  on API 29+, falls back to a downsampled decode on older builds. */
-private suspend fun loadThumbnail(context: Context, uriStr: String): ImageBitmap? =
+/**
+ * Decode a small thumbnail for [uriStr], in memory, through the shared LRU.
+ *
+ * Deliberately NOT `ContentResolver.loadThumbnail`: on Android 10+ (the Flip 2
+ * is API 30) MediaProvider persists what it hands back as
+ * `<dir>/.thumbnails/<id>.jpg` in shared storage, and phones plugged into a
+ * Mac as cameras import those as duplicate photos — one per photo this picker
+ * ever showed (Stefano, Oct 2026). See [decodeUriDownscaled] for the whole
+ * story. Don't bring it back.
+ */
+private suspend fun loadThumbnail(context: Context, uriStr: String, isVideo: Boolean): ImageBitmap? =
     withContext(Dispatchers.IO) {
         com.offline.dpadmessenger.ui.util.cachedImageByKey(uriStr)?.let { return@withContext it }
-        val uri = Uri.parse(uriStr)
-        val bmp = runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                context.contentResolver.loadThumbnail(uri, Size(256, 256), null).asImageBitmap()
-            } else {
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    val opts = BitmapFactory.Options().apply { inSampleSize = 8 }
-                    BitmapFactory.decodeStream(input, null, opts)?.asImageBitmap()
-                }
-            }
-        }.getOrNull()
+        val bmp = decodeUriDownscaled(context, Uri.parse(uriStr), 256, isVideo)
         if (bmp != null) com.offline.dpadmessenger.ui.util.putCachedImage(uriStr, bmp)
         bmp
     }

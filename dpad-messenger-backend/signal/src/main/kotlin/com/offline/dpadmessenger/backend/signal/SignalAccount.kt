@@ -12,7 +12,10 @@ import kotlinx.serialization.Serializable
  * @param aci the Account UUID — Signal's primary account identifier.
  * @param pni the Phone Number Identity UUID — Signal's number-rotation
  *            companion to ACI introduced in late 2022.
- * @param phoneNumber E.164 phone number bound to this account.
+ * @param pni null for an account with no phone number (linked via `nopni2`).
+ * @param phoneNumber E.164 phone number bound to this account, or "" for an
+ *                 account with no phone number. Use `ifBlank { null }` where
+ *                 a real number is required (sealed-sender localE164).
  * @param deviceId integer assigned by the primary device during linking
  *                 (1 = primary, 2+ = secondary devices).
  * @param password random password chosen by us during provisioning;
@@ -48,4 +51,12 @@ data class SignalAccount(
      * re-link to populate it. Never leaves the device.
      */
     val accountEntropyPool: String = "",
+    /**
+     * Base64 of the ProvisionMessage `authCredentialSalt` (16 bytes). Only sent
+     * for accounts with no PNI; needed to build group auth credentials for
+     * them (`receiveAuthCredentialWithoutPni`, which libsignal-android 0.86.5
+     * doesn't have yet). Captured now so those users won't need to re-link
+     * once groups are wired up for numberless accounts. Empty otherwise.
+     */
+    val authCredentialSaltBase64: String = "",
 )

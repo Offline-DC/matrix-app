@@ -30,6 +30,63 @@ object GoogleMessagesConfig {
     var messengerActivityClassName: String? = null
 
     /**
+     * Verbose protocol diagnostics on the GAIA pairing path (tag `GMGaiaPair`).
+     *
+     * Turns on: a field-by-field census plus a bounded hex dump of every
+     * `GaiaPairingRequestContainer` we send and every `GaiaPairingResponseContainer`
+     * we receive, and the `/web/config` cohort fingerprint.
+     *
+     * WHY IT EXISTS: on 2026-09-18 a customer's pairing was refused with
+     * `finishErrorType=3 finishErrorCode=32`, 520-690 ms after CLIENT_FINISHED --
+     * far too fast to have reached his handset. `32` is `CLIENT_ATTESTATION_MISSING`
+     * in Google's own enum, and `GaiaPairingRequestContainer` has grown a field 8,
+     * `privateAPIConfirmation`, that this codebase has never written. We cannot fix
+     * what we cannot see, and the only channel Google is talking to us through is
+     * the 42-byte response container we currently throw away.
+     *
+     * SAFE FOR SUPPORT CAPTURES. The dumps cover the pairing CONTAINER only. The
+     * tachyon auth token and the cookie jar live in the RPC envelope one level up
+     * and are never logged. Do not widen this to the envelope -- these logs get
+     * emailed.
+     *
+     * Default ON for the diagnostic build; flip to false to silence.
+     */
+    @Volatile
+    var pairingDiagnosticsEnabled: Boolean = true
+
+    /**
+     * Master switch for `GaiaPairingRequestContainer.privateAPIConfirmation`
+     * (field 8) -- the client attestation Google's web client sends on
+     * CLIENT_FINISHED.
+     *
+     * ON by default, because OFF is what produced `CLIENT_ATTESTATION_MISSING`
+     * (error 3/32) for a customer on 2026-09-18: Google flipped its `FUroQb`
+     * flag on, and any client that omits field 8 is now refused ~500 ms after
+     * CLIENT_FINISHED, before the handset is ever contacted.
+     *
+     * Turn it OFF only to reproduce that failure deliberately. Pairing will not
+     * succeed with it off for as long as `FUroQb` stays on.
+     */
+    @Volatile
+    var pairingSendPrivateApiConfirmation: Boolean = true
+
+    /**
+     * Override for the field 8 string. Null (the default) sends the value copied
+     * out of Google's own messagesweb bundle, which is what you want.
+     *
+     * This exists to answer "did Google change the string?" without a rebuild.
+     * Google distinguishes `CLIENT_ATTESTATION_MISSING` (32) from
+     * `CLIENT_ATTESTATION_MISMATCH` (33), so a wrong-but-present value returns
+     * 33 and a missing one returns 32 -- meaning a single failed attempt tells
+     * you whether the string drifted or the field stopped being read at all.
+     *
+     * Ignored when [pairingSendPrivateApiConfirmation] is false. An empty string
+     * is treated as "send nothing", same as turning the switch off.
+     */
+    @Volatile
+    var pairingPrivateApiConfirmation: String? = null
+
+    /**
      * Master switch for the `__Secure-1PSIDTS` keepalive (see [GMCookieRotation]).
      *
      * DEFAULT ON, on the strength of the 2026-06-12 field capture (Alex Browning),
