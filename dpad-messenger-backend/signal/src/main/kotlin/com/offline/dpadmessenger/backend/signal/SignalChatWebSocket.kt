@@ -462,7 +462,11 @@ class SignalChatWebSocket(
             // sealed sender we build it later from the sender certificate.
             val address = if (isSealed) null
                           else SignalProtocolAddress(sourceServiceId, sourceDevice)
-            val cipher = if (address != null) SessionCipher(store, address) else null
+            // libsignal ≥0.93 binds the sender + recipient addresses into the
+            // message MAC, so the LOCAL address must be exactly the service id
+            // the sender addressed (our ACI, or our PNI for a PNI-addressed
+            // message) plus our device id — see [localAddressFor].
+            val cipher = if (address != null) SessionCipher(store, localAddressFor(env), address) else null
             val cipherBody = env.content.toByteArray()
 
             when (env.type) {
@@ -1317,6 +1321,30 @@ class SignalChatWebSocket(
      * the primary; Signal does a session reset there instead), messages sent
      * to our PNI, and anything past [retryLimiter]'s budget.
      */
+    /** True when [env] was addressed to our PNI rather than our ACI. */
+    private fun isToOurPni(env: SignalServiceProtos.Envelope): Boolean {
+        val dest = env.destinationServiceId.orEmpty()
+        val destBinaryIsPni = env.hasDestinationServiceIdBinary() &&
+            env.destinationServiceIdBinary.size() == 17 &&
+            env.destinationServiceIdBinary.byteAt(0).toInt() == 0x01
+        val ourPni = account.pni?.removePrefix("PNI:")
+        return destBinaryIsPni || dest.startsWith("PNI:") ||
+            (ourPni != null && dest.removePrefix("PNI:").equals(ourPni, ignoreCase = true))
+    }
+
+    /**
+     * Our own protocol address for a 1:1 [SessionCipher] on [env]: the service
+     * id the sender addressed + our device id. Signal-Android does the same
+     * (SignalServiceCipher's localProtocolAddress). Since libsignal 0.93 this
+     * goes into the MAC check, so a PNI-addressed message must use our PNI
+     * ("PNI:<uuid>") and everything else our bare ACI.
+     */
+    private fun localAddressFor(env: SignalServiceProtos.Envelope): SignalProtocolAddress {
+        val ourPni = account.pni?.removePrefix("PNI:")
+        val serviceId = if (ourPni != null && isToOurPni(env)) "PNI:$ourPni" else account.aci
+        return SignalProtocolAddress(serviceId, account.deviceId)
+    }
+
     private fun requestResend(
         env: SignalServiceProtos.Envelope,
         sender: String,
@@ -1330,14 +1358,7 @@ class SignalChatWebSocket(
             Log.i(TAG, "decrypt error on a message from our own account ($who) — no retry receipt")
             return
         }
-        val dest = env.destinationServiceId.orEmpty()
-        val destBinaryIsPni = env.hasDestinationServiceIdBinary() &&
-            env.destinationServiceIdBinary.size() == 17 &&
-            env.destinationServiceIdBinary.byteAt(0).toInt() == 0x01
-        val ourPni = account.pni?.removePrefix("PNI:")
-        if (destBinaryIsPni || dest.startsWith("PNI:") ||
-            (ourPni != null && dest.removePrefix("PNI:").equals(ourPni, ignoreCase = true))
-        ) {
+        if (isToOurPni(env)) {
             Log.i(TAG, "decrypt error on a message to our PNI ($who) — no retry receipt")
             return
         }

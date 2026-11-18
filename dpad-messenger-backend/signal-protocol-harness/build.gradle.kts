@@ -9,10 +9,14 @@ plugins {
     kotlin("plugin.serialization") version "2.1.10"
     application
 }
-repositories { mavenCentral(); google() }
+repositories {
+    mavenCentral(); google()
+    // libsignal is no longer published to Maven Central after 0.86.5.
+    maven("https://build-artifacts.signal.org/libraries/maven/") { content { includeGroup("org.signal") } }
+}
 dependencies {
-    // Same version as ../signal (libsignal-android 0.86.5 wraps this client).
-    implementation("org.signal:libsignal-client:0.86.5")
+    // Same version as ../signal (libsignal-android 0.93.2 wraps this client).
+    implementation("org.signal:libsignal-client:0.93.2")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2")
 }
 kotlin { jvmToolchain(21) }
