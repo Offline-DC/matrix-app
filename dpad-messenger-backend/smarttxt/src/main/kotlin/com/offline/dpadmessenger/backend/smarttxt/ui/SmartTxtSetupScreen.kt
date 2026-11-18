@@ -104,10 +104,15 @@ import kotlinx.coroutines.launch
  * lives in the launcher's onboarding instead, on its "head's up" screen
  * before Smart Txt is launched.
  *
- * WAITING is where Smart Txt now opens: the Apple ID and password are typed on
- * the iPhone (Dumb Down 6.3) and arrive as a `smart_txt_login` through
- * SmartTxtLoginBridge, so the flip shows no form. CREDENTIALS is the form
- * itself, reached only through "login manually".
+ * WAITING was where Smart Txt opened from the 2026-11-04 redesign until 17 Nov:
+ * the Apple ID and password were typed on the iPhone (Dumb Down 6.3) and
+ * arrived as a `smart_txt_login` through SmartTxtLoginBridge, so the flip
+ * showed no form, and CREDENTIALS, the form itself, was reached only through
+ * "login manually". The owner moved the iMessage step back onto the flip on 17
+ * Nov and the iPhone's pages that typed the login are gone, so nothing can
+ * arrive on WAITING any more: Smart Txt opens on CREDENTIALS, the "login
+ * manually" route, from the start (see `manual`). WAITING and WaitingPage are
+ * unreachable until they're removed in their own change.
  */
 private enum class SignInStep { WAITING, CREDENTIALS, TWO_FACTOR, FSA, REGISTERING, SUCCESS }
 
@@ -124,26 +129,21 @@ fun SmartTxtSetupScreen(
     val scope = rememberCoroutineScope()
     val status by SmartTxtRepository.status.collectAsState()
 
-    var step by remember { mutableStateOf(SignInStep.WAITING) }
+    // The form, from the start (17 Nov): the person types their Apple ID here,
+    // on the flip. See SignInStep for the waiting page this used to open on.
+    var step by remember { mutableStateOf(SignInStep.CREDENTIALS) }
 
     // Set by "login manually" on the waiting page, and never cleared while this
     // screen is up: from then on it is today's sign-in form, and a login from
     // the iPhone is refused. While false, the sign-in in progress (if any) was
     // started by the iPhone, so it reports each turn back with an ack and a
     // failure returns to the waiting page rather than the form.
-    var manual by remember { mutableStateOf(false) }
+    // True from the start since 17 Nov: no iPhone types the login any more
+    // (its "sync ur iMessage" pages are gone), so every sign-in is this one.
+    // A stray smart_txt_login is still answered, as "manual".
+    var manual by remember { mutableStateOf(true) }
 
     var appleId by remember { mutableStateOf("") }
-    // True once a sign-in with the current Apple ID and password has failed, or
-    // been backed out of on the 2FA page: setup's auto sign-in then waits for
-    // one of them to change. Cleared by any edit to either box. See
-    // autoSignInAction.
-    var autoSignInHeld by remember { mutableStateOf(false) }
-    // Whether each box's last change was a whole value from the smartphone
-    // (Type Sync), not a key press. Setup's auto sign-in acts only on whole
-    // values. See autoSignInAction.
-    var appleIdWhole by remember { mutableStateOf(false) }
-    var passwordWhole by remember { mutableStateOf(false) }
     var password by remember { mutableStateOf("") }
 
     var twoFactorCode by remember { mutableStateOf("") }
@@ -269,9 +269,6 @@ fun SmartTxtSetupScreen(
                         ack(SmartTxtLoginAck.FAILED)
                     } else if (manual) {
                         error = result.message
-                        // Don't let setup's auto sign-in send these same values
-                        // again; see autoSignInAction (the "password loop").
-                        autoSignInHeld = true
                         step = SignInStep.CREDENTIALS
                     } else {
                         // iPhone route: no error page on the flip. The person is
@@ -331,10 +328,15 @@ fun SmartTxtSetupScreen(
 
     // Launcher device setup (2026-11-04 redesign): tell the launcher which page
     // is up, so it can cover the ones with nothing to press with its Figma
-    // pages, and — since those pages draw no keys — move from the Apple ID box
-    // to the password box and start the sign-in by itself once the smartphone
-    // has typed both in over type sync. The smartphone no longer tells the user
-    // to press anything here. Outside setup, nothing changes.
+    // pages. Outside setup, nothing changes.
+    //
+    // It also used to move from the Apple ID box to the password box and sign
+    // in by itself once the smartphone had pasted both in over Type Sync, since
+    // the launcher's pages hid this form's keys. Removed 17 Nov: the launcher
+    // no longer covers the form (the iMessage step is back on the flip), so its
+    // "sign in" key is right there; and it took any edit that added more than
+    // one letter at once for a paste, so a T9 word typed into the Apple ID box
+    // would have jumped to the password box mid-address.
     val inOnboarding = com.offline.dpadmessenger.ui.components.LocalOnboardingContinue.current != null
     // Leaving this screen ends what it published: without this the last page
     // (often CREDENTIALS) outlived it, so the next pass's launcher read a stale
@@ -356,31 +358,6 @@ fun SmartTxtSetupScreen(
             else -> SmartTxtOnboardingPage.SIGNING_IN
         }
     }
-    LaunchedEffect(appleId, password, step, signingIn, error, inOnboarding, autoSignInHeld, appleIdWhole, passwordWhole) {
-        when (autoSignInAction(
-            inSetup = inOnboarding,
-            onForm = step == SignInStep.CREDENTIALS,
-            signingIn = signingIn,
-            showingError = error != null,
-            heldAfterFailure = autoSignInHeld,
-            appleIdBlank = appleId.isBlank(),
-            passwordEmpty = password.isEmpty(),
-            appleIdWhole = appleIdWhole,
-            passwordWhole = passwordWhole,
-        )) {
-            AutoSignInAction.FOCUS_PASSWORD -> {
-                delay(ONBOARDING_FIELD_SETTLE_MS)
-                runCatching { passwordFr.requestFocus() }
-            }
-            AutoSignInAction.SIGN_IN -> {
-                // A paste arrives whole; the pause only lets a slow relay finish.
-                delay(ONBOARDING_SIGN_IN_SETTLE_MS)
-                startRegistration()
-            }
-            AutoSignInAction.NOTHING -> Unit
-        }
-    }
-
     // Use the launcher's Helvetica (Helvetica Now Text) across the whole sign-in
     // flow by overriding the typography styles this screen, DpadButton, and
     // OutlinedTextField read from the ambient MaterialTheme.
@@ -443,9 +420,9 @@ fun SmartTxtSetupScreen(
                 AutoFocus(if (password.isNotEmpty()) passwordFr else appleIdFr)
                 SignInPage(
                     appleId = appleId,
-                    onAppleIdChange = { appleIdWhole = arrivedWhole(appleId, it); appleId = it; error = null; autoSignInHeld = false },
+                    onAppleIdChange = { appleId = it; error = null },
                     password = password,
-                    onPasswordChange = { passwordWhole = arrivedWhole(password, it); password = it; error = null; autoSignInHeld = false },
+                    onPasswordChange = { password = it; error = null },
                     appleIdFr = appleIdFr,
                     passwordFr = passwordFr,
                     signingIn = signingIn,
@@ -489,12 +466,6 @@ fun SmartTxtSetupScreen(
                         pending2fa = null
                         if (deferred != null) {
                             cancelledByUser = true
-                            // Hold setup's auto sign-in until a box changes. Set
-                            // here, with the step, so it never sees the form
-                            // unheld: before, it sent the same Apple ID and
-                            // password to Apple again 0.8 s later, and every
-                            // Back brought a new 2FA prompt (10 Nov review).
-                            autoSignInHeld = true
                         }
                         step = homeStep()
                         // Cancel the registration coroutine's await.
@@ -530,7 +501,6 @@ fun SmartTxtSetupScreen(
                         pending2fa = null
                         if (deferred != null) {
                             cancelledByUser = true
-                            autoSignInHeld = true // as on the setup 2FA page above
                         }
                         step = homeStep()
                         // Cancel the registration coroutine's await.
@@ -824,6 +794,24 @@ private fun WaitingPage(
 }
 
 /**
+ * The sign-in form's words (owner, 18 Nov 2026: "change "Apple ID" to
+ * "email"", and the description under the heading: "check the dumb down app
+ * on ur smartphone"). The same words with and without setup; only the heading
+ * is broken by hand in setup's look, where its 228 px box would otherwise
+ * break it at "smart". The first box keeps its Apple ID job (an Apple account
+ * is signed in with its email or phone number); only its label changed. The
+ * paired iPhone's prompt titles itself with these labels too (its
+ * DumbphoneTextFieldPromptCopy), so change them together.
+ */
+internal object SignInCopy {
+    const val TITLE = "sign in to smart txt"
+    const val SETUP_TITLE = "sign in to\nsmart txt"
+    const val BODY = "check the dumb down app on ur smartphone"
+    const val APPLE_ID_LABEL = "phone number or email"
+    const val PASSWORD_LABEL = "password"
+}
+
+/**
  * The credentials form.
  *
  * Changes from the Material version it replaces, and why:
@@ -865,6 +853,52 @@ private fun SignInPage(
     var passwordVisible by remember { mutableStateOf(false) }
     val eyeFr = remember { FocusRequester() }
     var eyeFocused by remember { mutableStateOf(false) }
+    // Device setup (LocalOnboardingContinue is non-null only then): the setup
+    // look below, and "skip" for the way out.
+    val inOnboarding = com.offline.dpadmessenger.ui.components.LocalOnboardingContinue.current != null
+
+    // The paired iPhone types into these boxes (owner, 17 Nov; see
+    // SmartTxtFieldBridge): while a box has focus here, the iPhone shows a
+    // prompt with its label, and what's submitted there sets the box.
+    //
+    // Focus goes out as it settles, not on every event: moving from one box to
+    // the other is a blur then a focus, and without the pause the iPhone would
+    // see "none" in between and its prompt would close and reopen. While a
+    // sign-in runs, no box counts — the form is busy, and a value sent then
+    // would be dropped. Leaving the form (the 2FA page, the error page, Smart
+    // Txt closing) says "none" on the way out.
+    var appleIdFocused by remember { mutableStateOf(false) }
+    var passwordFocused by remember { mutableStateOf(false) }
+    LaunchedEffect(appleIdFocused, passwordFocused, signingIn) {
+        kotlinx.coroutines.delay(FIELD_FOCUS_SETTLE_MS)
+        com.offline.dpadmessenger.backend.smarttxt.SmartTxtFieldBridge.setFocused(
+            when {
+                signingIn -> null
+                appleIdFocused -> com.offline.dpadmessenger.backend.smarttxt.SmartTxtTextField.APPLE_ID
+                passwordFocused -> com.offline.dpadmessenger.backend.smarttxt.SmartTxtTextField.PASSWORD
+                else -> null
+            },
+        )
+    }
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose { com.offline.dpadmessenger.backend.smarttxt.SmartTxtFieldBridge.setFocused(null) }
+    }
+    // Values from the iPhone's prompt, collected for as long as the form is up
+    // (the bridge drops what arrives with no form). Through the same callbacks
+    // typing uses, so a value clears an old error and puts the cursor at the
+    // end, as a change from outside the box always does (see SignInField).
+    val currentSigningIn by androidx.compose.runtime.rememberUpdatedState(signingIn)
+    val currentOnAppleIdChange by androidx.compose.runtime.rememberUpdatedState(onAppleIdChange)
+    val currentOnPasswordChange by androidx.compose.runtime.rememberUpdatedState(onPasswordChange)
+    LaunchedEffect(Unit) {
+        com.offline.dpadmessenger.backend.smarttxt.SmartTxtFieldBridge.values.collect { v ->
+            if (currentSigningIn) return@collect
+            when (v.field) {
+                com.offline.dpadmessenger.backend.smarttxt.SmartTxtTextField.APPLE_ID -> currentOnAppleIdChange(v.value)
+                com.offline.dpadmessenger.backend.smarttxt.SmartTxtTextField.PASSWORD -> currentOnPasswordChange(v.value)
+            }
+        }
+    }
 
     // One place that decides what OK does, used by every path OK can arrive
     // on (see SignInField): on the eye it toggles the password, anywhere else
@@ -878,29 +912,18 @@ private fun SignInPage(
         }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(PageWhite)
-            // OK while nothing editable has focus (or an IME let it through).
-            // On the eye (not a text box) OK is never the IME's, even if its
-            // window is still up: TCL's stock keyboard keeps one showing, and
-            // deferring here left the eye's OK dead on phones without TT9.
-            .onPreviewKeyEvent { e ->
-                if (!e.isOk() || (imeShowing() && !eyeFocused)) return@onPreviewKeyEvent false
-                if (e.type == KeyEventType.KeyDown && e.nativeKeyEvent.repeatCount == 0) onOk()
-                true // swallow the KeyUp too, so it can't act on a field
-            }
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 12.dp),
-    ) {
-        Text("sign in to smart txt", style = SignInTitle, modifier = Modifier.padding(top = 20.dp))
-        Text(
-            "use the Dumb Down app on ur smartphone to type ur account details into the text boxes below.",
-            style = SignInBody,
-            modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
-        )
+    // OK while nothing editable has focus (or an IME let it through).
+    // On the eye (not a text box) OK is never the IME's, even if its
+    // window is still up: TCL's stock keyboard keeps one showing, and
+    // deferring here left the eye's OK dead on phones without TT9.
+    val okKeys = Modifier.onPreviewKeyEvent { e ->
+        if (!e.isOk() || (imeShowing() && !eyeFocused)) return@onPreviewKeyEvent false
+        if (e.type == KeyEventType.KeyDown && e.nativeKeyEvent.repeatCount == 0) onOk()
+        true // swallow the KeyUp too, so it can't act on a field
+    }
 
+    // What both looks share: the notice, the two boxes and what they do.
+    val form: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit = {
         // Used to sit on the removed intro page. It now goes here, between
         // the body and the fields, so it's read before the user signs in again.
         if (notice != null) {
@@ -910,7 +933,7 @@ private fun SignInPage(
         Spacer(Modifier.height(24.dp))
 
         SignInField(
-            label = "phone number or Apple ID",
+            label = SignInCopy.APPLE_ID_LABEL,
             value = appleId,
             onValueChange = onAppleIdChange,
             focusRequester = appleIdFr,
@@ -924,10 +947,11 @@ private fun SignInPage(
             onDown = { runCatching { passwordFr.requestFocus() } },
             onUp = null,
             onRight = null,
+            onFocusedChange = { appleIdFocused = it },
         )
         Spacer(Modifier.height(8.dp))
         SignInField(
-            label = "password",
+            label = SignInCopy.PASSWORD_LABEL,
             value = password,
             onValueChange = onPasswordChange,
             focusRequester = passwordFr,
@@ -942,6 +966,7 @@ private fun SignInPage(
             onUp = { runCatching { appleIdFr.requestFocus() } },
             // Right: password → the eye.
             onRight = { runCatching { eyeFr.requestFocus() } },
+            onFocusedChange = { passwordFocused = it },
             trailing = {
                 // Show / hide the password. Reached with D-pad Right from the
                 // password box; OK toggles it (see onOk), Left goes back.
@@ -967,6 +992,66 @@ private fun SignInPage(
         Spacer(Modifier.height(12.dp))
     }
 
+    // IN SETUP, THE SETUP LOOK (owner, 18 Nov 2026: "Use the same style as the
+    // other onboarding screens"). Since the flip signs Smart Txt in itself again
+    // (17 Nov), this form is the step's first page, between the launcher's own
+    // setup pages, and it was the one white page among them. So in setup it is
+    // drawn as the library's other setup pages are (OnboardingSmartTxtPages):
+    // in phone pixels, on the sunscreen page, with setup's progress bar, the
+    // 28 / 28 heading at (12, 21) broken as "sign in to / smart txt", and the
+    // 16 / 17.6 body at y 88 -- the 2-factor page's (6.2) places. The boxes are
+    // Figma's "text field" as before: no setup frame draws a text box, and its
+    // weak-ink label, stroke and sky focus ring read the same on this page. The
+    // launcher draws setup's soft-key bar over it, with these keys (its
+    // SmartTxtActivity). Outside setup (Smart Txt from home, signed out),
+    // Smart Txt's own white page stays, with the same words.
+    if (inOnboarding) {
+        OnboardingPixels {
+            Box(modifier = Modifier.fillMaxSize().background(ObPage)) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .then(okKeys)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 12.dp),
+                ) {
+                    androidx.compose.foundation.text.BasicText(
+                        SignInCopy.SETUP_TITLE,
+                        style = ObHeadingStyle,
+                        modifier = Modifier.padding(top = 21.dp).width(228.dp),
+                    )
+                    // The heading's two lines end at y 77; the body starts at 88.
+                    androidx.compose.foundation.text.BasicText(
+                        SignInCopy.BODY,
+                        style = ObBodyStyle,
+                        modifier = Modifier.padding(top = 11.dp).width(228.dp),
+                    )
+                    form()
+                }
+                // Over the page, so a form that scrolls (a notice above the
+                // boxes) passes under the bar, not over it.
+                ObProgressBar(Modifier.align(Alignment.TopStart))
+            }
+        }
+    } else {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(PageWhite)
+                .then(okKeys)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp),
+        ) {
+            Text(SignInCopy.TITLE, style = SignInTitle, modifier = Modifier.padding(top = 20.dp))
+            Text(
+                SignInCopy.BODY,
+                style = SignInBody,
+                modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+            )
+            form()
+        }
+    }
+
     // The way out sends a real Back press through the Activity's dispatcher,
     // so it does exactly what the hardware Back key does on this page --
     // whatever that is for the host. In the launcher's SmartTxtActivity there
@@ -978,7 +1063,6 @@ private fun SignInPage(
     //    and returns to where the user came from, like every other app.
     // Hidden while signing in: leaving mid-request would drop a sign-in
     // that may already be registering with Apple.
-    val inOnboarding = com.offline.dpadmessenger.ui.components.LocalOnboardingContinue.current != null
     val backDispatcher = androidx.activity.compose.LocalOnBackPressedDispatcherOwner.current
         ?.onBackPressedDispatcher
     com.offline.dpadmessenger.ui.navbar.SoftKeys(
@@ -1110,6 +1194,8 @@ private fun SignInField(
     onUp: (() -> Unit)?,
     onRight: (() -> Unit)?,
     trailing: (@Composable () -> Unit)? = null,
+    /** The box gained (true) or lost (false) focus. For the iPhone's prompt; see SignInPage. */
+    onFocusedChange: (Boolean) -> Unit = {},
 ) {
     var focused by remember { mutableStateOf(false) }
 
@@ -1163,7 +1249,10 @@ private fun SignInField(
             modifier = Modifier
                 .fillMaxWidth()
                 .focusRequester(focusRequester)
-                .onFocusEvent { focused = it.isFocused }
+                .onFocusEvent {
+                    if (it.isFocused != focused) onFocusedChange(it.isFocused)
+                    focused = it.isFocused
+                }
                 .onInterceptKeyBeforeSoftKeyboard { e ->
                     if (!e.isOk()) return@onInterceptKeyBeforeSoftKeyboard false
                     // The symbol row is up: OK must select the highlighted
@@ -1704,11 +1793,9 @@ private fun SpeechBubble(
 }
 
 /**
- * Setup: how long after the Apple ID lands before the password box takes focus.
- * Zero: the smartphone sends each value whole, and the redesign's 6.4 sends the
- * password only ~0.2 s after the Apple ID (seen on the 4058W, 5 Nov). At 400 ms
- * the password was typed onto the end of the Apple ID, unmasked.
+ * How long focus must stay put on the sign-in form before the iPhone hears
+ * which box has it (SmartTxtFieldBridge). Moving between the boxes is a blur
+ * then a focus a frame or two apart; 150 ms covers that on the 4058 without the
+ * iPhone's prompt lagging noticeably behind the box.
  */
-private const val ONBOARDING_FIELD_SETTLE_MS = 0L
-/** Setup: how long after the password lands before signing in by itself. */
-private const val ONBOARDING_SIGN_IN_SETTLE_MS = 800L
+private const val FIELD_FOCUS_SETTLE_MS = 150L

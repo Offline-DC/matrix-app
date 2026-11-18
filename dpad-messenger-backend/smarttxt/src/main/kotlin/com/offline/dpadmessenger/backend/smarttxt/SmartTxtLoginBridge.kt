@@ -142,4 +142,10 @@ interface SmartTxtCompanionSender {
      *  forwarding is live, and on every start while the saved state says on.
      *  Repeats are expected and harmless: the iPhone acts on it only on 6.7. */
     fun sendSmsForwardingOn()
+
+    /** Tell the iPhone which sign-in box has focus here ([field]), or that
+     *  none has (null), so it shows or hides its prompt for typing into it
+     *  ([SmartTxtFieldBridge], 17 Nov). A default that does nothing, so a host
+     *  with no iPhone, or a test fake, needn't implement it. */
+    fun sendTextFieldFocus(field: SmartTxtTextField?) {}
 }
