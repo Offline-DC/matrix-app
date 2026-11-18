@@ -77,6 +77,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
  * Txt keeps its own pages; these only replace them when the launcher provides
  * LocalOnboardingContinue.
  *
+ * The sign-in form joined them on 18 Nov 2026 (owner: "Use the same style as
+ * the other onboarding screens"): with the flip signing itself in again, it is
+ * the step's first page, so in setup it is drawn on this page, with this
+ * heading, body and bar (SignInPage, in SmartTxtSetupScreen.kt, uses the
+ * tokens below, which are internal for it).
+ *
  * Drawn in phone pixels (1 dp = 1 sp = 1 px), as the frames are, for the same
  * reason the launcher's setup kit does: the phone runs density 120 and font
  * scale 1.4 during setup, which drew Figma's numbers at about 75 %. The
@@ -121,7 +127,7 @@ val LocalOnboardingProgress = compositionLocalOf<Float?> { null }
  * top, the #262625 track and a #38ABFC fill with a rounded right end.
  */
 @Composable
-private fun ObProgressBar(modifier: Modifier = Modifier) {
+internal fun ObProgressBar(modifier: Modifier = Modifier) {
     val fraction = LocalOnboardingProgress.current ?: return
     Box(modifier.fillMaxWidth().height(8.dp).background(ObTrack)) {
         val filled = fraction.coerceIn(0f, 1f)
@@ -151,7 +157,7 @@ private val OnboardingDensity = Density(density = 1f, fontScale = 1f)
 internal fun OnboardingPixels(content: @Composable () -> Unit) =
     CompositionLocalProvider(LocalDensity provides OnboardingDensity, content = content)
 
-private val ObPage = Color(0xFFFAF594)        // fixed/brand (sunscreen)
+internal val ObPage = Color(0xFFFAF594)       // fixed/brand (sunscreen)
 private val ObHeading = Color(0xFF14140C)     // fixed/text strong on light bg
 private val ObBody = Color(0xFF575757)        // fixed/text weak on light bg
 private val ObDark = Color(0xFF0F0F0F)        // primary/background
@@ -182,9 +188,9 @@ private fun TextStyle.designed() = copy(
 )
 
 /** dp2/sans heading: Display Extra Bold 28 / 28. */
-private val ObHeadingStyle = TextStyle(fontFamily = ObExtraBold, fontWeight = FontWeight.ExtraBold, fontSize = 28.sp, lineHeight = 28.sp, color = ObHeading).designed()
+internal val ObHeadingStyle = TextStyle(fontFamily = ObExtraBold, fontWeight = FontWeight.ExtraBold, fontSize = 28.sp, lineHeight = 28.sp, color = ObHeading).designed()
 /** dp2/body: Display Medium 16 / 17.6. */
-private val ObBodyStyle = TextStyle(fontFamily = ObMedium, fontWeight = FontWeight.Medium, fontSize = 16.sp, lineHeight = 17.6.sp, color = ObBody).designed()
+internal val ObBodyStyle = TextStyle(fontFamily = ObMedium, fontWeight = FontWeight.Medium, fontSize = 16.sp, lineHeight = 17.6.sp, color = ObBody).designed()
 /** dp2/bttns/extra bold: the radio labels, 16 / 17.6. */
 private val ObLabelStyle = TextStyle(fontFamily = ObExtraBold, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp, lineHeight = 17.6.sp).designed()
 /** dp2/body smaller: the radio description, 14 / 15.4. */
@@ -291,7 +297,18 @@ internal fun OnboardingTwoFactorPage(
             )
         }
     }
-    SoftKeys(left = SoftKey(if (resending) "sending..." else "resend") { if (!resending) onResend() })
+    // "resend" on the left, "skip" on the right — frame 6.2 draws both (the
+    // skip restored 16 Nov, with the rest of setup's skips). Skip is the same
+    // gesture the sign-in page's own skip makes: a back press, which the
+    // launcher turns into "skip sign in?" and confirms there. Mirrors
+    // SmartTxtSetupScreen's binding, including dropping the key when there is
+    // no dispatcher to press.
+    val backDispatcher = androidx.activity.compose.LocalOnBackPressedDispatcherOwner.current
+        ?.onBackPressedDispatcher
+    SoftKeys(
+        left = SoftKey(if (resending) "sending..." else "resend") { if (!resending) onResend() },
+        right = if (backDispatcher == null) null else SoftKey("skip") { backDispatcher.onBackPressed() },
+    )
 }
 
 /**

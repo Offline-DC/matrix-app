@@ -53,51 +53,6 @@ internal fun iphoneLoginAction(
 internal fun canSignIn(appleId: String, password: String): Boolean =
     appleId.isNotBlank() && password.isNotEmpty()
 
-/** What setup's form does by itself as the smartphone types into it. */
-internal enum class AutoSignInAction { NOTHING, FOCUS_PASSWORD, SIGN_IN }
-
-/**
- * During setup the form has no keys on screen (the launcher's "set up smart
- * txt" page covers it), so it moves to the password box and signs in by
- * itself once the smartphone has typed both values in.
- *
- * [heldAfterFailure]: a sign-in with these exact values already failed, or was
- * backed out of on the 2FA page. Then it does NOT sign in again by itself
- * until the Apple ID or password changes: before this, "retry" (or Back) on
- * the error page sent the same wrong password to Apple again 0.8 s later,
- * every time, which is how an account gets locked (the "password loop",
- * 2026-11-06), and Back on the 2FA page did the same, with a new 2FA prompt
- * each time (10 Nov review). OK on the form still signs in on purpose.
- *
- * [appleIdWhole] / [passwordWhole]: the box's last change brought in more than
- * one character at once, i.e. a value the smartphone sent over Type Sync
- * (it always sends each value whole). Single key presses don't count: during
- * setup the form is hidden under the launcher's page, so keypad presses there
- * are stray, and with an immediate move to the password box two stray presses
- * used to send a junk sign-in to Apple (F35, 2026-11-06).
- */
-internal fun autoSignInAction(
-    inSetup: Boolean,
-    onForm: Boolean,
-    signingIn: Boolean,
-    showingError: Boolean,
-    heldAfterFailure: Boolean,
-    appleIdBlank: Boolean,
-    passwordEmpty: Boolean,
-    appleIdWhole: Boolean,
-    passwordWhole: Boolean,
-): AutoSignInAction = when {
-    !inSetup || !onForm || signingIn || showingError -> AutoSignInAction.NOTHING
-    appleIdBlank || !appleIdWhole -> AutoSignInAction.NOTHING
-    passwordEmpty -> AutoSignInAction.FOCUS_PASSWORD
-    heldAfterFailure || !passwordWhole -> AutoSignInAction.NOTHING
-    else -> AutoSignInAction.SIGN_IN
-}
-
-/** True when an edit brought in more than one character at once: a whole value
- *  from the smartphone, not a key press. See [autoSignInAction]. */
-internal fun arrivedWhole(before: String, after: String): Boolean = after.length - before.length > 1
-
 /** What Back (the flip's delete key) does on a 2FA code page. */
 internal enum class BackKeyAction { DELETE_DIGIT, LEAVE_PAGE, NOTHING }
 

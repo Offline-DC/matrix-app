@@ -58,59 +58,10 @@ class SmartTxtSignInRulesTest {
         assertEquals(false, canSignIn("", ""))
     }
 
-    // ---- setup's auto sign-in (the "password loop") ------------------------
-
-    private fun auto(
-        inSetup: Boolean = true,
-        onForm: Boolean = true,
-        signingIn: Boolean = false,
-        showingError: Boolean = false,
-        held: Boolean = false,
-        appleIdBlank: Boolean = false,
-        passwordEmpty: Boolean = false,
-        appleIdWhole: Boolean = true,
-        passwordWhole: Boolean = true,
-    ) = autoSignInAction(inSetup, onForm, signingIn, showingError, held, appleIdBlank, passwordEmpty, appleIdWhole, passwordWhole)
-
-    @Test fun `both values typed in setup signs in by itself`() {
-        assertEquals(AutoSignInAction.SIGN_IN, auto())
-    }
-
-    @Test fun `only the Apple ID typed moves to the password box`() {
-        assertEquals(AutoSignInAction.FOCUS_PASSWORD, auto(passwordEmpty = true))
-        // Even after a failure: moving focus never sends anything.
-        assertEquals(AutoSignInAction.FOCUS_PASSWORD, auto(passwordEmpty = true, held = true))
-    }
-
-    @Test fun `after a failed sign-in the same values are not sent again`() {
-        // "retry" or Back clears the error page, or Back on the 2FA page puts the
-        // form back; before the fix each of these signed in again.
-        assertEquals(AutoSignInAction.NOTHING, auto(held = true))
-    }
-
-    @Test fun `stray key presses in the hidden form never move focus or sign in`() {
-        // F35: one keypad press in the Apple ID box used to jump to the password
-        // box, and a second press then sent a junk sign-in to Apple.
-        assertEquals(AutoSignInAction.NOTHING, auto(passwordEmpty = true, appleIdWhole = false))
-        assertEquals(AutoSignInAction.NOTHING, auto(passwordWhole = false))
-        assertEquals(AutoSignInAction.NOTHING, auto(appleIdWhole = false, passwordWhole = false))
-    }
-
-    @Test fun `a value arrives whole only when more than one character comes at once`() {
-        assertEquals(true, arrivedWhole("", "someone@example.com"))
-        assertEquals(true, arrivedWhole("so", "someone@example.com"))
-        assertEquals(false, arrivedWhole("", "s"))
-        assertEquals(false, arrivedWhole("someone", "someone1"))
-        assertEquals(false, arrivedWhole("someone", "someon"))
-    }
-
-    @Test fun `nothing happens outside setup, off the form, mid sign-in or on the error page`() {
-        assertEquals(AutoSignInAction.NOTHING, auto(inSetup = false))
-        assertEquals(AutoSignInAction.NOTHING, auto(onForm = false))
-        assertEquals(AutoSignInAction.NOTHING, auto(signingIn = true))
-        assertEquals(AutoSignInAction.NOTHING, auto(showingError = true))
-        assertEquals(AutoSignInAction.NOTHING, auto(appleIdBlank = true))
-    }
+    // Setup's auto sign-in (the "password loop", autoSignInAction / arrivedWhole)
+    // was removed on 17 Nov with the launcher's cover over the form: the form's
+    // own "sign in" key shows in setup now, and a T9 word typed into the Apple
+    // ID box would have counted as a smartphone paste.
 
     // ---- the "send from" page's number --------------------------------------
 
