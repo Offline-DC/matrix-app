@@ -164,8 +164,16 @@ fun DpadComposer(
         if (fieldAttached && autoFocusOnAttach) {
             runCatching { fieldFr.requestFocus() }
             // Defensively hide the IME in case Compose auto-opened it.
-            delay(100)
-            keyboard?.hide()
+            //
+            // Not on the HIT. There Dumb Keys shows its bar the moment a text
+            // box takes focus (1.3-beta2), so this hide made the bar flash and
+            // vanish, and the user had to type a letter to get it back
+            // (2026-11-09). The TCL keeps the hide: its keyboard never showed
+            // itself on focus, and Back-in-one-press relies on nothing being up.
+            if (!IS_HIT) {
+                delay(100)
+                keyboard?.hide()
+            }
         }
     }
     // Focus goes on the inner BasicTextField directly so the user sees the
@@ -195,7 +203,8 @@ fun DpadComposer(
             onSend(payload)
         }
         fieldValue = TextFieldValue("")
-        keyboard?.hide()
+        // Same HIT exception as above: the bar stays up between messages.
+        if (!IS_HIT) keyboard?.hide()
         // Keep focus on the inner field after send. The IME stays hidden
         // because we just called hide(); next Back goes straight to nav.
         runCatching { fieldFr.requestFocus() }
@@ -396,9 +405,57 @@ fun DpadComposer(
                         // Pre-IME key handler: act on DPAD before the text
                         // field consumes events for cursor movement.
                         .onPreviewKeyEvent { event ->
+                            // HIT hardware arrows (slide-out QWERTY and keypad D-pad): inside the text they move the
+                            // cursor one character per press (we move it ourselves and consume
+                            // the key — returning false is not enough, because Compose's text
+                            // field treats a DPAD-source arrow as focus navigation and jumps to
+                            // "+"/send even with the cursor mid-text). At the very start / end
+                            // a fresh press falls through to the rules below, so "<" still
+                            // reaches "+" and ">" still reaches send; a HELD key stops at the
+                            // edge instead of flying out of the field. Never runs off the HIT
+                            // (isFromHitHardwareKeys is false there), so the TCL is untouched.
+                            if ((event.key == Key.DirectionLeft || event.key == Key.DirectionRight) &&
+                                isFromHitHardwareKeys(event)
+                            ) {
+                                // Key-ups carry no navigation; swallow them so a release after
+                                // the cursor reaches an end can't be read as "leave the field".
+                                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent true
+                                val left = event.key == Key.DirectionLeft
+                                val sel = fieldValue.selection
+                                val len = fieldValue.text.length
+                                val atEdge = sel.collapsed &&
+                                    (if (left) sel.start == 0 else sel.start >= len)
+                                val isRepeat = event.nativeKeyEvent.repeatCount != 0
+                                if (!atEdge || isRepeat) {
+                                    if (!atEdge) {
+                                        val pos = if (left) {
+                                            if (sel.collapsed) sel.start - 1 else sel.min
+                                        } else {
+                                            if (sel.collapsed) sel.end + 1 else sel.max
+                                        }
+                                        fieldValue = fieldValue.copy(selection = TextRange(pos.coerceIn(0, len)))
+                                    }
+                                    return@onPreviewKeyEvent true
+                                }
+                                // fresh press at the edge: fall through and leave the field
+                            }
                             if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                             if (event.nativeKeyEvent.repeatCount != 0) return@onPreviewKeyEvent false
                             when (event.key) {
+                                // HIT: OK sends, as on the TCL. On the TCL the keyboard (Dumb
+                                // Keys) turns OK into the field's Send action itself and the
+                                // key never reaches us. With the HIT's slider open the keyboard
+                                // steps aside and passes every key straight to the app, so OK
+                                // (and the QWERTY's Enter) arrived here as plain key events that
+                                // a text field does nothing with -- people had to tab over to
+                                // the send button. Send if there is something to send; an empty
+                                // field swallows the press rather than complaining. HIT hardware
+                                // keys only, so the TCL path is untouched.
+                                Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> {
+                                    if (!isFromHitHardwareKeys(event)) return@onPreviewKeyEvent false
+                                    if (fieldValue.text.isNotBlank() || pendingAttachmentUri != null) submit()
+                                    true
+                                }
                                 Key.DirectionUp -> {
                                     // Only leave the field for the messages above
                                     // when the cursor is on the FIRST line —
@@ -832,3 +889,26 @@ private val TextFieldValueSaver = androidx.compose.runtime.saveable.Saver<TextFi
         )
     },
 )
+
+/**
+ * True when [event] comes from one of the HIT's own keyboards: the slide-out
+ * QWERTY (`mtk-kpd`) or the keypad/D-pad (`aw9523-key`).
+ *
+ * Matched by input-device name and gated to the HIT (same test the Dumb Keys
+ * keyboard uses for its slider layers), so no other handset -- the TCL included --
+ * is ever affected, even one whose keypad happens to use the same driver name.
+ * Events injected by an IME (VIRTUAL_KEYBOARD device id) are excluded.
+ */
+private val HIT_KEY_DEVICES = setOf("mtk-kpd", "aw9523-key")
+
+private val IS_HIT: Boolean = listOf(
+    android.os.Build.MODEL, android.os.Build.DEVICE, android.os.Build.MANUFACTURER,
+).any { (it ?: "").uppercase().startsWith("HIT") }
+
+private fun isFromHitHardwareKeys(event: androidx.compose.ui.input.key.KeyEvent): Boolean {
+    if (!IS_HIT) return false
+    val native = event.nativeKeyEvent
+    if (native.deviceId == android.view.KeyCharacterMap.VIRTUAL_KEYBOARD) return false
+    val device = native.device ?: return false
+    return !device.isVirtual && device.name in HIT_KEY_DEVICES
+}

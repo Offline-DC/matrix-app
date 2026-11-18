@@ -1053,11 +1053,10 @@ private fun MediaBlock(
         loadedPath != null && attachment.kind == com.offline.dpadmessenger.data.AttachmentKind.IMAGE ->
             MediaThumbnail(loadedPath, attachment.mimeType, box)
 
+        // The video's first frame, a play arrow on a dark circle and its length
+        // (mockup approved 2026-11-05; HIT and TCL). Black card until the frame is ready.
         loadedPath != null && attachment.kind == com.offline.dpadmessenger.data.AttachmentKind.VIDEO ->
-            Box(box.background(Color.Black), contentAlignment = Alignment.Center) {
-                Icon(Icons.Filled.PlayArrow, contentDescription = "Play video",
-                    tint = Color.White, modifier = Modifier.size(48.dp))
-            }
+            VideoCard(loadedPath, box)
 
         else -> Box(
             box.background(MaterialTheme.colorScheme.surfaceVariant),
@@ -1087,6 +1086,49 @@ private fun MediaBlock(
                     else LocalDpadMessengerColors.current.mutedText,
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun VideoCard(path: String, modifier: Modifier) {
+    val thumb by androidx.compose.runtime.produceState(
+        initialValue = com.offline.dpadmessenger.ui.util.HitVideoThumb.cached(path),
+        path,
+    ) {
+        if (value == null) value = com.offline.dpadmessenger.ui.util.HitVideoThumb.load(path)
+    }
+    Box(modifier.background(Color.Black), contentAlignment = Alignment.Center) {
+        thumb?.bitmap?.let { bmp ->
+            Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = null,
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                modifier = Modifier.matchParentSize(),
+            )
+        }
+        Box(
+            Modifier
+                .size(48.dp)
+                .clip(CircleShape)
+                .background(Color.Black.copy(alpha = 0.55f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(Icons.Filled.PlayArrow, contentDescription = "Play video",
+                tint = Color.White, modifier = Modifier.size(32.dp))
+        }
+        val ms = thumb?.durationMs ?: 0L
+        if (ms > 0) {
+            Text(
+                text = com.offline.dpadmessenger.ui.util.HitVideoThumb.formatDuration(ms),
+                color = Color.White,
+                fontSize = 11.sp,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(6.dp)
+                    .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(3.dp))
+                    .padding(horizontal = 4.dp, vertical = 1.dp),
+            )
         }
     }
 }
