@@ -106,7 +106,7 @@ class Phone(val aci: String) {
     val store = InMemorySignalProtocolStore(identity, regId)
     val address = SignalProtocolAddress(aci, 1)
     fun startSession(flip: Flip, withOneTime: Boolean = true) =
-        SessionBuilder(store, flip.address).process(flip.bundle(withOneTime))
+        SessionBuilder(store, flip.address, address).process(flip.bundle(withOneTime))
     fun sealedTo(flip: Flip, text: String): ByteArray =
         SealedSessionCipher(store, UUID.fromString(aci), null, 1)
             .encrypt(flip.address, cert(aci, 1, identity), text.toByteArray())
@@ -192,7 +192,7 @@ fun main() {
             val b1 = Phone(bAci); b1.startSession(flip)
             flip.receiveSealed(b1.sealedTo(flip, "hi"))
             val b2 = Phone(bAci)
-            val sc = SessionCipher(flip.store, b1.address)
+            val sc = SessionCipher(flip.store, flip.address, b1.address)
             check(sc.remoteRegistrationId == b1.regId && b1.regId != b2.regId,
                 "[${if (old) "old" else "new"}] session reg id is B's OLD one → server answers 410 for device 1")
             if (old) {
@@ -200,15 +200,15 @@ fun main() {
                 // Even rebuilding fails: SessionBuilder checks isTrustedIdentity(SENDING).
                 flip.store.deleteSession(b1.address)
                 expectThrows<UntrustedIdentityException>("[old] building a session with B's new key throws UntrustedIdentity (SENDING)") {
-                    SessionBuilder(flip.store, b1.address).process(b2.bundleForFlip())
+                    SessionBuilder(flip.store, b1.address, flip.address).process(b2.bundleForFlip())
                 }
             } else {
                 val store = flip.store as AndroidSignalProtocolStore
                 check(store.containsSession(b1.address), "[new] containsSession true before archive")
                 store.archiveSession(b1.address)  // what sendToRecipientDevices does on 410 staleDevices=[1]
                 check(!store.containsSession(b1.address), "[new] containsSession false after archive → rebuild")
-                SessionBuilder(flip.store, b1.address).process(b2.bundleForFlip())
-                check(SessionCipher(flip.store, b1.address).remoteRegistrationId == b2.regId, "[new] rebuilt session carries B's NEW reg id → server accepts")
+                SessionBuilder(flip.store, b1.address, flip.address).process(b2.bundleForFlip())
+                check(SessionCipher(flip.store, flip.address, b1.address).remoteRegistrationId == b2.regId, "[new] rebuilt session carries B's NEW reg id → server accepts")
                 val ct = SealedSessionCipher(flip.store, UUID.fromString(flip.aci), null, 2)
                     .encrypt(b2.address, cert(flip.aci, 2, flip.identity), "reply".toByteArray())
                 val got = SealedSessionCipher(b2.store, UUID.fromString(bAci), null, 1)
