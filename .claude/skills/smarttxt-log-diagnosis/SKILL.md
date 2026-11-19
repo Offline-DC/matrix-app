@@ -26,7 +26,7 @@ have to re-derive them under time pressure.
 - **Smart Txt** = the launcher app (`com.offlineinc.dumbdownlauncher`) hosting a
   chat UI from **matrix-app**, backed by **rustpush**, the Rust iMessage engine,
   loaded over JNI as `libsmarttxt_ffi.so`.
-- **rustpush** here is `Offline-DC/rustpush`, forked from **`OpenBubbles/rustpush`**
+- **rustpush** here is `Offline-DC/rustpush-internal` (private; originally forked from **`OpenBubbles/rustpush`**)
   (the `upstream` remote). So the load-bearing iMessage logic *is* OpenBubbles'
   own source. "How does OpenBubbles do it?" almost always means "what does this
   rustpush do by default" — you can read it directly in `rustpush/src/`.

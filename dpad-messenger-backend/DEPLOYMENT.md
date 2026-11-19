@@ -42,7 +42,7 @@ whichever build model you pick.
 ## 3. Step 0 — get the native source into repos you own (do this now)
 
 Fork on GitHub:
-- `OpenBubbles/rustpush` → `Offline-DC/rustpush`
+- `OpenBubbles/rustpush` → `Offline-DC/rustpush` (since Nov 2026 our rustpush lives in the **private, non-fork** `Offline-DC/rustpush-internal`; the public fork is retired)
 - `OpenBubbles/apple-private-apis` → `Offline-DC/apple-private-apis`
 
 Then, bottom-up (submodule first, so its commit is pinnable):
@@ -61,7 +61,7 @@ cd ~/repos/rustpush
 # point the submodule at YOUR fork so clones resolve
 git config -f .gitmodules submodule.apple-private-apis.url https://github.com/Offline-DC/apple-private-apis.git
 git remote rename origin upstream
-git remote add origin https://github.com/Offline-DC/rustpush.git
+git remote add origin https://github.com/Offline-DC/rustpush-internal.git
 printf '.DS_Store\n*.bak\n' >> .gitignore
 git checkout -b smarttxt
 git add -A && git commit -m "Smart Txt: dumb->config, keystore de-panic, proxy removal, IDS refresh, submodule->fork"
@@ -111,7 +111,7 @@ cross-compile it.
 1. Add the engine as a submodule **inside** matrix-app, pinned to your fork:
    ```bash
    cd ~/repos/matrix-app
-   git submodule add -b smarttxt https://github.com/Offline-DC/rustpush.git rustpush
+   git submodule add -b smarttxt https://github.com/Offline-DC/rustpush-internal.git rustpush
    git submodule update --init --recursive
    ```
 2. Repoint the three `path` deps in `smarttxt-ffi/Cargo.toml` (one level shorter
@@ -163,7 +163,7 @@ cross-compile it.
 
 ## 6. Release checklist (Option A)
 
-- [ ] Native change made in `Offline-DC/rustpush` (and/or the omnisette fork); pushed.
+- [ ] Native change made in `Offline-DC/rustpush-internal` (and/or the omnisette fork); pushed.
 - [ ] `./scripts/build-rustpush-so.sh` → both ABIs rebuilt.
 - [ ] `libsmarttxt_ffi.so` (arm64 **and** armv7) + `dec.jar` committed in matrix-app.
 - [ ] Bump `versionCode`; `./gradlew :app:assembleRelease`.
