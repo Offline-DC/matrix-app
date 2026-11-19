@@ -5,7 +5,7 @@ Just enough of the system to place a log line and know which layer to fix.
 ## Repos
 
 - **`rustpush`** — the Rust iMessage engine: IDS registration, APNs, identity/key
-  management, group logic, send/receive. This checkout is `Offline-DC/rustpush`,
+  management, group logic, send/receive. This checkout is `Offline-DC/rustpush-internal` (private),
   **forked from `OpenBubbles/rustpush`** (`git remote -v` shows `upstream` =
   `github.com/OpenBubbles/rustpush`). Pinned to a specific rev. This is your
   OpenBubbles source of truth for protocol behaviour.
