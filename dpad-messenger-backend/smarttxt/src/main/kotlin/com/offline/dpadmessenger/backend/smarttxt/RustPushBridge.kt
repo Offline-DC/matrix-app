@@ -7,6 +7,7 @@ import com.offline.dpadmessenger.backend.smarttxt.absinthe.AbsintheStub
 import com.offline.dpadmessenger.backend.smarttxt.absinthe.AbsintheUnavailableException
 import com.offline.dpadmessenger.backend.smarttxt.relay.RelayException
 import com.offline.dpadmessenger.backend.smarttxt.relay.ValidationDataRelay
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -247,7 +248,7 @@ class RustPushBridge(
                 // Show the screen, relay the challenge to the companion, and wait for
                 // the companion's CTAP2 assertion (or null if the user backs out).
                 val response = fsaProvider.invoke(challenge)
-                    ?: return RegistrationResult.Failure("Sign-in cancelled.")
+                    ?: return RegistrationResult.Failure(SIGN_IN_CANCELLED)
                 // Submit the assertion to Apple; on success we fall through to register.
                 val verify = json.parseToJsonElement(
                     RustPushNative.nativeSubmitFsa(
@@ -280,8 +281,7 @@ class RustPushBridge(
             }
             parseRegisterResult(appleId, RustPushNative.nativeRegister(appleId))
         } catch (e: Throwable) {
-            Log.w(TAG, "sign-in threw", e)
-            RegistrationResult.Failure(humanizeLoginError(e.message), e)
+            signInFailureFor(e)
         }
     }
 
@@ -409,6 +409,30 @@ class RustPushBridge(
         /** True once `libsmarttxt_ffi.so` is bundled and loads. Auto-detected —
          *  no manual flag to flip. */
         val NATIVE_AVAILABLE: Boolean get() = RustPushNative.loaded
+
+        /** Shown (and logged as REGISTER_FAIL) when the user leaves sign-in part-way. */
+        internal const val SIGN_IN_CANCELLED = "Sign-in cancelled."
+
+        /**
+         * Turns an exception thrown during sign-in into the failure the user sees.
+         *
+         * A [CancellationException] is not a sign-in error: the sign-in coroutine is
+         * launched from the setup screen's `rememberCoroutineScope()`, so backing out,
+         * closing the lid or navigating away mid sign-in (often while waiting on the
+         * 2FA or security-key step) cancels it. That used to surface as "Sign-in
+         * failed. (Technical detail: rememberCoroutineScope left the composition)",
+         * which customers read as a crash (Offline-DC/matrix-app#27). Report it the
+         * same way the security-key back-out already does. We still return a
+         * Failure rather than rethrowing so the repository rolls its status back.
+         */
+        internal fun signInFailureFor(e: Throwable): RegistrationResult.Failure =
+            if (e is CancellationException) {
+                Log.i(TAG, "sign-in cancelled: ${e.message}")
+                RegistrationResult.Failure(SIGN_IN_CANCELLED, e)
+            } else {
+                Log.w(TAG, "sign-in threw", e)
+                RegistrationResult.Failure(humanizeLoginError(e.message), e)
+            }
 
         /**
          * Convert a raw native error — often deeply-nested Rust Debug output like
