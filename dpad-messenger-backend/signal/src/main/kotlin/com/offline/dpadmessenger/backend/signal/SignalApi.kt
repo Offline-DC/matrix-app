@@ -378,16 +378,22 @@ class SignalApi(
      * become the attachment's `cdnKey`, the resumable upload URL, and the
      * headers to replay on the create request. Mirrors mautrix-signal
      * `pkg/signalmeow/web::GetAttachmentUploadForm`.
+     *
+     * [uploadLength] is the size in bytes of what will be uploaded (the
+     * encrypted `iv || ciphertext || mac` blob, not the plaintext). Signal's
+     * server answers HTTP 400 when it is missing, so photos and voice notes
+     * never sent (Offline-DC/matrix-app#24).
      */
     suspend fun getAttachmentUploadForm(
         login: String,
         password: String,
+        uploadLength: Long,
     ): AttachmentUploadForm = withContext(Dispatchers.IO) {
         val authHeader = "Basic " + Base64.encodeToString(
             "$login:$password".toByteArray(),
             Base64.NO_WRAP,
         )
-        val url = "$baseUrl/v4/attachments/form/upload"
+        val url = uploadFormUrl(baseUrl, uploadLength)
         Log.d(TAG, "GET $url")
         val request = Request.Builder()
             .url(url)
@@ -626,6 +632,12 @@ class SignalApi(
         private const val TAG = "SignalApi"
         private const val MRM_MEDIA_TYPE = "application/vnd.signal-messenger.mrm"
         private const val PROTOBUF_MEDIA_TYPE = "application/x-protobuf"
+        /** URL for [getAttachmentUploadForm]; kept separate so it can be unit-tested. */
+        internal fun uploadFormUrl(baseUrl: String, uploadLength: Long): String {
+            require(uploadLength > 0) { "uploadLength must be positive, was $uploadLength" }
+            return "$baseUrl/v4/attachments/form/upload?uploadLength=$uploadLength"
+        }
+
         private val JSON = Json {
             ignoreUnknownKeys = true
             // Signal's server checks for explicit presence of fields
