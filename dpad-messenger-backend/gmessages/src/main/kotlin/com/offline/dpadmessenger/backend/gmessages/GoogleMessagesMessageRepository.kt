@@ -409,7 +409,10 @@ internal class GoogleMessagesMessageRepository(
             if (rooms.value.isNotEmpty() || messagesByRoom.value.isNotEmpty()) return@withLock
             val cutoff = autoDeleteCutoffMs()
             usersById.value = snap.usersById + (ME to currentUser)
-            rooms.value = snap.rooms
+            // Phones that already cached a blank-id room (matrix-app#30) drop it
+            // here, so they recover on the next start without a re-pair.
+            val restoredRooms = withoutBlankRoomIds(snap.rooms)
+            rooms.value = restoredRooms
             // Sweep leftover optimistic rows, but do NOT treat them all alike —
             // a "tmp_…" id at restore means two very different things now.
             //
@@ -424,6 +427,7 @@ internal class GoogleMessagesMessageRepository(
             //
             // FAILED rows are left alone either way: those never reached Google.
             val aged = snap.messagesByRoom
+                .filterKeys(::isUsableConversationId)
                 .mapValues { (_, list) -> list.filter { it.timestampMs >= cutoff } }
             var dropped = 0
             var stranded = 0
@@ -451,13 +455,13 @@ internal class GoogleMessagesMessageRepository(
                         "marked $stranded never-echoed row(s) FAILED",
                 )
             }
-            unreadByRoom.value = snap.unreadByRoom
+            unreadByRoom.value = snap.unreadByRoom.filterKeys(::isUsableConversationId)
             mutedRooms.value = snap.mutedRooms
-            outgoingIdByRoom.putAll(snap.outgoingIdByRoom)
-            snap.rooms.forEach { roomNameById[it.id] = it.name }
+            outgoingIdByRoom.putAll(snap.outgoingIdByRoom.filterKeys(::isUsableConversationId))
+            restoredRooms.forEach { roomNameById[it.id] = it.name }
             // We have something to show — skip the loading spinner; the live sync
             // will merge fresh data in.
-            if (snap.rooms.isNotEmpty()) _initialSyncComplete.value = true
+            if (restoredRooms.isNotEmpty()) _initialSyncComplete.value = true
         }
     }
 
@@ -480,7 +484,9 @@ internal class GoogleMessagesMessageRepository(
         val roomMap = rooms.value.associateBy { it.id }.toMutableMap()
         val unread = unreadByRoom.value.toMutableMap()
         val users = usersById.value.toMutableMap()
-        for (c in convs) {
+        // A conversation with no id can't be opened: it would become a room
+        // row whose "chat/" route crashes the messenger (matrix-app#30).
+        for (c in withUsableIds(convs) { it.conversationId }) {
             // Field 11 (defaultOutgoingID) is optional on the wire and decodes
             // to "" when absent (GMSessionProto: `var outgoingId = ""`). Writing
             // that over a known-good id makes the next send go out with a blank
@@ -545,7 +551,10 @@ internal class GoogleMessagesMessageRepository(
         val byRoom = messagesByRoom.value.toMutableMap()
         val unread = unreadByRoom.value.toMutableMap()
         val autoDeleteCutoff = autoDeleteCutoffMs()
-        for (gm in msgs) {
+        // No conversation id → nowhere to file it, and the provisional-room
+        // path below would add a blank-id room that crashes the messenger when
+        // pressed (matrix-app#30).
+        for (gm in withUsableIds(msgs) { it.conversationId }) {
             if (gm.isTombstone) continue // join/leave/protocol-switch system rows — skip for now
             // SMS reaction-fallback texts ('👍 to "Hi"', 'Liked "Hi"') are
             // redundant — the reaction itself renders as a chip on the target
@@ -1069,7 +1078,9 @@ internal class GoogleMessagesMessageRepository(
         // onConversations (via the event) will register the room; make sure
         // it's present before the UI navigates into it.
         onConversations(listOf(conv))
-        return conv.conversationId
+        // A blank id is skipped by onConversations and can't be opened
+        // (matrix-app#30); report it as a failure so the screen shows its error.
+        return conv.conversationId.takeIf(::isUsableConversationId)
     }
 
     override suspend fun startGroupConversation(destinations: List<String>, title: String?): String? {
@@ -1079,7 +1090,9 @@ internal class GoogleMessagesMessageRepository(
             .getOrElse { Log.e(TAG, "startGroupConversation failed", it); null }
             ?: return null
         onConversations(listOf(conv))
-        return conv.conversationId
+        // A blank id is skipped by onConversations and can't be opened
+        // (matrix-app#30); report it as a failure so the screen shows its error.
+        return conv.conversationId.takeIf(::isUsableConversationId)
     }
 
     // ---- MediaDownloader ----------------------------------------------------
@@ -1525,6 +1538,26 @@ internal class GoogleMessagesMessageRepository(
 
     companion object {
         private const val TAG = "GMRepo"
+
+        /** A conversation id we can route to. Absent proto string fields decode
+         *  to "" (GMSessionProto), and a blank id becomes a room row that crashes
+         *  the messenger when pressed (matrix-app#30). */
+        internal fun isUsableConversationId(id: String): Boolean = id.isNotBlank()
+
+        /** [items] whose conversation id ([idOf]) is usable; logs how many were
+         *  dropped. Used by onConversations / onMessages so a blank id never
+         *  reaches the room list. */
+        internal fun <T> withUsableIds(items: List<T>, idOf: (T) -> String): List<T> {
+            val kept = items.filter { isUsableConversationId(idOf(it)) }
+            if (kept.size != items.size) {
+                Log.w(TAG, "skipped ${items.size - kept.size} item(s) with a blank conversation id (matrix-app#30)")
+            }
+            return kept
+        }
+
+        /** [rooms] without any blank-id rows (see [isUsableConversationId]). */
+        internal fun withoutBlankRoomIds(rooms: List<Room>): List<Room> =
+            rooms.filter { isUsableConversationId(it.id) }
         private const val ME = "me"
         /** Shown instead of a raw conversation/participant id when no real name
          *  or number is available yet. */
