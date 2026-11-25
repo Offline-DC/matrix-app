@@ -53,6 +53,9 @@ dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2026.01.01")
     api(composeBom)
 
+    // Plain-JVM unit tests (Routes and other pure helpers).
+    testImplementation("junit:junit:4.13.2")
+
     // Core
     api("androidx.core:core-ktx:1.12.0")
     api("androidx.activity:activity-compose:1.8.2")

@@ -166,7 +166,9 @@ fun NewConversationScreen(
         scope.launch {
             val roomId = runCatching { starter.startConversation(destination) }.getOrNull()
             busy = false
-            if (roomId != null) {
+            // A blank id can't be opened (matrix-app#30) — treat it as a failure
+            // so the user gets the error and their focus back.
+            if (!roomId.isNullOrBlank()) {
                 onConversationStarted(roomId)
             } else {
                 error = "Couldn't start a conversation. Check the number and try again."
@@ -192,7 +194,9 @@ fun NewConversationScreen(
         scope.launch {
             val roomId = runCatching { groupStarter.startGroupConversation(numbers, null) }.getOrNull()
             busy = false
-            if (roomId != null) {
+            // A blank id can't be opened (matrix-app#30) — treat it as a failure
+            // so the user gets the error and their focus back.
+            if (!roomId.isNullOrBlank()) {
                 onConversationStarted(roomId)
             } else {
                 error = "Couldn't create the group. Try again."

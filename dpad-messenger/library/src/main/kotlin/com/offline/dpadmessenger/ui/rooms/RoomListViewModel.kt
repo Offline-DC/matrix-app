@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -27,6 +28,10 @@ class RoomListViewModel(
         // expected result if the heap is pinned (watch for back-to-back GCs reporting
         // "0% free" around the same timestamps). Remove all three once diagnosed.
         .onEach { android.util.Log.i("IMsgUiFlow", "UIFLOW vm: rooms=${it.size}") }
+        // A row with a blank id can never be opened (Routes.chatOrNull refuses it,
+        // matrix-app#30), and two of them would collide as LazyColumn keys. Hide
+        // them here so no backend can put a dead row in the list.
+        .map { list -> list.filter { it.room.id.isNotBlank() } }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     /**

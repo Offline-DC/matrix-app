@@ -124,8 +124,9 @@ fun DpadMessengerApp(
     // [authed] so a tap that arrives before pairing finishes still lands the
     // user in the thread once they're authenticated (rather than being dropped).
     androidx.compose.runtime.LaunchedEffect(initialRoomKey, authed) {
-        if (initialRoomId != null && authed) {
-            nav.navigate(Routes.chat(initialRoomId)) {
+        val route = Routes.chatOrNull(initialRoomId)
+        if (route != null && authed) {
+            nav.navigate(route) {
                 // Pop any thread the user was already sitting in back to the room
                 // list first. Without this, deep-linking from one chat to another
                 // reuses the same "chat/{roomId}" destination (and its existing
@@ -164,7 +165,7 @@ fun DpadMessengerApp(
                 val vm: RoomListViewModel = viewModel(factory = factory)
                 RoomListScreen(
                     viewModel = vm,
-                    onRoomClick = { roomId -> nav.navigate(Routes.chat(roomId)) },
+                    onRoomClick = { roomId -> Routes.chatOrNull(roomId)?.let { nav.navigate(it) } ?: logBlankRoom("room-list") },
                     onSettingsClick = {
                         focusRelinkOnSettings = false
                         nav.navigate(Routes.SETTINGS)
@@ -183,10 +184,15 @@ fun DpadMessengerApp(
                     groupStarter = repository as? com.offline.dpadmessenger.data.GroupConversationStarter,
                     onBack = { nav.popBackStack() },
                     onConversationStarted = { roomId ->
-                        nav.navigate(Routes.chat(roomId)) {
-                            // Replace the compose screen so Back from the chat
-                            // returns to the room list, not the number entry.
-                            popUpTo(Routes.NEW_CONVERSATION) { inclusive = true }
+                        val route = Routes.chatOrNull(roomId)
+                        if (route == null) {
+                            logBlankRoom("new-conversation")
+                        } else {
+                            nav.navigate(route) {
+                                // Replace the compose screen so Back from the chat
+                                // returns to the room list, not the number entry.
+                                popUpTo(Routes.NEW_CONVERSATION) { inclusive = true }
+                            }
                         }
                     },
                 )
@@ -299,6 +305,25 @@ internal object Routes {
     const val ARG_ROOM_ID = "roomId"
     const val CHAT = "chat/{$ARG_ROOM_ID}"
     fun chat(roomId: String) = "chat/$roomId"
+
+    /**
+     * The chat route for [roomId], or null when there is no usable id.
+     *
+     * `chat/{roomId}` needs a non-empty segment: navigating to plain `"chat/"`
+     * throws IllegalArgumentException ("Navigation destination that matches
+     * request ... chat/ cannot be found") on the main thread and takes the whole
+     * host activity down. A backend that ever surfaces a room with a blank id
+     * (Google Messages did, matrix-app#30) would otherwise crash the messenger
+     * every time that row is pressed. Every navigation into a chat goes through
+     * here so no backend can do that again.
+     */
+    fun chatOrNull(roomId: String?): String? =
+        roomId?.takeIf { it.isNotBlank() }?.let { chat(it) }
+}
+
+/** A chat was requested for a blank room id; ignore the press (see [Routes.chatOrNull]). */
+private fun logBlankRoom(from: String) {
+    android.util.Log.w("MessengerNav", "ignored open-chat with a blank room id (from=$from) — see matrix-app#30")
 }
 
 internal class RepositoryViewModelFactory(
