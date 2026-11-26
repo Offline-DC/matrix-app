@@ -406,6 +406,15 @@ class RustPushBridge(
          *  ever constructed. */
         private val CONNECT_LOCK = Any()
 
+        /** What the customer reads when Apple has paused registration (6009 /
+         *  rate-limited). A constant so SmartTxtRepository.fixConnection can show the
+         *  very same copy when it refuses to call Apple again (matrix-app#32). The
+         *  reasoning behind the wording is at its use in [humanizeLoginError]. */
+        const val APPLE_PAUSED_MESSAGE =
+            "Apple has paused iMessage registration for this device. Re-registering " +
+                "again makes the pause last longer, so please don't retry. Email " +
+                "support@dumb.co and we'll help you get it lifted with Apple."
+
         /** True once `libsmarttxt_ffi.so` is bundled and loads. Auto-detected —
          *  no manual flag to flip. */
         val NATIVE_AVAILABLE: Boolean get() = RustPushNative.loaded
@@ -511,9 +520,7 @@ class RustPushBridge(
                     // Settings -> Re-register now three times in 77s, and every tap
                     // preempted rustpush's backoff and re-hit an already-flagged
                     // account. Copy here must steer AWAY from retrying.
-                    "Apple has paused iMessage registration for this device. Re-registering " +
-                        "again makes the pause last longer, so please don't retry. Email " +
-                        "support@dumb.co and we'll help you get it lifted with Apple."
+                    APPLE_PAUSED_MESSAGE
                 lower.contains("(6001)") ->
                     "iMessage can't register while Advanced Data Protection or Contact Key Verification " +
                         "is on. Turn both off in your Apple Account settings, then try again."
