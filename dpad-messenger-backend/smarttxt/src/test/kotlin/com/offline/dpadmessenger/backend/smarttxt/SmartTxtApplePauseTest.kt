@@ -167,9 +167,58 @@ class SmartTxtApplePauseTest {
         val raw = "Registration Error Your iMessage access is temporarily disabled (6009) request timed out"
         val store = newStore()
         val apple = FakeApple(failWith(raw), success())
-        press(store, apple, t0)
+        // First press shows the paused copy too, not the "try again"-style copy the
+        // humaniser picked, while the pause is being recorded.
+        assertEquals(paused, press(store, apple, t0))
         assertEquals(paused, press(store, apple, t0 + 13_000L))
         assertEquals(1, apple.calls)
+    }
+
+    @Test
+    fun relayRateLimit_doesNotPause() {
+        // A 429 "rate limit" from our own anisette/validation relay is not Apple pausing
+        // the device; it must not block Re-register now for 24 h.
+        val store = newStore()
+        val apple = FakeApple(failWith("validation relay returned HTTP 429: rate limit exceeded"), success())
+        press(store, apple, t0)
+        assertEquals(0L, store.applePausedUntilMs())
+        assertEquals(SmartTxtRepository.FixOutcome.Recovered, press(store, apple, t0 + 13_000L))
+        assertEquals(2, apple.calls)
+    }
+
+    @Test
+    fun smallClockStepBack_staysPaused() {
+        // An NTP sync that moves the clock back a few minutes must not end the pause.
+        val store = newStore()
+        val apple = FakeApple(fail6009(), success())
+        press(store, apple, t0)
+        assertEquals(paused, press(store, apple, t0 - 5L * 60_000L))
+        assertEquals(1, apple.calls)
+    }
+
+    @Test
+    fun pausedOutcome_isWhatFixConnectionChecksBeforePhase1() {
+        // fixConnection returns this before the (slow, retried) local client rebuild,
+        // so a paused press offline answers at once.
+        val store = newStore()
+        assertEquals(null, SmartTxtRepository.applePausedOutcome(store, t0))
+        press(store, FakeApple(fail6009()), t0)
+        assertEquals(paused, SmartTxtRepository.applePausedOutcome(store, t0 + 13_000L))
+        assertEquals(null, SmartTxtRepository.applePausedOutcome(store, t0 + SmartTxtRepository.APPLE_PAUSE_MS))
+    }
+
+    @Test
+    fun rustpushReportingRegistered_clearsThePause() {
+        // rustpush's own background retry re-registered successfully: REGSTATE says
+        // "registered", so the pause is over.
+        val store = newStore()
+        press(store, FakeApple(fail6009()), t0)
+        for (state in listOf("failed", "registering", "no_client", "unknown")) {
+            SmartTxtRepository.clearApplePauseIfRegistered(state, store)
+            assertTrue(state, store.applePausedUntilMs() > t0)
+        }
+        SmartTxtRepository.clearApplePauseIfRegistered("registered", store)
+        assertEquals(0L, store.applePausedUntilMs())
     }
 
     @Test

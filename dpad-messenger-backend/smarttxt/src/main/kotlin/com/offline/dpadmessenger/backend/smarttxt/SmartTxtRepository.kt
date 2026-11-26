@@ -220,7 +220,11 @@ object SmartTxtRepository {
             return
         }
         when (val state = obj.optString("state", "unknown")) {
-            "registered" -> Log.i(TAG, "REGSTATE registered; next re-register in ${obj.optLong("next_s", -1L)}s")
+            "registered" -> {
+                Log.i(TAG, "REGSTATE registered; next re-register in ${obj.optLong("next_s", -1L)}s")
+                runCatching { clearApplePauseIfRegistered(state, SmartTxtAccountStore(context.applicationContext)) }
+                    .onFailure { Log.w(TAG, "could not clear the Apple pause: $it") }
+            }
             "registering" -> Log.i(TAG, "REGSTATE registering (rustpush is working on it)")
             "no_client", "unknown" -> Log.i(TAG, "REGSTATE $state — no signal, leaving status alone")
             "failed" -> {
@@ -735,9 +739,13 @@ object SmartTxtRepository {
      */
     fun fixConnection(context: Context): FixOutcome {
         val appContext = context.applicationContext
-        if (!SmartTxtAccountStore(appContext).isRegistered()) {
+        val store = SmartTxtAccountStore(appContext)
+        if (!store.isRegistered()) {
             return FixOutcome.NeedsUser(NOT_SIGNED_IN_MESSAGE)
         }
+        // Apple has paused registration (matrix-app#32): nothing below can help, so
+        // answer now rather than after Phase 1's retries. Re-checked in Phase 2.
+        applePausedOutcome(store, System.currentTimeMillis())?.let { return it }
 
         // PHASE 1 — the LOCAL half, retried.
         //
@@ -793,7 +801,7 @@ object SmartTxtRepository {
         // with a second fixConnection (healLock is reentrant; reregisterOnce takes it too).
         return synchronized(healLock) {
             reregisterUnlessPaused(
-                store = SmartTxtAccountStore(appContext),
+                store = store,
                 nowMs = System.currentTimeMillis(),
                 reregister = {
                     // Forget the previous attempt's raw text, so a throw here can't be
@@ -826,14 +834,7 @@ object SmartTxtRepository {
         reregister: () -> RegistrationResult,
         lastRaw: () -> String,
     ): FixOutcome {
-        val pausedUntil = store.applePausedUntilMs()
-        // The lower bound means a pause stamped under a wrong (future-dated) clock
-        // can't outlive one window once the clock is set back.
-        if (nowMs < pausedUntil && nowMs >= pausedUntil - APPLE_PAUSE_MS) {
-            Log.w(TAG, "fixConnection: Apple paused registration — NOT calling Apple " +
-                "(paused for another ${(pausedUntil - nowMs) / 60_000} min)")
-            return FixOutcome.NeedsUser(RustPushBridge.APPLE_PAUSED_MESSAGE)
-        }
+        applePausedOutcome(store, nowMs)?.let { return it }
         val r = runCatching { reregister() }.getOrElse {
             RegistrationResult.Failure(it.message ?: "unknown error")
         }
@@ -848,9 +849,11 @@ object SmartTxtRepository {
                 // humaniser has already replaced by this point.
                 if (isApplePause(r.message) || isApplePause(lastRaw())) {
                     // Apple paused registration: stop calling Apple until the window
-                    // passes or a registration succeeds (matrix-app#32).
+                    // passes or a registration succeeds (matrix-app#32). Always the
+                    // paused copy, whatever the humaniser picked, so the first press
+                    // never reads as "try again".
                     store.markApplePaused(nowMs + APPLE_PAUSE_MS)
-                    FixOutcome.NeedsUser(r.message)
+                    FixOutcome.NeedsUser(RustPushBridge.APPLE_PAUSED_MESSAGE)
                 } else if (isTerminalFailure(r.message) || isTerminalFailure(lastRaw())) {
                     FixOutcome.NeedsUser(r.message)
                 } else {
@@ -864,15 +867,39 @@ object SmartTxtRepository {
         }
     }
 
-    /** Apple has paused registration for this device: our "Apple has paused…" copy,
-     *  or rustpush's raw text for a 6009 / rate limit (the same triggers the
-     *  humaniser maps to that copy, matched directly in case an earlier humaniser
-     *  branch claimed the string first). */
+    /** The "Apple has paused…" outcome while a pause recorded by
+     *  [reregisterUnlessPaused] is in force, else null (matrix-app#32). Checked
+     *  before Phase 1 too, so a paused press answers at once instead of after the
+     *  local rebuild's retries. A pause stamped under a future-dated clock can't
+     *  outlive one window once the clock is set back; a small step back (an NTP
+     *  sync, [APPLE_PAUSE_CLOCK_SLACK_MS]) keeps it. */
+    @androidx.annotation.VisibleForTesting
+    internal fun applePausedOutcome(store: SmartTxtAccountStore, nowMs: Long): FixOutcome? {
+        val pausedUntil = store.applePausedUntilMs()
+        if (nowMs >= pausedUntil) return null
+        if (nowMs < pausedUntil - APPLE_PAUSE_MS - APPLE_PAUSE_CLOCK_SLACK_MS) return null
+        Log.w(TAG, "fixConnection: Apple paused registration — NOT calling Apple " +
+            "(paused for another ${(pausedUntil - nowMs) / 60_000} min)")
+        return FixOutcome.NeedsUser(RustPushBridge.APPLE_PAUSED_MESSAGE)
+    }
+
+    /** rustpush reports a healthy registration (its own background retry got
+     *  through): any pause recorded by [reregisterUnlessPaused] is over
+     *  (matrix-app#32). Called from [checkRegistrationHealth]. */
+    @androidx.annotation.VisibleForTesting
+    internal fun clearApplePauseIfRegistered(state: String, store: SmartTxtAccountStore) {
+        if (state == "registered") store.clearApplePause()
+    }
+
+    /** Apple has paused registration for this device: rustpush's text for a 6009
+     *  ("temporarily disabled", "(6009)") or Apple's rate limit ("rate-limited",
+     *  error.rs:38). Deliberately NOT a bare "rate limit", nor our humanised copy
+     *  (which the humaniser also shows for that): a 429 from our own
+     *  anisette/validation relay is not Apple pausing the device and must not
+     *  block Re-register now for 24 h. */
     private fun isApplePause(text: String): Boolean {
-        if (text == RustPushBridge.APPLE_PAUSED_MESSAGE) return true
         val m = text.lowercase()
-        return m.contains("temporarily disabled") || m.contains("(6009)") ||
-            m.contains("rate-limit") || m.contains("rate limit")
+        return m.contains("temporarily disabled") || m.contains("(6009)") || m.contains("rate-limited")
     }
 
     /** PHASE 1 of a fix: get the native runtime and a live client back up. Local work
@@ -1034,6 +1061,9 @@ object SmartTxtRepository {
      *  outlast it; any successful registration ends it early. */
     @androidx.annotation.VisibleForTesting
     internal const val APPLE_PAUSE_MS = DAY_MS
+
+    /** How far the clock may step back (an NTP sync) without ending a pause early. */
+    private const val APPLE_PAUSE_CLOCK_SLACK_MS = 10L * 60_000L
 
 
     /** Guards against two re-registrations running at once (a boot-path heal racing
