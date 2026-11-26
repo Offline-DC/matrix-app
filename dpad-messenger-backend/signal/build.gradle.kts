@@ -41,6 +41,7 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
     kotlinOptions { jvmTarget = "17" }
+    testOptions { unitTests.isReturnDefaultValues = true }
 
     packaging {
         resources.excludes.add("META-INF/AL2.0")
@@ -141,4 +142,6 @@ dependencies {
 
     // Required by libsignal-android.
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
+
+    testImplementation("junit:junit:4.13.2")
 }

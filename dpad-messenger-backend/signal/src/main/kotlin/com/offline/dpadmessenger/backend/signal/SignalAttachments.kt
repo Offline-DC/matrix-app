@@ -79,7 +79,7 @@ class SignalAttachments(
             val key = ByteArray(64).also { SecureRandom().nextBytes(it) }
             val encrypted = SignalAttachmentCrypto.encrypt(plaintext, key)
 
-            val form = api.getAttachmentUploadForm(login, password)
+            val form = api.getAttachmentUploadForm(login, password, encrypted.data.size.toLong())
             api.uploadAttachment(form, encrypted.data)
 
             Log.d(TAG, "uploaded ${plaintext.size}b as cdn${form.cdn} key=${form.key.take(12)}…")
