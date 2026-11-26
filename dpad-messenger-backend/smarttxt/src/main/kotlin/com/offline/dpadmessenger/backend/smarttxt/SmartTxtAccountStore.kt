@@ -1,6 +1,7 @@
 package com.offline.dpadmessenger.backend.smarttxt
 
 import android.content.Context
+import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import kotlinx.serialization.json.Json
@@ -20,26 +21,16 @@ import kotlinx.serialization.json.Json
  * gates on [isRegistered] before showing the chat, exactly how the gmessages UI
  * gates on `isPaired`.
  */
-class SmartTxtAccountStore(context: Context) {
+class SmartTxtAccountStore internal constructor(prefsFactory: () -> SharedPreferences) {
 
-    private val ctx = context.applicationContext
+    constructor(context: Context) : this({ encryptedPrefs(context.applicationContext) })
+
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
-    private val masterKey by lazy {
-        MasterKey.Builder(ctx)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build()
-    }
-
-    private val prefs by lazy {
-        EncryptedSharedPreferences.create(
-            ctx,
-            "dpad_smarttxt_account",
-            masterKey,
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-        )
-    }
+    /** Built lazily, as before. The internal constructor exists only so a plain JVM
+     *  test can hand in an in-memory [SharedPreferences] (EncryptedSharedPreferences
+     *  needs the Android keystore) — see SmartTxtApplePauseTest, matrix-app#32. */
+    private val prefs by lazy(prefsFactory)
 
     /** Persist (or replace) the dumb file. */
     fun saveConfig(config: MacOSConfig) {
@@ -74,6 +65,26 @@ class SmartTxtAccountStore(context: Context) {
         val acct = loadAccount() ?: return
         saveAccount(acct.copy(lastRegisteredMs = atMs))
         clearTerminalFailure()
+        clearApplePause()
+    }
+
+    /**
+     * Until when Apple has paused registration for this device (IDS 6009 /
+     * "temporarily disabled" / rate-limited), as wall-clock millis; 0 = no pause.
+     *
+     * Persisted so Settings -> "Re-register now" stops calling Apple after Apple
+     * has said to stop, across presses and process restarts (matrix-app#32).
+     * Cleared by [markRegistered] (any successful registration: interactive
+     * sign-in or a successful re-register) and by [clear] (sign-out with wipe).
+     */
+    fun applePausedUntilMs(): Long = prefs.getLong(KEY_APPLE_PAUSED_UNTIL, 0L)
+
+    fun markApplePaused(untilMs: Long) {
+        prefs.edit().putLong(KEY_APPLE_PAUSED_UNTIL, untilMs).apply()
+    }
+
+    fun clearApplePause() {
+        prefs.edit().remove(KEY_APPLE_PAUSED_UNTIL).apply()
     }
 
     /**
@@ -144,6 +155,19 @@ class SmartTxtAccountStore(context: Context) {
     fun enabledHandles(): Set<String> = prefs.getStringSet(KEY_ENABLED_HANDLES, null) ?: emptySet()
 
     private companion object {
+        fun encryptedPrefs(ctx: Context): SharedPreferences {
+            val masterKey = MasterKey.Builder(ctx)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            return EncryptedSharedPreferences.create(
+                ctx,
+                "dpad_smarttxt_account",
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+            )
+        }
+
         const val SCHEMA_VERSION = 1
         const val KEY_SCHEMA_VERSION = "schemaVersion"
         const val KEY_MACOS_CONFIG = "macOsConfig"
@@ -152,5 +176,6 @@ class SmartTxtAccountStore(context: Context) {
         const val KEY_TERMINAL_ERROR = "terminalRegistrationError"
         const val KEY_ENABLED_HANDLES = "enabledHandles"
         const val KEY_DEFAULT_HANDLE = "defaultHandle"
+        const val KEY_APPLE_PAUSED_UNTIL = "applePausedUntilMs"
     }
 }
