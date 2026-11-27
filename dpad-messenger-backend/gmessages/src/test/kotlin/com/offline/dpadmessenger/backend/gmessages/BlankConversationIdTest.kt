@@ -52,4 +52,47 @@ class BlankConversationIdTest {
         val kept = GoogleMessagesMessageRepository.withUsableIds(listOf(blank, real)) { it.conversationId }
         assertEquals(listOf("m2"), kept.map { it.messageId })
     }
+
+    // Google sometimes leaves the top-level ids unset and only sends them
+    // nested (mautrix/gmessages b580a1a). These must not decode to blank.
+
+    @Test
+    fun messageFallsBackToNestedConversationAndMessageIds() {
+        val group = ProtoWriter().string(1, "42").toByteArray()
+        val another = ProtoWriter().string(1, "m9").toByteArray()
+        val msg = GMSessionProto.parseMessage(
+            ProtoWriter().bytes(23, group).bytes(24, another).toByteArray()
+        )
+        assertEquals("42", msg.conversationId)
+        assertEquals("m9", msg.messageId)
+        assertEquals(1, GoogleMessagesMessageRepository.withUsableIds(listOf(msg)) { it.conversationId }.size)
+    }
+
+    @Test
+    fun topLevelIdsStillWinOverNestedOnes() {
+        val group = ProtoWriter().string(1, "nested").toByteArray()
+        val msg = GMSessionProto.parseMessage(
+            ProtoWriter().string(1, "m1").string(7, "top").bytes(23, group).toByteArray()
+        )
+        assertEquals("top", msg.conversationId)
+        assertEquals("m1", msg.messageId)
+    }
+
+    @Test
+    fun conversationFallsBackToNestedConversationId() {
+        val group = ProtoWriter().string(1, "77").toByteArray()
+        val conv = GMSessionProto.parseConversation(ProtoWriter().string(2, "Mom").bytes(31, group).toByteArray())
+        assertEquals("77", conv.conversationId)
+        val top = GMSessionProto.parseConversation(ProtoWriter().string(1, "5").bytes(31, group).toByteArray())
+        assertEquals("5", top.conversationId)
+    }
+
+    @Test
+    fun getOrCreateConversationResponseUsesNestedId() {
+        // "Couldn't start a conversation" when only the nested id came back.
+        val group = ProtoWriter().string(1, "88").toByteArray()
+        val conv = ProtoWriter().bytes(31, group).toByteArray()
+        val resp = ProtoWriter().bytes(2, conv).toByteArray()
+        assertEquals("88", GMSessionProto.parseGetOrCreateConversationResponse(resp)?.conversationId)
+    }
 }
