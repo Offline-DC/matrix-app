@@ -367,11 +367,27 @@ internal object GMSessionProto {
     fun revokeGaiaPairingRequest(pairingAttemptId: String): ByteArray =
         ProtoWriter().string(1, pairingAttemptId).toByteArray()
 
+    /**
+     * SomeKindOfGroupID { conversationID=1, nestedID=2, maybePhoneNumber=3 }
+     * (mautrix-gmessages conversations.proto). Google now sometimes leaves the
+     * top-level conversationID (Message field 7 / Conversation field 1) unset
+     * and only sends it here — Message.someKindOfGroupID=23,
+     * Conversation.someKindOfGroupID=31. Upstream falls back to it in
+     * libgm fillMissingIDs (mautrix/gmessages b580a1a, 2026-11-12). Without
+     * this, those items decode to a blank id and are dropped (matrix-app#30
+     * guard), so incoming texts vanish, sends never echo ("Not Delivered"),
+     * and new conversations fail.
+     */
+    private fun nestedConversationId(bytes: ByteArray): String =
+        ProtoReader.fields(bytes)[1]?.bytes?.toString(Charsets.UTF_8) ?: ""
+
     fun parseConversation(bytes: ByteArray): GMConversation {
         var id = ""; var name = ""; var latest = ""; var ts = 0L
         var unread = false; var group = false; var outgoingId = ""; var color = ""
         val participants = ArrayList<GMParticipant>()
         val others = ArrayList<String>()
+        // Fallback id from someKindOfGroupID (field 31) — see nestedConversationId.
+        var nestedId = ""
         forEachField(bytes) { f ->
             when (f.number) {
                 1 -> id = f.utf8()
@@ -384,8 +400,10 @@ internal object GMSessionProto {
                 15 -> color = f.utf8()
                 20 -> f.bytes?.let { participants.add(parseParticipant(it)) }
                 21 -> others.add(f.utf8())
+                31 -> f.bytes?.let { nestedId = nestedConversationId(it) }
             }
         }
+        if (id.isBlank()) id = nestedId
         return GMConversation(id, name, latest, ts, unread, group, outgoingId, color, participants, others)
     }
 
@@ -416,6 +434,9 @@ internal object GMSessionProto {
         var mediaDebug: String? = null
         val textParts = ArrayList<String>()
         val reactions = ArrayList<GMReaction>()
+        // Fallback ids from someKindOfGroupID (23) / anotherMessageID (24) —
+        // see nestedConversationId.
+        var nestedConvId = ""; var nestedMsgId = ""
         forEachField(bytes) { f ->
             when (f.number) {
                 1 -> id = f.utf8()
@@ -450,8 +471,12 @@ internal object GMSessionProto {
                 12 -> tmpId = f.utf8()
                 19 -> f.bytes?.let { re -> parseReactionEntry(re)?.let(reactions::add) }
                 21 -> f.bytes?.let { replyTo = ProtoReader.fields(it)[1]?.bytes?.toString(Charsets.UTF_8) }
+                23 -> f.bytes?.let { nestedConvId = nestedConversationId(it) }
+                24 -> f.bytes?.let { nestedMsgId = ProtoReader.fields(it)[1]?.bytes?.toString(Charsets.UTF_8) ?: "" }
             }
         }
+        if (convId.isBlank()) convId = nestedConvId
+        if (id.isBlank()) id = nestedMsgId
         val text = textParts.joinToString("\n")
         // Contentless row (no text, no media, no reactions) that isn't a
         // tombstone/deleted marker → capture its full field shape so the repo
